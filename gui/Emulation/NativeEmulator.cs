@@ -75,7 +75,7 @@ public sealed class NativeEmulator : IEmulator
     {
         if (!_audio.Ok) return;
         int n = (int)Native.omac_drain_audio(_h, _audioBuf, (nuint)_audioBuf.Length);
-        if (n > 0) _audio.Queue(_audioBuf, n);
+        if (n > 0) _audio.Feed(_audioBuf, n);
     }
 
     private readonly byte[] _logPoll = new byte[65536];

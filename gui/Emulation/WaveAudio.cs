@@ -3,10 +3,12 @@ using System.Runtime.InteropServices;
 namespace OpenMac.Gui.Emulation;
 
 /// <summary>
-/// Minimal streaming audio sink over Win32 waveOut — no external dependency.
-/// The emulated Mac produces 8-bit unsigned mono PCM at ~22254 Hz; each frame's
-/// drained samples are queued into a small pool of buffers. If the pool is full
-/// (host can't keep up) the excess is dropped rather than blocking the UI thread.
+/// Streaming audio sink over Win32 waveOut — no external dependency. The emulated
+/// Mac produces 8-bit unsigned mono PCM at ~22254 Hz. The per-frame sample drain
+/// is jittery (it rides the WPF dispatcher timer), so samples are accumulated in a
+/// ring and handed to waveOut as full, fixed-size buffers kept a few deep. That
+/// decouples the uneven producer from the steady consumer and avoids the underruns
+/// and dropped samples that make naive per-frame feeding sound rough.
 /// </summary>
 internal sealed class WaveAudio : IDisposable
 {
@@ -37,14 +39,18 @@ internal sealed class WaveAudio : IDisposable
 
     private const uint WHDR_DONE = 0x01;
     private const uint WAVE_MAPPER = 0xFFFFFFFF;
-    private const int NBUF = 8, BUFSZ = 4096;
+    private const int NBUF = 5;          // buffers kept in flight
+    private const int BUFSZ = 1024;      // ~46 ms each at 22254 Hz
     private static readonly int HdrSize = Marshal.SizeOf<WAVEHDR>();
 
     private IntPtr _h;
     private readonly IntPtr[] _hdr = new IntPtr[NBUF];
     private readonly IntPtr[] _data = new IntPtr[NBUF];
     private readonly bool[] _used = new bool[NBUF];
-    private int _next;
+
+    // Accumulation ring (decouples the jittery drain from steady playback).
+    private readonly byte[] _ring = new byte[BUFSZ * (NBUF + 4)];
+    private int _rHead, _rCount;
 
     public WaveAudio(int sampleRate)
     {
@@ -74,33 +80,44 @@ internal sealed class WaveAudio : IDisposable
 
     public bool Ok => _h != IntPtr.Zero;
 
-    /// <summary>Queue up to `count` samples; drops overflow instead of blocking.</summary>
-    public void Queue(byte[] samples, int count)
+    /// <summary>Accumulate this frame's samples and push any full buffers to the device.</summary>
+    public void Feed(byte[] samples, int count)
     {
         if (_h == IntPtr.Zero || count <= 0) return;
-        int offset = 0;
-        while (offset < count)
+
+        // 1. Append to the ring; on overflow drop the oldest so latency stays bounded.
+        for (int i = 0; i < count; i++)
+        {
+            if (_rCount == _ring.Length) { _rHead = (_rHead + 1) % _ring.Length; _rCount--; }
+            _ring[(_rHead + _rCount) % _ring.Length] = samples[i];
+            _rCount++;
+        }
+
+        // 2. Emit full, fixed-size buffers into any free slots.
+        while (_rCount >= BUFSZ)
         {
             int slot = FindFree();
-            if (slot < 0) return;           // pool full — drop the remainder
-            int n = Math.Min(count - offset, BUFSZ);
-            Marshal.Copy(samples, offset, _data[slot], n);
+            if (slot < 0) break;            // all buffers busy — leave the rest in the ring
+            int first = Math.Min(BUFSZ, _ring.Length - _rHead);
+            Marshal.Copy(_ring, _rHead, _data[slot], first);
+            if (first < BUFSZ)
+                Marshal.Copy(_ring, 0, IntPtr.Add(_data[slot], first), BUFSZ - first);
+            _rHead = (_rHead + BUFSZ) % _ring.Length;
+            _rCount -= BUFSZ;
+
             var h = Marshal.PtrToStructure<WAVEHDR>(_hdr[slot]);
-            h.dwBufferLength = (uint)n;
+            h.dwBufferLength = BUFSZ;
             h.dwFlags &= ~WHDR_DONE;
             Marshal.StructureToPtr(h, _hdr[slot], false);
             waveOutWrite(_h, _hdr[slot], HdrSize);
             _used[slot] = true;
-            offset += n;
         }
     }
 
     private int FindFree()
     {
-        for (int t = 0; t < NBUF; t++)
+        for (int i = 0; i < NBUF; i++)
         {
-            int i = _next;
-            _next = (i + 1) % NBUF;
             if (!_used[i]) return i;
             var h = Marshal.PtrToStructure<WAVEHDR>(_hdr[i]);
             if ((h.dwFlags & WHDR_DONE) != 0) { _used[i] = false; return i; }
