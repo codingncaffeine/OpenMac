@@ -297,6 +297,20 @@ void Machine::tickDevices(int cpuCycles) {
             }
         }
     }
+    // ADB wake-up poke: while the bus is idle and a device (keyboard/mouse)
+    // has an event to report, periodically fire a shift-register completion
+    // so the ROM's ADB manager wakes and polls the device. The ROM otherwise
+    // stops all ADB after startup and never learns of new input.
+    if (adbPending_ == 0 && adb_->state() == 3 && adb_->hasPendingEvent()) {
+        adbIdleTimer_ -= cpuCycles;
+        if (adbIdleTimer_ <= 0) {
+            adbIdleTimer_ = 6000;
+            via_->completeShift(true, 0xFF);
+        }
+    } else {
+        adbIdleTimer_ = 0;
+    }
+
     viaRemainder_ += cpuCycles;
     if (viaRemainder_ >= 10) {
         via_->tick(viaRemainder_ / 10);

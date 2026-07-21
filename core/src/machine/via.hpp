@@ -42,7 +42,12 @@ public:
     u8 shiftValue() const { return sr_; }
     void completeShift(bool input, u8 inValue) {
         if (input) sr_ = inValue;
-        ifr_ |= 0x04;   // SR interrupt flag
+        // A completed external shift raises BOTH the shift-register interrupt
+        // and the CB1 interrupt (CB1 carries the external shift clock). The
+        // ROM's ADB manager needs both; with only SR it treats the event as
+        // an error and resets the bus.
+        ifr_ |= 0x04;   // SR  (IFR bit 2)
+        ifr_ |= 0x10;   // CB1 (IFR bit 4)
     }
 
     u8 ora() const { return ora_; }

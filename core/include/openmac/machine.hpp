@@ -108,6 +108,7 @@ private:
     bool adbArmedInput_ = false;
     int adbPending_ = 0;        // CPU cycles until delivery (0 = none)
     bool adbPendingInput_ = false;
+    int adbIdleTimer_ = 0;      // countdown to the next idle wake-up poke
 
     void adbMaybeClock();
 

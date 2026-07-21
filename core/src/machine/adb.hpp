@@ -117,13 +117,12 @@ public:
         return 0xFF;
     }
 
-    bool intLine() const {
-        // While idle, a device holding data asserts SRQ (pulls /INT low) so the
-        // ROM's poll comes around and Talks register 0 to it. This only fires
-        // between transactions, so it can't disturb enumeration.
-        if (state_ == 3 && (mousePending_ || kbdHead_ != kbdTail_)) return false;
-        return int_;
-    }
+    bool intLine() const { return int_; }
+
+    // A device has movement/keys to report. When the bus is idle the machine
+    // must fire a shift-register completion interrupt to wake the ROM into
+    // polling (merely asserting /INT has no effect on the ROM's ADB manager).
+    bool hasPendingEvent() const { return mousePending_ || kbdHead_ != kbdTail_; }
 
 private:
     static constexpr int kKbdQ = 32;
