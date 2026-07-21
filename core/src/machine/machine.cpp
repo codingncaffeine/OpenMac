@@ -540,6 +540,14 @@ void Machine::execute68kTrap(u16 trap) {
     const u16 savedSr = cpu_.getSR();
     cpu_.pc = scratch;
     for (int guard = 0; guard < 4000000 && cpu_.pc != scratch + 2 && !cpu_.halted; ++guard) {
+        // Consult the .Sony driver intercept here too. A trap we execute (e.g.
+        // _MountVol for the hard disk) reads volumes through the .Sony driver's
+        // Prime entry, which must reach our C handler rather than the ROM's real
+        // driver code (which delegates any drive it doesn't own -> address error).
+        if ((!floppy_.empty() || !hd_.empty()) && trySonyTrap()) {
+            tickDevices(40);
+            continue;
+        }
         cpu_.setIrqLevel(via_->irqAsserted() ? 1 : 0);
         tickDevices(cpu_.step());
     }
@@ -620,13 +628,7 @@ int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
             cpu_.d[0] = 80;                      // a param block for _MountVol
             execute68kTrap(kTrapNewPtrSysClear);
             hdMountPb_ = cpu_.a[0];
-            // Auto-mount stays OFF (hdAutoMount_ defaults false). The refNum -2 +
-            // unit-table alias above is the correct Mini vMac model but not yet
-            // sufficient: the ROM reads the volume via the .Sony driver's internal
-            // dispatch table (JSR (A2,D1) in the file system), NOT the Prime entry
-            // we hook, and that internal routine delegates the unowned HD drive.
-            // Proper fix = replace the whole .Sony driver (trap bridge), not hook
-            // it -- see the master plan's HD phase.
+            hdAutoMount_ = true;   // HD configured; allow the auto-mount trigger
         }
     }
     return kNoErr;
