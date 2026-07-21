@@ -22,6 +22,7 @@ struct OMac {
     void* logUser = nullptr;
     uint32_t dbgFlags = 0;
     std::vector<std::string> logBuf;   // drained off the hot path by omac_poll_log
+    std::vector<u8> audioBuf;          // drained by omac_drain_audio
 
     OMac(std::vector<u8> rom, uint32_t ramMB)
         : mac(std::move(rom), openmac::Machine::Config{ramMB * 1024u * 1024u}) {}
@@ -63,6 +64,15 @@ OMAC_API void omac_destroy(OMac* m) { delete m; }
 OMAC_API void omac_reset(OMac* m) { if (m) m->mac.reset(); }
 OMAC_API void omac_run_frame(OMac* m) { if (m) m->mac.runFrame(); }
 OMAC_API void omac_render(OMac* m, uint32_t* argb) { if (m && argb) m->mac.renderScreen(argb); }
+
+OMAC_API size_t omac_drain_audio(OMac* m, uint8_t* out, size_t cap)
+{
+    if (!m || !out || cap == 0) return 0;
+    m->mac.drainAudio(m->audioBuf);
+    const size_t n = m->audioBuf.size() < cap ? m->audioBuf.size() : cap;
+    if (n) std::memcpy(out, m->audioBuf.data(), n);
+    return n;
+}
 
 OMAC_API void omac_insert_floppy(OMac* m, const uint8_t* img, size_t len, int ro)
 {

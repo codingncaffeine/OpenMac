@@ -36,6 +36,12 @@ OMAC_API void omac_run_frame(OMac*);
 /* Fill argb with OMAC_SCREEN_W*OMAC_SCREEN_H pixels (0xAARRGGBB). */
 OMAC_API void omac_render(OMac*, uint32_t* argb);
 
+/* ---- audio ---- */
+/* Drain pending sound samples (8-bit unsigned PCM, mono, ~22254 Hz) into out;
+   returns the count written (<= cap). Poll once per frame after omac_run_frame.
+   The ROM synthesizes its own boot chime through this path -- no bundled audio. */
+OMAC_API size_t omac_drain_audio(OMac*, uint8_t* out, size_t cap);
+
 /* ---- disks ---- */
 OMAC_API void omac_insert_floppy(OMac*, const uint8_t* img, size_t len, int read_only);
 OMAC_API void omac_eject_floppy(OMac*);
