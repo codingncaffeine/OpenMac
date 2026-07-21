@@ -1,0 +1,2 @@
+# OpenMac
+macintosh classic emulator
