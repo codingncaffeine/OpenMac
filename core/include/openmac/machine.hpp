@@ -55,6 +55,15 @@ public:
     void mouseMove(int dx, int dy, bool button);
     void keyEvent(u8 adbCode, bool down);
     bool keyHeld(u8 adbCode) const;
+
+    // Force the built-in ROM disk to boot (System 6) by holding the
+    // Cmd-Opt-X-O keys down in the KeyMap through the boot-device search,
+    // which is what the physical key combo does.
+    void setForceRomDisk(bool on) { forceRomDisk_ = on; }
+    u32 keyMapReads() const { return keyMapReads_; }
+    u32 keyMapReadPc() const { return keyMapReadPc_; }
+    int keyMapPcCount() const { return keyMapPcN_; }
+    u32 keyMapPc(int i) const { return keyMapPcs_[i]; }
     u8 adbLastCommand() const;
 
     struct AdbStats {
@@ -103,6 +112,12 @@ private:
     void adbMaybeClock();
 
     u64 totalCycles_ = 0;
+    u64 frameCounter_ = 0;
+    bool forceRomDisk_ = false;
+    u32 keyMapReads_ = 0;
+    u32 keyMapReadPc_ = 0;
+    u32 keyMapPcs_[12]{};
+    int keyMapPcN_ = 0;
     u64 lineTarget_ = 0;
     int viaRemainder_ = 0;
     u64 secondAcc_ = 0;

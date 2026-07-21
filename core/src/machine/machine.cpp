@@ -167,6 +167,15 @@ void Machine::logAccess(const char* what, u32 addr, bool write, u32 value) {
 
 u8 Machine::read8(u32 addr) {
     addr &= 0xFFFFFF;
+    if (addr >= 0x174 && addr <= 0x183 && !overlay_) {   // KeyMap region
+        const u32 rpc = cpu_.pc;
+        if (keyMapReads_ == 0) keyMapReadPc_ = rpc;
+        ++keyMapReads_;
+        bool seen = false;
+        for (int i = 0; i < keyMapPcN_; ++i)
+            if (keyMapPcs_[i] == rpc) { seen = true; break; }
+        if (!seen && keyMapPcN_ < 12) keyMapPcs_[keyMapPcN_++] = rpc;
+    }
     if (addr < 0x400000) {
         // The overlay maps only the ROM-sized window at zero, reads only;
         // RAM above it (and all writes) behave normally.
@@ -310,6 +319,7 @@ int Machine::stepInstruction() {
 }
 
 void Machine::runFrame() {
+    ++frameCounter_;
     u64 target = totalCycles_;
     for (int line = 0; line < kLinesPerFrame; ++line) {
         // /VBL is active-low: high while the beam draws, low during blanking.

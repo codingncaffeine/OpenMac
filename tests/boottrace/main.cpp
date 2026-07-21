@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
     u32 watchAddr = 0xFFFFFFFFu;
     bool mouseWalk = false;
     bool bootDisk = false;
+    bool forceRom = false;
     std::string dumpPath;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -136,6 +137,7 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--mouse-walk") mouseWalk = true;
         else if (arg == "--boot-disk") bootDisk = true;
+        else if (arg == "--force-rom") forceRom = true;
     }
     if (romPath.empty()) {
         std::fprintf(stderr, "usage: openmac_trace --rom <path> [--frames N] [--ram-mb M]\n");
@@ -151,6 +153,7 @@ int main(int argc, char** argv) {
                 rom.size(), rom[0], rom[1], rom[2], rom[3], rom[8], rom[9]);
 
     Machine mac(std::move(rom), {ramMB * 1024u * 1024u});
+    if (forceRom) mac.setForceRomDisk(true);
 
     int excCount = 0;
     mac.cpu().onException = [&](int vector, u32 pc) {
@@ -252,8 +255,11 @@ int main(int argc, char** argv) {
 
     if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
 
+    std::printf("\n-- KeyMap ($174) reads: %u  from PCs:", mac.keyMapReads());
+    for (int i = 0; i < mac.keyMapPcCount(); ++i) std::printf(" %06X", mac.keyMapPc(i));
+    std::printf(" --\n");
     const auto s = mac.adbStats();
-    std::printf("\n-- ADB: kbd[enum=%u modifiers=%u transitions=%u] "
+    std::printf("-- ADB: kbd[enum=%u modifiers=%u transitions=%u] "
                 "mouse[enum=%u polls=%u reports=%u] --\n",
                 s.kbdReg3, s.kbdReg2, s.kbdPolls, s.mouseReg3, s.mousePolls, s.mouseReports);
     std::printf("-- ADB command trace (addr.op.reg), first %zu: --\n",
