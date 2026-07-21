@@ -104,6 +104,7 @@ u32  M68000::pop32() { const u32 v = rd32(a[7]); a[7] += 4; return v; }
 // ---------------------------------------------------------------- exceptions
 
 int M68000::exception(int vector, int cycles) {
+    if (onException) onException(vector, instrStart_);
     const u16 oldSR = sr_;
     setSR(static_cast<u16>((sr_ | kS) & ~kT));
     push32(pc);
@@ -136,6 +137,8 @@ int M68000::step() {
 
     const bool traced = (sr_ & kT) != 0;
     instrStart_ = pc;
+    pcRing_[pcRingPos_] = pc;
+    pcRingPos_ = (pcRingPos_ + 1) & 127;
     eaUndoReg_ = -1;
     eaFaultCycles_ = 0;
     try {
@@ -159,6 +162,7 @@ int M68000::step() {
 //   +8  status register at the fault
 //   +10 program counter (long)
 int CpuOps::enterAddressError(M68000& c, const AddressError& ae) {
+    if (c.onException) c.onException(kVecAddressError, c.instrStart_);
     try {
         if (c.eaUndoReg_ >= 0) {
             if (!ae.read) c.a[c.eaUndoReg_] = c.eaUndoVal_;   // (An)+ write fault

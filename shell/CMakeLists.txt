@@ -32,4 +32,7 @@ target_link_libraries(imgui_lib PUBLIC SDL3::SDL3-static)
 add_executable(openmac
     src/main.cpp
 )
+if(WIN32)
+    target_sources(openmac PRIVATE openmac.rc)   # embeds the app icon
+endif()
 target_link_libraries(openmac PRIVATE openmac_core imgui_lib SDL3::SDL3-static openmac_warnings)

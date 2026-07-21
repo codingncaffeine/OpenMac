@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
     int profileAt = -1;
     u32 traceToPc = 0;
     u32 watchAddr = 0xFFFFFFFFu;
+    bool mouseWalk = false;
     std::string dumpPath;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -132,6 +133,7 @@ int main(int argc, char** argv) {
         else if (arg == "--watch" && i + 1 < argc) {
             watchAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
         }
+        else if (arg == "--mouse-walk") mouseWalk = true;
     }
     if (romPath.empty()) {
         std::fprintf(stderr, "usage: openmac_trace --rom <path> [--frames N] [--ram-mb M]\n");
@@ -148,8 +150,45 @@ int main(int argc, char** argv) {
 
     Machine mac(std::move(rom), {ramMB * 1024u * 1024u});
 
+    int excCount = 0;
+    mac.cpu().onException = [&](int vector, u32 pc) {
+        const bool crash = vector == 2 || vector == 3 || vector == 4 ||
+                           vector == 8 || vector == 11;
+        if (crash && excCount < 16) {
+            std::printf("EXC vec=%d (%s) at pc=%06X  cyc=%llu\n", vector,
+                        vector == 2 ? "bus" : vector == 3 ? "addr" :
+                        vector == 4 ? "illegal" : vector == 8 ? "priv" : "F-line",
+                        pc, static_cast<unsigned long long>(mac.totalCycles()));
+            if (vector == 11) {   // dump how we got here (oldest first)
+                const u8 c = mac.adbLastCommand();
+                std::printf("  last ADB cmd=%02X (addr=%d op=%d reg=%d)  a0=%08X a3=%08X\n",
+                            c, (c >> 4) & 0xF, (c >> 2) & 3, c & 3,
+                            mac.cpu().a[0], mac.cpu().a[3]);
+                std::printf("  trail:");
+                for (int b = 20; b >= 0; --b) std::printf(" %06X", mac.cpu().recentPc(b));
+                std::printf("\n");
+            }
+            ++excCount;
+        }
+    };
+
     if (traceToPc) {
         traceUntil(mac, traceToPc, u64(frames) * Machine::kLinesPerFrame * Machine::kCyclesPerLine);
+        return 0;
+    }
+
+    if (mouseWalk) {
+        for (int i = 0; i < 1900 && !mac.cpu().halted; ++i) mac.runFrame();
+        std::string before = dumpPath.empty() ? std::string() : dumpPath + ".before.bmp";
+        if (!before.empty()) dumpBmp(mac, before);
+        // Drive the mouse down-right for a while, then click.
+        for (int i = 0; i < 200 && !mac.cpu().halted; ++i) {
+            mac.mouseMove(4, 3, i >= 170);
+            mac.runFrame();
+        }
+        if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
+        std::printf("mouse-walk done: halted=%d pc=%06X\n",
+                    mac.cpu().halted ? 1 : 0, mac.cpu().pc);
         return 0;
     }
 

@@ -44,8 +44,15 @@ public:
     bool stopped = false;    // STOP: waiting for an interrupt
     bool halted  = false;    // double fault: only reset() recovers
 
+    // Recent instruction addresses, newest first (recentPc(0) = last executed).
+    u32 recentPc(int back) const { return pcRing_[(pcRingPos_ - 1 - back) & 127]; }
+
     // The RESET instruction pulses /RSTO: peripherals reset, CPU continues.
     std::function<void()> onResetInstruction;
+
+    // Fires as any exception is entered (vector, address of the faulting
+    // instruction). Diagnostics only.
+    std::function<void(int vector, u32 pc)> onException;
 
 private:
     friend struct CpuOps;
@@ -77,6 +84,8 @@ private:
     int irqLevel_ = 0;
     u32 instrStart_ = 0;   // address of the currently executing instruction
     u16 ir_ = 0;           // currently executing opcode (group-0 frames)
+    u32 pcRing_[128]{};     // recent instruction addresses (debug)
+    int pcRingPos_ = 0;
 
     // Address-register bookkeeping around a faulting EA access:
     //  kind 1: (An)+ — rolled back only when the faulting access is a WRITE

@@ -51,6 +51,15 @@ public:
     // Expand the 1-bit framebuffer to ARGB8888 (kScreenW * kScreenH).
     void renderScreen(u32* argbOut) const;
 
+    // Host input, delivered through the ADB devices.
+    void mouseMove(int dx, int dy, bool button);
+    void keyEvent(u8 adbCode, bool down);
+    bool keyHeld(u8 adbCode) const;
+    u8 adbLastCommand() const;
+
+    struct AdbStats { u32 mousePolls, kbdPolls, mouseReports; };
+    AdbStats adbStats() const;
+
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }

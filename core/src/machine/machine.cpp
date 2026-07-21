@@ -38,6 +38,13 @@ Machine::Machine(std::vector<u8> rom) : Machine(std::move(rom), Config{}) {}
 Machine::~Machine() = default;
 
 void Machine::wireVia() {
+    cpu_.onException = [this](int vector, u32 pc) {
+        // Log only the crash-class exceptions; A-line/traps are normal.
+        if (vector == 2 || vector == 3 || vector == 4 || vector == 8 ||
+            vector == 11) {
+            logAccess("EXC", pc, false, static_cast<u32>(vector));
+        }
+    };
     cpu_.onResetInstruction = [this] {
         // RESET asserts /RSTO to the peripherals only. It does NOT relatch the
         // boot overlay — that flip-flop is set by power-on reset and cleared by
@@ -99,6 +106,26 @@ void Machine::reset() {
     lineTarget_ = 0;
     viaRemainder_ = 0;
     secondAcc_ = 0;
+}
+
+void Machine::mouseMove(int dx, int dy, bool button) {
+    adb_->injectMouse(dx, dy, button);
+}
+
+void Machine::keyEvent(u8 adbCode, bool down) {
+    adb_->injectKey(adbCode, down);
+}
+
+bool Machine::keyHeld(u8 adbCode) const {
+    return adb_->keyHeld(adbCode);
+}
+
+u8 Machine::adbLastCommand() const {
+    return adb_->lastCommand();
+}
+
+Machine::AdbStats Machine::adbStats() const {
+    return {adb_->mousePolls(), adb_->kbdPolls(), adb_->mouseReports()};
 }
 
 u32 Machine::screenBase() const {
