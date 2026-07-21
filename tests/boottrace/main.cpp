@@ -122,6 +122,177 @@ void writeWav(const std::string& path, const std::vector<u8>& s, int rate) {
     f.write(reinterpret_cast<const char*>(s.data()), n);
 }
 
+// Bcc condition mnemonics indexed by (opcode >> 8) & 0xF; index 0/1 are BRA/BSR.
+const char* const kBcc[16] = {"BRA","BSR","BHI","BLS","BCC","BCS","BNE","BEQ",
+                              "BVC","BVS","BPL","BMI","BGE","BLT","BGT","BLE"};
+
+// ---- conditional breakpoints ---------------------------------------------
+
+// A parsed --break-if predicate: <lhs> <op> <hex>, where lhs is a data reg,
+// an address reg, or a 32-bit memory word [addr]. Values are unsigned 32-bit.
+struct BreakCond {
+    bool active = false;
+    int  lhs = 0;      // 0=Dn, 1=An, 2=[mem]
+    int  reg = 0;      // register index for lhs 0/1
+    u32  addr = 0;     // memory address for lhs 2
+    int  op = 0;       // 0 == 1 != 2 < 3 > 4 <= 5 >=
+    u32  rhs = 0;
+};
+
+// Parse "D0==5", "A0!=0", "[B30]==0" (spaces ignored, hex accepts 0x). Returns
+// false and leaves `out` inactive on any syntax error.
+bool parseBreakCond(const std::string& in, BreakCond& out) {
+    std::string s;
+    for (char ch : in) if (ch != ' ' && ch != '\t') s += ch;
+    if (s.empty()) return false;
+    size_t i = 0;
+    if (s[0] == '[') {
+        const size_t close = s.find(']');
+        if (close == std::string::npos) return false;
+        out.lhs = 2;
+        out.addr = static_cast<u32>(std::strtoul(s.substr(1, close - 1).c_str(), nullptr, 16));
+        i = close + 1;
+    } else if (s.size() >= 2 && (s[0] == 'D' || s[0] == 'd' || s[0] == 'A' || s[0] == 'a') &&
+               s[1] >= '0' && s[1] <= '7') {
+        out.lhs = (s[0] == 'A' || s[0] == 'a') ? 1 : 0;
+        out.reg = s[1] - '0';
+        i = 2;
+    } else {
+        return false;
+    }
+    if (i >= s.size()) return false;
+    if      (s.compare(i, 2, "==") == 0) { out.op = 0; i += 2; }
+    else if (s.compare(i, 2, "!=") == 0) { out.op = 1; i += 2; }
+    else if (s.compare(i, 2, "<=") == 0) { out.op = 4; i += 2; }
+    else if (s.compare(i, 2, ">=") == 0) { out.op = 5; i += 2; }
+    else if (s[i] == '<')                { out.op = 2; i += 1; }
+    else if (s[i] == '>')                { out.op = 3; i += 1; }
+    else return false;
+    if (i >= s.size()) return false;
+    out.rhs = static_cast<u32>(std::strtoul(s.c_str() + i, nullptr, 16));
+    out.active = true;
+    return true;
+}
+
+// Evaluate the predicate against live CPU/bus state (unsigned comparisons).
+bool evalBreakCond(const BreakCond& c, Machine& mac) {
+    const M68000& cpu = mac.cpu();
+    u32 lhs = 0;
+    if (c.lhs == 0)      lhs = cpu.d[c.reg];
+    else if (c.lhs == 1) lhs = cpu.a[c.reg];
+    else                 lhs = (u32(mac.read16(c.addr)) << 16) | mac.read16(c.addr + 2);
+    switch (c.op) {
+        case 0: return lhs == c.rhs;
+        case 1: return lhs != c.rhs;
+        case 2: return lhs <  c.rhs;
+        case 3: return lhs >  c.rhs;
+        case 4: return lhs <= c.rhs;
+        case 5: return lhs >= c.rhs;
+    }
+    return false;
+}
+
+// ---- step-over / step-out ------------------------------------------------
+
+// Print the D/A registers that changed between a snapshot and the live CPU.
+void reportRegDelta(const u32* dBefore, const u32* aBefore, const M68000& cpu) {
+    for (int i = 0; i < 8; ++i)
+        if (cpu.d[i] != dBefore[i])
+            std::printf("    D%d %08X -> %08X\n", i, dBefore[i], cpu.d[i]);
+    for (int i = 0; i < 8; ++i)
+        if (cpu.a[i] != aBefore[i])
+            std::printf("    A%d %08X -> %08X\n", i, aBefore[i], cpu.a[i]);
+}
+
+// Single-step until PC first equals `target`. Returns true if reached.
+bool runToPc(Machine& mac, u32 target, u64 maxCycles) {
+    while (mac.totalCycles() < maxCycles && !mac.cpu().halted) {
+        if (mac.cpu().pc == target) return true;
+        mac.stepInstruction();
+    }
+    return mac.cpu().pc == target;
+}
+
+// Run to `target`, then execute the instruction there. If it is a JSR/BSR,
+// keep stepping until the call returns (A7 back to its pre-call level); print
+// the call, its return site, and the register delta. Otherwise a single step.
+void stepOver(Machine& mac, u32 target, u64 maxCycles) {
+    if (!runToPc(mac, target, maxCycles)) {
+        std::printf("-- step-over: never reached %06X --\n", target);
+        return;
+    }
+    const M68000& cpu = mac.cpu();
+    const u16 op = mac.read16(target);
+    const bool isCall = (op & 0xFFC0) == 0x4E80 || (op & 0xFF00) == 0x6100;   // JSR / BSR
+    u32 dBefore[8], aBefore[8];
+    std::memcpy(dBefore, cpu.d, sizeof dBefore);
+    std::memcpy(aBefore, cpu.a, sizeof aBefore);
+    std::string dis;
+    openmac::dbg::disasm(mac, target, dis);
+    const std::string sym = openmac::dbg::symbolFor(mac, target);
+    if (!isCall) {
+        mac.stepInstruction();
+        std::printf("-- step %06X %-18s %-24s (not a call) --\n", target, sym.c_str(),
+                    dis.c_str());
+        reportRegDelta(dBefore, aBefore, cpu);
+        std::printf("    -> now pc=%06X\n", cpu.pc);
+        return;
+    }
+    const u32 retSp = cpu.a[7];        // SP just before the call pushes its return address
+    long steps = 0;
+    const long kCap = 2000000;
+    mac.stepInstruction();             // execute the JSR/BSR
+    ++steps;
+    while (steps < kCap && !mac.cpu().halted && cpu.a[7] < retSp) {
+        mac.stepInstruction();
+        ++steps;
+    }
+    std::printf("-- stepped over CALL at %06X %-18s %-24s -> returned to %06X %s "
+                "(%ld steps) --\n", target, sym.c_str(), dis.c_str(), cpu.pc,
+                openmac::dbg::symbolFor(mac, cpu.pc).c_str(), steps);
+    reportRegDelta(dBefore, aBefore, cpu);
+}
+
+// Run to `target`, then single-step (disassembling each instruction) until an
+// RTS/RTE pops the stack back above the entry SP — the current routine's own
+// return — and stop there.
+void stepOut(Machine& mac, u32 target, u64 maxCycles) {
+    if (!runToPc(mac, target, maxCycles)) {
+        std::printf("-- step-out: never reached %06X --\n", target);
+        return;
+    }
+    const M68000& cpu = mac.cpu();
+    const u32 entrySp = cpu.a[7];
+    u32 dBefore[8], aBefore[8];
+    std::memcpy(dBefore, cpu.d, sizeof dBefore);
+    std::memcpy(aBefore, cpu.a, sizeof aBefore);
+    std::printf("-- step-out from %06X %s (entrySP=%06X) --\n", target,
+                openmac::dbg::symbolFor(mac, target).c_str(), entrySp);
+    long steps = 0, printed = 0;
+    const long kCap = 2000000, kPrintCap = 20000;
+    while (steps < kCap && !mac.cpu().halted) {
+        const u32 pc = cpu.pc;
+        const u16 op = mac.read16(pc);
+        const bool isRet = op == 0x4E75 || op == 0x4E73;        // RTS / RTE
+        if (printed < kPrintCap) {
+            std::string dis;
+            openmac::dbg::disasm(mac, pc, dis);
+            std::printf("  %06X  %-18s %s\n", pc,
+                        openmac::dbg::symbolFor(mac, pc).c_str(), dis.c_str());
+            if (++printed == kPrintCap) std::printf("  ... (trace truncated) ...\n");
+        }
+        mac.stepInstruction();
+        ++steps;
+        if (isRet && cpu.a[7] > entrySp) {
+            std::printf("-- returned to %06X %s (%ld steps) --\n", cpu.pc,
+                        openmac::dbg::symbolFor(mac, cpu.pc).c_str(), steps);
+            reportRegDelta(dBefore, aBefore, cpu);
+            return;
+        }
+    }
+    std::printf("-- step-out: no return within %ld steps (pc=%06X) --\n", steps, cpu.pc);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -141,6 +312,12 @@ int main(int argc, char** argv) {
     u32 breakPc = 0, watchMem = 0xFFFFFFFFu;
     u32 breakTrap = 0, tracePc = 0, dumpMemAddr = 0, dumpMemLen = 0;
     int traceCount = 48;
+    u32 stepOverPc = 0, stepOutPc = 0;
+    bool stepOverSet = false, stepOutSet = false;
+    std::string breakCondStr, dumpStructName;
+    int breakCount = 0;
+    u32 dumpStructAddr = 0;
+    bool traceBranches = false, dumpStructSet = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--rom" && i + 1 < argc) romPath = argv[++i];
@@ -177,6 +354,22 @@ int main(int argc, char** argv) {
         else if (arg == "--mouse-walk") mouseWalk = true;
         else if (arg == "--boot-disk") bootDisk = true;
         else if (arg == "--force-rom") forceRom = true;
+        else if (arg == "--step-over" && i + 1 < argc) {
+            stepOverPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            stepOverSet = true;
+        }
+        else if (arg == "--step-out" && i + 1 < argc) {
+            stepOutPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            stepOutSet = true;
+        }
+        else if (arg == "--break-if" && i + 1 < argc) breakCondStr = argv[++i];
+        else if (arg == "--break-count" && i + 1 < argc) breakCount = std::atoi(argv[++i]);
+        else if (arg == "--trace-branches") traceBranches = true;
+        else if (arg == "--dump-struct" && i + 2 < argc) {
+            dumpStructAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            dumpStructName = argv[++i];
+            dumpStructSet = true;
+        }
     }
     if (romPath.empty()) {
         std::fprintf(stderr, "usage: openmac_trace --rom <path> [--frames N] [--ram-mb M]\n");
@@ -236,15 +429,67 @@ int main(int argc, char** argv) {
 
     u32 wPrevPc = 0, wLastVal = 0;
     bool wFirst = true;
-    int bpHits = 0;
-    if (breakPc || watchMem != 0xFFFFFFFFu) {
+    int bpHits = 0, bpQualified = 0, branchLines = 0;
+    BreakCond breakCond;
+    if (!breakCondStr.empty() && !parseBreakCond(breakCondStr, breakCond))
+        std::fprintf(stderr, "warning: could not parse --break-if '%s'; ignoring\n",
+                     breakCondStr.c_str());
+    if (breakPc || watchMem != 0xFFFFFFFFu || traceBranches) {
         mac.cpu().onStep = [&](u32 pc) {
-            if (breakPc && pc == breakPc && bpHits < 8) {
-                ++bpHits;
-                std::printf("\n=== BREAK pc=%06X (hit %d) cyc=%llu ===\n", pc, bpHits,
-                            static_cast<unsigned long long>(mac.totalCycles()));
-                openmac::dbg::dumpRegs(mac.cpu(), stdout);
-                openmac::dbg::dumpBacktrace(mac.cpu(), mac, stdout);
+            if (breakPc && pc == breakPc &&
+                (!breakCond.active || evalBreakCond(breakCond, mac))) {
+                ++bpQualified;
+                const bool fire = breakCount > 0 ? bpQualified == breakCount : bpHits < 8;
+                if (fire) {
+                    ++bpHits;
+                    std::printf("\n=== BREAK pc=%06X (hit %d) cyc=%llu ===\n", pc, bpHits,
+                                static_cast<unsigned long long>(mac.totalCycles()));
+                    if (breakCond.active || breakCount > 0)
+                        std::printf("  qualifying hit %d%s\n", bpQualified,
+                                    breakCount > 0 ? " (matched --break-count)" : "");
+                    openmac::dbg::dumpRegs(mac.cpu(), stdout);
+                    std::string dis;
+                    openmac::dbg::disasm(mac, pc, dis);
+                    std::printf("  %06X  %s\n", pc, dis.c_str());
+                    openmac::dbg::dumpBacktrace(mac.cpu(), mac, stdout);
+                }
+            }
+            if (traceBranches && branchLines < 5000) {
+                const u16 op = mac.read16(pc);
+                const char* mnem = nullptr;
+                u32 target = 0;
+                bool haveTarget = false;
+                if ((op & 0xF000) == 0x6000) {              // Bcc / BRA / BSR
+                    mnem = kBcc[(op >> 8) & 0xF];
+                    if ((op & 0xFF) == 0x00)
+                        target = pc + 2 + s16(mac.read16(pc + 2));
+                    else if ((op & 0xFF) == 0xFF)
+                        target = pc + 2 + s32((u32(mac.read16(pc + 2)) << 16) | mac.read16(pc + 4));
+                    else
+                        target = pc + 2 + s8(op & 0xFF);
+                    haveTarget = true;
+                } else if ((op & 0xF0F8) == 0x50C8) {       // DBcc
+                    mnem = "DBcc";
+                    target = pc + 2 + s16(mac.read16(pc + 2));
+                    haveTarget = true;
+                } else if ((op & 0xFFC0) == 0x4E80) mnem = "JSR";
+                else if ((op & 0xFFC0) == 0x4EC0) mnem = "JMP";
+                else if (op == 0x4E75) mnem = "RTS";
+                else if (op == 0x4E73) mnem = "RTE";
+                else if (op == 0x4E77) mnem = "RTR";
+                if (mnem) {
+                    ++branchLines;
+                    if (haveTarget)
+                        std::printf("BR %06X %-18s %-5s %06X %s\n", pc,
+                                    openmac::dbg::symbolFor(mac, pc).c_str(), mnem,
+                                    target & 0xFFFFFF,
+                                    openmac::dbg::symbolFor(mac, target & 0xFFFFFF).c_str());
+                    else
+                        std::printf("BR %06X %-18s %s\n", pc,
+                                    openmac::dbg::symbolFor(mac, pc).c_str(), mnem);
+                    if (branchLines == 5000)
+                        std::printf("-- branch trace cap (5000) reached --\n");
+                }
             }
             if (watchMem != 0xFFFFFFFFu) {
                 const u32 v = (static_cast<u32>(mac.read16(watchMem)) << 16) |
@@ -371,6 +616,13 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (stepOverSet || stepOutSet) {
+        const u64 maxCycles = u64(frames) * Machine::kLinesPerFrame * Machine::kCyclesPerLine;
+        if (stepOverSet) stepOver(mac, stepOverPc, maxCycles);
+        if (stepOutSet)  stepOut(mac, stepOutPc, maxCycles);
+        return 0;
+    }
+
     if (traceOsTraps) {
         // Log Memory Manager allocation traps with their results; a NIL result
         // (A0 = 0) is the classic origin of a later NIL-dereference crash.
@@ -456,6 +708,8 @@ int main(int argc, char** argv) {
         std::printf("-- memory $%06X (%u bytes) --\n", dumpMemAddr, dumpMemLen);
         openmac::dbg::dumpMem(mac, dumpMemAddr, dumpMemLen, stdout);
     }
+    if (dumpStructSet)
+        openmac::dbg::dumpStruct(mac, dumpStructAddr, dumpStructName.c_str(), stdout);
     if (checkHeapFlag) openmac::dbg::checkHeap(mac, stdout);
 
     if (!dumpPath.empty()) dumpBmp(mac, dumpPath);

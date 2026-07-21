@@ -265,6 +265,107 @@ void dumpMem(Machine& mac, u32 addr, u32 len, std::FILE* out) {
     }
 }
 
+// ---- struct-templated memory display -------------------------------------
+
+namespace {
+
+// One field of a Mac OS data structure: a byte/word/long at a fixed offset.
+// `ptr` marks longs worth resolving to a symbol (they hold an address).
+enum FieldKind { kByte = 1, kWord = 2, kLong = 4 };
+struct StructField { const char* name; u32 off; FieldKind kind; bool ptr; };
+
+// Offsets from Inside Macintosh, cross-checked against the enum in machine.cpp
+// (ioResult/dCtlPosition/dsDiskInPlace/tmCount) so the decode matches the code.
+const StructField kTMTask[] = {
+    {"qLink",      0x00, kLong, true },
+    {"qType",      0x04, kWord, false},
+    {"tmAddr",     0x06, kLong, true },
+    {"tmCount",    0x0A, kLong, false},
+    {"tmWakeUp",   0x0E, kLong, false},
+    {"tmReserved", 0x12, kLong, false},
+};
+const StructField kQHdr[] = {
+    {"qFlags", 0x00, kWord, false},
+    {"qHead",  0x02, kLong, true },
+    {"qTail",  0x06, kLong, true },
+};
+const StructField kIOParam[] = {
+    {"qLink",       0x00, kLong, true },
+    {"qType",       0x04, kWord, false},
+    {"ioTrap",      0x06, kWord, false},
+    {"ioCmdAddr",   0x08, kLong, true },
+    {"ioResult",    0x10, kWord, false},
+    {"ioNamePtr",   0x12, kLong, true },
+    {"ioVRefNum",   0x16, kWord, false},
+    {"ioRefNum",    0x18, kWord, false},
+    {"ioBuffer",    0x20, kLong, true },
+    {"ioReqCount",  0x24, kLong, false},
+    {"ioActCount",  0x28, kLong, false},
+    {"ioPosMode",   0x2C, kWord, false},
+    {"ioPosOffset", 0x2E, kLong, false},
+};
+const StructField kDCE[] = {
+    {"dCtlDriver",      0x00, kLong, true },
+    {"dCtlFlags",       0x04, kWord, false},
+    {"dCtlQHdr.qFlags", 0x06, kWord, false},   // dCtlQHdr is a 10-byte QHdr
+    {"dCtlQHdr.qHead",  0x08, kLong, true },
+    {"dCtlQHdr.qTail",  0x0C, kLong, true },
+    {"dCtlPosition",    0x10, kLong, false},
+    {"dCtlStorage",     0x14, kLong, true },
+    {"dCtlRefNum",      0x18, kWord, false},
+    {"dCtlCurTicks",    0x1A, kLong, false},
+    {"dCtlWindow",      0x1E, kLong, true },
+    {"dCtlDelay",       0x22, kWord, false},
+};
+// dsTwoSideFmt is at +$12 (18) per Inside Macintosh and machine.cpp's DrvSts
+// enum; the queue fields dQDrive/dQRefNum/dQFSID occupy $0C..$11 before it.
+const StructField kDrvSts[] = {
+    {"dsTrack",       0x00, kWord, false},
+    {"dsWriteProt",   0x02, kByte, false},
+    {"dsDiskInPlace", 0x03, kByte, false},
+    {"dsInstalled",   0x04, kByte, false},
+    {"dsSides",       0x05, kByte, false},
+    {"dsQLink",       0x06, kLong, true },
+    {"dsQType",       0x0A, kWord, false},
+    {"dsTwoSideFmt",  0x12, kByte, false},
+};
+
+} // namespace
+
+void dumpStruct(Machine& mac, u32 addr, const char* name, std::FILE* out) {
+    const StructField* fields = nullptr;
+    size_t count = 0;
+    if      (std::strcmp(name, "TMTask")  == 0) { fields = kTMTask;  count = sizeof kTMTask  / sizeof kTMTask[0]; }
+    else if (std::strcmp(name, "QHdr")    == 0) { fields = kQHdr;    count = sizeof kQHdr    / sizeof kQHdr[0]; }
+    else if (std::strcmp(name, "IOParam") == 0) { fields = kIOParam; count = sizeof kIOParam / sizeof kIOParam[0]; }
+    else if (std::strcmp(name, "DCE")     == 0) { fields = kDCE;     count = sizeof kDCE     / sizeof kDCE[0]; }
+    else if (std::strcmp(name, "DrvSts")  == 0) { fields = kDrvSts;  count = sizeof kDrvSts  / sizeof kDrvSts[0]; }
+    else {
+        std::fprintf(out, "-- struct '%s' @%06X: unknown (want TMTask|QHdr|IOParam|DCE|DrvSts) --\n",
+                     name, addr & 0xFFFFFF);
+        return;
+    }
+    std::fprintf(out, "-- %s @%06X --\n", name, addr & 0xFFFFFF);
+    for (size_t i = 0; i < count; ++i) {
+        const StructField& f = fields[i];
+        const u32 a = (addr + f.off) & 0xFFFFFF;
+        std::fprintf(out, "  +%02X  %-16s ", f.off, f.name);
+        if (f.kind == kByte) {
+            std::fprintf(out, "B  %02X\n", mac.read8(a));
+        } else if (f.kind == kWord) {
+            std::fprintf(out, "W  %04X\n", mac.read16(a));
+        } else {
+            const u32 v = (u32(mac.read16(a)) << 16) | mac.read16(a + 2);
+            std::fprintf(out, "L  %08X", v);
+            if (f.ptr) {
+                const std::string s = symbolFor(mac, v);
+                if (!s.empty()) std::fprintf(out, "  %s", s.c_str());
+            }
+            std::fprintf(out, "\n");
+        }
+    }
+}
+
 void dumpDriveQueue(Machine& mac, std::FILE* out) {
     auto r32 = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
     std::fprintf(out, "-- drive queue ($0308) --\n");

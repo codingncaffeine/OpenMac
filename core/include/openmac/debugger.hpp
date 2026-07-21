@@ -44,6 +44,12 @@ int disasm(Machine& mac, u32 pc, std::string& out);
 // Hex + ASCII dump of `len` bytes at `addr`.
 void dumpMem(Machine& mac, u32 addr, u32 len, std::FILE* out);
 
+// Decode a named Mac OS data structure at `addr`, printing each field with its
+// offset, size, and value; longs that hold an address are resolved through
+// symbolFor. Known names: TMTask, QHdr, IOParam, DCE, DrvSts. Prints a note
+// (and nothing else) when the name is not one of these.
+void dumpStruct(Machine& mac, u32 addr, const char* name, std::FILE* out);
+
 // Walk the drive queue (DrvQHdr) and list each mounted drive.
 void dumpDriveQueue(Machine& mac, std::FILE* out);
 
