@@ -31,6 +31,8 @@ constexpr int kSonyRefNum = -5;   // .Sony driver reference number
 constexpr u16 kTrapNewPtrSysClear = 0xA71E;
 constexpr u16 kTrapAddDrive = 0xA04E;
 constexpr u16 kTrapInsTime = 0xA058;
+constexpr u16 kTrapPostEvent = 0xA02F;
+constexpr u16 kTrapMountVol = 0xA00F;
 } // namespace
 
 Machine::Machine(std::vector<u8> rom, const Config& cfg)
@@ -398,6 +400,12 @@ void Machine::ejectFloppy() {
     if (drvStatusAddr_) write8(drvStatusAddr_ + dsDiskInPlace, 0);
 }
 
+void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
+    hd_ = std::move(image);
+    hdRO_ = readOnly;
+    hdStatusAddr_ = 0;   // re-added to the drive queue on the next driver Open
+}
+
 // The 16 IWM addresses each toggle one line; the odd address sets, the even
 // clears. A q7-off read returns the register selected by q6/q7.
 u8 Machine::iwmAccess(int reg, bool write, u8 data) {
@@ -574,14 +582,47 @@ int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
         cpu_.a[0] = tmTask;
         execute68kTrap(kTrapInsTime);        // _InsTime -> enqueues into tm_var+8
     }
+
+    // A second, fixed drive for the hard disk, if one is mounted: same driver
+    // (kSonyRefNum), the next drive number, a non-ejectable disk in place.
+    if (!hd_.empty()) {
+        cpu_.d[0] = SIZEOF_DrvSts;
+        execute68kTrap(kTrapNewPtrSysClear);
+        if (cpu_.a[0] != 0) {
+            hdStatusAddr_ = cpu_.a[0];
+            write16(hdStatusAddr_ + dsQType, static_cast<u16>(kSonyType));
+            write8(hdStatusAddr_ + dsInstalled, 1);
+            write8(hdStatusAddr_ + dsSides, 0xFF);
+            write8(hdStatusAddr_ + dsDiskInPlace, 8);   // 8 = non-ejectable disk
+            write8(hdStatusAddr_ + dsWriteProt, hdRO_ ? 0xFF : 0);
+            hdDriveNum_ = floppyDriveNum_ + 1;          // drive 3
+            cpu_.d[0] = (static_cast<u32>(hdDriveNum_) << 16) |
+                        (static_cast<u32>(kSonyRefNum) & 0xFFFF);
+            cpu_.a[0] = hdStatusAddr_ + dsQLink;
+            execute68kTrap(kTrapAddDrive);
+
+            cpu_.d[0] = 80;                      // a param block for _MountVol
+            execute68kTrap(kTrapNewPtrSysClear);
+            hdMountPb_ = cpu_.a[0];
+        }
+    }
     return kNoErr;
 }
 
 int Machine::sonyPrime(u32 pb, u32 dce) {
     write32(pb + ioActCount, 0);
-    if (drvStatusAddr_ == 0 || read8(drvStatusAddr_ + dsDiskInPlace) == 0)
+
+    // Route to the drive named in the parameter block: the fixed hard disk if
+    // its number matches, otherwise the floppy.
+    const s16 drive = static_cast<s16>(read16(pb + ioVRefNum));
+    const bool toHd = hdDriveNum_ != 0 && drive == hdDriveNum_;
+    std::vector<u8>* img = toHd ? &hd_ : &floppy_;
+    const u32 statusAddr = toHd ? hdStatusAddr_ : drvStatusAddr_;
+    const bool ro = toHd ? hdRO_ : floppyRO_;
+
+    if (statusAddr == 0 || read8(statusAddr + dsDiskInPlace) == 0)
         return kOffLinErr;
-    write8(drvStatusAddr_ + dsDiskInPlace, 2);   // disk accessed
+    if (!toHd) write8(statusAddr + dsDiskInPlace, 2);   // floppy: disk accessed
 
     const u32 buffer = read32(pb + ioBuffer);
     const u32 length = read32(pb + ioReqCount);
@@ -590,18 +631,20 @@ int Machine::sonyPrime(u32 pb, u32 dce) {
 
     const bool isRead = (read16(pb + ioTrap) & 0xFF) == kARdCmd;
     if (isRead) {
+        if (toHd) ++hdReads_;
         for (u32 i = 0; i < length; ++i) {
             const u32 src = position + i;
-            write8(buffer + i, src < floppy_.size() ? floppy_[src] : 0);
+            write8(buffer + i, src < img->size() ? (*img)[src] : 0);
         }
         write32(0x2FC, 0);   // clear TagBuf
         write32(0x300, 0);
         write32(0x304, 0);
     } else {
-        if (floppyRO_) return kWPrErr;
+        if (ro) return kWPrErr;
+        if (toHd) ++hdWrites_;
         for (u32 i = 0; i < length; ++i) {
             const u32 dst = position + i;
-            if (dst < floppy_.size()) floppy_[dst] = read8(buffer + i);
+            if (dst < img->size()) (*img)[dst] = read8(buffer + i);
         }
     }
     write32(pb + ioActCount, length);
@@ -624,16 +667,21 @@ int Machine::sonyControl(u32 pb, u32 /*dce*/) {
 
 int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
     const u16 code = read16(pb + csCode);
+    const s16 drive = static_cast<s16>(read16(pb + ioVRefNum));
+    const bool toHd = hdDriveNum_ != 0 && drive == hdDriveNum_;
+    const u32 statusAddr = toHd ? hdStatusAddr_ : drvStatusAddr_;
     switch (code) {
         case 8:    // return the drive status record
-            if (drvStatusAddr_)
+            if (statusAddr)
                 for (int i = 0; i < 22; ++i)
-                    write8(pb + csParam + i, read8(drvStatusAddr_ + dsWriteProt + i));
+                    write8(pb + csParam + i, read8(statusAddr + dsWriteProt + i));
             return kNoErr;
-        case 6:    // format list: one 1.44MB format
+        case 6: {  // format list: one format spanning the whole medium
+            const u32 blocks = toHd ? static_cast<u32>(hd_.size() / 512) : 2880u;
             write16(pb + csParam, 1);
-            write32(pb + csParam + 2, 2880);
+            write32(pb + csParam + 2, blocks);
             return kNoErr;
+        }
         default:
             return kNoErr;
     }
@@ -641,6 +689,26 @@ int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
 
 void Machine::runFrame() {
     ++frameCounter_;
+
+    // Once the System is up, post a disk-inserted event for the hard-disk drive
+    // so the System mounts its volume (the boot path only mounts the startup
+    // floppy). Retry periodically until the System actually reads the drive.
+    if (hdDriveNum_ != 0 && hdMountPb_ != 0 && hdReads_ + hdWrites_ == 0 &&
+        frameCounter_ > 1200 && (frameCounter_ % 90) == 0 && !inSony_) {
+        // Mount the hard-disk volume once the System is up (the boot path only
+        // mounts the startup floppy). Preserve the interrupted System's
+        // registers -- execute68kTrap only saves PC/SR, so _MountVol would
+        // otherwise clobber D0-D7/A0-A6 and the System would fault on resume.
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        write16(hdMountPb_ + ioVRefNum, static_cast<u16>(hdDriveNum_));
+        cpu_.a[0] = hdMountPb_;
+        execute68kTrap(kTrapMountVol);                 // _MountVol drive hdDriveNum_
+        diskEvtResult_ = cpu_.d[0] & 0xFFFF;           // OSErr from _MountVol
+        ++diskEvtPosts_;
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    }
+
     u64 target = totalCycles_;
     for (int line = 0; line < kLinesPerFrame; ++line) {
         // /VBL is active-low: high while the beam draws, low during blanking.

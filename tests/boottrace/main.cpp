@@ -308,6 +308,7 @@ int main(int argc, char** argv) {
     bool forceRom = false;
     std::string dumpPath;
     std::string floppyPath;
+    u32 hdBlankMB = 0;   // --harddisk-blank N: attach a blank N-MB hard disk
     bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
     bool traceIrq = false, traceAdb = false;
     u32 breakPc = 0, watchMem = 0xFFFFFFFFu;
@@ -323,6 +324,8 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--rom" && i + 1 < argc) romPath = argv[++i];
         else if (arg == "--floppy" && i + 1 < argc) floppyPath = argv[++i];
+        else if (arg == "--harddisk-blank" && i + 1 < argc)
+            hdBlankMB = static_cast<u32>(std::atoi(argv[++i]));
         else if (arg == "--trace-traps") traceTraps = true;
         else if (arg == "--trace-irq") traceIrq = true;
         else if (arg == "--trace-adb") traceAdb = true;
@@ -398,6 +401,11 @@ int main(int argc, char** argv) {
         }
         std::printf("FLOPPY %zu bytes inserted\n", img.size());
         mac.insertFloppy(std::move(img), false);
+    }
+    if (hdBlankMB > 0) {
+        std::vector<u8> hd(static_cast<size_t>(hdBlankMB) * 1024u * 1024u, 0u);
+        std::printf("HARD DISK %zu bytes (blank) attached\n", hd.size());
+        mac.insertHardDisk(std::move(hd), false);
     }
 
     if (traceTraps || breakTrap) {
@@ -752,6 +760,11 @@ int main(int argc, char** argv) {
     std::printf("-- ADB: kbd[enum=%u modifiers=%u transitions=%u] "
                 "mouse[enum=%u polls=%u reports=%u] --\n",
                 s.kbdReg3, s.kbdReg2, s.kbdPolls, s.mouseReg3, s.mousePolls, s.mouseReports);
+    if (mac.hardDiskPresent())
+        std::printf("-- HARD DISK: %zu bytes, drive#=%d, block accesses=%u, "
+                    "mount attempts=%u last result=%04X --\n",
+                    mac.hardDiskImage().size(), mac.hardDiskDriveNum(),
+                    mac.hdAccessCount(), mac.diskEvtPosts(), mac.diskEvtResult());
     std::printf("-- ADB command trace (addr.op.reg), first %zu: --\n",
                 mac.adbCmdTrace().size());
     const auto& tr = mac.adbCmdTrace();

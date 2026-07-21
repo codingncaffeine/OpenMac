@@ -59,6 +59,17 @@ public:
     void ejectFloppy();
     bool floppyInserted() const { return !floppy_.empty(); }
 
+    // Hard disk: a second, fixed (non-removable) image mounted through the same
+    // high-level .Sony interception as a hard-disk volume. Empty = no hard disk.
+    // Persist writes by reading hardDiskImage() back out after running.
+    void insertHardDisk(std::vector<u8> image, bool readOnly = false);
+    bool hardDiskPresent() const { return !hd_.empty(); }
+    const std::vector<u8>& hardDiskImage() const { return hd_; }
+    u32 hdAccessCount() const { return hdReads_ + hdWrites_; }
+    int hardDiskDriveNum() const { return hdDriveNum_; }   // 0 until Open adds it
+    u32 diskEvtPosts() const { return diskEvtPosts_; }
+    u32 diskEvtResult() const { return diskEvtResult_; }
+
     // Move the audio produced since the last call (unsigned 8-bit mono at the
     // ~22.25 kHz scanline rate) into `out`; the internal buffer is emptied.
     void drainAudio(std::vector<u8>& out);
@@ -150,6 +161,15 @@ private:
     u32 drvStatusAddr_ = 0;        // Mac address of our DrvSts record
     int floppyDriveNum_ = 0;
     bool inSony_ = false;          // re-entrancy guard during trap execution
+
+    std::vector<u8> hd_;           // hard-disk image (empty = none)
+    bool hdRO_ = false;
+    u32 hdStatusAddr_ = 0;         // DrvSts record for the hard disk
+    int hdDriveNum_ = 0;
+    u32 hdReads_ = 0, hdWrites_ = 0;   // block-I/O counters (feasibility probe)
+    u32 hdMountPb_ = 0;                // system-heap param block for _MountVol
+    u32 diskEvtPosts_ = 0;             // mount attempts
+    u32 diskEvtResult_ = 0xFFFFFFFFu;  // last _MountVol OSErr
 
     std::vector<u8> ram_;
     std::vector<u8> rom_;
