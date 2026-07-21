@@ -127,6 +127,10 @@ OMAC_API void omac_debug_enable(OMac* m, uint32_t flags)
 
     if (flags & OMAC_DBG_EXCEPT)
         cpu.onException = [self](int vec, u32 pc) {
+            // Real faults only. vec 10 (line-1010 / A-line) is the normal Toolbox
+            // trap dispatch and fires constantly -- logging it floods the sink and
+            // (via the front-end log callback) starves the boot.
+            if (vec != 2 && vec != 3 && vec != 4 && vec != 8 && vec != 11) return;
             static const char* kNames[] = {"reset", "", "bus", "addr", "illegal"};
             const char* nm = (vec >= 0 && vec <= 4) ? kNames[vec] : "exc";
             char regs[400], b[560];
