@@ -5,10 +5,11 @@
 // through the VIA shift register, and PB3 is the transceiver interrupt line.
 //
 // The transceiver timing model (verified against this ROM): every armed shift
-// completes; /INT (PB3) is held LOW while a Talk is still clocking valid
-// response bytes and HIGH once the response is exhausted, which is how the ROM
-// tells "got data" from "empty address". Commands route to devices by address;
-// a keyboard (addr 2) and a mouse (addr 3) hang off the bus.
+// completes and /INT (PB3) is held HIGH throughout a Talk response. The ROM
+// tells "got data" from "empty address" by the byte it clocks in (0xFF = empty),
+// NOT by a /INT edge -- pulsing /INT low mid-response makes the ADB ISR treat a
+// routine poll as unsolicited device data and wedge the boot. Commands route to
+// devices by address; a keyboard (addr 2) and a mouse (addr 3) hang off the bus.
 
 #include "openmac/types.hpp"
 
@@ -109,9 +110,14 @@ public:
 
     u8 cpuShiftIn() {
         if ((state_ == 1 || state_ == 2) && idx_ < len_) {
-            const u8 v = buf_[idx_++];
-            int_ = idx_ < len_ ? false : true;
-            return v;
+            // /INT is held HIGH for the ENTIRE response, not pulsed between the
+            // two bytes. A mid-transfer LOW makes the ROM's ADB ISR read the
+            // poll as unsolicited device data and wedge the boot (see emit()).
+            // The ROM tells a real report from an empty address by the byte
+            // value it clocks in (0xFF = empty), never by a /INT edge. This
+            // never bit a clean boot because mouse/keyboard carry no data during
+            // startup, so len_ was always 0 and this branch never ran.
+            return buf_[idx_++];
         }
         int_ = true;
         return 0xFF;

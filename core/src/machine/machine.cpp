@@ -325,8 +325,14 @@ void Machine::write16(u32 addr, u16 value) {
 
 void Machine::adbMaybeClock() {
     const int st = adb_->state();
-    const bool canClock =
-        st == 0 || ((st == 1 || st == 2) && adb_->transactionOpen());
+    // Any non-idle state clocks when the ROM has armed the SR. Earlier this also
+    // required transactionOpen() for the data states, but that stalled the ADB
+    // manager: after the idle wake, the ROM sets state 1 to read pending data
+    // WITHOUT re-issuing a command (so open_ is still false), and gating the
+    // shift there left it spinning on an SR interrupt that never came. Mini
+    // vMac's ADB_DoNewState services states 0/1/2 unconditionally; match that.
+    // Stale shifts are still cancelled separately when the bus reaches idle.
+    const bool canClock = st != 3;
     if (canClock && adbArmed_ && adbPending_ == 0) {
         adbArmed_ = false;
         // The ROM's ADB manager expects ~260 us between state change and the
@@ -497,6 +503,7 @@ bool Machine::trySonyTrap() {
     const u32 pb = cpu_.a[0], dce = cpu_.a[1];
     const int result = (this->*fn)(pb, dce);
     cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+
 
     // Driver return convention (per the Mac Device Manager's IOReturn): an
     // immediate (noQueue) call sets ioResult and returns with RTS; a queued
@@ -690,11 +697,15 @@ int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
 void Machine::runFrame() {
     ++frameCounter_;
 
-    // Once the System is up, post a disk-inserted event for the hard-disk drive
-    // so the System mounts its volume (the boot path only mounts the startup
-    // floppy). Retry periodically until the System actually reads the drive.
-    if (hdDriveNum_ != 0 && hdMountPb_ != 0 && !hdMounted_ && diskEvtPosts_ < 15 &&
-        frameCounter_ > 1200 && (frameCounter_ % 90) == 0 && !inSony_) {
+    // Mount the hard-disk volume once the System's file system is actually ready.
+    // _MountVol enqueues the new VCB into a low-memory volume queue at $360 that
+    // the System only builds when it mounts the boot floppy's volume (~cyc 250M /
+    // frame ~1920). The old frame>1200 guess fired ~100M cycles before that, into
+    // a still-0xFFFFFFFF queue header, and address-errored. Gate on the queue
+    // being initialized instead of guessing a frame; retry every 90 frames.
+    if (hdAutoMount_ && hdDriveNum_ != 0 && hdMountPb_ != 0 && !hdMounted_ &&
+        diskEvtPosts_ < 15 && (frameCounter_ % 90) == 0 && !inSony_ &&
+        (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) != 0xFFFFFFFFu)) {
         // Mount the hard-disk volume once the System is up (the boot path only
         // mounts the startup floppy). Preserve the interrupted System's
         // registers -- execute68kTrap only saves PC/SR, so _MountVol would

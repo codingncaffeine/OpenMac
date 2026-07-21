@@ -21,11 +21,15 @@ struct OMac {
     OMacLogFn logFn = nullptr;
     void* logUser = nullptr;
     uint32_t dbgFlags = 0;
+    std::vector<std::string> logBuf;   // drained off the hot path by omac_poll_log
 
     OMac(std::vector<u8> rom, uint32_t ramMB)
         : mac(std::move(rom), openmac::Machine::Config{ramMB * 1024u * 1024u}) {}
 
-    void log(const char* s) const { if (logFn) logFn(logUser, s); }
+    void log(const char* s) {
+        if (logFn) logFn(logUser, s);                 // legacy direct callback
+        if (logBuf.size() < 4000) logBuf.emplace_back(s);
+    }
 };
 
 namespace {
@@ -171,6 +175,20 @@ OMAC_API void omac_debug_dump(OMac* m, const char* name, char* out, size_t cap)
         formatRegs(m->mac.cpu(), out, cap);
     else
         std::snprintf(out, cap, "(%s view not wired yet; enable Debug mode to stream it to the log)", name);
+}
+
+OMAC_API void omac_poll_log(OMac* m, char* out, size_t cap)
+{
+    if (!m || !out || cap == 0) return;
+    size_t pos = 0;
+    for (const auto& line : m->logBuf) {
+        if (pos + line.size() + 1 >= cap) break;
+        std::memcpy(out + pos, line.data(), line.size());
+        pos += line.size();
+        out[pos++] = '\n';
+    }
+    out[pos] = '\0';
+    m->logBuf.clear();
 }
 
 OMAC_API const char* omac_version(void) { return "OpenMac core 0.1"; }

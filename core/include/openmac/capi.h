@@ -77,6 +77,11 @@ OMAC_API void omac_debug_enable(OMac*, uint32_t flags);
    name: "regs" | "backtrace" | "lowmem" | "via" | "drives" | "heap" | "disasm". */
 OMAC_API void omac_debug_dump(OMac*, const char* name, char* out, size_t cap);
 
+/* Drain buffered monitor lines (newline-separated) into out, then clear the
+   buffer. Poll this from the front-end's frame loop; unlike the callback it runs
+   off the CPU exception path, so it can't destabilize emulation. */
+OMAC_API void omac_poll_log(OMac*, char* out, size_t cap);
+
 /* Version string for the About box / logs. */
 OMAC_API const char* omac_version(void);
 
