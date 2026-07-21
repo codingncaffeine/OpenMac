@@ -196,7 +196,7 @@ private:
             emit(hi, 0xFF);
         } else if (reg == 3) {
             ++kbdReg3_;
-            emit(0x22, 0x02);   // SRQ-enable | addr 2 | handler 2 (extended kbd)
+            emit(0x62, 0x02);   // excep-event | SRQ | addr 2 | handler 2 (ext kbd)
         }
     }
 
@@ -217,7 +217,7 @@ private:
             emit(b0, b1);
         } else if (reg == 3) {
             ++mouseReg3_;
-            emit(0x23, 0x01);   // SRQ-enable | addr 3 | handler 1 (100cpi mouse)
+            emit(0x63, 0x01);   // excep-event | SRQ | addr 3 | handler 1 (100cpi mouse)
         }
     }
 

@@ -95,6 +95,11 @@ public:
     };
     ViaRegs viaRegs() const;
 
+    // ADB bus event trace for the monitor: fires on state changes and shift
+    // in/out with the current ADB state (0=cmd 1/2=data 3=idle) and the byte.
+    // ev is one of "state", "arm", "shiftOut", "shiftIn". Diagnostics only.
+    std::function<void(const char* ev, int state, u32 value)> onAdbEvent;
+
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }
@@ -165,7 +170,6 @@ private:
     bool adbArmedInput_ = false;
     int adbPending_ = 0;        // CPU cycles until delivery (0 = none)
     bool adbPendingInput_ = false;
-    int adbIdleTimer_ = 0;      // countdown to the next idle wake-up poke
 
     void adbMaybeClock();
 

@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     std::string dumpPath;
     std::string floppyPath;
     bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
-    bool traceIrq = false;
+    bool traceIrq = false, traceAdb = false;
     u32 breakPc = 0, watchMem = 0xFFFFFFFFu;
     u32 breakTrap = 0, tracePc = 0, dumpMemAddr = 0, dumpMemLen = 0;
     int traceCount = 48;
@@ -147,6 +147,7 @@ int main(int argc, char** argv) {
         else if (arg == "--floppy" && i + 1 < argc) floppyPath = argv[++i];
         else if (arg == "--trace-traps") traceTraps = true;
         else if (arg == "--trace-irq") traceIrq = true;
+        else if (arg == "--trace-adb") traceAdb = true;
         else if (arg == "--trace-os-traps") traceOsTraps = true;
         else if (arg == "--break-pc" && i + 1 < argc)
             breakPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
@@ -257,6 +258,27 @@ int main(int argc, char** argv) {
                 }
             }
             wPrevPc = pc;
+        };
+    }
+
+    if (traceAdb) {
+        mac.onAdbEvent = [&](const char* ev, int state, u32 val) {
+            static int n = 0;
+            if (n++ >= 4000) return;
+            const auto cyc = static_cast<unsigned long long>(mac.totalCycles());
+            if (std::strcmp(ev, "state") == 0)
+                std::printf("ADB   state=%d%s cyc=%llu\n", state,
+                            state == 3 ? " idle" : state == 0 ? " cmd" : "", cyc);
+            else if (std::strcmp(ev, "shiftOut") == 0 && state == 0) {
+                const int a = (val >> 4) & 0xF, o = (val >> 2) & 3, r = val & 3;
+                const char* on = o == 0 ? "reset" : o == 1 ? "flush" : o == 2 ? "listen" : "talk";
+                std::printf("ADB > cmd %02X  %d.%s.%d  cyc=%llu\n", val, a, on, r, cyc);
+            } else if (std::strcmp(ev, "shiftOut") == 0)
+                std::printf("ADB > data %02X (st%d) cyc=%llu\n", val, state, cyc);
+            else if (std::strcmp(ev, "shiftIn") == 0)
+                std::printf("ADB < %02X (st%d) cyc=%llu\n", val, state, cyc);
+            else if (std::strcmp(ev, "arm") == 0)
+                std::printf("ADB   arm-%s (st%d) cyc=%llu\n", val ? "in" : "out", state, cyc);
         };
     }
 

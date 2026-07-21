@@ -112,12 +112,18 @@ void Machine::wireVia() {
         adb_->setState((eff >> 4) & 3);                          // PB4/PB5
         if (adb_->state() != prev) {
             logAccess("ADBs", static_cast<u32>(adb_->state()), true, 0);
+            if (onAdbEvent) onAdbEvent("state", adb_->state(), adb_->lastCommand());
+            if (adb_->state() == 3) {   // idle ends the transaction: a shift
+                adbArmed_ = false;      // still pending would deliver a stale
+                adbPending_ = 0;        // byte and confuse the ROM's ADB manager
+            }
             adbMaybeClock();   // the rule inside decides if this clocks
         }
     };
     via_->srArmed = [this](bool input) {
         adbArmed_ = true;
         adbArmedInput_ = input;
+        if (onAdbEvent) onAdbEvent("arm", adb_->state(), input ? 1u : 0u);
         adbMaybeClock();
     };
     via_->srDisarmed = [this] {
@@ -321,7 +327,10 @@ void Machine::adbMaybeClock() {
         st == 0 || ((st == 1 || st == 2) && adb_->transactionOpen());
     if (canClock && adbArmed_ && adbPending_ == 0) {
         adbArmed_ = false;
-        adbPending_ = 300;
+        // The ROM's ADB manager expects ~260 us between state change and the
+        // shift completion (~5440 CPU cycles at 7.83 MHz). Too short and it
+        // mishandles the transaction (mouse stutters, polling stalls).
+        adbPending_ = 5440;
         adbPendingInput_ = adbArmedInput_;
     }
 }
@@ -335,30 +344,17 @@ void Machine::tickDevices(int cpuCycles) {
             if (adbPendingInput_) {
                 const u8 v = adb_->cpuShiftIn();
                 logAccess("ADBi", static_cast<u32>(adb_->state()), false, v);
+                if (onAdbEvent) onAdbEvent("shiftIn", adb_->state(), v);
                 via_->completeShift(true, v);
             } else {
                 const u8 v = via_->shiftValue();
                 logAccess("ADBo", static_cast<u32>(adb_->state()), true, v);
+                if (onAdbEvent) onAdbEvent("shiftOut", adb_->state(), v);
                 adb_->cpuShiftOut(v);
                 via_->completeShift(false, 0);
             }
         }
     }
-    // ADB wake-up poke: while the bus is idle and a device (keyboard/mouse)
-    // has an event to report, periodically fire a shift-register completion
-    // so the ROM's ADB manager wakes and polls the device. The ROM otherwise
-    // stops all ADB after startup and never learns of new input.
-    if (adbPending_ == 0 && adb_->state() == 3 && adb_->hasPendingEvent()) {
-        adbIdleTimer_ -= cpuCycles;
-        if (adbIdleTimer_ <= 0) {
-            adbIdleTimer_ = 6000;
-            adb_->reStageLastTalk();
-            via_->completeShift(true, 0xFF);
-        }
-    } else {
-        adbIdleTimer_ = 0;
-    }
-
     viaRemainder_ += cpuCycles;
     if (viaRemainder_ >= 10) {
         via_->tick(viaRemainder_ / 10);
@@ -649,7 +645,17 @@ void Machine::runFrame() {
     for (int line = 0; line < kLinesPerFrame; ++line) {
         // /VBL is active-low: high while the beam draws, low during blanking.
         if (line == 0) via_->setCA1(true);
-        if (line == kScreenH) via_->setCA1(false);
+        if (line == kScreenH) {
+            // Once-per-frame ADB wake (like Mini vMac's 60 Hz ADB_Update): if
+            // the bus is idle and a device has input pending, fire a shift
+            // completion so the ROM's ADB manager resumes its poll round-robin.
+            // The ROM stops ADB after startup and needs this nudge to resume.
+            if (adbPending_ == 0 && adb_->state() == 3 && adb_->hasPendingEvent()) {
+                adb_->reStageLastTalk();
+                via_->completeShift(true, 0xFF);
+            }
+            via_->setCA1(false);   // /VBL pulse
+        }
         if (ca2PulseLines_ > 0 && --ca2PulseLines_ == 0) via_->setCA2(false);
         target += kCyclesPerLine;
         while (totalCycles_ < target) {
