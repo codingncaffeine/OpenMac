@@ -119,7 +119,12 @@ public:
             // startup, so len_ was always 0 and this branch never ran.
             return buf_[idx_++];
         }
-        int_ = true;
+        // No (more) data for the polled device. Assert SRQ (/INT low) when the
+        // keyboard has data pending and it wasn't the device just polled, so the
+        // ROM's ADB manager does a poll-all and reaches the keyboard (addr 2) --
+        // otherwise it forever polls only the active device (the mouse).
+        const int polled = (cmd_ >> 4) & 0xF;
+        int_ = !(polled != kbdAddr_ && kbdHead_ != kbdTail_);
         return 0xFF;
     }
 
