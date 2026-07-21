@@ -25,6 +25,7 @@ add_executable(openmac_unit
     unit/main.cpp
     unit/test_cpu_reset.cpp
     unit/test_machine.cpp
+    unit/test_hfs.cpp
 )
 target_link_libraries(openmac_unit PRIVATE openmac_core doctest::doctest openmac_warnings)
 add_test(NAME unit COMMAND openmac_unit)
