@@ -41,6 +41,9 @@ internal static class Native
     public static extern void omac_insert_harddisk(IntPtr h, byte[] img, nuint len, int readOnly);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_harddisk_data(IntPtr h, byte[]? outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int omac_format_hfs(uint sizeBytes,
         [MarshalAs(UnmanagedType.LPStr)] string name, byte[] outBuf);
 

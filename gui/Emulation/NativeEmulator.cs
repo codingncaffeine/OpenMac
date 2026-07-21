@@ -122,8 +122,24 @@ public sealed class NativeEmulator : IEmulator
 
     public void DetachHardDisk()
     {
+        WriteBackHardDisk();
         HardDiskPath = null;
         HardDiskAttached = false;
+    }
+
+    /// <summary>Persist the live hard-disk image (with guest writes) back to its file.</summary>
+    private void WriteBackHardDisk()
+    {
+        if (_h == IntPtr.Zero || !HardDiskAttached || string.IsNullOrEmpty(HardDiskPath)) return;
+        try
+        {
+            nuint size = Native.omac_harddisk_data(_h, null, 0);   // query size
+            if (size == 0) return;
+            var buf = new byte[size];
+            nuint n = Native.omac_harddisk_data(_h, buf, size);
+            if (n > 0) File.WriteAllBytes(HardDiskPath!, buf);
+        }
+        catch { /* best-effort persistence */ }
     }
 
     public void MouseMove(int dx, int dy, bool button)
@@ -152,6 +168,7 @@ public sealed class NativeEmulator : IEmulator
 
     public void Dispose()
     {
+        WriteBackHardDisk();
         Destroy();
         _audio.Dispose();
     }

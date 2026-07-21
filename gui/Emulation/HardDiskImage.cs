@@ -3,13 +3,10 @@ using System.IO;
 namespace OpenMac.Gui.Emulation;
 
 /// <summary>
-/// Creates blank hard-disk image files.
-///
-/// TODO (wire-up): the native core is growing a real HFS formatter
-/// (<c>openmac::hfs::formatVolume</c>). Once that is exposed through the C ABI,
-/// <see cref="CreateBlank"/> should call it so the produced image is a genuine,
-/// mountable HFS volume. Until then it writes a zeroed image — the machine sees
-/// an uninitialized disk (which is still a valid, useful placeholder for the UI).
+/// Creates hard-disk image files formatted as empty, mountable HFS volumes via
+/// the native formatter (omac_format_hfs -> openmac::hfs::formatVolume). The Mac
+/// Classic can't format a .Sony-attached hard disk itself, so the image must be a
+/// real HFS volume up front or it won't mount.
 /// </summary>
 public static class HardDiskImage
 {
@@ -19,25 +16,23 @@ public static class HardDiskImage
     public static readonly int[] CommonSizesMB = { 20, 40, 80, 120, 240, 500 };
 
     /// <summary>
-    /// Write a blank hard-disk image of <paramref name="sizeMB"/> megabytes to
-    /// <paramref name="path"/>, formatted (when the native formatter is present)
-    /// as an empty HFS volume named <paramref name="volumeName"/>.
+    /// Write a hard-disk image of <paramref name="sizeMB"/> megabytes to
+    /// <paramref name="path"/>, formatted as an empty HFS volume named
+    /// <paramref name="volumeName"/>. Throws if the native formatter is missing
+    /// (a blank image would not mount, so none is written).
     /// </summary>
     public static void CreateBlank(string path, int sizeMB, string volumeName)
     {
         long sizeBytes = (long)sizeMB * 1024 * 1024;
 
         byte[]? formatted = NativeFormatter.TryFormat(sizeBytes, volumeName);
-        if (formatted is not null)
-        {
-            File.WriteAllBytes(path, formatted);
-            return;
-        }
+        if (formatted is null)
+            throw new InvalidOperationException(
+                "Could not format the disk image: the native HFS formatter " +
+                "(omac_format_hfs in openmac_c.dll) failed or is missing. A blank " +
+                "image would not mount, so no file was written.");
 
-        // Placeholder: allocate a zeroed image on disk without holding it all in
-        // memory. The disk mounts as "uninitialized" until the formatter is wired.
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-        fs.SetLength(sizeBytes);
+        File.WriteAllBytes(path, formatted);
     }
 }
 
