@@ -1,0 +1,25 @@
+# Build output
+build/
+out/
+cmake-build-*/
+.vs/
+.vscode/
+*.user
+
+# Dev-shell local state
+imgui.ini
+
+# Local planning docs — never pushed
+_plans/
+
+# Apple ROMs and disk images — user-supplied, never committed
+*.rom
+roms/
+*.img
+*.image
+*.dsk
+*.hfs
+*.dc42
+
+# Locally fetched test data (SingleStepTests etc.)
+tests/data/
