@@ -54,6 +54,13 @@ public:
     u8 orb() const { return orb_; }
     u8 ddra() const { return ddra_; }
     u8 ddrb() const { return ddrb_; }
+    // Interrupt/timer register views for the debugger.
+    u8 ifr() const { return ifr_; }
+    u8 ier() const { return ier_; }
+    u8 acr() const { return acr_; }
+    u8 pcr() const { return pcr_; }
+    u16 t1Counter() const { return t1c_; }
+    u16 t2Counter() const { return t2c_; }
 
 private:
     void setIFR(u8 bit);

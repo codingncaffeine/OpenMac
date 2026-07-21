@@ -318,4 +318,40 @@ void checkHeap(Machine& mac, std::FILE* out) {
     zoneInfo("SysZone", r32(0x02A6));
 }
 
+void dumpTimerQueue(Machine& mac, std::FILE* out) {
+    auto r32 = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
+    const u32 tm = r32(0x0B30) & 0xFFFFFF;   // tm_var
+    std::fprintf(out, "-- Time Manager queue (tm_var=[$0B30]=%06X) --\n", tm);
+    if (!tm || (tm & 1) || tm >= 0x400000) { std::fprintf(out, "  (no tm_var)\n"); return; }
+    // The active-timer QHdr sits at tm_var+8: qFlags (word), qHead (long @+$0A).
+    std::fprintf(out, "  qFlags=%04X qHead=%06X qTail=%06X\n", mac.read16(tm + 8),
+                 r32(tm + 0x0A) & 0xFFFFFF, r32(tm + 0x0E) & 0xFFFFFF);
+    u32 el = r32(tm + 0x0A) & 0xFFFFFF;      // qHead
+    int n = 0;
+    while (el && (el & 1) == 0 && el < 0x400000 && n < 24) {
+        // TMTask: qLink (+0), qType (+4), tmAddr (+6), tmCount (+$0A).
+        std::fprintf(out, "  task @%06X  qType=%04X tmAddr=%06X tmCount=%d\n", el,
+                     mac.read16(el + 4), r32(el + 6) & 0xFFFFFF,
+                     static_cast<int>(r32(el + 0x0A)));
+        el = r32(el) & 0xFFFFFF;              // qLink
+        ++n;
+    }
+    std::fprintf(out, "  %d task(s) queued\n", n);
+}
+
+void dumpVia(Machine& mac, std::FILE* out) {
+    const auto v = mac.viaRegs();
+    std::fprintf(out, "-- VIA 6522 --\n");
+    std::fprintf(out, "  ORA=%02X ORB=%02X DDRA=%02X DDRB=%02X ACR=%02X PCR=%02X SR=%02X\n",
+                 v.ora, v.orb, v.ddra, v.ddrb, v.acr, v.pcr, v.sr);
+    std::fprintf(out, "  T1=%04X T2=%04X  IFR=%02X IER=%02X  IRQ=%d\n",
+                 v.t1c, v.t2c, v.ifr, v.ier, v.irq ? 1 : 0);
+    static const char* kSrc[] = {"CA2", "CA1", "SR", "CB2", "CB1", "T2", "T1"};
+    const u8 active = v.ifr & v.ier & 0x7F;
+    std::fprintf(out, "  pending&enabled:");
+    for (int b = 0; b < 7; ++b)
+        if (active & (1u << b)) std::fprintf(out, " %s", kSrc[b]);
+    std::fprintf(out, "%s\n", active ? "" : " none");
+}
+
 } // namespace openmac::dbg

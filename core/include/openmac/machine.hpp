@@ -86,6 +86,15 @@ public:
     const std::vector<u8>& adbCmdTrace() const;
     const std::vector<u8>& adbRespTrace() const;
 
+    // VIA register snapshot for the monitor (the Via6522 type is internal, so
+    // the debugger and trace tool read state through this instead).
+    struct ViaRegs {
+        u8 ora, orb, ddra, ddrb, acr, pcr, ifr, ier, sr;
+        u16 t1c, t2c;
+        bool irq;
+    };
+    ViaRegs viaRegs() const;
+
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }

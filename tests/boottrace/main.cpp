@@ -137,6 +137,7 @@ int main(int argc, char** argv) {
     std::string dumpPath;
     std::string floppyPath;
     bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
+    bool traceIrq = false;
     u32 breakTrap = 0, tracePc = 0, dumpMemAddr = 0, dumpMemLen = 0;
     int traceCount = 48;
     for (int i = 1; i < argc; ++i) {
@@ -144,6 +145,7 @@ int main(int argc, char** argv) {
         if (arg == "--rom" && i + 1 < argc) romPath = argv[++i];
         else if (arg == "--floppy" && i + 1 < argc) floppyPath = argv[++i];
         else if (arg == "--trace-traps") traceTraps = true;
+        else if (arg == "--trace-irq") traceIrq = true;
         else if (arg == "--trace-os-traps") traceOsTraps = true;
         else if (arg == "--check-heap") checkHeapFlag = true;
         else if (arg == "--lowmem") lowmemDump = true;
@@ -210,6 +212,19 @@ int main(int argc, char** argv) {
                 openmac::dbg::dumpDriveQueue(mac, stdout);
                 openmac::dbg::dumpUnitTable(mac, stdout);
             }
+        };
+    }
+
+    if (traceIrq) {
+        mac.cpu().onInterrupt = [&](int level, u32 vec, u32 pc) {
+            const u8 ifr = level == 1 ? mac.viaRegs().ifr : 0;    // VIA IFR = source
+            const char* src = (ifr & 0x40) ? "T1" : (ifr & 0x20) ? "T2"
+                            : (ifr & 0x10) ? "CB1" : (ifr & 0x04) ? "SR/ADB"
+                            : (ifr & 0x02) ? "CA1/VBL" : (ifr & 0x01) ? "CA2" : "?";
+            static int n = 0;
+            if (n++ < 2000)
+                std::printf("IRQ L%d vec=%u pc=%06X ifr=%02X %-8s cyc=%llu\n", level, vec,
+                            pc, ifr, src, static_cast<unsigned long long>(mac.totalCycles()));
         };
     }
 
@@ -380,6 +395,8 @@ int main(int argc, char** argv) {
         openmac::dbg::dumpLowMem(mac, stdout);
         openmac::dbg::dumpDriveQueue(mac, stdout);
         openmac::dbg::dumpUnitTable(mac, stdout);
+        openmac::dbg::dumpTimerQueue(mac, stdout);
+        openmac::dbg::dumpVia(mac, stdout);
     }
     if (dumpMemLen) {
         std::printf("-- memory $%06X (%u bytes) --\n", dumpMemAddr, dumpMemLen);

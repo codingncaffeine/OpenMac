@@ -58,6 +58,10 @@ public:
     // trap opcode and its address. Used by the debugger for trap breakpoints.
     std::function<void(u16 opcode, u32 pc)> onTrap;
 
+    // Fires when the CPU takes an interrupt, with the level (1-7), the
+    // autovector number, and the PC being interrupted. Diagnostics only.
+    std::function<void(int level, u32 autovector, u32 pc)> onInterrupt;
+
 private:
     friend struct CpuOps;
 

@@ -131,6 +131,7 @@ int M68000::step() {
 
     const int mask = (sr_ >> 8) & 7;
     if (irqLevel_ > 0 && (irqLevel_ == 7 || irqLevel_ > mask)) {
+        if (onInterrupt) onInterrupt(irqLevel_, 24u + static_cast<u32>(irqLevel_), pc);
         return doInterrupt(irqLevel_);
     }
     if (stopped) return 4;

@@ -171,6 +171,13 @@ const std::vector<u8>& Machine::adbRespTrace() const {
     return adb_->respTrace();
 }
 
+Machine::ViaRegs Machine::viaRegs() const {
+    return {via_->ora(),  via_->orb(),  via_->ddra(), via_->ddrb(),
+            via_->acr(),  via_->pcr(),  via_->ifr(),  via_->ier(),
+            via_->shiftValue(), via_->t1Counter(), via_->t2Counter(),
+            via_->irqAsserted()};
+}
+
 u32 Machine::screenBase() const {
     return static_cast<u32>(ram_.size()) - (screenAlt_ ? 0xD900u : 0x5900u);
 }

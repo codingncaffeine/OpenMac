@@ -56,4 +56,12 @@ void dumpBacktrace(const M68000& cpu, Machine& mac, std::FILE* out);
 // first block whose header looks corrupt — a common cause of NIL handles.
 void checkHeap(Machine& mac, std::FILE* out);
 
+// Walk the Time Manager task queue (tm_var at low-mem $0B30, queue at +8) and
+// list the queued TMTasks. An empty queue here is a known boot-patch crash.
+void dumpTimerQueue(Machine& mac, std::FILE* out);
+
+// Dump the VIA 6522 registers and decode the pending+enabled interrupt
+// sources (T1/T2/SR/CB1/CA1...), the heart of the machine's interrupt flow.
+void dumpVia(Machine& mac, std::FILE* out);
+
 } // namespace openmac::dbg
