@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
     std::string floppyPath;
     bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
     bool traceIrq = false;
+    u32 breakPc = 0, watchMem = 0xFFFFFFFFu;
     u32 breakTrap = 0, tracePc = 0, dumpMemAddr = 0, dumpMemLen = 0;
     int traceCount = 48;
     for (int i = 1; i < argc; ++i) {
@@ -147,6 +148,10 @@ int main(int argc, char** argv) {
         else if (arg == "--trace-traps") traceTraps = true;
         else if (arg == "--trace-irq") traceIrq = true;
         else if (arg == "--trace-os-traps") traceOsTraps = true;
+        else if (arg == "--break-pc" && i + 1 < argc)
+            breakPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+        else if (arg == "--watch-mem" && i + 1 < argc)
+            watchMem = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
         else if (arg == "--check-heap") checkHeapFlag = true;
         else if (arg == "--lowmem") lowmemDump = true;
         else if (arg == "--break-trap" && i + 1 < argc)
@@ -225,6 +230,33 @@ int main(int argc, char** argv) {
             if (n++ < 2000)
                 std::printf("IRQ L%d vec=%u pc=%06X ifr=%02X %-8s cyc=%llu\n", level, vec,
                             pc, ifr, src, static_cast<unsigned long long>(mac.totalCycles()));
+        };
+    }
+
+    u32 wPrevPc = 0, wLastVal = 0;
+    bool wFirst = true;
+    int bpHits = 0;
+    if (breakPc || watchMem != 0xFFFFFFFFu) {
+        mac.cpu().onStep = [&](u32 pc) {
+            if (breakPc && pc == breakPc && bpHits < 8) {
+                ++bpHits;
+                std::printf("\n=== BREAK pc=%06X (hit %d) cyc=%llu ===\n", pc, bpHits,
+                            static_cast<unsigned long long>(mac.totalCycles()));
+                openmac::dbg::dumpRegs(mac.cpu(), stdout);
+                openmac::dbg::dumpBacktrace(mac.cpu(), mac, stdout);
+            }
+            if (watchMem != 0xFFFFFFFFu) {
+                const u32 v = (static_cast<u32>(mac.read16(watchMem)) << 16) |
+                              mac.read16(watchMem + 2);
+                if (wFirst) { wLastVal = v; wFirst = false; }
+                else if (v != wLastVal) {
+                    std::printf("WATCH [%06X] %08X -> %08X by pc=%06X cyc=%llu\n", watchMem,
+                                wLastVal, v, wPrevPc,
+                                static_cast<unsigned long long>(mac.totalCycles()));
+                    wLastVal = v;
+                }
+            }
+            wPrevPc = pc;
         };
     }
 

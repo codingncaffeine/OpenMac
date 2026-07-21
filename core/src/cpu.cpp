@@ -136,6 +136,8 @@ int M68000::step() {
     }
     if (stopped) return 4;
 
+    if (onStep) onStep(pc);
+
     const bool traced = (sr_ & kT) != 0;
     instrStart_ = pc;
     pcRing_[pcRingPos_] = pc;

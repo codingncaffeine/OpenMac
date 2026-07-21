@@ -62,6 +62,11 @@ public:
     // autovector number, and the PC being interrupted. Diagnostics only.
     std::function<void(int level, u32 autovector, u32 pc)> onInterrupt;
 
+    // Fires before each instruction with the PC about to execute. Drives the
+    // debugger's PC breakpoints and memory watchpoints. Leave unset for zero
+    // cost beyond a null check.
+    std::function<void(u32 pc)> onStep;
+
 private:
     friend struct CpuOps;
 
