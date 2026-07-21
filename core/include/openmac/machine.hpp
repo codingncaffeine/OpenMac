@@ -29,7 +29,8 @@ public:
     static constexpr int kLinesPerFrame = 370;
     static constexpr int kCyclesPerLine = 352;
 
-    Machine(std::vector<u8> rom, const Config& cfg = {});
+    Machine(std::vector<u8> rom, const Config& cfg);
+    explicit Machine(std::vector<u8> rom);   // default Config, defined in .cpp
     ~Machine() override;
 
     void reset();

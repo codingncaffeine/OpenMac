@@ -30,6 +30,11 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     reset();
 }
 
+// Config lives inside Machine, so its default member initializer cannot be
+// used in an in-class default argument; delegate from here where the class
+// is complete.
+Machine::Machine(std::vector<u8> rom) : Machine(std::move(rom), Config{}) {}
+
 Machine::~Machine() = default;
 
 void Machine::wireVia() {
