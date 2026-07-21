@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net11.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>OpenMac</AssemblyName>
+    <RootNamespace>OpenMac.Gui</RootNamespace>
+    <ApplicationIcon>..\shell\assets\openmac.ico</ApplicationIcon>
+    <Product>OpenMac</Product>
+    <AssemblyTitle>OpenMac</AssemblyTitle>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <!-- Ship the native core DLL (built by CMake into gui/native) beside the app. -->
+  <ItemGroup>
+    <None Include="native\openmac_c.dll" Condition="Exists('native\openmac_c.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>openmac_c.dll</Link>
+    </None>
+  </ItemGroup>
+
+</Project>

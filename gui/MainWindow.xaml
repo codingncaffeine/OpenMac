@@ -1,0 +1,78 @@
+<Window x:Class="OpenMac.Gui.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="OpenMac" Height="560" Width="760" MinWidth="360" MinHeight="300"
+        Background="{StaticResource WindowBg}" Foreground="{StaticResource TextPrimary}"
+        FontFamily="Segoe UI" FontSize="13">
+    <DockPanel>
+        <Menu DockPanel.Dock="Top">
+            <MenuItem Header="_File">
+                <MenuItem Header="Open ROM…" InputGestureText="Ctrl+O" Click="OpenRom_Click" />
+                <MenuItem x:Name="RecentMenu" Header="Open Recent" />
+                <Separator />
+                <MenuItem Header="Insert Floppy…" Click="InsertFloppy_Click" />
+                <MenuItem x:Name="EjectFloppyItem" Header="Eject Floppy" Click="EjectFloppy_Click" />
+                <Separator />
+                <MenuItem Header="Attach Hard Disk…" Click="AttachHardDisk_Click" />
+                <MenuItem Header="Create Hard Disk…" Click="CreateHardDisk_Click" />
+                <MenuItem x:Name="DetachHdItem" Header="Detach Hard Disk" Click="DetachHardDisk_Click" />
+                <Separator />
+                <MenuItem Header="Exit" InputGestureText="Alt+F4" Click="Exit_Click" />
+            </MenuItem>
+            <MenuItem Header="_Machine">
+                <MenuItem Header="Reset" InputGestureText="Ctrl+R" Click="Reset_Click" />
+                <Separator />
+                <MenuItem x:Name="Mem1Item" Header="1 MB RAM" Tag="1" Click="Memory_Click" />
+                <MenuItem x:Name="Mem2Item" Header="2 MB RAM" Tag="2" Click="Memory_Click" />
+                <MenuItem x:Name="Mem4Item" Header="4 MB RAM" Tag="4" Click="Memory_Click" />
+                <Separator />
+                <MenuItem x:Name="BootRomDiskItem" Header="Boot from ROM Disk (Cmd-Opt-X-O)"
+                          Click="BootRomDisk_Click" />
+            </MenuItem>
+            <MenuItem Header="_View">
+                <MenuItem x:Name="ScaleFitItem" Header="Fit Window" Tag="0" Click="Scale_Click" />
+                <MenuItem x:Name="Scale1Item" Header="1×  (512 × 342)" Tag="1" Click="Scale_Click" />
+                <MenuItem x:Name="Scale2Item" Header="2×  (1024 × 684)" Tag="2" Click="Scale_Click" />
+                <MenuItem x:Name="Scale3Item" Header="3×  (1536 × 1026)" Tag="3" Click="Scale_Click" />
+                <Separator />
+                <MenuItem Header="Fullscreen" InputGestureText="F11" Click="Fullscreen_Click" />
+                <MenuItem Header="Debugger…" Click="Debugger_Click" />
+            </MenuItem>
+            <MenuItem Header="_Help">
+                <MenuItem Header="About OpenMac" Click="About_Click" />
+            </MenuItem>
+        </Menu>
+
+        <Border DockPanel.Dock="Bottom" Background="{StaticResource Surface}"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0" Padding="10,3">
+            <Grid>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock x:Name="StatusState" Text="Stopped" Foreground="{StaticResource TextSecondary}" />
+                    <TextBlock Text="   " />
+                    <TextBlock x:Name="StatusMachine" Text="No ROM loaded" Foreground="{StaticResource TextSecondary}" />
+                </StackPanel>
+                <TextBlock x:Name="StatusBackend" HorizontalAlignment="Right" Text="core: stub"
+                           Foreground="{StaticResource TextSecondary}" />
+            </Grid>
+        </Border>
+
+        <Grid x:Name="ScreenHost" Background="{StaticResource Letterbox}">
+            <Viewbox Stretch="Uniform" StretchDirection="Both">
+                <Image x:Name="ScreenImage" Width="512" Height="342"
+                       RenderOptions.BitmapScalingMode="NearestNeighbor" />
+            </Viewbox>
+            <Border x:Name="Overlay" Background="#D0121214">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Text="OpenMac" FontSize="42" FontWeight="Bold"
+                               Foreground="{StaticResource TextPrimary}" HorizontalAlignment="Center" />
+                    <Border Width="66" Height="3" Background="{StaticResource Accent}"
+                            Margin="0,12" HorizontalAlignment="Center" />
+                    <TextBlock Text="Macintosh Classic emulator" FontSize="14"
+                               Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" />
+                    <TextBlock Text="File  ▸  Open ROM  to begin" Margin="0,16,0,0"
+                               Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" />
+                </StackPanel>
+            </Border>
+        </Grid>
+    </DockPanel>
+</Window>
