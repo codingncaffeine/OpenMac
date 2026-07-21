@@ -693,7 +693,7 @@ void Machine::runFrame() {
     // Once the System is up, post a disk-inserted event for the hard-disk drive
     // so the System mounts its volume (the boot path only mounts the startup
     // floppy). Retry periodically until the System actually reads the drive.
-    if (hdDriveNum_ != 0 && hdMountPb_ != 0 && hdReads_ + hdWrites_ == 0 &&
+    if (hdDriveNum_ != 0 && hdMountPb_ != 0 && !hdMounted_ && diskEvtPosts_ < 15 &&
         frameCounter_ > 1200 && (frameCounter_ % 90) == 0 && !inSony_) {
         // Mount the hard-disk volume once the System is up (the boot path only
         // mounts the startup floppy). Preserve the interrupted System's
@@ -706,6 +706,9 @@ void Machine::runFrame() {
         execute68kTrap(kTrapMountVol);                 // _MountVol drive hdDriveNum_
         diskEvtResult_ = cpu_.d[0] & 0xFFFF;           // OSErr from _MountVol
         ++diskEvtPosts_;
+        // 0 = mounted; 0xFFC9 = volOnLinErr (-55) = the volume is already
+        // on-line (a prior async attempt mounted it). Either way we are done.
+        if (diskEvtResult_ == 0 || diskEvtResult_ == 0xFFC9) hdMounted_ = true;
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     }
 

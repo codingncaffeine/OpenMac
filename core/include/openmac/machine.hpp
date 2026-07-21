@@ -170,6 +170,7 @@ private:
     u32 hdMountPb_ = 0;                // system-heap param block for _MountVol
     u32 diskEvtPosts_ = 0;             // mount attempts
     u32 diskEvtResult_ = 0xFFFFFFFFu;  // last _MountVol OSErr
+    bool hdMounted_ = false;           // volume mounted OK; stop retrying
 
     std::vector<u8> ram_;
     std::vector<u8> rom_;

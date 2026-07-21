@@ -4,6 +4,7 @@
 
 #include <openmac/machine.hpp>
 #include <openmac/debugger.hpp>
+#include <openmac/hfs.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -309,6 +310,7 @@ int main(int argc, char** argv) {
     std::string dumpPath;
     std::string floppyPath;
     u32 hdBlankMB = 0;   // --harddisk-blank N: attach a blank N-MB hard disk
+    u32 hdFormatMB = 0;  // --harddisk-format N: attach a formatted N-MB HFS disk
     bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
     bool traceIrq = false, traceAdb = false;
     u32 breakPc = 0, watchMem = 0xFFFFFFFFu;
@@ -326,6 +328,8 @@ int main(int argc, char** argv) {
         else if (arg == "--floppy" && i + 1 < argc) floppyPath = argv[++i];
         else if (arg == "--harddisk-blank" && i + 1 < argc)
             hdBlankMB = static_cast<u32>(std::atoi(argv[++i]));
+        else if (arg == "--harddisk-format" && i + 1 < argc)
+            hdFormatMB = static_cast<u32>(std::atoi(argv[++i]));
         else if (arg == "--trace-traps") traceTraps = true;
         else if (arg == "--trace-irq") traceIrq = true;
         else if (arg == "--trace-adb") traceAdb = true;
@@ -405,6 +409,11 @@ int main(int argc, char** argv) {
     if (hdBlankMB > 0) {
         std::vector<u8> hd(static_cast<size_t>(hdBlankMB) * 1024u * 1024u, 0u);
         std::printf("HARD DISK %zu bytes (blank) attached\n", hd.size());
+        mac.insertHardDisk(std::move(hd), false);
+    }
+    if (hdFormatMB > 0) {
+        auto hd = openmac::hfs::formatVolume(hdFormatMB * 1024u * 1024u, "OpenMac HD");
+        std::printf("HARD DISK %zu bytes (HFS-formatted) attached\n", hd.size());
         mac.insertHardDisk(std::move(hd), false);
     }
 
