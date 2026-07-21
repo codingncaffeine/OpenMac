@@ -146,11 +146,6 @@ private:
     int floppyDriveNum_ = 0;
     bool inSony_ = false;          // re-entrancy guard during trap execution
 
-    // DisposPtr(NIL) guard: this ROM's DisposPtr dereferences its argument, so
-    // NIL crashes, but later Memory Managers no-op it. The boot-time Time
-    // Manager installer hits this. Set to the DisposPtr handler for this ROM.
-    u32 disposPtrGuardPc_ = 0;
-
     std::vector<u8> ram_;
     std::vector<u8> rom_;
     u32 ramMask_ = 0;

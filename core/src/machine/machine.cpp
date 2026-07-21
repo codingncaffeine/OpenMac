@@ -30,6 +30,7 @@ constexpr int kARdCmd = 2;        // low byte of ioTrap for a Read
 constexpr int kSonyRefNum = -5;   // .Sony driver reference number
 constexpr u16 kTrapNewPtrSysClear = 0xA71E;
 constexpr u16 kTrapAddDrive = 0xA04E;
+constexpr u16 kTrapInsTime = 0xA058;
 } // namespace
 
 Machine::Machine(std::vector<u8> rom, const Config& cfg)
@@ -56,11 +57,6 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
         sonyControlPc_ = drvr + off(hoff + 12);
         sonyStatusPc_  = drvr + off(hoff + 14);
     }
-    // Enable the DisposPtr(NIL) guard for the Mac Classic ROM (checksum in the
-    // first four bytes). The handler address is ROM-specific.
-    if (rom_.size() >= 4 && rom_[0] == 0xA4 && rom_[1] == 0x9F &&
-        rom_[2] == 0x99 && rom_[3] == 0x14)
-        disposPtrGuardPc_ = 0x40A60A;
     reset();
 }
 
@@ -378,15 +374,6 @@ void Machine::tickDevices(int cpuCycles) {
 }
 
 int Machine::stepInstruction() {
-    if (disposPtrGuardPc_ && cpu_.pc == disposPtrGuardPc_ &&
-        (cpu_.a[0] & 0x00FFFFFF) == 0) {
-        cpu_.d[0] = 0;                     // noErr — DisposPtr(NIL) is a no-op
-        const u32 sp = cpu_.a[7];
-        cpu_.pc = read32(sp);              // RTS to the caller
-        cpu_.a[7] = sp + 4;
-        tickDevices(20);
-        return 20;
-    }
     if (!floppy_.empty() && trySonyTrap()) {
         tickDevices(40);
         return 40;
@@ -577,6 +564,20 @@ int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
                 (static_cast<u32>(kSonyRefNum) & 0xFFFF);
     cpu_.a[0] = drvStatusAddr_ + dsQLink;
     execute68kTrap(kTrapAddDrive);
+
+    // Install a Time Manager task, as the real .Sony Open does (ROM $434778):
+    // the driver's disk-motor spin-down timer. System 6's extended Time Manager
+    // patch walks tm_var+8 and re-installs every existing timer, so an empty
+    // queue there address-errors it. A standalone zeroed TMTask keeps it valid;
+    // the task is never Primed, so it never fires.
+    cpu_.d[0] = 32;                          // >= extended TMTask size (22)
+    execute68kTrap(kTrapNewPtrSysClear);     // A0 = zeroed system-heap block
+    if (cpu_.a[0] != 0) {
+        const u32 tmTask = cpu_.a[0];
+        write32(tmTask + 6, 0x43469A);       // tmAddr -> a harmless ROM RTS
+        cpu_.a[0] = tmTask;
+        execute68kTrap(kTrapInsTime);        // _InsTime -> enqueues into tm_var+8
+    }
     return kNoErr;
 }
 
