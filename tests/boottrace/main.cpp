@@ -39,16 +39,28 @@ void profileFrame(Machine& mac) {
     if (open) std::printf("  %06X-%06X\n", start, prev);
 }
 
-// Single-step until PC first hits `stopPc`, then dump the trail of PCs that
-// led there (collapsing tight loops to their last occurrence).
+// Single-step until PC first hits `stopPc` — or, when stopPc is 1, until
+// execution leaves plausible regions (a runaway) — then dump the trail.
 void traceUntil(Machine& mac, u32 stopPc, u64 maxCycles) {
     std::vector<u32> ring(96, 0);
     size_t head = 0;
     while (mac.totalCycles() < maxCycles && !mac.cpu().halted) {
         const u32 pc = mac.cpu().pc;
-        if (pc == stopPc) {
-            std::printf("-- reached %06X after %llu cycles; trail: --\n", stopPc,
+        const u32 p24 = pc & 0xFFFFFF;
+        const bool runaway =
+            stopPc == 1 && (pc > 0xFFFFFF || (p24 >= 0x480000 && p24 < 0x800000) ||
+                            (p24 >= 0x100000 && p24 < 0x400000));
+        if (pc == stopPc || runaway) {
+            std::printf("-- stopped at pc=%08X after %llu cycles; trail: --\n", pc,
                         static_cast<unsigned long long>(mac.totalCycles()));
+            auto rd32 = [&](u32 a) {
+                return (u32(mac.read16(a)) << 16) | mac.read16(a + 2);
+            };
+            std::printf("sr=%04X a7=%08X vec1=%08X vec2=%08X vec3=%08X\n",
+                        mac.cpu().getSR(), mac.cpu().a[7], rd32(0x64), rd32(0x68),
+                        rd32(0x6C));
+            std::printf("via IFR=%02X IER=%02X\n", mac.read8(0xEFFBFE),
+                        mac.read8(0xEFFDFE));
             std::vector<u32> trail;
             for (size_t i = 0; i < ring.size(); ++i) {
                 const u32 p = ring[(head + i) % ring.size()];

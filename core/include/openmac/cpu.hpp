@@ -3,6 +3,8 @@
 #include "openmac/bus.hpp"
 #include "openmac/types.hpp"
 
+#include <functional>
+
 namespace openmac {
 
 struct CpuOps;
@@ -41,6 +43,9 @@ public:
 
     bool stopped = false;    // STOP: waiting for an interrupt
     bool halted  = false;    // double fault: only reset() recovers
+
+    // The RESET instruction pulses /RSTO: peripherals reset, CPU continues.
+    std::function<void()> onResetInstruction;
 
 private:
     friend struct CpuOps;

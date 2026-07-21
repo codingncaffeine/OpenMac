@@ -60,7 +60,10 @@ u8 Via6522::read(int reg) {
     case 10: {
         clearIFR(kIrqSR);
         const u8 v = sr_;
-        if (((acr_ >> 2) & 7) != 0) {   // reading re-arms a shift-in
+        const int mode = (acr_ >> 2) & 7;
+        if (mode == 3 || mode == 7) {   // external clock: the device decides
+            if (srArmed) srArmed(true);
+        } else if (mode != 0) {
             srTicks_ = 16;
             srInput_ = true;
         }
@@ -113,15 +116,27 @@ void Via6522::write(int reg, u8 value) {
         t2Running_ = true;
         clearIFR(kIrqT2);
         break;
-    case 10:
+    case 10: {
         sr_ = value;
         clearIFR(kIrqSR);
-        if (((acr_ >> 2) & 7) != 0) {   // writing starts a shift-out
+        const int mode = (acr_ >> 2) & 7;
+        if (mode == 3 || mode == 7) {   // external clock: the device decides
+            if (srArmed) srArmed(mode == 3);
+        } else if (mode != 0) {
             srTicks_ = 16;
-            srInput_ = ((acr_ >> 2) & 4) == 0;   // modes 1-3 shift in
+            srInput_ = (mode & 4) == 0;
         }
         break;
-    case 11: acr_ = value; break;
+    }
+    case 11: {
+        const int oldMode = (acr_ >> 2) & 7;
+        acr_ = value;
+        const int newMode = (acr_ >> 2) & 7;
+        const bool wasExt = oldMode == 3 || oldMode == 7;
+        const bool isExt = newMode == 3 || newMode == 7;
+        if (wasExt && !isExt && srDisarmed) srDisarmed();
+        break;
+    }
     case 12: pcr_ = value; break;
     case 13: // IFR: writing 1s clears those bits
         ifr_ = static_cast<u8>(ifr_ & ~(value & 0x7F));
@@ -137,8 +152,7 @@ void Via6522::write(int reg, u8 value) {
 void Via6522::tick(int viaClocks) {
     while (viaClocks-- > 0) {
         if (srTicks_ > 0 && --srTicks_ == 0) {
-            if (srInput_) sr_ = shiftIn ? shiftIn() : 0xFF;
-            else if (shiftOut) shiftOut(sr_);
+            if (srInput_) sr_ = 0xFF;   // internal-clock modes: idle line
             setIFR(kIrqSR);
         }
         // T1: free-running counter; interrupts only while armed
@@ -183,7 +197,8 @@ void Via6522::setCA1(bool level) {
 }
 
 void Via6522::setCA2(bool level) {
-    const bool positive = (pcr_ & 0x04) != 0;   // input modes: bit2 polarity
+    if (pcr_ & 0x08) { ca2_ = level; return; }   // CA2 in output mode: ignore
+    const bool positive = (pcr_ & 0x04) != 0;    // input modes: bit2 polarity
     if (ca2_ != level) {
         if ((positive && !ca2_ && level) || (!positive && ca2_ && !level)) {
             setIFR(kIrqCA2);

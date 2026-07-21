@@ -114,7 +114,7 @@ int CpuOps::opStop(M68000& c, u16) {
 
 int CpuOps::opReset(M68000& c, u16) {
     if (!flag(c, kS)) return privilegeViolation(c);
-    // Asserts /RSTO for 124 clocks; device-reset hook arrives with the machine.
+    if (c.onResetInstruction) c.onResetInstruction();   // /RSTO to peripherals
     return 132;
 }
 

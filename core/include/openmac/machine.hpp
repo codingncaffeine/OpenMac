@@ -16,6 +16,7 @@ namespace openmac {
 
 class Via6522;
 class Rtc;
+class AdbTransceiver;
 
 class Machine final : public IBus {
 public:
@@ -73,7 +74,18 @@ private:
 
     std::unique_ptr<Via6522> via_;
     std::unique_ptr<Rtc> rtc_;
+    std::unique_ptr<AdbTransceiver> adb_;
     M68000 cpu_;
+
+    // The CPU arms a shift; the transceiver clocks it only in an active
+    // state (0/1/2), either when armed there or when the state lines enter
+    // one. Idle never clocks — that is what ends a transaction.
+    bool adbArmed_ = false;
+    bool adbArmedInput_ = false;
+    int adbPending_ = 0;        // CPU cycles until delivery (0 = none)
+    bool adbPendingInput_ = false;
+
+    void adbMaybeClock();
 
     u64 totalCycles_ = 0;
     u64 lineTarget_ = 0;

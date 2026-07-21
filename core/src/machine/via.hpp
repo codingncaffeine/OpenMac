@@ -33,10 +33,17 @@ public:
     std::function<void(u8 value, u8 ddr)> outA;
     std::function<void(u8 value, u8 ddr)> outB;
 
-    // Shift register completion (ADB transceiver): shiftOut receives the
-    // byte the CPU sent; shiftIn supplies the byte the outside world returns.
-    std::function<void(u8)> shiftOut;
-    std::function<u8()> shiftIn;
+    // Externally-clocked shift register (ADB transceiver): srArmed fires
+    // when the CPU arms a transfer (input = shift-in); the machine calls
+    // completeShift when/if the transceiver actually clocks the byte.
+    std::function<void(bool input)> srArmed;
+    std::function<void()> srDisarmed;   // ACR left external-shift mode
+
+    u8 shiftValue() const { return sr_; }
+    void completeShift(bool input, u8 inValue) {
+        if (input) sr_ = inValue;
+        ifr_ |= 0x04;   // SR interrupt flag
+    }
 
     u8 ora() const { return ora_; }
     u8 orb() const { return orb_; }

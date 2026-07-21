@@ -1,5 +1,6 @@
 #include "openmac/machine.hpp"
 
+#include "adb.hpp"
 #include "rtc.hpp"
 #include "via.hpp"
 
@@ -17,6 +18,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
       rom_(std::move(rom)),
       via_(std::make_unique<Via6522>()),
       rtc_(std::make_unique<Rtc>()),
+      adb_(std::make_unique<AdbTransceiver>()),
       cpu_(*this) {
     ramMask_ = cfg.ramSize - 1;
     // ROM sizes are powers of two (Classic: 512K); mirror across its window.
@@ -31,6 +33,15 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
 Machine::~Machine() = default;
 
 void Machine::wireVia() {
+    cpu_.onResetInstruction = [this] {
+        logAccess("RSET", cpu_.pc, true, 0);
+        via_->reset();
+        rtc_->reset();      // protocol state only; time and PRAM survive
+        adb_->reset();
+        adbArmed_ = false;
+        adbPending_ = 0;
+        overlay_ = true;    // the overlay flip-flop sets on any reset
+    };
     rtc_->onByte = [this](const char* what, u8 v) {
         logAccess(what, 0, false, v);   // RTC wire bytes, addr not meaningful
     };
@@ -39,6 +50,7 @@ void Machine::wireVia() {
     via_->inB = [this] {
         u8 v = 0xFF;
         if (!rtc_->dataOut()) v = static_cast<u8>(v & ~0x01);
+        if (!adb_->intLine()) v = static_cast<u8>(v & ~0x08);   // PB3
         return v;
     };
     via_->outA = [this](u8 value, u8 ddr) {
@@ -49,6 +61,21 @@ void Machine::wireVia() {
     via_->outB = [this](u8 value, u8 ddr) {
         const u8 eff = static_cast<u8>(value | ~ddr);
         rtc_->setLines((eff & 0x01) != 0, (eff & 0x02) != 0, (eff & 0x04) != 0);
+        const int prev = adb_->state();
+        adb_->setState((eff >> 4) & 3);                          // PB4/PB5
+        if (adb_->state() != prev) {
+            logAccess("ADBs", static_cast<u32>(adb_->state()), true, 0);
+            adbMaybeClock();   // the rule inside decides if this clocks
+        }
+    };
+    via_->srArmed = [this](bool input) {
+        adbArmed_ = true;
+        adbArmedInput_ = input;
+        adbMaybeClock();
+    };
+    via_->srDisarmed = [this] {
+        adbArmed_ = false;
+        adbPending_ = 0;
     };
 }
 
@@ -56,6 +83,8 @@ void Machine::reset() {
     overlay_ = true;
     via_->reset();
     rtc_->reset();
+    adb_->reset();
+    adbPending_ = 0;
     cpu_.reset();
     lineTarget_ = 0;
     viaRemainder_ = 0;
@@ -93,7 +122,9 @@ void Machine::logAccess(const char* what, u32 addr, bool write, u32 value) {
 u8 Machine::read8(u32 addr) {
     addr &= 0xFFFFFF;
     if (addr < 0x400000) {
-        if (overlay_) return rom_[addr & romMask_];
+        // The overlay maps only the ROM-sized window at zero, reads only;
+        // RAM above it (and all writes) behave normally.
+        if (overlay_ && addr <= romMask_) return rom_[addr];
         return ram_[addr & ramMask_];
     }
     if (addr < 0x580000) return rom_[addr & romMask_];
@@ -132,8 +163,7 @@ u8 Machine::read8(u32 addr) {
 void Machine::write8(u32 addr, u8 value) {
     addr &= 0xFFFFFF;
     if (addr < 0x400000) {
-        if (!overlay_) ram_[addr & ramMask_] = value;
-        else logAccess("ROMW", addr, true, value);
+        ram_[addr & ramMask_] = value;   // writes reach RAM even under overlay
         return;
     }
     if (addr < 0x580000) {
@@ -183,8 +213,35 @@ void Machine::write16(u32 addr, u16 value) {
     write8(addr + 1, static_cast<u8>(value & 0xFF));
 }
 
+void Machine::adbMaybeClock() {
+    const int st = adb_->state();
+    const bool canClock =
+        st == 0 || ((st == 1 || st == 2) && adb_->transactionOpen());
+    if (canClock && adbArmed_ && adbPending_ == 0) {
+        adbArmed_ = false;
+        adbPending_ = 300;
+        adbPendingInput_ = adbArmedInput_;
+    }
+}
+
 void Machine::tickDevices(int cpuCycles) {
     totalCycles_ += static_cast<u64>(cpuCycles);
+    if (adbPending_ > 0) {
+        adbPending_ -= cpuCycles;
+        if (adbPending_ <= 0) {
+            adbPending_ = 0;
+            if (adbPendingInput_) {
+                const u8 v = adb_->cpuShiftIn();
+                logAccess("ADBi", static_cast<u32>(adb_->state()), false, v);
+                via_->completeShift(true, v);
+            } else {
+                const u8 v = via_->shiftValue();
+                logAccess("ADBo", static_cast<u32>(adb_->state()), true, v);
+                adb_->cpuShiftOut(v);
+                via_->completeShift(false, 0);
+            }
+        }
+    }
     viaRemainder_ += cpuCycles;
     if (viaRemainder_ >= 10) {
         via_->tick(viaRemainder_ / 10);
