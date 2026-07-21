@@ -10,9 +10,26 @@ FetchContent_Declare(doctest
 )
 FetchContent_MakeAvailable(doctest)
 
+FetchContent_Declare(miniz
+    URL https://github.com/richgel999/miniz/archive/refs/tags/3.0.2.tar.gz
+    SYSTEM
+)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(nlohmann_json
+    URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz
+    SYSTEM
+)
+FetchContent_MakeAvailable(miniz nlohmann_json)
+
 add_executable(openmac_unit
     unit/main.cpp
     unit/test_cpu_reset.cpp
 )
 target_link_libraries(openmac_unit PRIVATE openmac_core doctest::doctest openmac_warnings)
 add_test(NAME unit COMMAND openmac_unit)
+
+# SingleStepTests runner: point it at a local clone of SingleStepTests/680x0.
+add_executable(openmac_sst
+    cpu_sst/main.cpp
+)
+target_link_libraries(openmac_sst PRIVATE openmac_core miniz nlohmann_json::nlohmann_json openmac_warnings)
