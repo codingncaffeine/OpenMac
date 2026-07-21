@@ -6,6 +6,9 @@ add_library(openmac_core STATIC
     src/cpu_ops_shift_bits.cpp
     src/cpu_ops_muldiv_bcd.cpp
     src/cpu_ops_flow.cpp
+    src/machine/machine.cpp
+    src/machine/via.cpp
+    src/machine/rtc.cpp
 )
 
 target_include_directories(openmac_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

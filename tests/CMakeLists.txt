@@ -24,9 +24,15 @@ FetchContent_MakeAvailable(miniz nlohmann_json)
 add_executable(openmac_unit
     unit/main.cpp
     unit/test_cpu_reset.cpp
+    unit/test_machine.cpp
 )
 target_link_libraries(openmac_unit PRIVATE openmac_core doctest::doctest openmac_warnings)
 add_test(NAME unit COMMAND openmac_unit)
+
+add_executable(openmac_trace
+    boottrace/main.cpp
+)
+target_link_libraries(openmac_trace PRIVATE openmac_core openmac_warnings)
 
 # SingleStepTests runner: point it at a local clone of SingleStepTests/680x0.
 add_executable(openmac_sst
