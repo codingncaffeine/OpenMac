@@ -3,6 +3,7 @@
 // access log. The debugger you can read in a terminal.
 
 #include <openmac/machine.hpp>
+#include <openmac/debugger.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -134,9 +135,27 @@ int main(int argc, char** argv) {
     bool bootDisk = false;
     bool forceRom = false;
     std::string dumpPath;
+    std::string floppyPath;
+    bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
+    u32 breakTrap = 0, tracePc = 0, dumpMemAddr = 0, dumpMemLen = 0;
+    int traceCount = 48;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--rom" && i + 1 < argc) romPath = argv[++i];
+        else if (arg == "--floppy" && i + 1 < argc) floppyPath = argv[++i];
+        else if (arg == "--trace-traps") traceTraps = true;
+        else if (arg == "--trace-os-traps") traceOsTraps = true;
+        else if (arg == "--check-heap") checkHeapFlag = true;
+        else if (arg == "--lowmem") lowmemDump = true;
+        else if (arg == "--break-trap" && i + 1 < argc)
+            breakTrap = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+        else if (arg == "--trace-pc" && i + 1 < argc)
+            tracePc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+        else if (arg == "--trace-count" && i + 1 < argc) traceCount = std::atoi(argv[++i]);
+        else if (arg == "--dump-mem" && i + 2 < argc) {
+            dumpMemAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            dumpMemLen = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+        }
         else if (arg == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
         else if (arg == "--ram-mb" && i + 1 < argc) ramMB = static_cast<u32>(std::atoi(argv[++i]));
         else if (arg == "--profile" && i + 1 < argc) profileAt = std::atoi(argv[++i]);
@@ -166,6 +185,33 @@ int main(int argc, char** argv) {
 
     Machine mac(std::move(rom), {ramMB * 1024u * 1024u});
     if (forceRom) mac.setForceRomDisk(true);
+    if (!floppyPath.empty()) {
+        std::ifstream ff(floppyPath, std::ios::binary);
+        std::vector<u8> img{std::istreambuf_iterator<char>(ff),
+                            std::istreambuf_iterator<char>()};
+        if (img.empty()) {
+            std::fprintf(stderr, "cannot read floppy: %s\n", floppyPath.c_str());
+            return 2;
+        }
+        std::printf("FLOPPY %zu bytes inserted\n", img.size());
+        mac.insertFloppy(std::move(img), false);
+    }
+
+    if (traceTraps || breakTrap) {
+        mac.cpu().onTrap = [&](u16 trap, u32 pc) {
+            if (traceTraps) {
+                std::string s;
+                if (openmac::dbg::describeIOTrap(mac, trap, pc, mac.cpu().a[0], s))
+                    std::printf("TRAP %s\n", s.c_str());
+            }
+            if (breakTrap && (trap & 0x0FFFu) == (breakTrap & 0x0FFFu)) {
+                std::printf("\n=== BREAK trap %04X at pc=%06X ===\n", trap, pc);
+                openmac::dbg::dumpRegs(mac.cpu(), stdout);
+                openmac::dbg::dumpDriveQueue(mac, stdout);
+                openmac::dbg::dumpUnitTable(mac, stdout);
+            }
+        };
+    }
 
     int excCount = 0;
     mac.cpu().onException = [&](int vector, u32 pc) {
@@ -176,14 +222,19 @@ int main(int argc, char** argv) {
                         vector == 2 ? "bus" : vector == 3 ? "addr" :
                         vector == 4 ? "illegal" : vector == 8 ? "priv" : "F-line",
                         pc, static_cast<unsigned long long>(mac.totalCycles()));
-            if (vector == 11) {   // dump how we got here (oldest first)
-                const u8 c = mac.adbLastCommand();
-                std::printf("  last ADB cmd=%02X (addr=%d op=%d reg=%d)  a0=%08X a3=%08X\n",
-                            c, (c >> 4) & 0xF, (c >> 2) & 3, c & 3,
-                            mac.cpu().a[0], mac.cpu().a[3]);
-                std::printf("  trail:");
-                for (int b = 20; b >= 0; --b) std::printf(" %06X", mac.cpu().recentPc(b));
+            if (vector == 2 || vector == 3 || vector == 11) {   // how we got here
+                std::printf("  trail (oldest first):\n   ");
+                for (int b = 119; b >= 0; --b) {
+                    std::printf(" %06X", mac.cpu().recentPc(b));
+                    if (b % 10 == 0) std::printf("\n   ");
+                }
                 std::printf("\n");
+                openmac::dbg::dumpRegs(mac.cpu(), stdout);
+                std::string dis;
+                openmac::dbg::disasm(mac, pc, dis);
+                std::printf("  faulting: %06X  %s\n", pc, dis.c_str());
+                openmac::dbg::dumpBacktrace(mac.cpu(), mac, stdout);
+                openmac::dbg::checkHeap(mac, stdout);
             }
             ++excCount;
         }
@@ -229,6 +280,62 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (tracePc) {
+        const u64 maxCycles = u64(frames) * Machine::kLinesPerFrame * Machine::kCyclesPerLine;
+        bool tracing = false;
+        int traced = 0;
+        while (mac.totalCycles() < maxCycles && !mac.cpu().halted && traced < traceCount) {
+            const u32 pc = mac.cpu().pc;
+            if (pc == tracePc) tracing = true;
+            if (tracing) {
+                std::string dis;
+                openmac::dbg::disasm(mac, pc, dis);
+                std::printf("%06X  %-30s D0=%08X D1=%08X A0=%06X A1=%06X\n", pc,
+                            dis.c_str(), mac.cpu().d[0], mac.cpu().d[1],
+                            mac.cpu().a[0], mac.cpu().a[1]);
+                ++traced;
+            }
+            mac.stepInstruction();
+        }
+        std::printf("\n");
+        openmac::dbg::dumpRegs(mac.cpu(), stdout);
+        return 0;
+    }
+
+    if (traceOsTraps) {
+        // Log Memory Manager allocation traps with their results; a NIL result
+        // (A0 = 0) is the classic origin of a later NIL-dereference crash.
+        struct Pend { u32 ret; u16 trap; };
+        std::vector<Pend> pend;
+        mac.cpu().onTrap = [&](u16 trap, u32 pc) {
+            if ((trap & 0xF800) != 0xA000) return;          // OS traps only
+            if (openmac::dbg::trapReturnsPtrInA0(trap)) {
+                std::printf("-> %-14s size=%-8d @%06X\n", openmac::dbg::trapName(trap),
+                            mac.cpu().d[0], pc);
+                pend.push_back({pc + 2, trap});
+            } else if ((mac.cpu().a[0] & 0xFFFFFF) == 0) {  // NIL pointer argument
+                std::printf("!! %-14s A0=NIL @%06X\n", openmac::dbg::trapName(trap), pc);
+            }
+        };
+        const u64 maxCycles = u64(frames) * Machine::kLinesPerFrame * Machine::kCyclesPerLine;
+        while (mac.totalCycles() < maxCycles && !mac.cpu().halted) {
+            const u32 pc = mac.cpu().pc;
+            for (size_t i = pend.size(); i-- > 0;) {
+                if (pend[i].ret == pc) {
+                    const u32 a0 = mac.cpu().a[0] & 0xFFFFFF;
+                    std::printf("<- %-14s A0=%06X%s\n", openmac::dbg::trapName(pend[i].trap),
+                                a0, a0 == 0 ? "   *** NIL (allocation failed) ***" : "");
+                    pend.erase(pend.begin() + static_cast<long>(i));
+                    break;
+                }
+            }
+            mac.stepInstruction();
+        }
+        std::printf("\n");
+        openmac::dbg::checkHeap(mac, stdout);
+        return 0;
+    }
+
     int bootHold = 0;
     if (bootDisk) {
         mac.keyEvent(0x37, true); mac.keyEvent(0x3A, true);   // Command, Option
@@ -268,6 +375,17 @@ int main(int argc, char** argv) {
     };
     std::printf("globals: MemTop=%08X BufPtr=%08X ScrnBase=%08X SoundBase=%08X\n",
                 rd32(0x108), rd32(0x10C), rd32(0x824), rd32(0x266));
+
+    if (lowmemDump) {
+        openmac::dbg::dumpLowMem(mac, stdout);
+        openmac::dbg::dumpDriveQueue(mac, stdout);
+        openmac::dbg::dumpUnitTable(mac, stdout);
+    }
+    if (dumpMemLen) {
+        std::printf("-- memory $%06X (%u bytes) --\n", dumpMemAddr, dumpMemLen);
+        openmac::dbg::dumpMem(mac, dumpMemAddr, dumpMemLen, stdout);
+    }
+    if (checkHeapFlag) openmac::dbg::checkHeap(mac, stdout);
 
     if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
 

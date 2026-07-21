@@ -52,6 +52,13 @@ public:
     // Expand the 1-bit framebuffer to ARGB8888 (kScreenW * kScreenH).
     void renderScreen(u32* argbOut) const;
 
+    // Floppy: mount a raw sector image (400K/800K/1.44MB). We service it
+    // through a replacement .Sony disk driver rather than emulating the IWM,
+    // so any image the ROM's HFS can read will boot. Empty image = no disk.
+    void insertFloppy(std::vector<u8> image, bool readOnly = false);
+    void ejectFloppy();
+    bool floppyInserted() const { return !floppy_.empty(); }
+
     // Move the audio produced since the last call (unsigned 8-bit mono at the
     // ~22.25 kHz scanline rate) into `out`; the internal buffer is emptied.
     void drainAudio(std::vector<u8>& out);
@@ -93,6 +100,47 @@ private:
     void wireVia();
     void logAccess(const char* what, u32 addr, bool write, u32 value);
     void tickDevices(int cpuCycles);
+
+    // 16/32-bit big-endian views over the bus, for reading Mac parameter
+    // blocks and buffers from driver handlers.
+    u32 read32(u32 addr) { return (static_cast<u32>(read16(addr)) << 16) | read16(addr + 2); }
+    void write32(u32 addr, u32 v) {
+        write16(addr, static_cast<u16>(v >> 16));
+        write16(addr + 2, static_cast<u16>(v));
+    }
+
+    // High-level .Sony driver replacement. We intercept the ROM driver's
+    // Open/Prime/Control/Status routines and service disk I/O from floppy_
+    // directly. Locating the driver yields its four routine entry points.
+    u32 findSonyDriver();          // ROM address of the .Sony DRVR, or 0
+    bool trySonyTrap();            // dispatch if the PC is a driver routine
+    int sonyOpen(u32 pb, u32 dce);
+    int sonyPrime(u32 pb, u32 dce);
+    int sonyControl(u32 pb, u32 dce);
+    int sonyStatus(u32 pb, u32 dce);
+    // Run a Mac A-line trap synchronously from within a driver handler.
+    void execute68kTrap(u16 trap);
+
+    // Minimal IWM: track the phase/mode lines the ROM pokes and answer its
+    // disk-sense reads so the startup probe finds the drive and disk. The
+    // actual sector I/O is handled by the .Sony interception, not here.
+    u8 iwmAccess(int reg, bool write, u8 data);
+    u8 iwmReadReg();
+    u8 iwmStatus();
+    u8 iwmLines_ = 0;   // b0-3 ca0-3, b4 motor, b5 drivesel, b6 q6, b7 q7
+    u8 iwmMode_ = 0;    // Mode register, read back in Status bits 0-4
+
+    std::vector<u8> floppy_;
+    bool floppyRO_ = false;
+    u32 sonyOpenPc_ = 0, sonyPrimePc_ = 0, sonyControlPc_ = 0, sonyStatusPc_ = 0;
+    u32 drvStatusAddr_ = 0;        // Mac address of our DrvSts record
+    int floppyDriveNum_ = 0;
+    bool inSony_ = false;          // re-entrancy guard during trap execution
+
+    // DisposPtr(NIL) guard: this ROM's DisposPtr dereferences its argument, so
+    // NIL crashes, but later Memory Managers no-op it. The boot-time Time
+    // Manager installer hits this. Set to the DisposPtr handler for this ROM.
+    u32 disposPtrGuardPc_ = 0;
 
     std::vector<u8> ram_;
     std::vector<u8> rom_;

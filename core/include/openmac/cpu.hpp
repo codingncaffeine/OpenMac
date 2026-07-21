@@ -54,6 +54,10 @@ public:
     // instruction). Diagnostics only.
     std::function<void(int vector, u32 pc)> onException;
 
+    // Fires when an A-line (Toolbox/OS trap) instruction executes, with the
+    // trap opcode and its address. Used by the debugger for trap breakpoints.
+    std::function<void(u16 opcode, u32 pc)> onTrap;
+
 private:
     friend struct CpuOps;
 

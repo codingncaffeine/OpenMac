@@ -127,8 +127,9 @@ int CpuOps::opIllegal(M68000& c, u16) {
     return raiseException(c, kVecIllegal, 34);
 }
 
-int CpuOps::opALine(M68000& c, u16) {
+int CpuOps::opALine(M68000& c, u16 opcode) {
     c.pc = instrStart(c);
+    if (c.onTrap) c.onTrap(opcode, c.pc);
     return raiseException(c, kVecALine, 34);
 }
 

@@ -11,6 +11,25 @@ namespace openmac {
 namespace {
 constexpr u32 kCpuHz = 7833600;
 constexpr size_t kMaxLogEntries = 400;
+
+// Device Manager / Sony disk driver structure offsets and result codes
+// (Inside Macintosh: Devices / Files). Used by the replacement .Sony driver.
+enum {
+    ioTrap = 6, ioResult = 16, ioVRefNum = 22, ioBuffer = 32,
+    ioReqCount = 36, ioActCount = 40, ioPosOffset = 46,
+    dCtlPosition = 16, dCtlQHdr = 6,
+    dsWriteProt = 2, dsDiskInPlace = 3, dsInstalled = 4, dsSides = 5,
+    dsQLink = 6, dsQType = 10, dsTwoSideFmt = 18, dsNewIntf = 19,
+    dsMFMDrive = 22, dsMFMDisk = 23, dsTwoMegFmt = 24, SIZEOF_DrvSts = 30,
+    csCode = 26, csParam = 28,
+};
+constexpr int kNoErr = 0, kControlErr = -17, kReadErr = -19, kWritErr = -20,
+              kWPrErr = -44, kParamErr = -50, kOffLinErr = -65;
+constexpr int kSonyType = 0;      // dsQType value for a Sony (floppy) drive
+constexpr int kARdCmd = 2;        // low byte of ioTrap for a Read
+constexpr int kSonyRefNum = -5;   // .Sony driver reference number
+constexpr u16 kTrapNewPtrSysClear = 0xA71E;
+constexpr u16 kTrapAddDrive = 0xA04E;
 } // namespace
 
 Machine::Machine(std::vector<u8> rom, const Config& cfg)
@@ -27,6 +46,21 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     rom_.resize(rs, 0xFF);
     romMask_ = rs - 1;
     wireVia();
+    if (u32 drvr = findSonyDriver()) {
+        auto off = [&](u32 h) {
+            return (static_cast<u32>(rom_[h & romMask_]) << 8) | rom_[(h + 1) & romMask_];
+        };
+        const u32 hoff = drvr & romMask_;
+        sonyOpenPc_    = drvr + off(hoff + 8);
+        sonyPrimePc_   = drvr + off(hoff + 10);
+        sonyControlPc_ = drvr + off(hoff + 12);
+        sonyStatusPc_  = drvr + off(hoff + 14);
+    }
+    // Enable the DisposPtr(NIL) guard for the Mac Classic ROM (checksum in the
+    // first four bytes). The handler address is ROM-specific.
+    if (rom_.size() >= 4 && rom_[0] == 0xA4 && rom_[1] == 0x9F &&
+        rom_[2] == 0x99 && rom_[3] == 0x14)
+        disposPtrGuardPc_ = 0x40A60A;
     reset();
 }
 
@@ -215,9 +249,8 @@ u8 Machine::read8(u32 addr) {
         logAccess("SCCd", addr, false, 0);
         return 0;
     }
-    if (addr < 0xE00000) {          // IWM/SWIM (P6)
-        logAccess("IWM", addr, false, 0x1F);
-        return 0x1F;
+    if (addr < 0xE00000) {          // IWM
+        return iwmAccess((addr >> 9) & 0xF, false, 0);
     }
     if (addr < 0xF00000) {
         return via_->read((addr >> 9) & 15);
@@ -259,8 +292,8 @@ void Machine::write8(u32 addr, u8 value) {
         }
         return;
     }
-    if (addr < 0xE00000) {
-        logAccess("IWM", addr, true, value);
+    if (addr < 0xE00000) {          // IWM
+        iwmAccess((addr >> 9) & 0xF, true, value);
         return;
     }
     if (addr < 0xF00000) {
@@ -338,10 +371,268 @@ void Machine::tickDevices(int cpuCycles) {
 }
 
 int Machine::stepInstruction() {
+    if (disposPtrGuardPc_ && cpu_.pc == disposPtrGuardPc_ &&
+        (cpu_.a[0] & 0x00FFFFFF) == 0) {
+        cpu_.d[0] = 0;                     // noErr — DisposPtr(NIL) is a no-op
+        const u32 sp = cpu_.a[7];
+        cpu_.pc = read32(sp);              // RTS to the caller
+        cpu_.a[7] = sp + 4;
+        tickDevices(20);
+        return 20;
+    }
+    if (!floppy_.empty() && trySonyTrap()) {
+        tickDevices(40);
+        return 40;
+    }
     cpu_.setIrqLevel(via_->irqAsserted() ? 1 : 0);
     const int c = cpu_.step();
     tickDevices(c);
     return c;
+}
+
+// ---- High-level .Sony floppy driver -------------------------------------
+//
+// The ROM's real .Sony driver reads the physical drive through the IWM. We
+// intercept its Open/Prime/Control/Status routines at their entry points and
+// service a raw disk image directly, which sidesteps the IWM and the GCR/MFM
+// encoding entirely (the same approach mature Mac emulators take).
+
+void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
+    floppy_ = std::move(image);
+    floppyRO_ = readOnly;
+    drvStatusAddr_ = 0;   // re-added to the drive queue on the next driver Open
+}
+
+void Machine::ejectFloppy() {
+    floppy_.clear();
+    if (drvStatusAddr_) write8(drvStatusAddr_ + dsDiskInPlace, 0);
+}
+
+// The 16 IWM addresses each toggle one line; the odd address sets, the even
+// clears. A q7-off read returns the register selected by q6/q7.
+u8 Machine::iwmAccess(int reg, bool write, u8 data) {
+    u8 ret = data;
+    switch (reg) {
+        case 0x0: iwmLines_ &= ~0x01u; break;   // ca0 off
+        case 0x1: iwmLines_ |=  0x01u; break;   // ca0 on
+        case 0x2: iwmLines_ &= ~0x02u; break;   // ca1 off
+        case 0x3: iwmLines_ |=  0x02u; break;   // ca1 on
+        case 0x4: iwmLines_ &= ~0x04u; break;   // ca2 off
+        case 0x5: iwmLines_ |=  0x04u; break;   // ca2 on
+        case 0x6: iwmLines_ &= ~0x08u; break;   // ca3/LSTRB off
+        case 0x7: iwmLines_ |=  0x08u; break;   // ca3/LSTRB on
+        case 0x8: iwmLines_ &= ~0x10u; break;   // motor off
+        case 0x9: iwmLines_ |=  0x10u; break;   // motor on
+        case 0xA: iwmLines_ &= ~0x20u; break;   // internal drive
+        case 0xB: iwmLines_ |=  0x20u; break;   // external drive
+        case 0xC: iwmLines_ &= ~0x40u; break;   // q6 off
+        case 0xD: iwmLines_ |=  0x40u; break;   // q6 on
+        case 0xE:                               // q7 off (read register)
+            if (!write) ret = iwmReadReg();
+            iwmLines_ &= ~0x80u;
+            break;
+        case 0xF:                               // q7 on (write mode/data)
+            if (write && (iwmLines_ & 0x10) == 0) iwmMode_ = data;  // motor off: mode reg
+            iwmLines_ |= 0x80u;
+            break;
+    }
+    return ret;
+}
+
+u8 Machine::iwmReadReg() {
+    switch ((iwmLines_ >> 6) & 3) {   // q6 = bit6, q7 = bit7
+        case 1:  return iwmStatus();  // q6 only: Status (holds the sense bit)
+        default: return 0;            // Data / Handshake: no encoded stream
+    }
+}
+
+u8 Machine::iwmStatus() {
+    const bool sel = ((via_->ora() >> 5) & 1) != 0;   // VIA PA5 selects the line
+    const int idx = ((iwmLines_ & 0x04) ? 8 : 0) |    // ca2
+                    ((iwmLines_ & 0x02) ? 4 : 0) |    // ca1
+                    ((iwmLines_ & 0x01) ? 2 : 0) |    // ca0
+                    (sel ? 1 : 0);
+    bool high = false;   // active-low lines: false (0) = asserted
+    switch (idx) {
+        case 0x1: high = floppy_.empty(); break;   // CSTIN: 0 = disk in place
+        case 0x3: high = !floppyRO_;      break;   // WRPROT: 0 = protected
+        case 0x5: high = false;           break;   // TK0: 0 = on track 0
+        case 0xE: high = false;           break;   // INSTALLED: 0 = drive present
+        default:  high = false;           break;
+    }
+    u8 s = high ? 0x80 : 0x00;
+    if (iwmLines_ & 0x10) s |= 0x20;   // motor on
+    s |= (iwmMode_ & 0x1F);            // Mode register reads back in bits 0-4
+    return s;
+}
+
+u32 Machine::findSonyDriver() {
+    // The .Sony DRVR resource: the Pascal name ".Sony" whose 18-bytes-earlier
+    // header carries small, in-range routine offsets (distinguishing it from
+    // the plain name references elsewhere in the ROM).
+    static const u8 name[6] = {0x05, '.', 'S', 'o', 'n', 'y'};
+    for (u32 i = 20; i + 6 < rom_.size(); ++i) {
+        bool match = true;
+        for (int j = 0; j < 6; ++j)
+            if (rom_[i + j] != name[j]) { match = false; break; }
+        if (!match) continue;
+        const u32 h = i - 18;   // drvrFlags, 18 bytes before the name length byte
+        auto off = [&](u32 a) { return (static_cast<u32>(rom_[a]) << 8) | rom_[a + 1]; };
+        const u32 o = off(h + 8), p = off(h + 10), c = off(h + 12), s = off(h + 14);
+        if (o && p && c && s && o < 0x2000 && p < 0x2000 && c < 0x2000 && s < 0x2000)
+            return 0x400000u + h;
+    }
+    return 0;
+}
+
+bool Machine::trySonyTrap() {
+    if (inSony_ || sonyPrimePc_ == 0) return false;
+    const u32 pc = cpu_.pc;
+    int (Machine::*fn)(u32, u32) = nullptr;
+    if (pc == sonyOpenPc_)         fn = &Machine::sonyOpen;
+    else if (pc == sonyPrimePc_)   fn = &Machine::sonyPrime;
+    else if (pc == sonyControlPc_) fn = &Machine::sonyControl;
+    else if (pc == sonyStatusPc_)  fn = &Machine::sonyStatus;
+    else return false;
+
+    inSony_ = true;
+    const u32 pb = cpu_.a[0], dce = cpu_.a[1];
+    const int result = (this->*fn)(pb, dce);
+    cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+
+    // Driver return convention (per the Mac Device Manager's IOReturn): an
+    // immediate (noQueue) call sets ioResult and returns with RTS; a queued
+    // call completes through IODone, which dequeues it and runs the completion
+    // routine. Open is not queued I/O and always returns to its caller.
+    auto doRts = [&] {
+        const u32 sp = cpu_.a[7];
+        cpu_.pc = read32(sp);
+        cpu_.a[7] = sp + 4;
+    };
+    const bool immediate = pc != sonyPrimePc_ && pc != sonyControlPc_ &&
+                           pc != sonyStatusPc_;                       // Open
+    const bool noQueue = pb && (read16(pb + ioTrap) & 0x0200);        // noQueueBit
+    const u32 ioDone = read32(0x08FC);
+    if (immediate || noQueue || result > 0 || !ioDone) {
+        if (pb) write16(pb + ioResult, static_cast<u16>(result > 0 ? result : 0));
+        doRts();
+    } else {
+        cpu_.pc = ioDone;   // JMP IODone (dequeue + completion for a queued call)
+    }
+    inSony_ = false;
+    return true;
+}
+
+void Machine::execute68kTrap(u16 trap) {
+    // Place the A-line word in a scratch cell above the sound buffer, point the
+    // PC at it, and step until control returns to the following word. The trap
+    // dispatcher runs the routine and adjusts the return PC past the A-line.
+    const u32 scratch = (static_cast<u32>(ram_.size()) - 8) & ramMask_;
+    ram_[scratch]     = static_cast<u8>(trap >> 8);
+    ram_[scratch + 1] = static_cast<u8>(trap & 0xFF);
+    const u32 savedPc = cpu_.pc;
+    const u16 savedSr = cpu_.getSR();
+    cpu_.pc = scratch;
+    for (int guard = 0; guard < 4000000 && cpu_.pc != scratch + 2 && !cpu_.halted; ++guard) {
+        cpu_.setIrqLevel(via_->irqAsserted() ? 1 : 0);
+        tickDevices(cpu_.step());
+    }
+    cpu_.pc = savedPc;
+    cpu_.setSR(savedSr);
+}
+
+int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
+    write32(dce + dCtlPosition, 0);
+    // Queue version must be >= 3 or System 8 replaces the driver.
+    write16(dce + dCtlQHdr, static_cast<u16>((read16(dce + dCtlQHdr) & 0xFF00) | 3));
+    write32(0x134, 0xDEADBEEF);   // fake SonyVars pointer
+
+    // Allocate the drive-status record from the system heap.
+    cpu_.d[0] = SIZEOF_DrvSts;
+    execute68kTrap(kTrapNewPtrSysClear);
+    if (cpu_.a[0] == 0) return -108;   // memFullErr
+    drvStatusAddr_ = cpu_.a[0];
+
+    write16(drvStatusAddr_ + dsQType, static_cast<u16>(kSonyType));
+    write8(drvStatusAddr_ + dsInstalled, 1);
+    write8(drvStatusAddr_ + dsSides, 0xFF);       // double-sided
+    write8(drvStatusAddr_ + dsTwoSideFmt, 0xFF);
+    write8(drvStatusAddr_ + dsNewIntf, 0xFF);
+    write8(drvStatusAddr_ + dsMFMDrive, 0xFF);    // SuperDrive
+    write8(drvStatusAddr_ + dsMFMDisk, 0xFF);     // MFM disk
+    write8(drvStatusAddr_ + dsTwoMegFmt, 0xFF);   // 1.44MB
+    write8(drvStatusAddr_ + dsDiskInPlace, 1);    // removable disk inserted
+    write8(drvStatusAddr_ + dsWriteProt, floppyRO_ ? 0xFF : 0);
+
+    // Add to the drive queue: D0 = (driveNum << 16) | refNum, A0 = &dsQLink.
+    floppyDriveNum_ = 2;   // internal floppy
+    cpu_.d[0] = (static_cast<u32>(floppyDriveNum_) << 16) |
+                (static_cast<u32>(kSonyRefNum) & 0xFFFF);
+    cpu_.a[0] = drvStatusAddr_ + dsQLink;
+    execute68kTrap(kTrapAddDrive);
+    return kNoErr;
+}
+
+int Machine::sonyPrime(u32 pb, u32 dce) {
+    write32(pb + ioActCount, 0);
+    if (drvStatusAddr_ == 0 || read8(drvStatusAddr_ + dsDiskInPlace) == 0)
+        return kOffLinErr;
+    write8(drvStatusAddr_ + dsDiskInPlace, 2);   // disk accessed
+
+    const u32 buffer = read32(pb + ioBuffer);
+    const u32 length = read32(pb + ioReqCount);
+    const u32 position = read32(dce + dCtlPosition);
+    if ((length & 0x1FF) || (position & 0x1FF)) return kParamErr;
+
+    const bool isRead = (read16(pb + ioTrap) & 0xFF) == kARdCmd;
+    if (isRead) {
+        for (u32 i = 0; i < length; ++i) {
+            const u32 src = position + i;
+            write8(buffer + i, src < floppy_.size() ? floppy_[src] : 0);
+        }
+        write32(0x2FC, 0);   // clear TagBuf
+        write32(0x300, 0);
+        write32(0x304, 0);
+    } else {
+        if (floppyRO_) return kWPrErr;
+        for (u32 i = 0; i < length; ++i) {
+            const u32 dst = position + i;
+            if (dst < floppy_.size()) floppy_[dst] = read8(buffer + i);
+        }
+    }
+    write32(pb + ioActCount, length);
+    write32(dce + dCtlPosition, position + length);
+    return kNoErr;
+}
+
+int Machine::sonyControl(u32 pb, u32 /*dce*/) {
+    const u16 code = read16(pb + csCode);
+    switch (code) {
+        case 1:    // KillIO
+            return kControlErr;
+        case 7:    // eject
+            if (drvStatusAddr_) write8(drvStatusAddr_ + dsDiskInPlace, 0);
+            return kNoErr;
+        default:   // verify / format / tag buffer / track cache: accept
+            return kNoErr;
+    }
+}
+
+int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
+    const u16 code = read16(pb + csCode);
+    switch (code) {
+        case 8:    // return the drive status record
+            if (drvStatusAddr_)
+                for (int i = 0; i < 22; ++i)
+                    write8(pb + csParam + i, read8(drvStatusAddr_ + dsWriteProt + i));
+            return kNoErr;
+        case 6:    // format list: one 1.44MB format
+            write16(pb + csParam, 1);
+            write32(pb + csParam + 2, 2880);
+            return kNoErr;
+        default:
+            return kNoErr;
+    }
 }
 
 void Machine::runFrame() {

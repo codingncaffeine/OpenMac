@@ -67,6 +67,7 @@ openmac::u8 sdlToAdb(SDL_Scancode sc) {
 struct Settings {
     int ramMB = 4;
     bool bootDisk = false;
+    std::string floppyPath;            // disk image inserted at startup
     std::vector<std::string> recent;   // most-recent first
 };
 
@@ -86,6 +87,7 @@ Settings loadSettings() {
         const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
         if (k == "ram") s.ramMB = std::atoi(v.c_str());
         else if (k == "bootdisk") s.bootDisk = std::atoi(v.c_str()) != 0;
+        else if (k == "floppy") s.floppyPath = v;
         else if (k == "recent" && !v.empty()) s.recent.push_back(v);
     }
     return s;
@@ -94,6 +96,7 @@ Settings loadSettings() {
 void saveSettings(const Settings& s) {
     std::ofstream f(configDir() + "openmac.cfg", std::ios::trunc);
     f << "ram=" << s.ramMB << "\n" << "bootdisk=" << (s.bootDisk ? 1 : 0) << "\n";
+    if (!s.floppyPath.empty()) f << "floppy=" << s.floppyPath << "\n";
     for (size_t i = 0; i < s.recent.size() && i < 8; ++i) f << "recent=" << s.recent[i] << "\n";
 }
 
@@ -108,13 +111,15 @@ struct FilePick {
     std::mutex m;
     std::string path;
     bool ready = false;
+    bool floppy = false;
 };
 FilePick g_pick;
 
-void SDLCALL onFileChosen(void*, const char* const* filelist, int) {
+void SDLCALL onFileChosen(void* userdata, const char* const* filelist, int) {
     if (filelist && filelist[0]) {
         std::lock_guard<std::mutex> lock(g_pick.m);
         g_pick.path = filelist[0];
+        g_pick.floppy = userdata != nullptr;
         g_pick.ready = true;
     }
 }
@@ -178,6 +183,13 @@ int main(int argc, char** argv) {
         openmac::Machine::Config cfg;
         cfg.ramSize = static_cast<openmac::u32>(settings.ramMB) * 1024u * 1024u;
         mac = std::make_unique<openmac::Machine>(std::move(rom), cfg);
+        if (!settings.floppyPath.empty()) {
+            auto img = loadFile(settings.floppyPath);
+            if (!img.empty()) {
+                mac->insertFloppy(std::move(img), false);
+                logline("floppy inserted: " + settings.floppyPath);
+            }
+        }
         loadedRom = romPath;
         frameNo = 0;
         mac->cpu().onException = [&](int vector, openmac::u32 pc) {
@@ -203,6 +215,13 @@ int main(int argc, char** argv) {
         static const SDL_DialogFileFilter filters[] = {
             {"Macintosh ROM", "rom;bin"}, {"All files", "*"}};
         SDL_ShowOpenFileDialog(onFileChosen, nullptr, window, filters, 2, nullptr, false);
+    };
+
+    auto openFloppyDialog = [&] {
+        static const SDL_DialogFileFilter filters[] = {
+            {"Disk image", "img;image;dsk;dc42"}, {"All files", "*"}};
+        SDL_ShowOpenFileDialog(onFileChosen, reinterpret_cast<void*>(1), window, filters, 2,
+                               nullptr, false);
     };
 
     if (!cliRom.empty()) startMachine(cliRom);
@@ -243,11 +262,28 @@ int main(int argc, char** argv) {
         // Consume a ROM chosen by the file dialog (set on another thread).
         {
             std::string picked;
+            bool pickedFloppy = false;
             {
                 std::lock_guard<std::mutex> lock(g_pick.m);
-                if (g_pick.ready) { picked = g_pick.path; g_pick.ready = false; }
+                if (g_pick.ready) {
+                    picked = g_pick.path;
+                    pickedFloppy = g_pick.floppy;
+                    g_pick.ready = false;
+                }
             }
-            if (!picked.empty()) startMachine(picked);
+            if (!picked.empty()) {
+                if (pickedFloppy) {
+                    settings.floppyPath = picked;
+                    saveSettings(settings);
+                    if (mac) {
+                        auto img = loadFile(picked);
+                        if (!img.empty()) mac->insertFloppy(std::move(img), false);
+                    }
+                    logline("floppy set: " + picked);
+                } else {
+                    startMachine(picked);
+                }
+            }
         }
 
         if (mac && machineRunning) {
@@ -285,6 +321,13 @@ int main(int argc, char** argv) {
             menuH = ImGui::GetWindowSize().y;
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Open ROM...")) openDialog();
+                if (ImGui::MenuItem("Insert Floppy...")) openFloppyDialog();
+                if (!settings.floppyPath.empty() &&
+                    ImGui::MenuItem("Eject Floppy")) {
+                    settings.floppyPath.clear();
+                    saveSettings(settings);
+                    if (mac) mac->ejectFloppy();
+                }
                 if (ImGui::BeginMenu("Recent ROMs", !settings.recent.empty())) {
                     for (const auto& r : settings.recent)
                         if (ImGui::MenuItem(r.c_str())) startMachine(r);

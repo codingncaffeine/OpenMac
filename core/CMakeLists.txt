@@ -9,6 +9,7 @@ add_library(openmac_core STATIC
     src/machine/machine.cpp
     src/machine/via.cpp
     src/machine/rtc.cpp
+    src/debugger.cpp
 )
 
 target_include_directories(openmac_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
