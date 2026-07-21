@@ -1,6 +1,7 @@
 #include "openmac/debugger.hpp"
 
 #include <cstdint>
+#include <cstring>
 
 namespace openmac::dbg {
 
@@ -71,6 +72,40 @@ const LowMem kGlobals[] = {
     {0x08FC, "JIODone",    4}, {0x0904, "CurrentA5",  4}, {0x0910, "CurApName",4},
 };
 } // namespace
+
+std::string symbolFor(Machine& mac, u32 addr) {
+    addr &= 0xFFFFFF;
+    for (const auto& g : kGlobals) {          // low-memory globals (data)
+        const u32 sz = g.size == 10 ? 10u : static_cast<u32>(g.size);
+        if (addr >= g.addr && addr < g.addr + sz) {
+            char b[40];
+            if (addr == g.addr) std::snprintf(b, sizeof b, "%s", g.name);
+            else std::snprintf(b, sizeof b, "%s+%X", g.name, addr - g.addr);
+            return b;
+        }
+    }
+    if (addr >= 0x400000) {                   // named OS trap handlers ($0400 table)
+        u32 bestBase = 0;
+        const char* bestName = nullptr;
+        for (int i = 0; i < 256; ++i) {
+            const char* nm = trapName(static_cast<u16>(0xA000 | i));
+            if (!nm || std::strcmp(nm, "_OSTrap") == 0) continue;   // named only
+            const u32 h = ((u32(mac.read16(0x0400 + i * 4)) << 16) |
+                           mac.read16(0x0400 + i * 4 + 2)) & 0xFFFFFF;
+            if (h >= 0x400000 && h <= addr && addr - h < 0x1000 && h > bestBase) {
+                bestBase = h;
+                bestName = nm;
+            }
+        }
+        if (bestName) {
+            char b[48];
+            if (addr == bestBase) std::snprintf(b, sizeof b, "%s", bestName);
+            else std::snprintf(b, sizeof b, "%s+%X", bestName, addr - bestBase);
+            return b;
+        }
+    }
+    return "";
+}
 
 void dumpRegs(const M68000& cpu, std::FILE* out) {
     for (int i = 0; i < 8; ++i)
@@ -285,7 +320,9 @@ void dumpBacktrace(const M68000& cpu, Machine& mac, std::FILE* out) {
     std::fprintf(out, "  pc   %06X\n", cpu.pc & 0xFFFFFF);
     u32 fp = cpu.a[6];
     for (int i = 0; i < 24 && fp && (fp & 1) == 0 && fp < 0x400000; ++i) {
-        std::fprintf(out, "  #%-2d  ret %06X  (frame %06X)\n", i, r32(fp + 4) & 0xFFFFFF, fp);
+        const u32 ret = r32(fp + 4) & 0xFFFFFF;
+        std::fprintf(out, "  #%-2d  ret %06X  %-20s (frame %06X)\n", i, ret,
+                     symbolFor(mac, ret).c_str(), fp);
         const u32 next = r32(fp);       // link to caller's frame (higher address)
         if (next <= fp || (next & 1)) break;
         fp = next;
@@ -297,7 +334,7 @@ void dumpBacktrace(const M68000& cpu, Machine& mac, std::FILE* out) {
     for (int i = 0, found = 0; i < 160 && sp < 0x400000 && found < 24; ++i, sp += 2) {
         const u32 v = r32(sp) & 0xFFFFFF;
         if (v >= 0x400100 && v < 0x440000 && (v & 1) == 0) {
-            std::fprintf(out, "    %06X: %06X\n", sp, v);
+            std::fprintf(out, "    %06X: %06X  %s\n", sp, v, symbolFor(mac, v).c_str());
             ++found;
         }
     }

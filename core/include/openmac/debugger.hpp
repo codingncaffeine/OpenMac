@@ -14,6 +14,12 @@ namespace openmac::dbg {
 // Name of an A-line trap ($Axxx), or nullptr if unknown.
 const char* trapName(u16 opcode);
 
+// Resolve an address to the nearest known symbol as "Name" or "Name+offset",
+// or "" if none is known. Sources: low-memory globals and the OS trap
+// dispatch table (so a ROM handler resolves to its trap name). Reads live
+// state through the bus, so trap handlers resolve once the table is built.
+std::string symbolFor(Machine& mac, u32 addr);
+
 // True for OS traps that return a pointer/handle in A0 (New/Realloc/Recover);
 // a zero result is the classic source of a later NIL-dereference crash.
 bool trapReturnsPtrInA0(u16 opcode);
