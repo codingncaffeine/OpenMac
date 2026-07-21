@@ -29,6 +29,9 @@ internal static class Native
     public static extern void omac_render(IntPtr h, byte[] argb);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_drain_audio(IntPtr h, byte[] outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_insert_floppy(IntPtr h, byte[] img, nuint len, int readOnly);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

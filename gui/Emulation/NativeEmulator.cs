@@ -22,10 +22,12 @@ public sealed class NativeEmulator : IEmulator
 
     private IntPtr _h;
     private readonly Native.LogCallback _logCb;   // kept alive against GC
+    private readonly WaveAudio _audio;
 
     public NativeEmulator()
     {
         _logCb = OnCoreLog;
+        _audio = new WaveAudio(22254);            // ROM-synthesized chime + system sounds
     }
 
     private void OnCoreLog(IntPtr user, IntPtr line)
@@ -64,6 +66,16 @@ public sealed class NativeEmulator : IEmulator
         if (_h == IntPtr.Zero) return;
         Native.omac_run_frame(_h);
         DrainLog();
+        DrainAudio();
+    }
+
+    private readonly byte[] _audioBuf = new byte[8192];
+
+    private void DrainAudio()
+    {
+        if (!_audio.Ok) return;
+        int n = (int)Native.omac_drain_audio(_h, _audioBuf, (nuint)_audioBuf.Length);
+        if (n > 0) _audio.Queue(_audioBuf, n);
     }
 
     private readonly byte[] _logPoll = new byte[65536];
@@ -138,5 +150,9 @@ public sealed class NativeEmulator : IEmulator
         }
     }
 
-    public void Dispose() => Destroy();
+    public void Dispose()
+    {
+        Destroy();
+        _audio.Dispose();
+    }
 }
