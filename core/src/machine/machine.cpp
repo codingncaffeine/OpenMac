@@ -28,6 +28,7 @@ constexpr int kNoErr = 0, kControlErr = -17, kReadErr = -19, kWritErr = -20,
 constexpr int kSonyType = 0;      // dsQType value for a Sony (floppy) drive
 constexpr int kARdCmd = 2;        // low byte of ioTrap for a Read
 constexpr int kSonyRefNum = -5;   // .Sony driver reference number
+constexpr int kHdRefNum   = -2;   // hard disk's own driver refNum (unit-table alias)
 constexpr u16 kTrapNewPtrSysClear = 0xA71E;
 constexpr u16 kTrapAddDrive = 0xA04E;
 constexpr u16 kTrapInsTime = 0xA058;
@@ -590,8 +591,11 @@ int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
         execute68kTrap(kTrapInsTime);        // _InsTime -> enqueues into tm_var+8
     }
 
-    // A second, fixed drive for the hard disk, if one is mounted: same driver
-    // (kSonyRefNum), the next drive number, a non-ejectable disk in place.
+    // A second, fixed drive for the hard disk, if one is mounted. Following Mini
+    // vMac's SONYEMDV model: the ROM's .Sony driver only owns its floppy drives,
+    // so the HD gets its OWN driver reference number (-2) and a separate unit-table
+    // slot aliased to the .Sony DCE -- the ROM then dispatches the HD's I/O to the
+    // same driver code we hook, which serves it from the image by drive number.
     if (!hd_.empty()) {
         cpu_.d[0] = SIZEOF_DrvSts;
         execute68kTrap(kTrapNewPtrSysClear);
@@ -604,13 +608,25 @@ int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
             write8(hdStatusAddr_ + dsWriteProt, hdRO_ ? 0xFF : 0);
             hdDriveNum_ = floppyDriveNum_ + 1;          // drive 3
             cpu_.d[0] = (static_cast<u32>(hdDriveNum_) << 16) |
-                        (static_cast<u32>(kSonyRefNum) & 0xFFFF);
+                        (static_cast<u32>(kHdRefNum) & 0xFFFF);
             cpu_.a[0] = hdStatusAddr_ + dsQLink;
             execute68kTrap(kTrapAddDrive);
+
+            // Alias unit-table slot 1 (refNum -2, the HD) to slot 4 (refNum -5,
+            // .Sony) so the HD's I/O dispatches to the .Sony driver code we hook.
+            const u32 utb = read32(0x011C);             // UTableBase
+            if (utb != 0) write32(utb + 4 * 1, read32(utb + 4 * 4));
 
             cpu_.d[0] = 80;                      // a param block for _MountVol
             execute68kTrap(kTrapNewPtrSysClear);
             hdMountPb_ = cpu_.a[0];
+            // Auto-mount stays OFF (hdAutoMount_ defaults false). The refNum -2 +
+            // unit-table alias above is the correct Mini vMac model but not yet
+            // sufficient: the ROM reads the volume via the .Sony driver's internal
+            // dispatch table (JSR (A2,D1) in the file system), NOT the Prime entry
+            // we hook, and that internal routine delegates the unowned HD drive.
+            // Proper fix = replace the whole .Sony driver (trap bridge), not hook
+            // it -- see the master plan's HD phase.
         }
     }
     return kNoErr;
