@@ -92,7 +92,18 @@ TEST_CASE("formatVolume produces a mountable, empty 20 MB HFS volume") {
     // The exact geometry chosen for a 20 MB volume (documented in the report).
     CHECK(alBlkSiz == 512u);
     CHECK(nmAlBlks == 40945u);
-    CHECK(freeBks == 40942u);
+    CHECK(freeBks == 40307u);
+
+    // Each B*-tree file spans one full clump (drXTClpSiz / drCTClpSiz) — the
+    // sizing a real hfsutils format uses and that _MountVol accepts. For 20 MB:
+    // (40945 / 128) * 512 = 319 allocation blocks = 163328 bytes each.
+    const u32 xtClpSiz = rd32(img, kMdbOff + 0x4A);    // drXTClpSiz
+    const u32 ctClpSiz = rd32(img, kMdbOff + 0x4E);    // drCTClpSiz
+    CHECK(xtFlSize == xtClpSiz);
+    CHECK(ctFlSize == ctClpSiz);
+    CHECK(xtFlSize == 163328u);
+    CHECK(ctFlSize == 163328u);
+    CHECK(btAllocBlks == 638u);
 
     // Backup MDB (logical block vlen-2) is an exact copy of the primary MDB.
     const std::size_t vlen = sizeBytes / 512u;
@@ -120,6 +131,16 @@ TEST_CASE("formatVolume produces a mountable, empty 20 MB HFS volume") {
     CHECK(rd16(img, ctHdr + 0x0e + 0) == 1);           // bthDepth
     CHECK(rd32(img, ctHdr + 0x0e + 2) == 1);           // bthRoot
     CHECK(rd32(img, ctHdr + 0x0e + 6) == 2);           // bthNRecs (dir + thread)
+
+    // Each tree file is a full clump of 512-byte nodes; only the header (and,
+    // for the catalog, the root leaf) is in use, the rest are free. The
+    // node-allocation bitmap (header record 2 @ 0x0f8) marks exactly those.
+    CHECK(rd32(img, xtHdr + 0x0e + 22) == 319u);       // extents bthNNodes
+    CHECK(rd32(img, xtHdr + 0x0e + 26) == 318u);       // extents bthFree (node 0 used)
+    CHECK(img[xtHdr + 0x0f8] == 0x80);                 // node map: only node 0
+    CHECK(rd32(img, ctHdr + 0x0e + 22) == 319u);       // catalog bthNNodes
+    CHECK(rd32(img, ctHdr + 0x0e + 26) == 317u);       // catalog bthFree (nodes 0,1 used)
+    CHECK(img[ctHdr + 0x0f8] == 0xC0);                 // node map: nodes 0 and 1
 
     // --- catalog leaf node (the root directory) ---------------------------
     CHECK(img[ctLeaf + 8] == 0xFF);                    // ndType == leaf

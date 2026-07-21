@@ -201,29 +201,42 @@ std::vector<u8> formatVolume(u32 sizeBytes, const std::string& volumeName) {
     const u32 alBlSt = vbmSt + vbmSz;                      // first alloc block's log. block
     const u32 nmAlBlks = (vlen - 2 - alBlSt) / lpa;        // number of allocation blocks
 
-    // The extents and catalog B*-tree files, sized minimally: the extents file
-    // holds just its header node; the catalog file holds its header node plus
-    // one leaf node (the root directory). Files are whole numbers of allocation
-    // blocks, laid out contiguously from allocation block 0.
-    const u32 nodesPerAB = lpa;                            // 512-byte nodes per alloc block
-    const u32 extAllocBlks = 1;
-    const u32 catAllocBlks = (2 + nodesPerAB - 1) / nodesPerAB;
-    const u32 extNodes = extAllocBlks * nodesPerAB;
-    const u32 catNodes = catAllocBlks * nodesPerAB;
+    // Clump size — the growth increment and the initial size of each B*-tree
+    // file. libhfs computes it as (drNmAlBlks / 128) * drAlBlkSiz, floored to a
+    // few allocation blocks so it is always a non-zero multiple of the block
+    // size.
+    u32 clump = (nmAlBlks / 128u) * alBlkSiz;
+    if (clump < alBlkSiz * 4u)
+        clump = alBlkSiz * 4u;
+
+    // The extents-overflow and catalog B*-tree files each occupy one full
+    // clump, exactly as a real hfsutils format does. A minimal one-/two-node
+    // tree is read by _MountVol but rejected, so each file must span its clump
+    // with the surplus nodes left free. The extents file uses only its header
+    // node (node 0); the catalog file additionally uses one leaf node (node 1)
+    // for the root directory.
+    //
+    // Cap the node count at the single header-node allocation map's capacity
+    // (HFS_MAP1SZ * 8 nodes) so continuation map nodes are never needed; within
+    // the supported ~64 MB range the clump is well under this.
+    const u32 nodesPerAB = lpa;                 // 512-byte nodes per alloc block
+    const u32 kMaxMapNodes = 256u * 8u;         // HFS_MAP1SZ (256 bytes) * 8 bits
+    u32 clumpAllocBlks = clump / alBlkSiz;
+    if (clumpAllocBlks * nodesPerAB > kMaxMapNodes)
+        clumpAllocBlks = kMaxMapNodes / nodesPerAB;
+
+    const u32 extAllocBlks = clumpAllocBlks;
+    const u32 catAllocBlks = clumpAllocBlks;
+    const u32 extNodes = extAllocBlks * nodesPerAB;   // == xtFlSize / 512
+    const u32 catNodes = catAllocBlks * nodesPerAB;   // == ctFlSize / 512
 
     const u32 extFirstAB = 0;
     const u32 catFirstAB = extAllocBlks;
     const u32 usedAllocBlks = extAllocBlks + catAllocBlks;
     const u32 freeBks = nmAlBlks - usedAllocBlks;
 
-    const u32 xtFlSize = extAllocBlks * alBlkSiz;
-    const u32 ctFlSize = catAllocBlks * alBlkSiz;
-
-    // Clump size (growth increment) — a non-zero multiple of the alloc block
-    // size, as libhfs computes it.
-    u32 clump = (nmAlBlks / 128u) * alBlkSiz;
-    if (clump < alBlkSiz)
-        clump = alBlkSiz * 4u;
+    const u32 xtFlSize = extAllocBlks * alBlkSiz;     // == clump
+    const u32 ctFlSize = catAllocBlks * alBlkSiz;     // == clump
 
     // Logical-block position of each file's first node.
     const u32 extFirstBlk = alBlSt + extFirstAB * lpa;

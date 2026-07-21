@@ -19,8 +19,9 @@ namespace openmac::hfs {
 //   0..1  boot blocks (zeroed; this is a non-bootable data volume)
 //   2     Master Directory Block (drSigWord == 0x4244 'BD')
 //   3..   volume bitmap
-//   ...   extents-overflow B*-tree file (one header node)
-//   ...   catalog B*-tree file (header node + one leaf node = root directory)
+//   ...   extents-overflow B*-tree file (one clump; header node in use)
+//   ...   catalog B*-tree file (one clump; header + one leaf node in use,
+//         the leaf holding the root directory record and its thread)
 //   n-2   alternate (backup) MDB
 //   n-1   reserved
 //
