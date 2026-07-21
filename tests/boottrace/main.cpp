@@ -117,6 +117,7 @@ int main(int argc, char** argv) {
     u32 ramMB = 4;
     int profileAt = -1;
     u32 traceToPc = 0;
+    u32 watchAddr = 0xFFFFFFFFu;
     std::string dumpPath;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -128,6 +129,9 @@ int main(int argc, char** argv) {
             traceToPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
         }
         else if (arg == "--dump-screen" && i + 1 < argc) dumpPath = argv[++i];
+        else if (arg == "--watch" && i + 1 < argc) {
+            watchAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+        }
     }
     if (romPath.empty()) {
         std::fprintf(stderr, "usage: openmac_trace --rom <path> [--frames N] [--ram-mb M]\n");
@@ -146,6 +150,26 @@ int main(int argc, char** argv) {
 
     if (traceToPc) {
         traceUntil(mac, traceToPc, u64(frames) * Machine::kLinesPerFrame * Machine::kCyclesPerLine);
+        return 0;
+    }
+
+    if (watchAddr != 0xFFFFFFFFu) {
+        auto rd32 = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
+        const u64 maxCycles = u64(frames) * Machine::kLinesPerFrame * Machine::kCyclesPerLine;
+        u32 last = rd32(watchAddr);
+        std::printf("watch [%06X] initial=%08X\n", watchAddr, last);
+        int hits = 0;
+        while (mac.totalCycles() < maxCycles && !mac.cpu().halted && hits < 60) {
+            const u32 pc = mac.cpu().pc;
+            mac.stepInstruction();
+            const u32 now = rd32(watchAddr);
+            if (now != last) {
+                std::printf("[%06X] %08X -> %08X  by pc=%06X\n", watchAddr, last, now, pc);
+                last = now;
+                ++hits;
+            }
+        }
+        std::printf("halted=%d final=%08X\n", mac.cpu().halted ? 1 : 0, last);
         return 0;
     }
 

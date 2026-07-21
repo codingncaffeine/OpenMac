@@ -39,13 +39,15 @@ Machine::~Machine() = default;
 
 void Machine::wireVia() {
     cpu_.onResetInstruction = [this] {
+        // RESET asserts /RSTO to the peripherals only. It does NOT relatch the
+        // boot overlay — that flip-flop is set by power-on reset and cleared by
+        // the ROM via VIA PA4, and must stay as the ROM left it here.
         logAccess("RSET", cpu_.pc, true, 0);
         via_->reset();
         rtc_->reset();      // protocol state only; time and PRAM survive
         adb_->reset();
         adbArmed_ = false;
         adbPending_ = 0;
-        overlay_ = true;    // the overlay flip-flop sets on any reset
     };
     rtc_->onByte = [this](const char* what, u8 v) {
         logAccess(what, 0, false, v);   // RTC wire bytes, addr not meaningful
@@ -59,9 +61,12 @@ void Machine::wireVia() {
         return v;
     };
     via_->outA = [this](u8 value, u8 ddr) {
-        const u8 eff = static_cast<u8>(value | ~ddr);   // undriven lines float high
-        overlay_ = (eff & 0x10) != 0;                   // PA4
-        screenAlt_ = (eff & 0x40) == 0;                 // PA6: 0 = alternate buffer
+        // The boot overlay is a one-way latch: power-on sets it, the ROM's
+        // first driven PA4=0 clears it, and after that PA4 can never set it
+        // again (only a power-on reset does). The ROM later drives PA4 high
+        // for its own purposes; the hardware ignores that for the overlay.
+        if ((ddr & 0x10) && !(value & 0x10)) overlay_ = false;
+        if (ddr & 0x40) screenAlt_ = (value & 0x40) == 0;   // PA6: 0 = alt buffer
     };
     via_->outB = [this](u8 value, u8 ddr) {
         const u8 eff = static_cast<u8>(value | ~ddr);

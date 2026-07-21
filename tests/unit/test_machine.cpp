@@ -27,7 +27,7 @@ constexpr u32 viaReg(int r) { return kViaBase + (static_cast<u32>(r) << 9); }
 
 } // namespace
 
-TEST_CASE("boot overlay maps ROM at zero until PA4 clears it") {
+TEST_CASE("boot overlay maps ROM at zero and is a one-way latch until reset") {
     Machine mac(fakeRom(), {1u * 1024 * 1024});
     CHECK(mac.overlayActive());
     CHECK(mac.read8(0) == 0x00);       // ROM vector bytes visible at 0
@@ -35,17 +35,23 @@ TEST_CASE("boot overlay maps ROM at zero until PA4 clears it") {
     CHECK(mac.cpu().pc == 0x00400010); // reset vector fetched through overlay
     CHECK(mac.cpu().a[7] == 0x2000);
 
-    // Drive PA4 low through the VIA: DDRA all output, ORA with PA4 clear.
+    // Driving PA4 low (DDRA output, ORA bit 4 = 0) clears the overlay.
     mac.write8(viaReg(3), 0xFF);
     mac.write8(viaReg(15), 0x00);
     CHECK_FALSE(mac.overlayActive());
     mac.write8(0x100, 0xAB);
     CHECK(mac.read8(0x100) == 0xAB);   // RAM now lives at zero
 
-    // Flip it back on: reads at 0 return ROM again.
+    // One-way latch: driving PA4 high again does NOT bring the overlay back
+    // (the ROM reuses PA4 late in boot and must not re-map ROM over RAM).
     mac.write8(viaReg(15), 0x10);
+    CHECK_FALSE(mac.overlayActive());
+    mac.write8(0x104, 0xCD);
+    CHECK(mac.read8(0x104) == 0xCD);   // still RAM
+
+    // Only a power-on reset re-arms it.
+    mac.reset();
     CHECK(mac.overlayActive());
-    CHECK(mac.read8(0) == 0x00);
 }
 
 TEST_CASE("machine runs frames and raises VBL through the VIA") {
