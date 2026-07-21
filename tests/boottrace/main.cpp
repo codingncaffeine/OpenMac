@@ -322,6 +322,7 @@ int main(int argc, char** argv) {
     int breakCount = 0;
     u32 dumpStructAddr = 0;
     bool traceBranches = false, dumpStructSet = false;
+    u32 disasmAddr = 0; int disasmCount = 0; bool disasmSet = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--rom" && i + 1 < argc) romPath = argv[++i];
@@ -378,6 +379,11 @@ int main(int argc, char** argv) {
             dumpStructAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             dumpStructName = argv[++i];
             dumpStructSet = true;
+        }
+        else if (arg == "--disasm" && i + 2 < argc) {
+            disasmAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            disasmCount = std::atoi(argv[++i]);
+            disasmSet = true;
         }
     }
     if (romPath.empty()) {
@@ -573,6 +579,18 @@ int main(int argc, char** argv) {
         }
     };
 
+    if (disasmSet) {
+        u32 a = disasmAddr;
+        for (int k = 0; k < disasmCount; ++k) {
+            std::string dis;
+            const int len = openmac::dbg::disasm(mac, a, dis);
+            std::printf("  %06X  %-24s %s\n", a, dis.c_str(),
+                        openmac::dbg::symbolFor(mac, a).c_str());
+            a += len > 0 ? static_cast<u32>(len) : 2;
+        }
+        return 0;
+    }
+
     if (traceToPc) {
         traceUntil(mac, traceToPc, u64(frames) * Machine::kLinesPerFrame * Machine::kCyclesPerLine);
         return 0;
@@ -607,9 +625,30 @@ int main(int argc, char** argv) {
             }
         }
         if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
+        // If we wedged in low RAM, single-step the spin loop and dump it so we
+        // can see exactly which condition the ROM is stuck waiting on.
+        if ((mac.cpu().pc & 0xFFFFFF) < 0x100000) {
+            std::printf("-- WEDGE trail (single-stepped from %06X): --\n", mac.cpu().pc);
+            for (int k = 0; k < 48 && !mac.cpu().halted; ++k) {
+                const u32 pc = mac.cpu().pc;
+                std::string dis;
+                openmac::dbg::disasm(mac, pc, dis);
+                std::printf("  %06X  %-30s D0=%08X D1=%08X A0=%06X A1=%06X A2=%06X\n",
+                            pc, dis.c_str(), mac.cpu().d[0], mac.cpu().d[1],
+                            mac.cpu().a[0] & 0xFFFFFF, mac.cpu().a[1] & 0xFFFFFF,
+                            mac.cpu().a[2] & 0xFFFFFF);
+                mac.stepInstruction();
+            }
+            openmac::dbg::dumpRegs(mac.cpu(), stdout);
+            openmac::dbg::dumpBacktrace(mac.cpu(), mac, stdout);
+        }
         const auto s = mac.adbStats();
-        std::printf("boot-nudge done: pc=%06X kbdPolls=%u mousePolls=%u mouseReports=%u\n",
-                    mac.cpu().pc, s.kbdPolls, s.mousePolls, s.mouseReports);
+        static std::vector<u32> npix(static_cast<size_t>(Machine::kScreenW) * Machine::kScreenH);
+        mac.renderScreen(npix.data());
+        long nblack = 0;
+        for (u32 p : npix) nblack += (p == 0xFF000000u);
+        std::printf("boot-nudge done: pc=%06X kbdPolls=%u mousePolls=%u mouseReports=%u black=%ld\n",
+                    mac.cpu().pc, s.kbdPolls, s.mousePolls, s.mouseReports, nblack);
         return 0;
     }
 
