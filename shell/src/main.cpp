@@ -7,9 +7,11 @@
 
 #include <openmac/machine.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -61,40 +63,82 @@ openmac::u8 sdlToAdb(SDL_Scancode sc) {
     }
 }
 
+// -------- persisted settings (a small key=value file next to the exe) --------
+struct Settings {
+    int ramMB = 4;
+    bool bootDisk = false;
+    std::vector<std::string> recent;   // most-recent first
+};
+
+std::string configDir() {
+    const char* base = SDL_GetBasePath();
+    return base ? std::string(base) : std::string();
+}
+
+Settings loadSettings() {
+    Settings s;
+    std::ifstream f(configDir() + "openmac.cfg");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        if (k == "ram") s.ramMB = std::atoi(v.c_str());
+        else if (k == "bootdisk") s.bootDisk = std::atoi(v.c_str()) != 0;
+        else if (k == "recent" && !v.empty()) s.recent.push_back(v);
+    }
+    return s;
+}
+
+void saveSettings(const Settings& s) {
+    std::ofstream f(configDir() + "openmac.cfg", std::ios::trunc);
+    f << "ram=" << s.ramMB << "\n" << "bootdisk=" << (s.bootDisk ? 1 : 0) << "\n";
+    for (size_t i = 0; i < s.recent.size() && i < 8; ++i) f << "recent=" << s.recent[i] << "\n";
+}
+
+void pushRecent(Settings& s, const std::string& path) {
+    s.recent.erase(std::remove(s.recent.begin(), s.recent.end(), path), s.recent.end());
+    s.recent.insert(s.recent.begin(), path);
+    if (s.recent.size() > 8) s.recent.resize(8);
+}
+
+// -------- async file dialog handoff (callback runs on a dialog thread) -------
+struct FilePick {
+    std::mutex m;
+    std::string path;
+    bool ready = false;
+};
+FilePick g_pick;
+
+void SDLCALL onFileChosen(void*, const char* const* filelist, int) {
+    if (filelist && filelist[0]) {
+        std::lock_guard<std::mutex> lock(g_pick.m);
+        g_pick.path = filelist[0];
+        g_pick.ready = true;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string romPath;
-    openmac::Machine::Config cfg;
-    bool bootDisk = false;
+    std::string cliRom;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--rom" && i + 1 < argc) romPath = argv[++i];
-        else if (arg == "--ram-mb" && i + 1 < argc) {
-            cfg.ramSize = static_cast<openmac::u32>(std::atoi(argv[++i])) * 1024u * 1024u;
-        }
-        else if (arg == "--boot-disk") bootDisk = true;
+        if (arg == "--rom" && i + 1 < argc) cliRom = argv[++i];
     }
-
-    std::ofstream log("openmac.log", std::ios::trunc);
-    auto logline = [&](const std::string& s) { log << s << "\n"; log.flush(); };
-    logline(std::string("OpenMac start; rom=") + romPath +
-            (bootDisk ? " (holding Cmd-Opt-X-O for ROM-disk boot)" : ""));
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
-        SDL_Log("SDL_Init failed: %s", SDL_GetError());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenMac", SDL_GetError(), nullptr);
         return 1;
     }
-    SDL_Window* window = SDL_CreateWindow("OpenMac", 1024, 684, SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow("OpenMac", 1024, 720, SDL_WINDOW_RESIZABLE);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
     if (!window || !renderer) {
-        SDL_Log("SDL window/renderer failed: %s", SDL_GetError());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenMac", SDL_GetError(), window);
         return 1;
     }
     SDL_SetRenderVSync(renderer, 1);
-    SDL_SetRenderLogicalPresentation(renderer, openmac::Machine::kScreenW,
-                                     openmac::Machine::kScreenH,
-                                     SDL_LOGICAL_PRESENTATION_LETTERBOX);
 
     SDL_Texture* screenTex = SDL_CreateTexture(
         renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
@@ -107,43 +151,59 @@ int main(int argc, char** argv) {
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
 
+    std::ofstream log(configDir() + "openmac.log", std::ios::trunc);
+    auto logline = [&](const std::string& s) { log << s << "\n"; log.flush(); };
+
+    Settings settings = loadSettings();
     std::unique_ptr<openmac::Machine> mac;
-    std::string status = "No ROM loaded. Start with: openmac --rom <path>";
-    if (!romPath.empty()) {
+    std::string loadedRom;
+    std::string loadError;
+    int bootHold = 0;
+    int frameNo = 0;
+
+    auto startMachine = [&](const std::string& romPath) {
         auto rom = loadFile(romPath);
-        if (rom.empty()) {
-            status = "Failed to read ROM: " + romPath;
-        } else {
-            mac = std::make_unique<openmac::Machine>(std::move(rom), cfg);
-            status = "ROM: " + romPath;
-            mac->cpu().onException = [&](int vector, openmac::u32 pc) {
-                if (vector == 2 || vector == 3 || vector == 4 || vector == 8 ||
-                    vector == 11) {
-                    char b[96];
-                    std::snprintf(b, sizeof b, "EXC vec=%d at pc=%06X cyc=%llu",
-                                  vector, pc,
-                                  static_cast<unsigned long long>(mac->totalCycles()));
-                    logline(b);
-                }
-            };
+        if (rom.empty()) { loadError = "Could not read ROM: " + romPath; return; }
+        loadError.clear();
+        openmac::Machine::Config cfg;
+        cfg.ramSize = static_cast<openmac::u32>(settings.ramMB) * 1024u * 1024u;
+        mac = std::make_unique<openmac::Machine>(std::move(rom), cfg);
+        loadedRom = romPath;
+        frameNo = 0;
+        mac->cpu().onException = [&](int vector, openmac::u32 pc) {
+            if (vector == 2 || vector == 3 || vector == 4 || vector == 8 || vector == 11) {
+                char b[96];
+                std::snprintf(b, sizeof b, "EXC vec=%d at pc=%06X cyc=%llu", vector, pc,
+                              static_cast<unsigned long long>(mac->totalCycles()));
+                logline(b);
+            }
+        };
+        bootHold = 0;
+        if (settings.bootDisk) {                        // hold Cmd-Opt-X-O
+            mac->keyEvent(0x37, true); mac->keyEvent(0x3A, true);
+            mac->keyEvent(0x07, true); mac->keyEvent(0x1F, true);
+            bootHold = 200;
         }
-    }
+        pushRecent(settings, romPath);
+        saveSettings(settings);
+        logline("loaded " + romPath + (settings.bootDisk ? " (ROM-disk boot)" : ""));
+    };
 
-    // ROM-disk boot: hold Cmd-Option-X-O down through the early boot window.
-    int bootHold = bootDisk ? 200 : 0;
-    if (mac && bootDisk) {
-        mac->keyEvent(0x37, true); mac->keyEvent(0x3A, true);   // Command, Option
-        mac->keyEvent(0x07, true); mac->keyEvent(0x1F, true);   // X, O
-    }
+    auto openDialog = [&] {
+        static const SDL_DialogFileFilter filters[] = {
+            {"Macintosh ROM", "rom;bin"}, {"All files", "*"}};
+        SDL_ShowOpenFileDialog(onFileChosen, nullptr, window, filters, 2, nullptr, false);
+    };
 
-    std::vector<openmac::u32> pixels(
-        static_cast<size_t>(openmac::Machine::kScreenW) * openmac::Machine::kScreenH,
-        0xFF202020u);
+    if (!cliRom.empty()) startMachine(cliRom);
 
     bool running = true;
     bool machineRunning = true;
+    bool showDebugger = true;
     bool mouseDown = false;
-    int frameNo = 0;
+    std::vector<openmac::u32> pixels(
+        static_cast<size_t>(openmac::Machine::kScreenW) * openmac::Machine::kScreenH, 0xFF101010u);
+
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -151,17 +211,15 @@ int main(int argc, char** argv) {
             ImGuiIO& io = ImGui::GetIO();
             if (event.type == SDL_EVENT_QUIT) running = false;
             else if (!mac) continue;
-            else if (event.type == SDL_EVENT_MOUSE_MOTION && !io.WantCaptureMouse) {
+            else if (event.type == SDL_EVENT_MOUSE_MOTION && !io.WantCaptureMouse)
                 mac->mouseMove(static_cast<int>(event.motion.xrel),
                                static_cast<int>(event.motion.yrel), mouseDown);
-            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
-                       event.button.button == SDL_BUTTON_LEFT && !io.WantCaptureMouse) {
-                mouseDown = true;
-                mac->mouseMove(0, 0, true);
+            else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                     event.button.button == SDL_BUTTON_LEFT && !io.WantCaptureMouse) {
+                mouseDown = true; mac->mouseMove(0, 0, true);
             } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP &&
                        event.button.button == SDL_BUTTON_LEFT) {
-                mouseDown = false;
-                mac->mouseMove(0, 0, false);
+                mouseDown = false; mac->mouseMove(0, 0, false);
             } else if (event.type == SDL_EVENT_KEY_DOWN && !io.WantCaptureKeyboard &&
                        !event.key.repeat) {
                 const openmac::u8 c = sdlToAdb(event.key.scancode);
@@ -172,77 +230,161 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Consume a ROM chosen by the file dialog (set on another thread).
+        {
+            std::string picked;
+            {
+                std::lock_guard<std::mutex> lock(g_pick.m);
+                if (g_pick.ready) { picked = g_pick.path; g_pick.ready = false; }
+            }
+            if (!picked.empty()) startMachine(picked);
+        }
+
         if (mac && machineRunning) {
             mac->runFrame();
-            if (bootHold > 0 && --bootHold == 0) {          // release the boot combo
+            if (bootHold > 0 && --bootHold == 0) {
                 mac->keyEvent(0x37, false); mac->keyEvent(0x3A, false);
                 mac->keyEvent(0x07, false); mac->keyEvent(0x1F, false);
-                logline("released Cmd-Opt-X-O");
             }
-            if (++frameNo % 60 == 0) {                       // ~once a second
+            if (++frameNo % 60 == 0) {
                 const auto s = mac->adbStats();
                 char b[160];
                 std::snprintf(b, sizeof b,
                     "f=%d pc=%06X cyc=%llu mousePolls=%u kbdPolls=%u mouseReports=%u%s",
                     frameNo, mac->cpu().pc,
                     static_cast<unsigned long long>(mac->totalCycles()),
-                    s.mousePolls, s.kbdPolls, s.mouseReports,
-                    mac->cpu().halted ? " HALTED" : "");
+                    s.mousePolls, s.kbdPolls, s.mouseReports, mac->cpu().halted ? " HALTED" : "");
                 logline(b);
             }
         }
         if (mac) {
             mac->renderScreen(pixels.data());
-            SDL_UpdateTexture(screenTex, nullptr, pixels.data(),
-                              openmac::Machine::kScreenW * 4);
+            SDL_UpdateTexture(screenTex, nullptr, pixels.data(), openmac::Machine::kScreenW * 4);
         }
 
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Machine");
-        ImGui::TextUnformatted(status.c_str());
+        float menuH = 0.0f;
+        if (ImGui::BeginMainMenuBar()) {
+            menuH = ImGui::GetWindowSize().y;
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Open ROM...")) openDialog();
+                if (ImGui::BeginMenu("Recent ROMs", !settings.recent.empty())) {
+                    for (const auto& r : settings.recent)
+                        if (ImGui::MenuItem(r.c_str())) startMachine(r);
+                    ImGui::EndMenu();
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Quit")) running = false;
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Machine")) {
+                if (ImGui::MenuItem("Reset", nullptr, false, mac != nullptr)) mac->reset();
+                ImGui::MenuItem("Run", nullptr, &machineRunning, mac != nullptr);
+                ImGui::Separator();
+                if (ImGui::BeginMenu("Memory")) {
+                    for (int mb : {1, 2, 4})
+                        if (ImGui::MenuItem((std::to_string(mb) + " MB").c_str(), nullptr,
+                                            settings.ramMB == mb)) {
+                            settings.ramMB = mb; saveSettings(settings);
+                        }
+                    ImGui::EndMenu();
+                }
+                if (ImGui::MenuItem("Boot from ROM disk (Cmd-Opt-X-O)", nullptr, &settings.bootDisk))
+                    saveSettings(settings);
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("View")) {
+                ImGui::MenuItem("Debugger", nullptr, &showDebugger);
+                ImGui::EndMenu();
+            }
+            ImGui::EndMainMenuBar();
+        }
+
+        // Fit the 512x342 screen into the window below the menu bar.
         if (mac) {
-            ImGui::Checkbox("Run", &machineRunning);
-            ImGui::SameLine();
-            if (ImGui::Button("Step Instr")) mac->stepInstruction();
-            ImGui::SameLine();
-            if (ImGui::Button("Step Frame")) mac->runFrame();
-            ImGui::SameLine();
-            if (ImGui::Button("Reset")) mac->reset();
+            int winW = 0, winH = 0;
+            SDL_GetRenderOutputSize(renderer, &winW, &winH);
+            const float availH = static_cast<float>(winH) - menuH;
+            const float sx = static_cast<float>(winW) / openmac::Machine::kScreenW;
+            const float sy = availH / openmac::Machine::kScreenH;
+            const float sc = sx < sy ? sx : sy;
+            SDL_FRect dst;
+            dst.w = openmac::Machine::kScreenW * sc;
+            dst.h = openmac::Machine::kScreenH * sc;
+            dst.x = (winW - dst.w) * 0.5f;
+            dst.y = menuH + (availH - dst.h) * 0.5f;
+            SDL_SetRenderDrawColor(renderer, 16, 16, 16, 255);
+            SDL_RenderClear(renderer);
+            SDL_RenderTexture(renderer, screenTex, nullptr, &dst);
+        } else {
+            SDL_SetRenderDrawColor(renderer, 24, 26, 32, 255);
+            SDL_RenderClear(renderer);
+            // Launcher.
+            const ImGuiViewport* vp = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(ImVec2(vp->WorkSize.x * 0.5f, vp->WorkSize.y * 0.5f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            ImGui::Begin("Welcome to OpenMac", nullptr,
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoMove);
+            ImGui::TextUnformatted("Macintosh Classic emulator");
+            ImGui::Spacing();
+            if (ImGui::Button("Open ROM...", ImVec2(220, 0))) openDialog();
+            if (!settings.recent.empty()) {
+                ImGui::SeparatorText("Recent");
+                for (const auto& r : settings.recent)
+                    if (ImGui::Selectable(r.c_str())) startMachine(r);
+            }
+            ImGui::SeparatorText("Options");
+            int ramIdx = settings.ramMB == 1 ? 0 : settings.ramMB == 2 ? 1 : 2;
+            const char* rams[] = {"1 MB", "2 MB", "4 MB"};
+            if (ImGui::Combo("Memory", &ramIdx, rams, 3)) {
+                settings.ramMB = ramIdx == 0 ? 1 : ramIdx == 1 ? 2 : 4;
+                saveSettings(settings);
+            }
+            if (ImGui::Checkbox("Boot System 6 from ROM disk (Cmd-Opt-X-O)", &settings.bootDisk))
+                saveSettings(settings);
+            if (!loadError.empty()) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", loadError.c_str());
+            }
+            ImGui::End();
+        }
+
+        if (mac && showDebugger) {
+            ImGui::SetNextWindowSize(ImVec2(340, 460), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Debugger", &showDebugger);
+            auto& cpu = mac->cpu();
             ImGui::Text("cycles: %llu   overlay: %s",
                         static_cast<unsigned long long>(mac->totalCycles()),
                         mac->overlayActive() ? "ON" : "off");
-
-            auto& cpu = mac->cpu();
+            if (ImGui::Button("Step Instr")) mac->stepInstruction();
+            ImGui::SameLine();
+            if (ImGui::Button("Reset")) mac->reset();
             ImGui::SeparatorText("CPU");
-            for (int i = 0; i < 8; ++i) {
+            for (int i = 0; i < 8; ++i)
                 ImGui::Text("D%d %08X   A%d %08X", i, cpu.d[i], i, cpu.a[i]);
-            }
-            ImGui::Text("PC %08X  SR %04X  USP %08X  SSP %08X", cpu.pc,
-                        cpu.getSR(), cpu.uspValue(), cpu.sspValue());
-            if (cpu.halted) ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "HALTED (double fault)");
-            if (cpu.stopped) ImGui::TextUnformatted("STOPPED (awaiting interrupt)");
-
+            ImGui::Text("PC %08X  SR %04X", cpu.pc, cpu.getSR());
+            if (cpu.halted) ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "HALTED");
+            const auto s = mac->adbStats();
+            ImGui::SeparatorText("ADB");
+            ImGui::Text("mouse polls %u  reports %u  kbd polls %u",
+                        s.mousePolls, s.mouseReports, s.kbdPolls);
             ImGui::SeparatorText("Access log");
-            if (ImGui::Button("Clear")) mac->clearAccessLog();
-            ImGui::BeginChild("log", ImVec2(0, 160), ImGuiChildFlags_Borders);
-            for (const auto& line : mac->accessLog()) {
-                ImGui::TextUnformatted(line.c_str());
-            }
+            ImGui::BeginChild("log", ImVec2(0, 150), ImGuiChildFlags_Borders);
+            for (const auto& l : mac->accessLog()) ImGui::TextUnformatted(l.c_str());
             ImGui::EndChild();
+            ImGui::End();
         }
-        ImGui::End();
 
         ImGui::Render();
-        SDL_SetRenderDrawColor(renderer, 24, 24, 24, 255);
-        SDL_RenderClear(renderer);
-        if (mac) SDL_RenderTexture(renderer, screenTex, nullptr, nullptr);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
         SDL_RenderPresent(renderer);
     }
 
+    saveSettings(settings);
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

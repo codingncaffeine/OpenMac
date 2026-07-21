@@ -29,7 +29,7 @@ add_library(imgui_lib STATIC
 target_include_directories(imgui_lib SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui_lib PUBLIC SDL3::SDL3-static)
 
-add_executable(openmac
+add_executable(openmac WIN32
     src/main.cpp
 )
 if(WIN32)
