@@ -305,6 +305,8 @@ int main(int argc, char** argv) {
     u32 watchAddr = 0xFFFFFFFFu;
     bool mouseWalk = false;
     bool bootNudge = false;
+    bool keyTest = false;
+    std::string swapFloppyPath;
     bool bootDisk = false;
     bool forceRom = false;
     std::string dumpPath;
@@ -362,6 +364,8 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--mouse-walk") mouseWalk = true;
         else if (arg == "--boot-nudge") bootNudge = true;
+        else if (arg == "--key-test") keyTest = true;
+        else if (arg == "--swap-floppy" && i + 1 < argc) swapFloppyPath = argv[++i];
         else if (arg == "--boot-disk") bootDisk = true;
         else if (arg == "--force-rom") forceRom = true;
         else if (arg == "--step-over" && i + 1 < argc) {
@@ -649,6 +653,51 @@ int main(int argc, char** argv) {
         for (u32 p : npix) nblack += (p == 0xFF000000u);
         std::printf("boot-nudge done: pc=%06X kbdPolls=%u mousePolls=%u mouseReports=%u black=%ld\n",
                     mac.cpu().pc, s.kbdPolls, s.mousePolls, s.mouseReports, nblack);
+        return 0;
+    }
+
+    if (!swapFloppyPath.empty()) {
+        // Boot, then eject + insert a different floppy after the desktop is up and
+        // see whether the System notices (a new VCB) -- i.e. does a swap work?
+        for (int i = 0; i < 2000 && !mac.cpu().halted; ++i) mac.runFrame();
+        auto vcbq = [&](const char* when) {
+            auto rd32 = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
+            std::printf("VCBQHdr %-7s head=%06X tail=%06X\n", when, rd32(0x358), rd32(0x35C));
+        };
+        vcbq("before");
+        // Note: don't eject here -- ejecting the boot floppy the System runs from
+        // wedges this headless test (the real installer runs from RAM). Just swap
+        // the image in, which is enough to exercise the disk-inserted event.
+        std::ifstream sf(swapFloppyPath, std::ios::binary);
+        std::vector<u8> img2{std::istreambuf_iterator<char>(sf), std::istreambuf_iterator<char>()};
+        std::printf("swapping in %zu bytes\n", img2.size());
+        mac.insertFloppy(std::move(img2), false);
+        for (int i = 0; i < 800 && !mac.cpu().halted; ++i) mac.runFrame();
+        vcbq("after");
+        std::printf("swap: halted=%d pc=%06X\n", mac.cpu().halted ? 1 : 0, mac.cpu().pc);
+        return 0;
+    }
+
+    if (keyTest) {
+        // Boot, then inject a key AFTER the desktop is up and watch the ROM's
+        // KeyMap ($174) -- i.e. does keyboard input register post-boot?
+        for (int i = 0; i < 1900 && !mac.cpu().halted; ++i) mac.runFrame();
+        auto keymap = [&](const char* when) {
+            std::printf("KeyMap %-7s", when);
+            for (u32 a = 0x174; a < 0x17C; ++a) std::printf(" %02X", mac.read8(a));
+            std::printf("\n");
+        };
+        const auto s0 = mac.adbStats();
+        keymap("before");
+        mac.keyEvent(0x00, true);                       // 'A' down (ADB 0x00)
+        for (int i = 0; i < 60 && !mac.cpu().halted; ++i) mac.runFrame();
+        keymap("A-down");
+        mac.keyEvent(0x00, false);                      // 'A' up
+        for (int i = 0; i < 60 && !mac.cpu().halted; ++i) mac.runFrame();
+        keymap("A-up");
+        const auto s1 = mac.adbStats();
+        std::printf("key-test: kbdEnum=%u kbdPolls %u->%u modifiers %u->%u\n",
+                    s1.kbdReg3, s0.kbdPolls, s1.kbdPolls, s0.kbdReg2, s1.kbdReg2);
         return 0;
     }
 
