@@ -399,7 +399,14 @@ int Machine::stepInstruction() {
 void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
     floppy_ = std::move(image);
     floppyRO_ = readOnly;
-    drvStatusAddr_ = 0;   // re-added to the drive queue on the next driver Open
+    if (drvStatusAddr_ != 0) {
+        // Post-boot swap: the drive already exists. Mark a disk in place and queue
+        // a disk-inserted event (below) so the System -- or an installer waiting
+        // for the next disk -- notices and mounts the new floppy.
+        write8(drvStatusAddr_ + dsDiskInPlace, 1);
+        floppyInsertPending_ = true;
+    }
+    // else pre-boot: the .Sony driver's Open adds the drive (drvStatusAddr_ == 0).
 }
 
 void Machine::ejectFloppy() {
@@ -714,6 +721,18 @@ int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
 
 void Machine::runFrame() {
     ++frameCounter_;
+
+    // A floppy swapped in after boot: post a disk-inserted event so the System
+    // mounts the new disk (e.g. an installer's "please insert the next disk").
+    if (floppyInsertPending_ && !inSony_) {
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        cpu_.d[0] = 7;                                  // diskEvt
+        cpu_.a[0] = static_cast<u32>(floppyDriveNum_);  // eventMsg = drive number
+        execute68kTrap(kTrapPostEvent);
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        floppyInsertPending_ = false;
+    }
 
     // Mount the hard-disk volume once the System's file system is actually ready.
     // _MountVol enqueues the new VCB into a low-memory volume queue at $360 that

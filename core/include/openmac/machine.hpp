@@ -171,11 +171,10 @@ private:
     u32 diskEvtPosts_ = 0;             // mount attempts
     u32 diskEvtResult_ = 0xFFFFFFFFu;  // last _MountVol OSErr
     bool hdMounted_ = false;           // volume mounted OK; stop retrying
-    // Auto-mounting the HD via the .Sony driver is WIP: the ROM's .Sony driver
-    // does not own our HD drive number, so its reads never reach our intercept
-    // (they route to the floppy) -- a hollow mount that would silently lose data.
-    // Kept off until real SCSI / a proper Device Manager dispatch lands (P4).
+    // Enabled by sonyOpen once a hard disk is configured; the mount trigger then
+    // runs _MountVol with the .Sony intercept consulted (see execute68kTrap).
     bool hdAutoMount_ = false;
+    bool floppyInsertPending_ = false; // a floppy was swapped in after boot
 
     std::vector<u8> ram_;
     std::vector<u8> rom_;
