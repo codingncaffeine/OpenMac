@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
         if (arg == "--rom" && i + 1 < argc) cliRom = argv[++i];
     }
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenMac", SDL_GetError(), nullptr);
         return 1;
     }
@@ -144,6 +144,16 @@ int main(int argc, char** argv) {
         renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
         openmac::Machine::kScreenW, openmac::Machine::kScreenH);
     SDL_SetTextureScaleMode(screenTex, SDL_SCALEMODE_NEAREST);
+
+    // Audio: unsigned 8-bit mono at the Mac's ~22.25 kHz scanline sample rate.
+    SDL_AudioSpec aspec;
+    aspec.format = SDL_AUDIO_U8;
+    aspec.channels = 1;
+    aspec.freq = 22254;
+    SDL_AudioStream* audio =
+        SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &aspec, nullptr, nullptr);
+    if (audio) SDL_ResumeAudioStreamDevice(audio);
+    std::vector<openmac::u8> audioBuf;
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -242,6 +252,10 @@ int main(int argc, char** argv) {
 
         if (mac && machineRunning) {
             mac->runFrame();
+            mac->drainAudio(audioBuf);
+            if (audio && !audioBuf.empty())
+                SDL_PutAudioStreamData(audio, audioBuf.data(),
+                                       static_cast<int>(audioBuf.size()));
             if (bootHold > 0 && --bootHold == 0) {
                 mac->keyEvent(0x37, false); mac->keyEvent(0x3A, false);
                 mac->keyEvent(0x07, false); mac->keyEvent(0x1F, false);
@@ -385,6 +399,7 @@ int main(int argc, char** argv) {
     }
 
     saveSettings(settings);
+    if (audio) SDL_DestroyAudioStream(audio);
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

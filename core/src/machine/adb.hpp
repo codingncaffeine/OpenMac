@@ -124,6 +124,18 @@ public:
     // polling (merely asserting /INT has no effect on the ROM's ADB manager).
     bool hasPendingEvent() const { return mousePending_ || kbdHead_ != kbdTail_; }
 
+    // Re-stage the response for the last Talk command, so an idle wake-up
+    // presents valid data rather than a bare interrupt (which the ROM treats
+    // as an error and answers with a bus reset).
+    void reStageLastTalk() {
+        if (((cmd_ >> 2) & 3) != 3) return;   // last command was not a Talk
+        len_ = idx_ = 0;
+        const int addr = (cmd_ >> 4) & 0xF;
+        const int reg = cmd_ & 3;
+        if (addr == kbdAddr_) talkKeyboard(reg);
+        else if (addr == mouseAddr_) talkMouse(reg);
+    }
+
 private:
     static constexpr int kKbdQ = 32;
 

@@ -109,6 +109,18 @@ void dumpBmp(Machine& mac, const std::string& path) {
     std::printf("screen dumped to %s\n", path.c_str());
 }
 
+void writeWav(const std::string& path, const std::vector<u8>& s, int rate) {
+    std::ofstream f(path, std::ios::binary);
+    auto w32 = [&](u32 v) { for (int i = 0; i < 4; ++i) f.put(static_cast<char>((v >> (8 * i)) & 0xFF)); };
+    auto w16 = [&](u16 v) { f.put(static_cast<char>(v & 0xFF)); f.put(static_cast<char>((v >> 8) & 0xFF)); };
+    const u32 n = static_cast<u32>(s.size());
+    f.write("RIFF", 4); w32(36 + n); f.write("WAVE", 4);
+    f.write("fmt ", 4); w32(16); w16(1); w16(1); w32(static_cast<u32>(rate));
+    w32(static_cast<u32>(rate)); w16(1); w16(8);
+    f.write("data", 4); w32(n);
+    f.write(reinterpret_cast<const char*>(s.data()), n);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -224,9 +236,13 @@ int main(int argc, char** argv) {
         bootHold = 200;
     }
 
+    std::vector<u8> allAudio;
+    std::vector<u8> tmpAudio;
     for (int i = 0; i < frames; ++i) {
         if (i == profileAt) profileFrame(mac);
         mac.runFrame();
+        mac.drainAudio(tmpAudio);
+        allAudio.insert(allAudio.end(), tmpAudio.begin(), tmpAudio.end());
         if (bootHold > 0 && --bootHold == 0) {
             mac.keyEvent(0x37, false); mac.keyEvent(0x3A, false);
             mac.keyEvent(0x07, false); mac.keyEvent(0x1F, false);
@@ -254,6 +270,15 @@ int main(int argc, char** argv) {
                 rd32(0x108), rd32(0x10C), rd32(0x824), rd32(0x266));
 
     if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
+
+    {
+        int lo = 255, hi = 0; long nonSilent = 0;
+        for (u8 v : allAudio) { if (v < lo) lo = v; if (v > hi) hi = v; if (v < 0x7C || v > 0x84) ++nonSilent; }
+        std::printf("\n-- audio: %zu samples, min=%d max=%d non-silent=%ld --\n",
+                    allAudio.size(), lo, hi, nonSilent);
+        if (!allAudio.empty())
+            writeWav("I:/Visual Studio Projects/scratch/openmac/shots/boot.wav", allAudio, 22254);
+    }
 
     std::printf("\n-- KeyMap ($174) reads: %u  from PCs:", mac.keyMapReads());
     for (int i = 0; i < mac.keyMapPcCount(); ++i) std::printf(" %06X", mac.keyMapPc(i));

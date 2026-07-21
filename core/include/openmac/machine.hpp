@@ -48,8 +48,13 @@ public:
     bool overlayActive() const { return overlay_; }
 
     u32 screenBase() const;
+    u32 soundBase() const;
     // Expand the 1-bit framebuffer to ARGB8888 (kScreenW * kScreenH).
     void renderScreen(u32* argbOut) const;
+
+    // Move the audio produced since the last call (unsigned 8-bit mono at the
+    // ~22.25 kHz scanline rate) into `out`; the internal buffer is emptied.
+    void drainAudio(std::vector<u8>& out);
 
     // Host input, delivered through the ADB devices.
     void mouseMove(int dx, int dy, bool button);
@@ -130,6 +135,7 @@ private:
     u8 sccRegs_[16]{};
 
     std::vector<std::string> accessLog_;
+    std::vector<u8> audioOut_;
 };
 
 } // namespace openmac

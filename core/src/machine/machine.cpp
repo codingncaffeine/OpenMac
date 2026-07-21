@@ -141,6 +141,17 @@ u32 Machine::screenBase() const {
     return static_cast<u32>(ram_.size()) - (screenAlt_ ? 0xD900u : 0x5900u);
 }
 
+u32 Machine::soundBase() const {
+    // Main sound/PWM buffer sits just below the top of RAM (alt buffer is
+    // 0x5F00 lower). 370 words, one scanned per horizontal line.
+    return static_cast<u32>(ram_.size()) - (screenAlt_ ? 0x5F00u : 0x0300u);
+}
+
+void Machine::drainAudio(std::vector<u8>& out) {
+    out.swap(audioOut_);
+    audioOut_.clear();
+}
+
 void Machine::renderScreen(u32* argbOut) const {
     const u32 base = screenBase();
     for (int y = 0; y < kScreenH; ++y) {
@@ -305,6 +316,7 @@ void Machine::tickDevices(int cpuCycles) {
         adbIdleTimer_ -= cpuCycles;
         if (adbIdleTimer_ <= 0) {
             adbIdleTimer_ = 6000;
+            adb_->reStageLastTalk();
             via_->completeShift(true, 0xFF);
         }
     } else {
@@ -345,6 +357,16 @@ void Machine::runFrame() {
             stepInstruction();
             if (cpu_.halted) return;
         }
+
+        // Sound: one 8-bit sample per scanline. The high byte of each word in
+        // the buffer is the PWM level; PA0-2 scale the volume, and PB7 high
+        // disables the output.
+        const u8 raw = ram_[(soundBase() + static_cast<u32>(line) * 2) & ramMask_];
+        const int vol = via_->ora() & 0x07;
+        const bool enabled = (via_->orb() & 0x80) == 0;
+        int s = 0x80;
+        if (enabled && vol != 0) s = 0x80 + ((static_cast<int>(raw) - 0x80) * vol) / 7;
+        if (audioOut_.size() < 8192) audioOut_.push_back(static_cast<u8>(s));
     }
 }
 
