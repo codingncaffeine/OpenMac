@@ -125,7 +125,16 @@ u8 Machine::adbLastCommand() const {
 }
 
 Machine::AdbStats Machine::adbStats() const {
-    return {adb_->mousePolls(), adb_->kbdPolls(), adb_->mouseReports()};
+    return {adb_->mousePolls(), adb_->kbdPolls(), adb_->mouseReports(),
+            adb_->kbdReg2(), adb_->kbdReg3(), adb_->mouseReg3()};
+}
+
+const std::vector<u8>& Machine::adbCmdTrace() const {
+    return adb_->cmdTrace();
+}
+
+const std::vector<u8>& Machine::adbRespTrace() const {
+    return adb_->respTrace();
 }
 
 u32 Machine::screenBase() const {

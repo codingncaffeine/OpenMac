@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
     u32 traceToPc = 0;
     u32 watchAddr = 0xFFFFFFFFu;
     bool mouseWalk = false;
+    bool bootDisk = false;
     std::string dumpPath;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -134,6 +135,7 @@ int main(int argc, char** argv) {
             watchAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
         }
         else if (arg == "--mouse-walk") mouseWalk = true;
+        else if (arg == "--boot-disk") bootDisk = true;
     }
     if (romPath.empty()) {
         std::fprintf(stderr, "usage: openmac_trace --rom <path> [--frames N] [--ram-mb M]\n");
@@ -212,9 +214,20 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    int bootHold = 0;
+    if (bootDisk) {
+        mac.keyEvent(0x37, true); mac.keyEvent(0x3A, true);   // Command, Option
+        mac.keyEvent(0x07, true); mac.keyEvent(0x1F, true);   // X, O
+        bootHold = 200;
+    }
+
     for (int i = 0; i < frames; ++i) {
         if (i == profileAt) profileFrame(mac);
         mac.runFrame();
+        if (bootHold > 0 && --bootHold == 0) {
+            mac.keyEvent(0x37, false); mac.keyEvent(0x3A, false);
+            mac.keyEvent(0x07, false); mac.keyEvent(0x1F, false);
+        }
         const auto& cpu = mac.cpu();
 
         // Screen activity: count black pixels in the visible buffer.
@@ -239,7 +252,25 @@ int main(int argc, char** argv) {
 
     if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
 
-    std::printf("\n-- access log (%zu entries) --\n", mac.accessLog().size());
+    const auto s = mac.adbStats();
+    std::printf("\n-- ADB: kbd[enum=%u modifiers=%u transitions=%u] "
+                "mouse[enum=%u polls=%u reports=%u] --\n",
+                s.kbdReg3, s.kbdReg2, s.kbdPolls, s.mouseReg3, s.mousePolls, s.mouseReports);
+    std::printf("-- ADB command trace (addr.op.reg), first %zu: --\n",
+                mac.adbCmdTrace().size());
+    const auto& tr = mac.adbCmdTrace();
+    const auto& rs = mac.adbRespTrace();
+    for (size_t i = 0; i < tr.size(); ++i) {
+        const u8 c = tr[i];
+        const char* op = ((c >> 2) & 3) == 0 ? "rst" : ((c >> 2) & 3) == 1 ? "flu"
+                       : ((c >> 2) & 3) == 2 ? "LSN" : "TLK";
+        std::printf(" %d.%s.%d%s", (c >> 4) & 0xF, op, c & 3,
+                    (i < rs.size() && rs[i]) ? "+" : " ");
+        if ((i + 1) % 8 == 0) std::printf("\n");
+    }
+    std::printf("\n");
+
+    std::printf("-- access log (%zu entries) --\n", mac.accessLog().size());
     int shown = 0;
     for (const auto& line : mac.accessLog()) {
         std::printf("%s\n", line.c_str());

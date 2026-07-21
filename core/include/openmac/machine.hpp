@@ -57,8 +57,13 @@ public:
     bool keyHeld(u8 adbCode) const;
     u8 adbLastCommand() const;
 
-    struct AdbStats { u32 mousePolls, kbdPolls, mouseReports; };
+    struct AdbStats {
+        u32 mousePolls, kbdPolls, mouseReports;
+        u32 kbdReg2, kbdReg3, mouseReg3;
+    };
     AdbStats adbStats() const;
+    const std::vector<u8>& adbCmdTrace() const;
+    const std::vector<u8>& adbRespTrace() const;
 
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }

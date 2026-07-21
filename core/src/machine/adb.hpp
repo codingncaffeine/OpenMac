@@ -12,6 +12,8 @@
 
 #include "openmac/types.hpp"
 
+#include <vector>
+
 namespace openmac {
 
 // ADB keycodes we care about (Apple keyboard layout).
@@ -81,6 +83,11 @@ public:
     u32 mousePolls() const { return mousePolls_; }
     u32 kbdPolls() const { return kbdPolls_; }
     u32 mouseReports() const { return mouseReports_; }
+    u32 kbdReg2() const { return kbdReg2_; }   // ROM read modifier state
+    u32 kbdReg3() const { return kbdReg3_; }   // keyboard enumerated (device info)
+    u32 mouseReg3() const { return mouseReg3_; }
+    const std::vector<u8>& cmdTrace() const { return cmdTrace_; }
+    const std::vector<u8>& respTrace() const { return respTrace_; }
 
     void cpuShiftOut(u8 value) {
         if (state_ == 0) {
@@ -144,13 +151,14 @@ private:
             listenReg_ = reg;
             listenAddr_ = addr;
             listenPos_ = 0;
-            return;
+        } else if (op == 3) {
+            if (addr == kbdAddr_) talkKeyboard(reg);
+            else if (addr == mouseAddr_) talkMouse(reg);
         }
-        if (op != 3) return;    // reset/flush produce no response data
-
-        if (addr == kbdAddr_) talkKeyboard(reg);
-        else if (addr == mouseAddr_) talkMouse(reg);
-        // any other address: empty (no device), /INT stays high
+        if (cmdTrace_.size() < 512) {
+            cmdTrace_.push_back(cmd_);
+            respTrace_.push_back(len_ > 0 ? 1 : 0);   // did a device answer?
+        }
     }
 
     void talkKeyboard(int reg) {
@@ -166,6 +174,7 @@ private:
             }
             emit(first, second);
         } else if (reg == 2) {
+            ++kbdReg2_;
             // Modifier/LED register: bit = 0 means the key is down.
             u8 hi = 0xFF;
             if (keyState_[adbkey::kCommand])  hi &= ~0x01u;
@@ -175,6 +184,7 @@ private:
             if (keyState_[adbkey::kCapsLock]) hi &= ~0x20u;
             emit(hi, 0xFF);
         } else if (reg == 3) {
+            ++kbdReg3_;
             emit(0x22, 0x02);   // SRQ-enable | addr 2 | handler 2 (extended kbd)
         }
     }
@@ -195,6 +205,7 @@ private:
             const u8 b1 = static_cast<u8>(0x80 | (dx & 0x7F));
             emit(b0, b1);
         } else if (reg == 3) {
+            ++mouseReg3_;
             emit(0x23, 0x01);   // SRQ-enable | addr 3 | handler 1 (100cpi mouse)
         }
     }
@@ -224,6 +235,9 @@ private:
     int listenReg_ = -1, listenAddr_ = 0, listenPos_ = 0;
     u8 listenBuf_[2]{};
     u32 mousePolls_ = 0, kbdPolls_ = 0, mouseReports_ = 0;
+    u32 kbdReg2_ = 0, kbdReg3_ = 0, mouseReg3_ = 0;
+    std::vector<u8> cmdTrace_;
+    std::vector<u8> respTrace_;
 };
 
 } // namespace openmac
