@@ -25,6 +25,7 @@ struct AddressError {
     bool read;
     bool instruction;   // true when raised by an instruction-stream fetch
     int  pcBias = -2;   // data faults push pc-2; a few microcode paths push pc
+    int  fetchExtra = 0; // pre-fault cycles for instruction-fetch faults
 };
 
 // Vector numbers
@@ -128,7 +129,8 @@ struct CpuOps {
     static void writeAt(M68000& c, u32 addr, u32 v, int size);
 
     // Raise an address error if a jump target is odd, else set pc.
-    static void jumpTo(M68000& c, u32 target);
+    // fetchExtra = cycles this instruction spent before the target fetch.
+    static void jumpTo(M68000& c, u32 target, int fetchExtra = 0);
 
     // ---- condition codes (Bcc/Scc/DBcc) ----
     static bool testCond(const M68000& c, int cond);
@@ -149,6 +151,7 @@ struct CpuOps {
         return c.exception(kVecPrivilege, 34);
     }
     static u32 instrStart(const M68000& c) { return c.instrStart_; }
+    static void setFaultCycles(M68000& c, int cycles) { c.eaFaultCycles_ = cycles; }
 
     // ---- table registration (cpu_decode.cpp) ----
     static void buildTableInto(std::array<Handler, 65536>& t);

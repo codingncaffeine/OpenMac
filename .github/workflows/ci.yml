@@ -27,3 +27,24 @@ jobs:
         run: cmake --build build --parallel
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  cpu-sst:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache SingleStepTests
+        uses: actions/cache@v4
+        with:
+          path: tests/data/680x0
+          key: sst-680x0-v1
+      - name: Fetch SingleStepTests
+        run: |
+          if [ ! -d tests/data/680x0/68000/v1 ]; then
+            git clone --depth 1 https://github.com/SingleStepTests/680x0.git tests/data/680x0
+          fi
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPENMAC_BUILD_SHELL=OFF
+      - name: Build harness
+        run: cmake --build build --parallel --target openmac_sst
+      - name: Run 68000 state validation
+        run: ./build/tests/openmac_sst tests/data/680x0/68000/v1 --max-show 10

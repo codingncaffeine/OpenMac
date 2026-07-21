@@ -43,6 +43,50 @@ int CpuOps::opMul(M68000& c, u16 op) {
     return base + eaTimeBW(eaIndex(mode, reg));
 }
 
+namespace {
+
+// Data-dependent division timing, modeling the 68000's restoring divider.
+int divuCycles(u32 dividend, u16 divisor) {
+    if ((dividend >> 16) >= divisor) return 10;   // overflow, detected early
+    int mcycles = 38;
+    const u32 hdivisor = static_cast<u32>(divisor) << 16;
+    for (int i = 0; i < 15; ++i) {
+        const u32 temp = dividend;
+        dividend <<= 1;
+        if (static_cast<s32>(temp) < 0) {
+            dividend -= hdivisor;
+        } else {
+            mcycles += 2;
+            if (dividend >= hdivisor) { dividend -= hdivisor; mcycles -= 1; }
+        }
+    }
+    return mcycles * 2;
+}
+
+int divsCycles(s32 dividend, s16 divisor) {
+    int mcycles = 6;
+    if (dividend < 0) mcycles += 1;
+    const u32 aDividend =
+        static_cast<u32>(dividend < 0 ? -static_cast<s64>(dividend) : dividend);
+    const u16 aDivisor = static_cast<u16>(divisor < 0 ? -divisor : divisor);
+    // The divider checks the pre-shifted dividend: any absolute quotient that
+    // cannot fit in 15 bits is caught up front.
+    if ((aDividend >> 15) >= aDivisor) return (mcycles + 2) * 2;
+    u32 aquot = aDividend / aDivisor;
+    mcycles += 55;
+    if (divisor >= 0) {
+        if (dividend >= 0) mcycles -= 1;
+        else mcycles += 1;
+    }
+    for (int i = 0; i < 15; ++i) {
+        if (static_cast<s16>(aquot) >= 0) mcycles += 1;
+        aquot <<= 1;
+    }
+    return mcycles * 2;
+}
+
+} // namespace
+
 int CpuOps::opDiv(M68000& c, u16 op) {
     const bool isSigned = (op & 0x0100) != 0;
     const int mode = (op >> 3) & 7, reg = op & 7;
@@ -57,32 +101,34 @@ int CpuOps::opDiv(M68000& c, u16 op) {
     }
 
     if (!isSigned) {
+        const int cycles = divuCycles(t, s) + eaT;
         const u32 q = t / s;
-        const u32 rem = t % s;
         if (q > 0xFFFF) {
             setFlag(c, kV, true);
             setFlag(c, kC, false);
-            return 10 + eaT;
+            return cycles;
         }
-        c.d[dreg] = (rem << 16) | (q & 0xFFFF);
+        c.d[dreg] = ((t % s) << 16) | (q & 0xFFFF);
         setNZ(c, q, 1);
         c.sr_ = static_cast<u16>(c.sr_ & ~(kV | kC));
-        return 76 + eaT + 64;   // placeholder mid-range; exact algorithm later
+        return cycles;
     }
 
     const s32 st = static_cast<s32>(t);
     const s32 ss = static_cast<s32>(static_cast<s16>(s));
-    const s32 q = st / ss;
-    const s32 rem = st % ss;
-    if (q > 32767 || q < -32768) {
+    const int cycles = divsCycles(st, static_cast<s16>(s)) + eaT;
+    const s64 q64 = static_cast<s64>(st) / ss;
+    if (q64 > 32767 || q64 < -32768) {
         setFlag(c, kV, true);
         setFlag(c, kC, false);
-        return 12 + eaT;
+        return cycles;
     }
+    const s32 q = static_cast<s32>(q64);
+    const s32 rem = st % ss;
     c.d[dreg] = (static_cast<u32>(rem & 0xFFFF) << 16) | static_cast<u32>(q & 0xFFFF);
     setNZ(c, static_cast<u32>(q), 1);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV | kC));
-    return 120 + eaT;           // placeholder; exact algorithm later
+    return cycles;
 }
 
 namespace {
@@ -171,7 +217,7 @@ int CpuOps::opTas(M68000& c, u16 op) {
     setNZ(c, v, 0);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV | kC));
     c.wr8(addr, static_cast<u8>(v | 0x80));
-    return 14 + eaTimeBW(eaIndex(mode, reg));
+    return 10 + eaTimeBW(eaIndex(mode, reg));
 }
 
 } // namespace openmac

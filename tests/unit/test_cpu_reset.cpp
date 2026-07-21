@@ -36,5 +36,5 @@ TEST_CASE("reset loads SSP and PC from the vector table and enters supervisor mo
 
     CHECK(cpu.a[7] == 0x2000);
     CHECK(cpu.pc == 0x400);
-    CHECK((cpu.sr & 0x2000) != 0);
+    CHECK((cpu.getSR() & 0x2000) != 0);
 }

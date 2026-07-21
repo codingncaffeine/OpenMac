@@ -133,12 +133,13 @@ int CpuOps::opBitOp(M68000& c, u16 op) {
         bit &= 31;
         const u32 m = 1u << bit;
         setFlag(c, kZ, (c.d[reg] & m) == 0);
+        const int high = bit >= 16 ? 2 : 0;   // upper-word bits cost 2 more
         int cyc;
         switch (kind) {
-        case 0: cyc = 6; break;
-        case 1: c.d[reg] ^= m; cyc = 8; break;
-        case 2: c.d[reg] &= ~m; cyc = 10; break;
-        default: c.d[reg] |= m; cyc = 8; break;
+        case 0: cyc = 6; high ? (void)0 : (void)0; break;
+        case 1: c.d[reg] ^= m; cyc = 6 + high; break;
+        case 2: c.d[reg] &= ~m; cyc = 8 + high; break;
+        default: c.d[reg] |= m; cyc = 6 + high; break;
         }
         return cyc + (isStatic ? 4 : 0);
     }

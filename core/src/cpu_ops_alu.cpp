@@ -80,7 +80,7 @@ int CpuOps::opAddqSubq(M68000& c, u16 op) {
 
     if (mode == 1) { // address register: full 32-bit, no flags
         c.a[reg] = isSub ? c.a[reg] - data : c.a[reg] + data;
-        return 8;
+        return size == 2 ? 6 : 8;   // the word form pays for sign extension
     }
     if (mode == 0) {
         const u32 r = isSub ? subFlags(c, data, c.d[reg], size, false, false)

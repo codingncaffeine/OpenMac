@@ -42,6 +42,7 @@ void M68000::setCCR(u8 value) {
 u8 M68000::rd8(u32 addr) {
     const u8 v = bus_.read8(addr & 0xFFFFFF);
     eaUndoReg_ = -1;
+    eaFaultCycles_ = 4;
     return v;
 }
 
@@ -49,6 +50,7 @@ u16 M68000::rd16(u32 addr) {
     if (addr & 1) throw AddressError{addr, true, false};
     const u16 v = bus_.read16(addr & 0xFFFFFF);
     eaUndoReg_ = -1;
+    eaFaultCycles_ = 4;   // a completed access counts toward a later fault
     return v;
 }
 
@@ -57,18 +59,21 @@ u32 M68000::rd32(u32 addr) {
     const u32 hi = bus_.read16(addr & 0xFFFFFF);
     const u32 lo = bus_.read16((addr + 2) & 0xFFFFFF);
     eaUndoReg_ = -1;
+    eaFaultCycles_ = 8;
     return (hi << 16) | lo;
 }
 
 void M68000::wr8(u32 addr, u8 v) {
     bus_.write8(addr & 0xFFFFFF, v);
     eaUndoReg_ = -1;
+    eaFaultCycles_ = 4;
 }
 
 void M68000::wr16(u32 addr, u16 v) {
     if (addr & 1) throw AddressError{addr, false, false};
     bus_.write16(addr & 0xFFFFFF, v);
     eaUndoReg_ = -1;
+    eaFaultCycles_ = 4;
 }
 
 void M68000::wr32(u32 addr, u32 v) {
@@ -76,6 +81,7 @@ void M68000::wr32(u32 addr, u32 v) {
     bus_.write16(addr & 0xFFFFFF, static_cast<u16>(v >> 16));
     bus_.write16((addr + 2) & 0xFFFFFF, static_cast<u16>(v & 0xFFFF));
     eaUndoReg_ = -1;
+    eaFaultCycles_ = 8;
 }
 
 u16 M68000::fetch16() {
@@ -131,6 +137,7 @@ int M68000::step() {
     const bool traced = (sr_ & kT) != 0;
     instrStart_ = pc;
     eaUndoReg_ = -1;
+    eaFaultCycles_ = 0;
     try {
         const u16 op = fetch16();
         ir_ = op;
@@ -174,6 +181,8 @@ int CpuOps::enterAddressError(M68000& c, const AddressError& ae) {
         const u32 pushPc = ae.instruction ? c.pc - 4
                                           : c.pc + static_cast<u32>(ae.pcBias);
 
+        const int pre = ae.instruction ? ae.fetchExtra : c.eaFaultCycles_;
+        c.eaFaultCycles_ = 0;
         c.push32(pushPc);
         c.push16(oldSR);
         c.push16(c.ir_);
@@ -181,7 +190,7 @@ int CpuOps::enterAddressError(M68000& c, const AddressError& ae) {
         c.push16(status);
         c.pc = c.rd32(kVecAddressError * 4);
         if (c.pc & 1) { c.halted = true; }
-        return 50;
+        return 50 + pre;
     } catch (const AddressError&) {
         c.halted = true;   // fault during fault processing: dead until reset
         return 4;
@@ -264,12 +273,15 @@ u32 CpuOps::briefExtension(M68000& c, u32 base) {
 
 u32 CpuOps::calcEA(M68000& c, int mode, int reg, int size) {
     switch (mode) {
-    case 2: return c.a[reg];
+    case 2:
+        c.eaFaultCycles_ += 0;
+        return c.a[reg];
     case 3: {
         const u32 addr = c.a[reg];
         c.eaUndoReg_ = reg;
         c.eaUndoVal_ = addr;
         c.eaUndoKind_ = 1;
+        c.eaFaultCycles_ += 0;
         u32 inc = size == 0 ? 1u : size == 1 ? 2u : 4u;
         if (size == 0 && reg == 7) inc = 2;
         c.a[reg] += inc;
@@ -279,23 +291,38 @@ u32 CpuOps::calcEA(M68000& c, int mode, int reg, int size) {
         u32 dec = size == 0 ? 1u : size == 1 ? 2u : 4u;
         if (size == 0 && reg == 7) dec = 2;
         c.a[reg] -= dec;
+        c.eaFaultCycles_ += 2;  // odd address caught during the internal cycle
         return c.a[reg];
     }
     case 5: {
         const s32 disp = static_cast<s16>(c.fetch16());
+        c.eaFaultCycles_ +=  4;
         return c.a[reg] + static_cast<u32>(disp);
     }
-    case 6: return briefExtension(c, c.a[reg]);
+    case 6: {
+        const u32 addr = briefExtension(c, c.a[reg]);
+        c.eaFaultCycles_ += 6;  // caught during the index internal cycle
+        return addr;
+    }
     case 7:
         switch (reg) {
-        case 0: return static_cast<u32>(static_cast<s32>(static_cast<s16>(c.fetch16())));
-        case 1: return c.fetch32();
+        case 0:
+            c.eaFaultCycles_ += 4;
+            return static_cast<u32>(static_cast<s32>(static_cast<s16>(c.fetch16())));
+        case 1:
+            c.eaFaultCycles_ += 8;
+            return c.fetch32();
         case 2: {
             const u32 base = c.pc;
             const s32 disp = static_cast<s16>(c.fetch16());
+            c.eaFaultCycles_ += 4;
             return base + static_cast<u32>(disp);
         }
-        case 3: return briefExtension(c, c.pc);
+        case 3: {
+            const u32 addr = briefExtension(c, c.pc);
+            c.eaFaultCycles_ += 6;
+            return addr;
+        }
         default: break;
         }
         break;
@@ -305,6 +332,7 @@ u32 CpuOps::calcEA(M68000& c, int mode, int reg, int size) {
 }
 
 u32 CpuOps::calcPredecLowFirst(M68000& c, int reg, int size) {
+    c.eaFaultCycles_ += 2;
     if (size < 2) {
         u32 dec = size == 0 ? 1u : 2u;
         if (size == 0 && reg == 7) dec = 2;
@@ -340,9 +368,9 @@ u32 CpuOps::readEA(M68000& c, int mode, int reg, int size) {
     return readAt(c, calcEA(c, mode, reg, size), size);
 }
 
-void CpuOps::jumpTo(M68000& c, u32 target) {
+void CpuOps::jumpTo(M68000& c, u32 target, int fetchExtra) {
     c.pc = target;   // hardware loads PC first, then faults on the fetch
-    if (target & 1) throw AddressError{target, true, true};
+    if (target & 1) throw AddressError{target, true, true, -2, fetchExtra};
 }
 
 bool CpuOps::testCond(const M68000& c, int cond) {

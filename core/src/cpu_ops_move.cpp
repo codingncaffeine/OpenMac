@@ -20,6 +20,11 @@ int CpuOps::opMove(M68000& c, u16 op) {
     const int dstReg  = (op >> 9) & 7;
     const bool isLong = size == 2;
 
+    // With a memory destination, MOVE's source read sits one prefetch
+    // refill later than the ALU ops'; register destinations do not.
+    if (dstMode >= 2 && srcMode >= 2 && !(srcMode == 7 && srcReg == 4)) {
+        setFaultCycles(c, 4);
+    }
     const u32 v = readEA(c, srcMode, srcReg, size);
     const int srcIdx = eaIndex(srcMode, srcReg);
     const int srcTime = isLong ? eaTimeL(srcIdx) : eaTimeBW(srcIdx);
@@ -233,6 +238,7 @@ int CpuOps::opMovem(M68000& c, u16 op) {
 
     if (!toRegs && mode == 4) { // reg -> mem, predecrement: A7..D0
         // Reversed mask: bit 0 = A7 .. bit 7 = A0, bit 8 = D7 .. bit 15 = D0
+        setFaultCycles(c, 4);
         u32 addr = c.a[reg];
         for (int i = 0; i < 16; ++i) {
             if (!((mask >> i) & 1)) continue;
@@ -250,6 +256,7 @@ int CpuOps::opMovem(M68000& c, u16 op) {
     }
 
     if (!toRegs) { // reg -> mem, control modes: D0..A7 ascending
+        setFaultCycles(c, 4);
         u32 addr = calcEA(c, mode, reg, size);
         for (int i = 0; i < 16; ++i) {
             if (!((mask >> i) & 1)) continue;
@@ -263,6 +270,7 @@ int CpuOps::opMovem(M68000& c, u16 op) {
 
     // mem -> reg: D0..A7 ascending; word loads sign-extend. A postinc base
     // is committed +2 around each read, so a faulting read leaves initial+2.
+    setFaultCycles(c, 4);
     u32 addr = (mode == 3) ? c.a[reg] : calcEA(c, mode, reg, size);
     for (int i = 0; i < 16; ++i) {
         if (!((mask >> i) & 1)) continue;

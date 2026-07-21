@@ -11,11 +11,11 @@ int CpuOps::opBcc(M68000& c, u16 op) {
 
     if (cond == 1) { // BSR pushes the return before the target fetch can fault
         c.push32(c.pc);
-        jumpTo(c, base + static_cast<u32>(disp));
+        jumpTo(c, base + static_cast<u32>(disp), 10);
         return 18;
     }
     if (cond == 0 || testCond(c, cond)) { // BRA / taken Bcc
-        jumpTo(c, base + static_cast<u32>(disp));
+        jumpTo(c, base + static_cast<u32>(disp), 2);
         return 10;
     }
     return wordDisp ? 12 : 8;
@@ -30,7 +30,7 @@ int CpuOps::opDbcc(M68000& c, u16 op) {
     const u16 count = static_cast<u16>((c.d[reg] & 0xFFFF) - 1);
     writeSized(c.d[reg], count, 1);
     if (count != 0xFFFF) {
-        jumpTo(c, base + static_cast<u32>(disp));
+        jumpTo(c, base + static_cast<u32>(disp), 2);
         return 10;
     }
     return 14;
@@ -39,29 +39,31 @@ int CpuOps::opDbcc(M68000& c, u16 op) {
 int CpuOps::opJmp(M68000& c, u16 op) {
     const int mode = (op >> 3) & 7, reg = op & 7;
     const u32 addr = calcEA(c, mode, reg, 2);
-    jumpTo(c, addr);
     static constexpr int cyc[12] = {0, 0, 8, 0, 0, 10, 14, 10, 12, 10, 14, 0};
-    return cyc[eaIndex(mode, reg)];
+    const int t = cyc[eaIndex(mode, reg)];
+    jumpTo(c, addr, t - 8);   // the final two target prefetches are the 8
+    return t;
 }
 
 int CpuOps::opJsr(M68000& c, u16 op) {
     const int mode = (op >> 3) & 7, reg = op & 7;
     const u32 addr = calcEA(c, mode, reg, 2);
     const u32 ret = c.pc;
-    jumpTo(c, addr);      // an odd target faults before the return is pushed
-    c.push32(ret);
     static constexpr int cyc[12] = {0, 0, 16, 0, 0, 18, 22, 18, 20, 18, 22, 0};
-    return cyc[eaIndex(mode, reg)];
+    const int t = cyc[eaIndex(mode, reg)];
+    jumpTo(c, addr, t - 16);  // an odd target faults before the return push
+    c.push32(ret);
+    return t;
 }
 
 int CpuOps::opRts(M68000& c, u16) {
-    jumpTo(c, c.pop32());
+    jumpTo(c, c.pop32(), 8);
     return 16;
 }
 
 int CpuOps::opRtr(M68000& c, u16) {
     c.setCCR(static_cast<u8>(c.pop16()));
-    jumpTo(c, c.pop32());
+    jumpTo(c, c.pop32(), 12);
     return 20;
 }
 
@@ -70,7 +72,7 @@ int CpuOps::opRte(M68000& c, u16) {
     const u16 newSR = c.pop16();
     const u32 newPC = c.pop32();
     c.setSR(newSR);
-    jumpTo(c, newPC);
+    jumpTo(c, newPC, 12);
     return 20;
 }
 
@@ -91,13 +93,13 @@ int CpuOps::opChk(M68000& c, u16 op) {
     const int eaT = eaTimeBW(eaIndex(mode, reg));
 
     c.sr_ = static_cast<u16>(c.sr_ & ~(kZ | kV | kC));   // hardware clears these
-    if (v < 0) {
+    if (v < 0) {       // the sign trap wins the N flag and runs 2 longer
         setFlag(c, kN, true);
         return raiseException(c, kVecChk, 40 + eaT);
     }
     if (v > bound) {
         setFlag(c, kN, false);
-        return raiseException(c, kVecChk, 40 + eaT);
+        return raiseException(c, kVecChk, 38 + eaT);
     }
     return 10 + eaT;
 }

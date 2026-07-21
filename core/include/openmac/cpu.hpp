@@ -80,6 +80,7 @@ private:
     int eaUndoReg_ = -1;
     u32 eaUndoVal_ = 0;
     int eaUndoKind_ = 0;
+    int eaFaultCycles_ = 0;   // pre-fault cycles if the pending access faults
 };
 
 } // namespace openmac
