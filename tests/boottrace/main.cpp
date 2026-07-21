@@ -303,6 +303,7 @@ int main(int argc, char** argv) {
     u32 traceToPc = 0;
     u32 watchAddr = 0xFFFFFFFFu;
     bool mouseWalk = false;
+    bool bootNudge = false;
     bool bootDisk = false;
     bool forceRom = false;
     std::string dumpPath;
@@ -352,6 +353,7 @@ int main(int argc, char** argv) {
             watchAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
         }
         else if (arg == "--mouse-walk") mouseWalk = true;
+        else if (arg == "--boot-nudge") bootNudge = true;
         else if (arg == "--boot-disk") bootDisk = true;
         else if (arg == "--force-rom") forceRom = true;
         else if (arg == "--step-over" && i + 1 < argc) {
@@ -571,6 +573,26 @@ int main(int argc, char** argv) {
         if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
         std::printf("mouse-walk done: halted=%d pc=%06X\n",
                     mac.cpu().halted ? 1 : 0, mac.cpu().pc);
+        return 0;
+    }
+
+    if (bootNudge) {
+        // Reproduce the shell hang: a burst of mouse motion early in boot (while
+        // the ROM is still in its boot-time ADB idle-wait), then stop, and check
+        // the boot recovers to the desktop instead of wedging at $00BB0A.
+        for (int i = 0; i < frames && !mac.cpu().halted; ++i) {
+            if (i >= 200 && i < 340 && (i & 3) == 0) mac.mouseMove(3, 2, false);
+            mac.runFrame();
+            if (i % 400 == 0) {
+                const auto s = mac.adbStats();
+                std::printf("f=%d pc=%06X kbdPolls=%u mousePolls=%u mouseReports=%u\n",
+                            i, mac.cpu().pc, s.kbdPolls, s.mousePolls, s.mouseReports);
+            }
+        }
+        if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
+        const auto s = mac.adbStats();
+        std::printf("boot-nudge done: pc=%06X kbdPolls=%u mousePolls=%u mouseReports=%u\n",
+                    mac.cpu().pc, s.kbdPolls, s.mousePolls, s.mouseReports);
         return 0;
     }
 

@@ -171,6 +171,12 @@ private:
     int adbPending_ = 0;        // CPU cycles until delivery (0 = none)
     bool adbPendingInput_ = false;
 
+    // Back-off for the once-per-frame idle wake: if wakes stop producing polls
+    // (the ROM is not autopolling, e.g. it is in the boot idle-wait spin), stop
+    // nudging and flush stale input so the bus can idle. See runFrame.
+    int adbWakeStreak_ = 0;
+    u32 adbLastPollTotal_ = 0;
+
     void adbMaybeClock();
 
     u64 totalCycles_ = 0;

@@ -136,6 +136,18 @@ public:
         else if (addr == mouseAddr_) talkMouse(reg);
     }
 
+    // Discard input the ROM never came back to poll. In normal use the ROM
+    // polls constantly so this is never needed, but an event injected while the
+    // ROM is NOT polling (e.g. a mouse nudge during the boot-time "wait for ADB
+    // idle" spin) would otherwise keep hasPendingEvent() true forever, making
+    // the machine's once-per-frame idle wake fire endlessly and deadlock that
+    // spin. Dropping the stale event lets the bus reach idle.
+    void flushStaleInput() {
+        mousePending_ = false;
+        mouseDx_ = mouseDy_ = 0;
+        kbdHead_ = kbdTail_ = 0;
+    }
+
 private:
     static constexpr int kKbdQ = 32;
 

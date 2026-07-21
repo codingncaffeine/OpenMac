@@ -650,9 +650,28 @@ void Machine::runFrame() {
             // the bus is idle and a device has input pending, fire a shift
             // completion so the ROM's ADB manager resumes its poll round-robin.
             // The ROM stops ADB after startup and needs this nudge to resume.
+            //
+            // But the ROM only consumes a wake while it is actually autopolling.
+            // During the boot-time "spin until the ADB bus is idle" loop
+            // ($00BB0A) it is not, so a wake there just keeps the bus busy and
+            // deadlocks the spin (a mouse nudge during boot wedged the whole
+            // boot this way). So track whether our wakes produce polls: if they
+            // do not for several frames, back off and flush the stale input,
+            // letting the bus idle. Real desktop input is never dropped -- there
+            // the ROM polls, which bumps the count and resets the streak.
+            const u32 adbPolls = adb_->mousePolls() + adb_->kbdPolls();
+            if (adbPolls != adbLastPollTotal_) { adbLastPollTotal_ = adbPolls; adbWakeStreak_ = 0; }
             if (adbPending_ == 0 && adb_->state() == 3 && adb_->hasPendingEvent()) {
-                adb_->reStageLastTalk();
-                via_->completeShift(true, 0xFF);
+                if (adbWakeStreak_ < 8) {
+                    adb_->reStageLastTalk();
+                    via_->completeShift(true, 0xFF);
+                    ++adbWakeStreak_;
+                } else {
+                    adb_->flushStaleInput();   // ROM isn't polling; let it idle
+                    adbWakeStreak_ = 0;
+                }
+            } else {
+                adbWakeStreak_ = 0;
             }
             via_->setCA1(false);   // /VBL pulse
         }
