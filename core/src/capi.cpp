@@ -84,6 +84,16 @@ OMAC_API void omac_insert_harddisk(OMac* m, const uint8_t* img, size_t len, int 
     if (m && img) m->mac.insertHardDisk(std::vector<u8>(img, img + len), ro != 0);
 }
 
+OMAC_API size_t omac_harddisk_data(OMac* m, uint8_t* out, size_t cap)
+{
+    if (!m || !m->mac.hardDiskPresent()) return 0;
+    const auto& img = m->mac.hardDiskImage();
+    if (!out) return img.size();               // query size
+    const size_t n = img.size() < cap ? img.size() : cap;
+    if (n) std::memcpy(out, img.data(), n);
+    return n;
+}
+
 OMAC_API int omac_format_hfs(uint32_t size_bytes, const char* name, uint8_t* out)
 {
     if (!out) return -1;

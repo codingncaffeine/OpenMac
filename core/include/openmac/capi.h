@@ -47,6 +47,11 @@ OMAC_API void omac_insert_floppy(OMac*, const uint8_t* img, size_t len, int read
 OMAC_API void omac_eject_floppy(OMac*);
 OMAC_API void omac_insert_harddisk(OMac*, const uint8_t* img, size_t len, int read_only);
 
+/* Copy the live hard-disk image (including guest writes) into out; returns the
+   byte count, or the full size when out is NULL. Front-ends use this to persist
+   the disk back to its file on eject/exit. */
+OMAC_API size_t omac_harddisk_data(OMac*, uint8_t* out, size_t cap);
+
 /* Format a blank HFS volume of size_bytes into out (which must hold size_bytes).
    Returns 0 on success. Front-ends use this for "Create Hard Disk". */
 OMAC_API int omac_format_hfs(uint32_t size_bytes, const char* volume_name, uint8_t* out);
