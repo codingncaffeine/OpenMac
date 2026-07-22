@@ -966,9 +966,13 @@ void Machine::runFrame() {
                 cpu_.a[0] = floppyMountPb_;
                 execute68kTrap(kTrapMountVol);
                 mountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
-                cpu_.d[0] = 7;                          // diskEvt
-                cpu_.a[0] = (static_cast<u32>(mountRes) << 16) | static_cast<u16>(floppyDriveNum_);
-                execute68kTrap(kTrapPostEvent);         // hi word = mount result, lo = drive
+                // _PostEvent (Inside Macintosh I-257): A0 = event code, D0 = event
+                // message. Putting the code in D0 posted event 2 (mouseUp) instead of 7
+                // (diskEvt), so no disk-inserted event ever reached the Finder or the
+                // installer's disk-switch -- inserted disks mounted but nothing reacted.
+                cpu_.a[0] = 7;                          // diskEvt
+                cpu_.d[0] = (static_cast<u32>(mountRes) << 16) | static_cast<u16>(floppyDriveNum_);
+                execute68kTrap(kTrapPostEvent);         // message: hi word = mount result, lo = drive
             }
             floppyPending_.clear();                     // drop the staged disk either way
         }
@@ -1048,6 +1052,11 @@ void Machine::runFrame() {
         // 0 = mounted; 0xFFC9 = volOnLinErr (-55) = the volume is already
         // on-line (a prior async attempt mounted it). Either way we are done.
         if (diskEvtResult_ == 0 || diskEvtResult_ == 0xFFC9) hdMounted_ = true;
+        if (diskEvtResult_ == 0) {                     // let the Finder show the new volume
+            cpu_.a[0] = 7;                             // diskEvt (A0 = event code)
+            cpu_.d[0] = static_cast<u16>(hdDriveNum_); // D0 = message: result 0 | drive
+            execute68kTrap(kTrapPostEvent);
+        }
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     }
 
