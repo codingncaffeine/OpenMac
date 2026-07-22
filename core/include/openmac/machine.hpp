@@ -205,6 +205,7 @@ private:
     // runs _MountVol with the .Sony intercept consulted (see execute68kTrap).
     bool hdAutoMount_ = false;
     bool floppyInsertPending_ = false; // a floppy was swapped in after boot
+    bool floppyEjectPending_ = false;  // eject requested; unmount the volume next runFrame
     u32 floppyMountPb_ = 0;            // lazily-allocated _MountVol param block
     std::vector<u8> floppyPending_;    // staged swap image, applied next runFrame
     bool floppyPendingRO_ = false;

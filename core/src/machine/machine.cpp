@@ -485,6 +485,14 @@ void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
 }
 
 void Machine::ejectFloppy() {
+    // A floppy that mounted after boot must be UNMOUNTED (its VCB dropped) to leave the
+    // desktop -- merely reporting the disk out keeps the volume on-line and the Finder
+    // asking for it back. Defer to a clean frame boundary; keep the image until then so
+    // the unmount's flush lands on the right disk. Pre-boot / empty drive: clear now.
+    if (drvStatusAddr_ != 0 && !floppy_.empty()) {
+        floppyEjectPending_ = true;
+        return;
+    }
     floppy_.clear();
     if (drvStatusAddr_) write8(drvStatusAddr_ + dsDiskInPlace, 0);
 }
@@ -878,6 +886,42 @@ void Machine::runFrame() {
             // desktop". (The real-key path clears $0174 itself on key-up.)
             for (int i = 0; i < 16; ++i) write8(0x0174 + static_cast<u32>(i), 0);
             romDiskKeymapHeld_ = false;
+        }
+    }
+
+    // An eject requested from the UI: unmount the volume so it leaves the desktop,
+    // rather than just reporting the disk out (which leaves the Finder wanting it back).
+    // A busy volume (files open, fBsyErr) can't be put away -- leave it, as a real Mac does.
+    if (floppyEjectPending_ && !inSony_ && drvStatusAddr_ != 0) {
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        if (floppyMountPb_ == 0) {
+            cpu_.d[0] = 80;
+            execute68kTrap(kTrapNewPtrSysClear);
+            floppyMountPb_ = cpu_.a[0];
+        }
+        const u32 vcbTailBefore = (static_cast<u32>(read16(0x035C)) << 16) | read16(0x035E);
+        u16 unmountRes = 0;
+        if (floppyMountPb_ != 0) {
+            write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
+            cpu_.a[0] = floppyMountPb_;
+            execute68kTrap(kTrapUnmountVol);
+            unmountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+        }
+        const bool ejected = (unmountRes != 0xFFD1);   // fBsyErr (-47) => busy, keep it
+        if (ejected) {
+            floppy_.clear();
+            write8(drvStatusAddr_ + dsDiskInPlace, 0);
+        }
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        floppyEjectPending_ = false;
+        if (onDiag) {
+            const u32 vcbTailAfter = (static_cast<u32>(read16(0x035C)) << 16) | read16(0x035E);
+            char b[160];
+            std::snprintf(b, sizeof b, "floppy: eject unmount=%04X ejected=%d VCBtail %06X->%06X%s",
+                          unmountRes, ejected ? 1 : 0, vcbTailBefore & 0xFFFFFF,
+                          vcbTailAfter & 0xFFFFFF, ejected ? "" : " [disk busy -- close its windows first]");
+            onDiag(b);
         }
     }
 
