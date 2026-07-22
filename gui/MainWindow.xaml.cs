@@ -18,7 +18,18 @@ public partial class MainWindow : Window
     private IEmulator _emulator;
     private readonly WriteableBitmap _bitmap;
     private readonly byte[] _bgra;
-    private readonly DispatcherTimer _timer;
+
+    // Wall-clock-paced frame loop. CompositionTarget.Rendering fires once per
+    // display refresh; a Stopwatch decides how many 60.15 Hz Mac frames are
+    // actually due, so emulation (hence audio production) tracks real time rather
+    // than the low-priority, sub-60 Hz DispatcherTimer that made sound choppy.
+    private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+    private long _lastTicks;
+    private double _frameAcc;
+    private int _fpsFrames;
+    private double _fpsElapsed;
+    private const double FrameSeconds = 1.0 / 60.15;
+    private EventHandler? _renderHandler;
 
     private bool _mouseLocked;
     private bool _ignoreUpAfterLock;
@@ -43,9 +54,10 @@ public partial class MainWindow : Window
         StatusBackend.Text = _emulator.IsRealCore ? "core: native" : "core: stub (not linked)";
         Log.Line($"GUI ready — {_emulator.BackendName} backend, screen {w}x{h}");
 
-        _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1000.0 / 60.0) };
-        _timer.Tick += (_, _) => Tick();
-        _timer.Start();
+        timeBeginPeriod(1);                       // sharpen OS timer resolution for steady pacing
+        _lastTicks = _clock.ElapsedTicks;
+        _renderHandler = (_, _) => Tick();
+        CompositionTarget.Rendering += _renderHandler;
 
         WireInput();
         BuildRecentMenu();
@@ -57,7 +69,12 @@ public partial class MainWindow : Window
             if (!string.IsNullOrEmpty(_settings.LastRom) && File.Exists(_settings.LastRom))
                 LoadRom(_settings.LastRom!);
         };
-        Closing += (_, _) => _settings.Save();
+        Closing += (_, _) =>
+        {
+            if (_renderHandler != null) CompositionTarget.Rendering -= _renderHandler;
+            timeEndPeriod(1);
+            _settings.Save();
+        };
     }
 
     /// <summary>Real core if openmac_c.dll loads; otherwise the stub preview.</summary>
@@ -78,11 +95,41 @@ public partial class MainWindow : Window
 
     private void Tick()
     {
-        _emulator.RunFrame();
+        long now = _clock.ElapsedTicks;
+        double dt = (now - _lastTicks) / (double)System.Diagnostics.Stopwatch.Frequency;
+        _lastTicks = now;
+        if (dt > 0.25) dt = 0.25;                 // after a stall, resync rather than fast-forward
+        _frameAcc += dt;
+
+        int ran = 0;
+        while (_frameAcc >= FrameSeconds && ran < 4)   // catch up, but cap the burst
+        {
+            _emulator.RunFrame();
+            _frameAcc -= FrameSeconds;
+            ran++;
+        }
+        if (_frameAcc > FrameSeconds) _frameAcc = FrameSeconds;   // drop backlog beyond the cap
+        if (ran == 0) return;                     // no whole frame due this refresh — nothing to blit
+
         _emulator.RenderTo(_bgra);
         _bitmap.WritePixels(new Int32Rect(0, 0, _emulator.ScreenWidth, _emulator.ScreenHeight),
                             _bgra, _emulator.ScreenWidth * 4, 0);
+
+        // Once a second, log the real emulated frame rate and audio buffer health,
+        // so a "choppy sound" report comes with hard numbers (fps low => pacing;
+        // underruns high with fps ~60 => buffering).
+        _fpsFrames += ran;
+        _fpsElapsed += dt;
+        if (_fpsElapsed >= 1.0)
+        {
+            Log.Line($"perf: fps={_fpsFrames / _fpsElapsed:F1}  {_emulator.AudioStats()}");
+            _fpsFrames = 0;
+            _fpsElapsed = 0;
+        }
     }
+
+    [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
+    [DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint ms);
 
     // ---- input ----
     private void WireInput()

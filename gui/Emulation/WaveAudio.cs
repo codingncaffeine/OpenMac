@@ -52,6 +52,11 @@ internal sealed class WaveAudio : IDisposable
     private readonly byte[] _ring = new byte[BUFSZ * (NBUF + 4)];
     private int _rHead, _rCount;
 
+    // Health counters, reset each Stats() read (diagnostics for choppy audio).
+    private int _underruns, _drops;
+    private long _fed;
+    private bool _started;
+
     public WaveAudio(int sampleRate)
     {
         var fmt = new WAVEFORMATEX
@@ -88,14 +93,16 @@ internal sealed class WaveAudio : IDisposable
         // 1. Append to the ring; on overflow drop the oldest so latency stays bounded.
         for (int i = 0; i < count; i++)
         {
-            if (_rCount == _ring.Length) { _rHead = (_rHead + 1) % _ring.Length; _rCount--; }
+            if (_rCount == _ring.Length) { _rHead = (_rHead + 1) % _ring.Length; _rCount--; _drops++; }
             _ring[(_rHead + _rCount) % _ring.Length] = samples[i];
             _rCount++;
         }
+        _fed += count;
 
         // 2. Emit full, fixed-size buffers into any free slots.
         while (_rCount >= BUFSZ)
         {
+            if (_started && InFlight() == 0) _underruns++;   // waveOut had run dry
             int slot = FindFree();
             if (slot < 0) break;            // all buffers busy — leave the rest in the ring
             int first = Math.Min(BUFSZ, _ring.Length - _rHead);
@@ -111,7 +118,29 @@ internal sealed class WaveAudio : IDisposable
             Marshal.StructureToPtr(h, _hdr[slot], false);
             waveOutWrite(_h, _hdr[slot], HdrSize);
             _used[slot] = true;
+            _started = true;
         }
+    }
+
+    // Buffers written to the device but not yet finished playing.
+    private int InFlight()
+    {
+        int n = 0;
+        for (int i = 0; i < NBUF; i++)
+        {
+            if (!_used[i]) continue;
+            var h = Marshal.PtrToStructure<WAVEHDR>(_hdr[i]);
+            if ((h.dwFlags & WHDR_DONE) == 0) n++;
+        }
+        return n;
+    }
+
+    /// <summary>One-line health snapshot; resets the per-interval counters.</summary>
+    public string Stats()
+    {
+        string s = $"audio: inflight={InFlight()}/{NBUF} ring={_rCount} fed={_fed} underruns={_underruns} drops={_drops}";
+        _fed = 0; _underruns = 0; _drops = 0;
+        return s;
     }
 
     private int FindFree()

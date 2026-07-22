@@ -65,6 +65,7 @@ public sealed class StubEmulator : IEmulator
     public void MouseMove(int dx, int dy, bool button) { }
     public void MouseButton(bool down) { }
     public void KeyEvent(int adbCode, bool down) { }
+    public string AudioStats() => "";
 
     public void Dispose() { }
 }

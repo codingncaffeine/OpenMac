@@ -157,6 +157,8 @@ public sealed class NativeEmulator : IEmulator
         if (_h != IntPtr.Zero) Native.omac_key(_h, adbCode, down ? 1 : 0);
     }
 
+    public string AudioStats() => _audio.Ok ? _audio.Stats() : "audio: (no device)";
+
     private void Destroy()
     {
         if (_h != IntPtr.Zero)

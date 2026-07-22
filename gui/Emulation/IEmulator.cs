@@ -37,4 +37,7 @@ public interface IEmulator : IDisposable
     void MouseMove(int dx, int dy, bool button);
     void MouseButton(bool down);
     void KeyEvent(int adbCode, bool down);
+
+    /// <summary>One-line audio buffer health line for the perf log ("" if none).</summary>
+    string AudioStats();
 }
