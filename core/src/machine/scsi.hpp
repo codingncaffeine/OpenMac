@@ -236,7 +236,8 @@ public:
             case 2: writeMr(v); break;      // Mode (MR)
             case 3: tcr_ = v; break;        // Target Command (TCR)
             case 4: ser_ = v; break;        // Select Enable (SER)
-            case 5: case 6: case 7: break;  // Start DMA Send/TgtRecv/InitRecv (mode start; data flows via reg 0/6)
+            case 6: dataOut(v); break;      // pseudo-DMA send: initiator -> target data (symmetric to read reg 6)
+            case 5: case 7: break;          // Start DMA Send / Reset (mode start; data flows via reg 0/6)
         }
     }
 

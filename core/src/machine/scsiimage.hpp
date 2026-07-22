@@ -103,9 +103,9 @@ inline std::vector<u8> buildScsiDriver() {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // delay/emask/menu
         0x00, 0x1A,                         // drvrOpen   = 0x1A
         0x00, 0x1E,                         // drvrPrime  = 0x1E
-        0x00, 0x76,                         // drvrCtl    = 0x76
-        0x00, 0x7E,                         // drvrStatus = 0x7E
-        0x00, 0x86,                         // drvrClose  = 0x86
+        0x00, 0x78,                         // drvrCtl    = 0x78
+        0x00, 0x80,                         // drvrStatus = 0x80
+        0x00, 0x88,                         // drvrClose  = 0x88
         0x07, '.', 'S', 'c', 's', 'i', 'H', 'D',   // drvrName ".ScsiHD", ends even at 0x1A
         // Open (0x1A): dOpened is preset, so this is only a safety no-op
         0x70, 0x00, 0x4E, 0x75,             // MOVEQ #0,D0; RTS
@@ -127,14 +127,14 @@ inline std::vector<u8> buildScsiDriver() {
         0xE2, 0x8A,                         // LSR.L #1,D2            D2 = block count
         0x24, 0x68, 0x00, 0x20,             // MOVEA.L $20(A0),A2     ioBuffer -> A2
         0x21, 0x68, 0x00, 0x24, 0x00, 0x28, // MOVE.L $24(A0),$28(A0) ioActCount = ioReqCount
+        0x7A, 0x00,                         // MOVEQ #0,D5            SCSI target id 0 (both paths)
+        0x28, 0x3C, 0x00, 0x00, 0x02, 0x00, // MOVE.L #512,D4         block size (both paths; MULU'd to bytes)
         0x30, 0x28, 0x00, 0x06,             // MOVE.W $06(A0),D0      ioTrap: _Read=$A002, _Write=$A003
         0x08, 0x00, 0x00, 0x00,             // BTST #0,D0             odd trap number => write
-        0x67, 0x04,                         // BEQ.S .read
-        0x70, 0x00,                         // MOVEQ #0,D0            write: accept (real SCSI write is next phase)
-        0x60, 0x0E,                         // BRA.S .done
-        0x7A, 0x00,                         // .read: MOVEQ #0,D5     SCSI target id 0
-        0x28, 0x3C, 0x00, 0x00, 0x02, 0x00, // MOVE.L #512,D4         block size (MULU'd to byte count)
-        0x4E, 0xB9, 0x00, 0x40, 0x41, 0xD4, // JSR $004041D4          SCSI READ(6); D0 = result
+        0x67, 0x06,                         // BEQ.S .read
+        0x61, 0x00, 0x00, 0x30,             // BSR.W wr6 (@ +0x8C)    write: real SCSI WRITE(6)
+        0x60, 0x06,                         // BRA.S .done
+        0x4E, 0xB9, 0x00, 0x40, 0x41, 0xD4, // .read: JSR $004041D4   SCSI READ(6); D0 = result
         0x24, 0x5F,                         // .done: MOVEA.L (A7)+,A2
         0x2C, 0x1F,                         // MOVE.L (A7)+,D6
         0x2A, 0x1F,                         // MOVE.L (A7)+,D5
@@ -143,12 +143,67 @@ inline std::vector<u8> buildScsiDriver() {
         0x22, 0x5F,                         // MOVEA.L (A7)+,A1  restore DCE ($4041D4 clobbered it)
         0x20, 0x78, 0x08, 0xFC,             // MOVEA.L (jIODone).W,A0  A1=DCE, D0=result
         0x4E, 0xD0,                         // JMP (A0)  -- IODone dequeues the request + sets ioResult
-        // Control (0x76): accept + complete with noErr via IODone
+        // Control (0x78): accept + complete with noErr via IODone
         0x70, 0x00, 0x20, 0x78, 0x08, 0xFC, 0x4E, 0xD0,
-        // Status (0x7E): accept + complete with noErr via IODone
+        // Status (0x80): accept + complete with noErr via IODone
         0x70, 0x00, 0x20, 0x78, 0x08, 0xFC, 0x4E, 0xD0,
-        // Close (0x86): immediate no-op
+        // Close (0x88): immediate no-op
         0x70, 0x00, 0x4E, 0x75,
+        // wr6 (0x8C): SCSI WRITE(6) subroutine -- same shape as the ROM's read at $4041D4
+        // but CDB opcode $0A and SCSIWrite (selector 6). In: D3=block, D2=count, D4=block
+        // size, D5=target, A2=buffer. Out: D0 = SCSI status (0 = GOOD). Uses $09FA CDB/
+        // status scratch and the reserved-stack discipline of $4041D4; leaves A1 intact.
+        0x2F, 0x07,                         // MOVE.L D7,-(A7)
+        0x7E, 0x00,                         // MOVEQ #0,D7
+        0x41, 0xF8, 0x09, 0xFA,             // LEA $09FA,A0
+        0x10, 0xFC, 0x00, 0x0A,             // MOVE.B #$0A,(A0)+      WRITE(6)
+        0x48, 0x43,                         // SWAP D3
+        0x02, 0x03, 0x00, 0x1F,             // ANDI.B #$1F,D3
+        0x10, 0xC3,                         // MOVE.B D3,(A0)+        LBA[20:16]
+        0x48, 0x43,                         // SWAP D3
+        0x30, 0xC3,                         // MOVE.W D3,(A0)+        LBA[15:0]
+        0x10, 0xC2,                         // MOVE.B D2,(A0)+        length
+        0x42, 0x18,                         // CLR.B (A0)+            control
+        0xC8, 0xC2,                         // MULU D2,D4             D4 = block size * count = bytes
+        0x9E, 0xFC, 0x00, 0x14,             // SUBA.W #$14,A7         reserve TIB
+        0x2C, 0x0F,                         // MOVE.L A7,D6           D6 = TIB ptr
+        0x55, 0x8F,                         // SUBQ.L #2,A7          reserve result word
+        0x3F, 0x3C, 0x00, 0x01,             // MOVE.W #1,-(A7)        SCSIGet
+        0xA8, 0x15,                         // _SCSIDispatch
+        0x3E, 0x17,                         // MOVE.W (A7),D7
+        0x66, 0x4E,                         // BNE.S .err
+        0x3F, 0x05,                         // MOVE.W D5,-(A7)        target id
+        0x3F, 0x3C, 0x00, 0x02,             // MOVE.W #2,-(A7)        SCSISelect
+        0xA8, 0x15,                         // _SCSIDispatch
+        0x3E, 0x17,                         // MOVE.W (A7),D7
+        0x66, 0x42,                         // BNE.S .err
+        0x48, 0x78, 0x09, 0xFA,             // PEA $09FA              CDB ptr
+        0x3F, 0x3C, 0x00, 0x06,             // MOVE.W #6,-(A7)        CDB length
+        0x3F, 0x3C, 0x00, 0x03,             // MOVE.W #3,-(A7)        SCSICmd
+        0xA8, 0x15,                         // _SCSIDispatch
+        0x3E, 0x17,                         // MOVE.W (A7),D7
+        0x66, 0x18,                         // BNE.S .compl
+        0x20, 0x46,                         // MOVE.L D6,A0           A0 = TIB
+        0x30, 0xFC, 0x00, 0x01,             // MOVE.W #1,(A0)+        scInc
+        0x20, 0xCA,                         // MOVE.L A2,(A0)+        buffer
+        0x20, 0xC4,                         // MOVE.L D4,(A0)+        byte count
+        0x30, 0xBC, 0x00, 0x07,             // MOVE.W #7,(A0)         scStop
+        0x2F, 0x06,                         // MOVE.L D6,-(A7)        push TIB pointer (SCSIRead/Write arg)
+        0x3F, 0x3C, 0x00, 0x06,             // MOVE.W #6,-(A7)        SCSIWrite (selector 6)
+        0xA8, 0x15,                         // _SCSIDispatch
+        0x3E, 0x17,                         // MOVE.W (A7),D7
+        // .compl:
+        0x48, 0x78, 0x09, 0xFA,             // PEA $09FA              status buffer
+        0x48, 0x78, 0x09, 0xFC,             // PEA $09FC              message buffer
+        0x2F, 0x3C, 0x00, 0x00, 0x00, 0x00, // MOVE.L #0,-(A7)        timeout
+        0x3F, 0x3C, 0x00, 0x04,             // MOVE.W #4,-(A7)        SCSIComplete
+        0xA8, 0x15,                         // _SCSIDispatch
+        0x3E, 0x38, 0x09, 0xFA,             // MOVE.W $09FA,D7        status byte -> result (0 = GOOD)
+        // .err:
+        0xDE, 0xFC, 0x00, 0x16,             // ADDA.W #$16,A7         release reserved stack
+        0x30, 0x07,                         // MOVE.W D7,D0
+        0x2E, 0x1F,                         // MOVE.L (A7)+,D7
+        0x4E, 0x75,                         // RTS
     };
 }
 

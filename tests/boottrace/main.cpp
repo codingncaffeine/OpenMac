@@ -817,7 +817,7 @@ int main(int argc, char** argv) {
             openmac::dbg::describeIOTrap(mac, trap, pc, a0, s);
             std::printf("IO-> %s\n", s.c_str());
             pend.push_back({pc + 2, a0, trap});
-            if (trc == 0) trc = 5000;  // trace the dispatch/driver/completion path once
+            if (trc == 0 && (trap & 1)) trc = 4000;  // trace the first WRITE path (A003) once
         };
         // Match the return PC per instruction to read the completed ioResult. The mount
         // is triggered inside runFrame(), so we must drive whole frames (not step raw).
