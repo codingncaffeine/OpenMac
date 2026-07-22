@@ -314,7 +314,7 @@ int main(int argc, char** argv) {
     u32 hdBlankMB = 0;   // --harddisk-blank N: attach a blank N-MB hard disk
     u32 hdFormatMB = 0;  // --harddisk-format N: attach a formatted N-MB HFS disk
     bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
-    bool traceIrq = false, traceAdb = false;
+    bool traceIrq = false, traceAdb = false, traceDevIo = false;
     u32 breakPc = 0, watchMem = 0xFFFFFFFFu;
     u32 breakTrap = 0, tracePc = 0, dumpMemAddr = 0, dumpMemLen = 0;
     int traceCount = 48;
@@ -337,6 +337,7 @@ int main(int argc, char** argv) {
         else if (arg == "--trace-irq") traceIrq = true;
         else if (arg == "--trace-adb") traceAdb = true;
         else if (arg == "--trace-os-traps") traceOsTraps = true;
+        else if (arg == "--trace-devio") traceDevIo = true;
         else if (arg == "--break-pc" && i + 1 < argc)
             breakPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
         else if (arg == "--watch-mem" && i + 1 < argc)
@@ -794,6 +795,51 @@ int main(int argc, char** argv) {
         }
         std::printf("\n");
         openmac::dbg::checkHeap(mac, stdout);
+        return 0;
+    }
+
+    if (traceDevIo) {
+        // Device Manager I/O (_Open/_Close/_Read/_Write/_Control/_Status/_KillIO) to our
+        // SCSI hard disk (refNum -2 or drive 4): log entry PB and the ioResult once the
+        // trap returns, so a mount's read conversation and its result codes are visible.
+        struct Pend { u32 ret, pb; u16 trap; };
+        std::vector<Pend> pend;
+        int trc = 0;   // when >0, dump the next N instructions (set when our read fires)
+        mac.cpu().onTrap = [&](u16 trap, u32 pc) {
+            if ((trap & 0x0800) != 0) return;               // OS traps only (not Toolbox)
+            const u16 t = trap & 0xF0FF;                     // fold async/immediate bits
+            if (t < 0xA000 || (t & 0x00FF) > 0x0006) return; // Open..KillIO
+            const u32 a0 = mac.cpu().a[0];
+            const int16_t refNum = int16_t(mac.read16(a0 + 0x18));
+            const int16_t drive  = int16_t(mac.read16(a0 + 0x16));
+            if (refNum != -2 && drive != 4) return;
+            std::string s;
+            openmac::dbg::describeIOTrap(mac, trap, pc, a0, s);
+            std::printf("IO-> %s\n", s.c_str());
+            pend.push_back({pc + 2, a0, trap});
+            if (trc == 0) trc = 5000;  // trace the dispatch/driver/completion path once
+        };
+        // Match the return PC per instruction to read the completed ioResult. The mount
+        // is triggered inside runFrame(), so we must drive whole frames (not step raw).
+        mac.cpu().onStep = [&](u32 pc) {
+            for (size_t i = pend.size(); i-- > 0;) {
+                if (pend[i].ret == pc) {
+                    const int16_t r = int16_t(mac.read16(pend[i].pb + 0x10));
+                    std::printf("IO<- trap=%04X ioResult=%d\n", pend[i].trap, r);
+                    pend.erase(pend.begin() + static_cast<long>(i));
+                    break;
+                }
+            }
+            if (trc > 0) {
+                std::string d;
+                openmac::dbg::disasm(mac, pc, d);
+                std::printf("  %06X D0=%08X A0=%06X A1=%06X %s\n", pc, mac.cpu().d[0],
+                            mac.cpu().a[0] & 0xFFFFFF, mac.cpu().a[1] & 0xFFFFFF, d.c_str());
+                --trc;
+            }
+        };
+        for (int i = 0; i < frames && !mac.cpu().halted; ++i) mac.runFrame();
+        std::printf("\n");
         return 0;
     }
 

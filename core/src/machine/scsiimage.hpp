@@ -58,7 +58,98 @@ inline u16 driverChecksum(const std::vector<u8>& driver) {
 // RAM $1FBC and the boot reached the desktop cleanly. This stub just returns; the real
 // installer (build the DQE, _AddDrive, wire Prime to SCSI Manager I/O) replaces it.
 inline std::vector<u8> buildScsiDriver() {
-    return { 0x4E, 0x75 };   // RTS
+    // Full clean-room disk driver loaded from the disk's Apple_Driver43 partition. The
+    // ROM JSRs the installer at offset 0 (A0 = HFS partition entry). It installs the
+    // embedded DRVR at refNum -2 by hand-building the Device Control Entry + unit-table
+    // slot the exact way the ROM does (a unit-table entry is a *locked Handle* whose
+    // master pointer -> the DCE; dCtlDriver is a plain pointer to the DRVR, dCtlRefNum =
+    // -2). Layout verified against the ROM's own .Sony DCE with the debugger's
+    // dump-struct. Then it _AddDrives drive 4. The DRVR's Prime drives real SCSI
+    // transfers (reusing the ROM's SCSI-Manager read at $4041D4). This cut marks Open
+    // ($09E0 @ $0CFA) and Prime ($5000 @ $0CFC) so the mount chain can be traced.
+    //
+    // Traps preserve A2-A6/D3-D7, so the driver pointer lives in A2, the DCE in A3, the
+    // handle body in A4 across the _NewPtr calls. A5 is CurrentA5 -- never touched.
+    return {
+        // ---- installer (offset 0): manual DCE install + _AddDrive ----
+        0x45, 0xFA, 0x00, 0x5A,             // LEA drvr(PC),A2        A2 = &DRVR (drvr @ +0x5C)
+        0x26, 0x28, 0x00, 0x08,             // MOVE.L 8(A0),D3        D3 = pmPyPartStart (before A0 clobbered)
+        0x20, 0x3C, 0x00, 0x00, 0x00, 0x30, // MOVE.L #$30,D0
+        0xA7, 0x1E,                         // _NewPtr,Sys,Clear      A0 = DCE
+        0x26, 0x48,                         // MOVEA.L A0,A3          A3 = DCE
+        0x27, 0x43, 0x00, 0x14,             // MOVE.L D3,$14(A3)      dCtlStorage = partition phys start
+        0x70, 0x04,                         // MOVEQ #4,D0
+        0xA7, 0x1E,                         // _NewPtr,Sys,Clear      A0 = master ptr (handle body)
+        0x28, 0x48,                         // MOVEA.L A0,A4          A4 = handle
+        0x20, 0x0B,                         // MOVE.L A3,D0           D0 = DCE ptr
+        0x00, 0x80, 0x80, 0x00, 0x00, 0x00, // ORI.L #$80000000,D0    set locked-master-ptr flag
+        0x28, 0x80,                         // MOVE.L D0,(A4)         *handle = flagged DCE ptr
+        0x22, 0x78, 0x01, 0x1C,             // MOVEA.L ($011C).W,A1   A1 = UTableBase
+        0x23, 0x4C, 0x00, 0x04,             // MOVE.L A4,4(A1)        UTableBase[1] = handle (refNum -2)
+        0x26, 0x8A,                         // MOVE.L A2,(A3)         DCE.dCtlDriver = &DRVR
+        0x37, 0x7C, 0x4F, 0x20, 0x00, 0x04, // MOVE.W #$4F20,4(A3)    dCtlFlags: NeedLock|R|W|Ctl|Stat|dOpened
+        0x37, 0x7C, 0xFF, 0xFE, 0x00, 0x18, // MOVE.W #-2,$18(A3)     DCE.dCtlRefNum = -2
+        0x70, 0x1E,                         // MOVEQ #30,D0
+        0xA7, 0x1E,                         // _NewPtr,Sys,Clear      A0 = DrvSts
+        0x11, 0x7C, 0x00, 0x01, 0x00, 0x04, // MOVE.B #1,4(A0)        dsInstalled
+        0x11, 0x7C, 0x00, 0x08, 0x00, 0x03, // MOVE.B #8,3(A0)        dsDiskInPlace
+        0x22, 0x48,                         // MOVEA.L A0,A1
+        0x20, 0x3C, 0x00, 0x04, 0xFF, 0xFE, // MOVE.L #$0004FFFE,D0   drive 4 | refNum -2
+        0x41, 0xE9, 0x00, 0x06,             // LEA 6(A1),A0          &dsQLink
+        0xA0, 0x4E,                         // _AddDrive
+        0x4E, 0x75,                         // RTS
+        // ---- DRVR (offset 0x5C) ----
+        0x4F, 0x00,                         // drvrFlags: NeedLock|dReadEnable|dWritEnable|dCtlEnable|dStatEnable
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // delay/emask/menu
+        0x00, 0x1A,                         // drvrOpen   = 0x1A
+        0x00, 0x1E,                         // drvrPrime  = 0x1E
+        0x00, 0x76,                         // drvrCtl    = 0x76
+        0x00, 0x7E,                         // drvrStatus = 0x7E
+        0x00, 0x86,                         // drvrClose  = 0x86
+        0x07, '.', 'S', 'c', 's', 'i', 'H', 'D',   // drvrName ".ScsiHD", ends even at 0x1A
+        // Open (0x1A): dOpened is preset, so this is only a safety no-op
+        0x70, 0x00, 0x4E, 0x75,             // MOVEQ #0,D0; RTS
+        // Prime (0x1E): read/write blocks over SCSI via the ROM's block routine ($4041D4).
+        // A0 = I/O param block, A1 = DCE. Save the callee-preserved regs we touch, plus A1
+        // -- $4041D4 clobbers A1, but jIODone needs A1 = DCE at completion.
+        0x2F, 0x09,                         // MOVE.L A1,-(A7)   save DCE across the SCSI call
+        0x2F, 0x03,                         // MOVE.L D3,-(A7)
+        0x2F, 0x04,                         // MOVE.L D4,-(A7)
+        0x2F, 0x05,                         // MOVE.L D5,-(A7)
+        0x2F, 0x06,                         // MOVE.L D6,-(A7)
+        0x2F, 0x0A,                         // MOVE.L A2,-(A7)
+        0x26, 0x28, 0x00, 0x2E,             // MOVE.L $2E(A0),D3      ioPosOffset (bytes)
+        0xE0, 0x8B,                         // LSR.L #8,D3
+        0xE2, 0x8B,                         // LSR.L #1,D3            D3 = block within partition (/512)
+        0xD6, 0xA9, 0x00, 0x14,             // ADD.L $14(A1),D3       + dCtlStorage -> absolute LBA
+        0x24, 0x28, 0x00, 0x24,             // MOVE.L $24(A0),D2      ioReqCount (bytes)
+        0xE0, 0x8A,                         // LSR.L #8,D2
+        0xE2, 0x8A,                         // LSR.L #1,D2            D2 = block count
+        0x24, 0x68, 0x00, 0x20,             // MOVEA.L $20(A0),A2     ioBuffer -> A2
+        0x21, 0x68, 0x00, 0x24, 0x00, 0x28, // MOVE.L $24(A0),$28(A0) ioActCount = ioReqCount
+        0x30, 0x28, 0x00, 0x06,             // MOVE.W $06(A0),D0      ioTrap: _Read=$A002, _Write=$A003
+        0x08, 0x00, 0x00, 0x00,             // BTST #0,D0             odd trap number => write
+        0x67, 0x04,                         // BEQ.S .read
+        0x70, 0x00,                         // MOVEQ #0,D0            write: accept (real SCSI write is next phase)
+        0x60, 0x0E,                         // BRA.S .done
+        0x7A, 0x00,                         // .read: MOVEQ #0,D5     SCSI target id 0
+        0x28, 0x3C, 0x00, 0x00, 0x02, 0x00, // MOVE.L #512,D4         block size (MULU'd to byte count)
+        0x4E, 0xB9, 0x00, 0x40, 0x41, 0xD4, // JSR $004041D4          SCSI READ(6); D0 = result
+        0x24, 0x5F,                         // .done: MOVEA.L (A7)+,A2
+        0x2C, 0x1F,                         // MOVE.L (A7)+,D6
+        0x2A, 0x1F,                         // MOVE.L (A7)+,D5
+        0x28, 0x1F,                         // MOVE.L (A7)+,D4
+        0x26, 0x1F,                         // MOVE.L (A7)+,D3
+        0x22, 0x5F,                         // MOVEA.L (A7)+,A1  restore DCE ($4041D4 clobbered it)
+        0x20, 0x78, 0x08, 0xFC,             // MOVEA.L (jIODone).W,A0  A1=DCE, D0=result
+        0x4E, 0xD0,                         // JMP (A0)  -- IODone dequeues the request + sets ioResult
+        // Control (0x76): accept + complete with noErr via IODone
+        0x70, 0x00, 0x20, 0x78, 0x08, 0xFC, 0x4E, 0xD0,
+        // Status (0x7E): accept + complete with noErr via IODone
+        0x70, 0x00, 0x20, 0x78, 0x08, 0xFC, 0x4E, 0xD0,
+        // Close (0x86): immediate no-op
+        0x70, 0x00, 0x4E, 0x75,
+    };
 }
 
 // Wrap `hfs` (a raw HFS volume) and `driver` (68k driver bytes) into a full

@@ -750,6 +750,16 @@ void Machine::installSonyDrives() {
             hdMountPb_ = cpu_.a[0];
             hdAutoMount_ = true;   // HD configured; allow the auto-mount trigger
         }
+    } else if (!hd_.empty() && scsiHandlesHd_) {
+        // SCSI owns the HD: the disk's own driver (loaded by the ROM from its
+        // Apple_Driver43 partition) runs _DrvrInstall + _AddDrive for the drive. We
+        // only set up the deferred _MountVol trigger for that drive (number 4, matching
+        // the installer), so the System mounts it through the disk driver's own Prime.
+        hdDriveNum_ = floppyDriveNum_ + 2;   // drive 4
+        cpu_.d[0] = 80;
+        execute68kTrap(kTrapNewPtrSysClear);
+        hdMountPb_ = cpu_.a[0];
+        hdAutoMount_ = true;
     }
 }
 
