@@ -889,21 +889,33 @@ void Machine::runFrame() {
     // Prime -- the same path the boot floppy took). Mounting it ourselves or
     // posting a bare diskEvt did not satisfy the "please insert the disk" modal.
     if (floppyInsertPending_ && !inSony_ && drvStatusAddr_ != 0) {
-        // Trigger the disk-switch to re-read: post a disk-inserted event (Basilisk
-        // II does the same after flagging dsDiskInPlace). The System reads the new
-        // volume through our .Sony Prime.
+        // A bare diskEvt does not mount anything. The ROM's disk-insert interrupt does
+        // two things: it _MountVols the drive, then posts a disk-inserted event carrying
+        // that result. Do the same -- _MountVol reads the newly inserted volume through
+        // our .Sony Prime and adds its VCB; the event tells the Finder to show the icon.
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        if (floppyMountPb_ == 0) {
+            cpu_.d[0] = 80;                              // a param block for _MountVol
+            execute68kTrap(kTrapNewPtrSysClear);
+            floppyMountPb_ = cpu_.a[0];
+        }
+        u16 mountRes = 0;
+        if (floppyMountPb_ != 0) {
+            write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
+            cpu_.a[0] = floppyMountPb_;
+            execute68kTrap(kTrapMountVol);              // _MountVol the internal drive
+            mountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+        }
         cpu_.d[0] = 7;                                   // diskEvt
-        cpu_.a[0] = static_cast<u32>(floppyDriveNum_);   // message = drive number
-        execute68kTrap(kTrapPostEvent);
-        const u16 postErr = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+        cpu_.a[0] = (static_cast<u32>(mountRes) << 16) | static_cast<u16>(floppyDriveNum_);
+        execute68kTrap(kTrapPostEvent);                  // hi word = mount result, lo = drive
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
         floppyInsertPending_ = false;
         if (onDiag) {
             char b[96];
-            std::snprintf(b, sizeof b,
-                "floppy: diskEvt posted (postErr=%04X) -> disk-switch should re-read", postErr);
+            std::snprintf(b, sizeof b, "floppy: _MountVol(drive %d) -> %04X, diskEvt posted",
+                          floppyDriveNum_, mountRes);
             onDiag(b);
         }
     }
