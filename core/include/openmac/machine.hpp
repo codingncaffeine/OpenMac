@@ -111,6 +111,10 @@ public:
     // ev is one of "state", "arm", "shiftOut", "shiftIn". Diagnostics only.
     std::function<void(const char* ev, int state, u32 value)> onAdbEvent;
 
+    // Rare, always-on diagnostics (disk insert/mount results, etc.) routed to the
+    // GUI log so a "swap didn't work" report has hard numbers behind it.
+    std::function<void(const char* msg)> onDiag;
+
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }
@@ -175,6 +179,9 @@ private:
     // runs _MountVol with the .Sony intercept consulted (see execute68kTrap).
     bool hdAutoMount_ = false;
     bool floppyInsertPending_ = false; // a floppy was swapped in after boot
+    u32 floppyMountPb_ = 0;            // lazily-allocated _MountVol param block
+    std::vector<u8> floppyPending_;    // staged swap image, applied next runFrame
+    bool floppyPendingRO_ = false;
 
     std::vector<u8> ram_;
     std::vector<u8> rom_;

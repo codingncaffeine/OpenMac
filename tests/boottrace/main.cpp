@@ -404,6 +404,7 @@ int main(int argc, char** argv) {
                 rom.size(), rom[0], rom[1], rom[2], rom[3], rom[8], rom[9]);
 
     Machine mac(std::move(rom), {ramMB * 1024u * 1024u});
+    mac.onDiag = [](const char* s) { std::printf("[diag] %s\n", s); };
     if (forceRom) mac.setForceRomDisk(true);
     if (!floppyPath.empty()) {
         std::ifstream ff(floppyPath, std::ios::binary);

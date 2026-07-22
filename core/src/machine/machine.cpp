@@ -34,6 +34,7 @@ constexpr u16 kTrapAddDrive = 0xA04E;
 constexpr u16 kTrapInsTime = 0xA058;
 constexpr u16 kTrapPostEvent = 0xA02F;
 constexpr u16 kTrapMountVol = 0xA00F;
+constexpr u16 kTrapEject = 0xA017;
 } // namespace
 
 Machine::Machine(std::vector<u8> rom, const Config& cfg)
@@ -397,16 +398,33 @@ int Machine::stepInstruction() {
 // encoding entirely (the same approach mature Mac emulators take).
 
 void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
+    if (drvStatusAddr_ != 0 && !image.empty()) {
+        // Post-boot swap. Stage the new image; runFrame ejects the OLD volume
+        // first (flushing to the disk still in floppy_), then swaps and mounts the
+        // new one. Doing the eject before replacing floppy_ is what makes the swap
+        // take -- otherwise the old volume stays on-line and _MountVol returns
+        // volOnLinErr and never reads the new disk.
+        floppyPending_ = std::move(image);
+        floppyPendingRO_ = readOnly;
+        floppyInsertPending_ = true;
+        if (onDiag) {
+            char b[128];
+            std::snprintf(b, sizeof b, "floppy: staged swap of %zu bytes (drvStatus=%06X)",
+                          floppyPending_.size(), drvStatusAddr_);
+            onDiag(b);
+        }
+        return;
+    }
+    // Pre-boot (or an empty image): take effect immediately. The .Sony driver's
+    // Open adds the drive later (drvStatusAddr_ == 0 until then).
     floppy_ = std::move(image);
     floppyRO_ = readOnly;
-    if (drvStatusAddr_ != 0) {
-        // Post-boot swap: the drive already exists. Mark a disk in place and queue
-        // a disk-inserted event (below) so the System -- or an installer waiting
-        // for the next disk -- notices and mounts the new floppy.
-        write8(drvStatusAddr_ + dsDiskInPlace, 1);
-        floppyInsertPending_ = true;
+    if (onDiag) {
+        char b[128];
+        std::snprintf(b, sizeof b, "floppy: inserted %zu bytes pre-boot (driver Open adds the drive)",
+                      floppy_.size());
+        onDiag(b);
     }
-    // else pre-boot: the .Sony driver's Open adds the drive (drvStatusAddr_ == 0).
 }
 
 void Machine::ejectFloppy() {
@@ -722,16 +740,59 @@ int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
 void Machine::runFrame() {
     ++frameCounter_;
 
-    // A floppy swapped in after boot: post a disk-inserted event so the System
-    // mounts the new disk (e.g. an installer's "please insert the next disk").
-    if (floppyInsertPending_ && !inSony_) {
+    // A floppy swapped in after boot. On real hardware the .Sony disk-inserted
+    // interrupt ejects/offlines the old volume, mounts the new one, then posts a
+    // disk-inserted event. We have no interrupt, so drive that sequence here:
+    // eject the old volume (its image is still in floppy_, so any flush lands on
+    // the right disk), swap the new image in, mount it, then post the event.
+    // Ejecting first is essential -- otherwise the old volume stays on-line and
+    // _MountVol returns volOnLinErr (-55) without ever reading the new disk.
+    if (floppyInsertPending_ && !inSony_ && drvStatusAddr_ != 0) {
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-        cpu_.d[0] = 7;                                  // diskEvt
-        cpu_.a[0] = static_cast<u32>(floppyDriveNum_);  // eventMsg = drive number
+
+        if (floppyMountPb_ == 0) {                       // one system-heap param block
+            cpu_.d[0] = 80;
+            execute68kTrap(kTrapNewPtrSysClear);
+            floppyMountPb_ = cpu_.a[0];
+        }
+        u16 ejectErr = 0xFFFF, mountErr = 0xFFFF;
+        if (floppyMountPb_ != 0) {
+            // 1. Eject/offline the volume currently on the drive, flushing to the
+            //    OLD disk (still in floppy_).
+            write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
+            cpu_.a[0] = floppyMountPb_;
+            execute68kTrap(kTrapEject);
+            ejectErr = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+            // 2. Physically swap the new disk in.
+            floppy_ = std::move(floppyPending_);
+            floppyRO_ = floppyPendingRO_;
+            floppyPending_.clear();
+            write8(drvStatusAddr_ + dsDiskInPlace, 1);
+            // 3. Mount the new volume (the drive is free now).
+            write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
+            cpu_.a[0] = floppyMountPb_;
+            execute68kTrap(kTrapMountVol);
+            mountErr = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+        }
+        // 4. Post the disk-inserted event: message = (mountResult << 16) | driveNum.
+        //    volOnLinErr (-55 / 0xFFC9) = already on-line -> report success (0).
+        const u16 evtHi = (mountErr == 0xFFC9) ? 0 : mountErr;
+        cpu_.d[0] = 7;                                   // diskEvt
+        cpu_.a[0] = (static_cast<u32>(evtHi) << 16) |
+                    (static_cast<u32>(floppyDriveNum_) & 0xFFFFu);
         execute68kTrap(kTrapPostEvent);
+        const u16 postErr = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
         floppyInsertPending_ = false;
+        if (onDiag) {
+            char b[160];
+            std::snprintf(b, sizeof b,
+                "floppy: swap drive %d -> ejectErr=%04X mountErr=%04X postErr=%04X",
+                floppyDriveNum_, ejectErr, mountErr, postErr);
+            onDiag(b);
+        }
     }
 
     // Mount the hard-disk volume once the System's file system is actually ready.

@@ -25,7 +25,10 @@ struct OMac {
     std::vector<u8> audioBuf;          // drained by omac_drain_audio
 
     OMac(std::vector<u8> rom, uint32_t ramMB)
-        : mac(std::move(rom), openmac::Machine::Config{ramMB * 1024u * 1024u}) {}
+        : mac(std::move(rom), openmac::Machine::Config{ramMB * 1024u * 1024u}) {
+        // Always-on, low-volume diagnostics (disk insert/mount) -> the GUI log.
+        mac.onDiag = [this](const char* s) { log(s); };
+    }
 
     void log(const char* s) {
         if (logFn) logFn(logUser, s);                 // legacy direct callback
