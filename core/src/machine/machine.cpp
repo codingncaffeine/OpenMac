@@ -3,6 +3,7 @@
 #include "adb.hpp"
 #include "rtc.hpp"
 #include "scsi.hpp"
+#include "scsiimage.hpp"
 #include "via.hpp"
 
 #include <cstdio>
@@ -491,10 +492,12 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hd_ = std::move(image);
     hdRO_ = readOnly;
     hdStatusAddr_ = 0;   // re-added to the drive queue on the next driver Open
-    // Present the same image on the SCSI bus as target ID 0 (the standard internal
-    // drive). During the transition the .Sony shim still does the real mounting; the
-    // SCSI target lets the ROM's bus scan see and read the disk.
-    scsi_->disk.attach(&hd_, 0);
+    // Present the volume on the SCSI bus (target ID 0) wrapped in an Apple partition
+    // structure -- Driver Descriptor Map + Apple Partition Map + a driver partition --
+    // so the ROM's boot scan can read a real map and driver from it. The .Sony shim
+    // still does the actual mounting during the transition.
+    scsiImage_ = scsi::buildAppleScsiDisk(hd_, /*driver*/ {});
+    scsi_->disk.attach(&scsiImage_, 0);
     scsi_->disk.readOnly = readOnly;
 }
 

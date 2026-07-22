@@ -180,6 +180,7 @@ private:
     bool inSony_ = false;          // re-entrancy guard during trap execution
 
     std::vector<u8> hd_;           // hard-disk image (empty = none)
+    std::vector<u8> scsiImage_;    // hd_ wrapped in an Apple partition structure for the SCSI bus
     bool hdRO_ = false;
     u32 hdStatusAddr_ = 0;         // DrvSts record for the hard disk
     int hdDriveNum_ = 0;
