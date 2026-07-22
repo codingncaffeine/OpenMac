@@ -17,6 +17,7 @@ namespace openmac {
 class Via6522;
 class Rtc;
 class AdbTransceiver;
+class Ncr5380;
 
 class Machine final : public IBus {
 public:
@@ -198,6 +199,7 @@ private:
     std::unique_ptr<Via6522> via_;
     std::unique_ptr<Rtc> rtc_;
     std::unique_ptr<AdbTransceiver> adb_;
+    std::unique_ptr<Ncr5380> scsi_;
     M68000 cpu_;
 
     // The CPU arms a shift; the transceiver clocks it only in an active

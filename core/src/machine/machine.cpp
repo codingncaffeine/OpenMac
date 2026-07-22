@@ -2,6 +2,7 @@
 
 #include "adb.hpp"
 #include "rtc.hpp"
+#include "scsi.hpp"
 #include "via.hpp"
 
 #include <cstdio>
@@ -44,6 +45,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
       via_(std::make_unique<Via6522>()),
       rtc_(std::make_unique<Rtc>()),
       adb_(std::make_unique<AdbTransceiver>()),
+      scsi_(std::make_unique<Ncr5380>()),
       cpu_(*this) {
     ramMask_ = cfg.ramSize - 1;
     // ROM sizes are powers of two (Classic: 512K); mirror across its window.
@@ -158,6 +160,7 @@ void Machine::reset() {
     via_->reset();
     rtc_->reset();
     adb_->reset();
+    scsi_->reset();
     adbPending_ = 0;
     cpu_.reset();
     lineTarget_ = 0;
@@ -263,9 +266,10 @@ u8 Machine::read8(u32 addr) {
         return ram_[addr & ramMask_];
     }
     if (addr < 0x580000) return rom_[addr & romMask_];
-    if (addr < 0x600000) {          // NCR 5380 SCSI (P4)
-        logAccess("SCSI", addr, false, 0);
-        return 0;
+    if (addr < 0x600000) {          // NCR 5380 SCSI: read bank (even address)
+        const u8 v = scsi_->read((addr >> 4) & 7);
+        logAccess("SCSI", addr, false, v);
+        return v;
     }
     if (addr < 0x800000) {          // RAM alias while the overlay is up
         if (overlay_) return ram_[addr & ramMask_];
@@ -304,7 +308,8 @@ void Machine::write8(u32 addr, u8 value) {
         logAccess("ROMW", addr, true, value);
         return;
     }
-    if (addr < 0x600000) {
+    if (addr < 0x600000) {          // NCR 5380 SCSI: write bank (odd address)
+        scsi_->write((addr >> 4) & 7, value);
         logAccess("SCSI", addr, true, value);
         return;
     }
