@@ -161,11 +161,36 @@ OMAC_API void omac_debug_enable(OMac* m, uint32_t flags)
             if (vec != 2 && vec != 3 && vec != 4 && vec != 8 && vec != 11) return;
             static const char* kNames[] = {"reset", "", "bus", "addr", "illegal"};
             const char* nm = (vec >= 0 && vec <= 4) ? kNames[vec] : "exc";
-            char regs[400], b[560];
-            formatRegs(self->mac.cpu(), regs, sizeof regs);
-            std::snprintf(b, sizeof b, "EXC vec=%d (%s) @ %06X cyc=%llu\n%s",
+            auto& mac = self->mac;
+            char regs[400];
+            formatRegs(mac.cpu(), regs, sizeof regs);
+            // The faulting instruction plus a short A6 frame-chain backtrace, so the log
+            // alone locates a crash's cause -- e.g. who called in with the bad pointer --
+            // without having to reproduce it.
+            std::string ins;
+            openmac::dbg::disasm(mac, pc, ins);
+            auto r32 = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
+            char bt[240];
+            int n = std::snprintf(bt, sizeof bt, "  bt");
+            u32 fp = mac.cpu().a[6];
+            for (int i = 0; i < 10 && fp >= 0x100 && fp < 0x00400000 && !(fp & 1); ++i) {
+                n += std::snprintf(bt + n, (n < (int)sizeof bt) ? sizeof bt - n : 0,
+                                   " %06X", r32(fp + 4) & 0xFFFFFF);
+                const u32 nf = r32(fp);
+                if (nf <= fp || nf >= 0x00400000 || (nf & 1)) break;   // must climb + stay even
+                fp = nf;
+            }
+            // The last instructions executed before the fault -- the path into it.
+            char tr[280];
+            int tn = std::snprintf(tr, sizeof tr, "  trail");
+            for (int i = 23; i >= 0 && tn < (int)sizeof tr; --i)
+                tn += std::snprintf(tr + tn, sizeof tr - tn, " %06X",
+                                    mac.cpu().recentPc(i) & 0xFFFFFF);
+            char b[1400];
+            std::snprintf(b, sizeof b, "EXC vec=%d (%s) @ %06X cyc=%llu  [%s]\n%s\n%s\n%s",
                           vec, nm, pc,
-                          static_cast<unsigned long long>(self->mac.totalCycles()), regs);
+                          static_cast<unsigned long long>(mac.totalCycles()),
+                          ins.c_str(), regs, bt, tr);
             self->log(b);
         };
     else
