@@ -38,6 +38,7 @@ public sealed class NativeEmulator : IEmulator
 
     public void LoadRom(string path, int ramMB, bool bootRomDisk)
     {
+        WriteBackHardDisk();   // persist the current disk's guest writes before teardown
         Destroy();
         byte[] rom = File.ReadAllBytes(path);
         _h = Native.omac_create(rom, (nuint)rom.Length, (uint)ramMB);
@@ -117,6 +118,7 @@ public sealed class NativeEmulator : IEmulator
     public void AttachHardDisk(string path)
     {
         if (_h == IntPtr.Zero) return;
+        WriteBackHardDisk();   // persist a previously-attached disk before switching
         byte[] img = File.ReadAllBytes(path);
         Native.omac_insert_harddisk(_h, img, (nuint)img.Length, 0);
         HardDiskPath = path;

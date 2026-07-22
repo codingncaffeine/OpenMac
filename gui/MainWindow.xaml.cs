@@ -276,7 +276,13 @@ public partial class MainWindow : Window
         }
     }
 
-    private void Reset_Click(object sender, RoutedEventArgs e) => _emulator.Reset();
+    private void Reset_Click(object sender, RoutedEventArgs e)
+    {
+        // Full restart: reload the ROM so the SCSI bus is re-scanned and any hard disk
+        // re-mounts (a warm reset leaves the prior boot's mount state behind).
+        if (_emulator.RomPath is { } rom) LoadRom(rom);
+        else _emulator.Reset();
+    }
 
     private void Memory_Click(object sender, RoutedEventArgs e)
     {
@@ -344,6 +350,17 @@ public partial class MainWindow : Window
         _settings.LastHardDisk = path;
         _settings.Save();
         UpdateUi();
+        // SCSI disks are found only during the ROM's boot scan, so one attached to a
+        // running Mac won't appear until it restarts. Offer to restart now; LoadRom
+        // re-attaches the disk (and any floppy) before the scan so it mounts.
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom)
+        {
+            var r = MessageBox.Show(this,
+                "The Mac scans the SCSI bus only at startup, so a newly attached hard " +
+                "disk isn't visible until it restarts.\n\nRestart now to use it?",
+                "Attach Hard Disk", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (r == MessageBoxResult.Yes) LoadRom(rom);
+        }
     }
 
     private void DetachHardDisk_Click(object sender, RoutedEventArgs e)
