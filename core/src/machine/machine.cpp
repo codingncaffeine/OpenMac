@@ -15,7 +15,7 @@ constexpr size_t kMaxLogEntries = 400;
 // Device Manager / Sony disk driver structure offsets and result codes
 // (Inside Macintosh: Devices / Files). Used by the replacement .Sony driver.
 enum {
-    ioTrap = 6, ioResult = 16, ioVRefNum = 22, ioBuffer = 32,
+    ioTrap = 6, ioResult = 16, ioNamePtr = 18, ioVRefNum = 22, ioPermssn = 27, ioBuffer = 32,
     ioReqCount = 36, ioActCount = 40, ioPosOffset = 46,
     dCtlPosition = 16, dCtlQHdr = 6,
     dsWriteProt = 2, dsDiskInPlace = 3, dsInstalled = 4, dsSides = 5,
@@ -35,6 +35,7 @@ constexpr u16 kTrapInsTime = 0xA058;
 constexpr u16 kTrapPostEvent = 0xA02F;
 constexpr u16 kTrapMountVol = 0xA00F;
 constexpr u16 kTrapEject = 0xA017;
+constexpr u16 kTrapOpen = 0xA000;
 } // namespace
 
 Machine::Machine(std::vector<u8> rom, const Config& cfg)
@@ -94,7 +95,23 @@ void Machine::wireVia() {
         logAccess(what, 0, false, v);   // RTC wire bytes, addr not meaningful
     };
     // Undriven port lines float high; PA0 low would mean a factory test jig.
-    via_->inA = [] { return u8(0xFF); };
+    //
+    // PA3 is the Mac Classic's "boot the built-in ROM disk" sense line. The
+    // startup code at ROM $43F770 makes PA3 an input (BCLR #3,DDRA) and, when it
+    // reads LOW, stores $0B into low-memory $0CB3. That flag gates the entire
+    // internal-EDisk open/boot path -- the decision point at $43F82A is
+    // `CMPI.B #$0B,$0CB3; BNE skip`. With PA3 floating high the flag stays $FF,
+    // so the ROM never opens the .EDisk driver (DRVR id 51), the drive queue is
+    // left empty, and the machine lands on the flashing-? screen. Pull PA3 low
+    // when the ROM disk is explicitly forced, or while the documented
+    // Cmd-Opt-X-O startup combo is held, and the ROM boots System 6.0.3 from ROM
+    // through its own driver (which scans the ROM window at $43E256 for the
+    // "EDisk" signature and serves reads straight out of ROM).
+    via_->inA = [this] {
+        u8 v = 0xFF;
+        if (forceRomDisk_ || romDiskComboHeld()) v = static_cast<u8>(v & ~0x08u);  // PA3 = 0
+        return v;
+    };
     via_->inB = [this] {
         u8 v = 0xFF;
         if (!rtc_->dataOut()) v = static_cast<u8>(v & ~0x01);
@@ -158,6 +175,11 @@ void Machine::keyEvent(u8 adbCode, bool down) {
 
 bool Machine::keyHeld(u8 adbCode) const {
     return adb_->keyHeld(adbCode);
+}
+
+bool Machine::romDiskComboHeld() const {
+    return adb_->keyHeld(adbkey::kCommand) && adb_->keyHeld(adbkey::kOption) &&
+           adb_->keyHeld(adbkey::kX)       && adb_->keyHeld(adbkey::kO);
 }
 
 u8 Machine::adbLastCommand() const {
@@ -399,18 +421,18 @@ int Machine::stepInstruction() {
 
 void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
     if (drvStatusAddr_ != 0 && !image.empty()) {
-        // Post-boot swap. Stage the new image; runFrame ejects the OLD volume
-        // first (flushing to the disk still in floppy_), then swaps and mounts the
-        // new one. Doing the eject before replacing floppy_ is what makes the swap
-        // take -- otherwise the old volume stays on-line and _MountVol returns
-        // volOnLinErr and never reads the new disk.
-        floppyPending_ = std::move(image);
-        floppyPendingRO_ = readOnly;
+        // Post-boot swap. The installer has already ejected the old disk (its own
+        // csCode-7 eject cleared dsDiskInPlace). Drop the new image in, flag the
+        // disk present, and post a disk-inserted event next frame so the disk-
+        // switch re-reads it through our .Sony Prime.
+        floppy_ = std::move(image);
+        floppyRO_ = readOnly;
+        write8(drvStatusAddr_ + dsDiskInPlace, 1);      // flag: disk present
         floppyInsertPending_ = true;
         if (onDiag) {
             char b[128];
-            std::snprintf(b, sizeof b, "floppy: staged swap of %zu bytes (drvStatus=%06X)",
-                          floppyPending_.size(), drvStatusAddr_);
+            std::snprintf(b, sizeof b, "floppy: inserted %zu bytes (drvStatus=%06X), disk present",
+                          floppy_.size(), drvStatusAddr_);
             onDiag(b);
         }
         return;
@@ -484,7 +506,15 @@ u8 Machine::iwmStatus() {
                     (sel ? 1 : 0);
     bool high = false;   // active-low lines: false (0) = asserted
     switch (idx) {
-        case 0x1: high = floppy_.empty(); break;   // CSTIN: 0 = disk in place
+        case 0x1:
+            high = floppy_.empty();   // CSTIN: 0 = disk in place
+            if (cstinLogBudget_ > 0 && onDiag) {
+                --cstinLogBudget_;
+                char b[64];
+                std::snprintf(b, sizeof b, "CSTIN poll: %s", high ? "no-disk" : "disk-in");
+                onDiag(b);
+            }
+            break;
         case 0x3: high = !floppyRO_;      break;   // WRPROT: 0 = protected
         case 0x5: high = false;           break;   // TK0: 0 = on track 0
         case 0xE: high = false;           break;   // INSTALLED: 0 = drive present
@@ -527,6 +557,20 @@ bool Machine::trySonyTrap() {
 
     inSony_ = true;
     const u32 pb = cpu_.a[0], dce = cpu_.a[1];
+    if (sonyLogBudget_ > 0 && onDiag) {
+        --sonyLogBudget_;
+        const char* nm = fn == &Machine::sonyOpen ? "Open" :
+                         fn == &Machine::sonyPrime ? "Prime" :
+                         fn == &Machine::sonyControl ? "Ctrl" : "Status";
+        const s16 drive = pb ? static_cast<s16>(read16(pb + ioVRefNum)) : 0;
+        const u16 code = pb ? read16(pb + csCode) : 0;       // csCode for Ctrl/Status
+        const u8 dip = drvStatusAddr_ ? read8(drvStatusAddr_ + dsDiskInPlace) : 0xFF;
+        char b[128];
+        std::snprintf(b, sizeof b, "sony %-6s drive=%d csCode=%u dsDiskInPlace=%u",
+                      nm, static_cast<int>(drive), static_cast<unsigned>(code),
+                      static_cast<unsigned>(dip));
+        onDiag(b);
+    }
     const int result = (this->*fn)(pb, dce);
     cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
 
@@ -585,11 +629,21 @@ int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
     // Queue version must be >= 3 or System 8 replaces the driver.
     write16(dce + dCtlQHdr, static_cast<u16>((read16(dce + dCtlQHdr) & 0xFF00) | 3));
     write32(0x134, 0xDEADBEEF);   // fake SonyVars pointer
+    installSonyDrives();
+    return kNoErr;
+}
+
+// Register the floppy (drive 2) and, if present, the hard disk (drive 3) in the
+// drive queue. Reached through sonyOpen when the System opens the .Sony driver;
+// also called directly for boot paths that never open it (ROM-disk boot with no
+// floppy), where the ROM driver is pre-marked open so its Open routine never runs.
+void Machine::installSonyDrives() {
+    if (drvStatusAddr_ != 0) return;   // already installed
 
     // Allocate the drive-status record from the system heap.
     cpu_.d[0] = SIZEOF_DrvSts;
     execute68kTrap(kTrapNewPtrSysClear);
-    if (cpu_.a[0] == 0) return -108;   // memFullErr
+    if (cpu_.a[0] == 0) return;
     drvStatusAddr_ = cpu_.a[0];
 
     write16(drvStatusAddr_ + dsQType, static_cast<u16>(kSonyType));
@@ -600,7 +654,7 @@ int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
     write8(drvStatusAddr_ + dsMFMDrive, 0xFF);    // SuperDrive
     write8(drvStatusAddr_ + dsMFMDisk, 0xFF);     // MFM disk
     write8(drvStatusAddr_ + dsTwoMegFmt, 0xFF);   // 1.44MB
-    write8(drvStatusAddr_ + dsDiskInPlace, 1);    // removable disk inserted
+    write8(drvStatusAddr_ + dsDiskInPlace, floppy_.empty() ? 0 : 1);
     write8(drvStatusAddr_ + dsWriteProt, floppyRO_ ? 0xFF : 0);
 
     // Add to the drive queue: D0 = (driveNum << 16) | refNum, A0 = &dsQLink.
@@ -656,7 +710,6 @@ int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
             hdAutoMount_ = true;   // HD configured; allow the auto-mount trigger
         }
     }
-    return kNoErr;
 }
 
 int Machine::sonyPrime(u32 pb, u32 dce) {
@@ -709,6 +762,9 @@ int Machine::sonyControl(u32 pb, u32 /*dce*/) {
             return kControlErr;
         case 7:    // eject
             if (drvStatusAddr_) write8(drvStatusAddr_ + dsDiskInPlace, 0);
+            sonyLogBudget_ = 600;   // trace the disk-switch wait that follows an eject
+            cstinLogBudget_ = 200;
+            if (onDiag) onDiag("sony: eject (csCode 7) -> disk-switch wait begins");
             return kNoErr;
         default:   // verify / format / tag buffer / track cache: accept
             return kNoErr;
@@ -740,57 +796,97 @@ int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
 void Machine::runFrame() {
     ++frameCounter_;
 
-    // A floppy swapped in after boot. On real hardware the .Sony disk-inserted
-    // interrupt ejects/offlines the old volume, mounts the new one, then posts a
-    // disk-inserted event. We have no interrupt, so drive that sequence here:
-    // eject the old volume (its image is still in floppy_, so any flush lands on
-    // the right disk), swap the new image in, mount it, then post the event.
-    // Ejecting first is essential -- otherwise the old volume stays on-line and
-    // _MountVol returns volOnLinErr (-55) without ever reading the new disk.
+    // Force the built-in ROM disk (EDisk) to boot. The ROM boots System 6 from
+    // ROM only when TWO conditions hold at its startup boot-device check ($43F8E6):
+    //   1. low-mem $0CB3 == $0B  -- gated on VIA PA3 reading low (see wireVia); and
+    //   2. the KeyMap at $0174 exactly matches the Cmd-Opt-X-O bit pattern.
+    // wireVia drives PA3 low when the ROM disk is forced/the combo is held; here we
+    // also hold the Cmd-Opt-X-O pattern in the KeyMap through the check. We start
+    // only once $0CB3 has latched to $0B (which happens right after the RAM test, so
+    // the RAM test's use of low memory is never disturbed) and stop as soon as a
+    // boot device is chosen (BootDrive $0210 leaves $FFFF), so the combo is gone
+    // before the Finder loads and is never mistaken for a "rebuild desktop" request.
+    if ((forceRomDisk_ || romDiskComboHeld()) && read8(0x0CB3) == 0x0B) {
+        if (read16(0x0210) == 0xFFFF) {   // no boot device chosen yet: hold the combo
+            static const u8 kCmdOptXO[16] = {
+                0x80, 0x00, 0x00, 0x80,  0x00, 0x00, 0x80, 0x04,
+                0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00};
+            for (int i = 0; i < 16; ++i)
+                write8(0x0174 + static_cast<u32>(i), kCmdOptXO[i]);
+            romDiskKeymapHeld_ = true;
+        } else if (romDiskKeymapHeld_) {
+            // The boot device is chosen and the ROM has latched the combo. Release
+            // it (clear the KeyMap) once, as a real key-up would -- otherwise the
+            // still-"held" Cmd-Opt is read by the loading Finder as "rebuild the
+            // desktop". (The real-key path clears $0174 itself on key-up.)
+            for (int i = 0; i < 16; ++i) write8(0x0174 + static_cast<u32>(i), 0);
+            romDiskKeymapHeld_ = false;
+        }
+    }
+
+    // A floppy swapped in after boot. The ROM notices a disk change through the
+    // drive's disk-in-place sense line (IWM CSTIN) + the DrvSts flag, which it
+    // polls -- it has to see the disk leave and return. insertFloppy reports the
+    // drive empty for a short window (floppyEjectSense_); here we count it down,
+    // then drop the new image in and flag the disk present so the ROM runs its OWN
+    // disk-inserted path (offline the old volume, mount the new one via our .Sony
+    // Prime -- the same path the boot floppy took). Mounting it ourselves or
+    // posting a bare diskEvt did not satisfy the "please insert the disk" modal.
     if (floppyInsertPending_ && !inSony_ && drvStatusAddr_ != 0) {
+        // Trigger the disk-switch to re-read: post a disk-inserted event (Basilisk
+        // II does the same after flagging dsDiskInPlace). The System reads the new
+        // volume through our .Sony Prime.
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-
-        if (floppyMountPb_ == 0) {                       // one system-heap param block
-            cpu_.d[0] = 80;
-            execute68kTrap(kTrapNewPtrSysClear);
-            floppyMountPb_ = cpu_.a[0];
-        }
-        u16 ejectErr = 0xFFFF, mountErr = 0xFFFF;
-        if (floppyMountPb_ != 0) {
-            // 1. Eject/offline the volume currently on the drive, flushing to the
-            //    OLD disk (still in floppy_).
-            write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
-            cpu_.a[0] = floppyMountPb_;
-            execute68kTrap(kTrapEject);
-            ejectErr = static_cast<u16>(cpu_.d[0] & 0xFFFF);
-            // 2. Physically swap the new disk in.
-            floppy_ = std::move(floppyPending_);
-            floppyRO_ = floppyPendingRO_;
-            floppyPending_.clear();
-            write8(drvStatusAddr_ + dsDiskInPlace, 1);
-            // 3. Mount the new volume (the drive is free now).
-            write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
-            cpu_.a[0] = floppyMountPb_;
-            execute68kTrap(kTrapMountVol);
-            mountErr = static_cast<u16>(cpu_.d[0] & 0xFFFF);
-        }
-        // 4. Post the disk-inserted event: message = (mountResult << 16) | driveNum.
-        //    volOnLinErr (-55 / 0xFFC9) = already on-line -> report success (0).
-        const u16 evtHi = (mountErr == 0xFFC9) ? 0 : mountErr;
         cpu_.d[0] = 7;                                   // diskEvt
-        cpu_.a[0] = (static_cast<u32>(evtHi) << 16) |
-                    (static_cast<u32>(floppyDriveNum_) & 0xFFFFu);
+        cpu_.a[0] = static_cast<u32>(floppyDriveNum_);   // message = drive number
         execute68kTrap(kTrapPostEvent);
         const u16 postErr = static_cast<u16>(cpu_.d[0] & 0xFFFF);
-
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
         floppyInsertPending_ = false;
         if (onDiag) {
-            char b[160];
+            char b[96];
             std::snprintf(b, sizeof b,
-                "floppy: swap drive %d -> ejectErr=%04X mountErr=%04X postErr=%04X",
-                floppyDriveNum_, ejectErr, mountErr, postErr);
+                "floppy: diskEvt posted (postErr=%04X) -> disk-switch should re-read", postErr);
+            onDiag(b);
+        }
+    }
+
+    // Under ROM-disk boot with no floppy, the System never opens the .Sony driver
+    // itself, so sonyOpen (which registers the hard disk) never runs and an attached
+    // HD won't appear. Force .Sony open once the Device Manager is up, so the HD is
+    // added exactly as a floppy insertion would have. Only fires while .Sony is NOT
+    // already open (drvStatusAddr_ == 0), so it never runs under a floppy boot.
+    if (!hd_.empty() && drvStatusAddr_ == 0 && sonyOpenPc_ != 0 && !inSony_ &&
+        frameCounter_ > 1600 && (frameCounter_ % 60) == 0 &&
+        read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        if (sonyForceOpenPb_ == 0) {
+            cpu_.d[0] = 96;
+            execute68kTrap(kTrapNewPtrSysClear);
+            sonyForceOpenPb_ = cpu_.a[0];
+            if (sonyForceOpenPb_ != 0) {
+                static const u8 nm[6] = {0x05, '.', 'S', 'o', 'n', 'y'};
+                for (int i = 0; i < 6; ++i) write8(sonyForceOpenPb_ + 64 + i, nm[i]);
+            }
+        }
+        if (sonyForceOpenPb_ != 0) {
+            write32(sonyForceOpenPb_ + ioNamePtr, sonyForceOpenPb_ + 64);
+            write8(sonyForceOpenPb_ + ioPermssn, 0);
+            cpu_.a[0] = sonyForceOpenPb_;
+            execute68kTrap(kTrapOpen);   // ensure the .Sony DCE exists (the alias target)
+        }
+        // The ROM driver is pre-open so _Open never ran our sonyOpen; register the
+        // drives directly against the now-valid .Sony unit-table slot.
+        inSony_ = true;
+        installSonyDrives();
+        inSony_ = false;
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        if (onDiag) {
+            char b[96];
+            std::snprintf(b, sizeof b, "hd: ROM-boot drive install -> drvStatus=%06X hdDrive=%d",
+                          drvStatusAddr_, hdDriveNum_);
             onDiag(b);
         }
     }

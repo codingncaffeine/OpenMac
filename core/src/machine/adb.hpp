@@ -119,12 +119,16 @@ public:
             // startup, so len_ was always 0 and this branch never ran.
             return buf_[idx_++];
         }
-        // No (more) data for the polled device. Assert SRQ (/INT low) when the
-        // keyboard has data pending and it wasn't the device just polled, so the
-        // ROM's ADB manager does a poll-all and reaches the keyboard (addr 2) --
-        // otherwise it forever polls only the active device (the mouse).
+        // No (more) data for the polled device. Assert SRQ (/INT low) when a device
+        // that ISN'T the one just polled has data pending, so the ROM's ADB manager
+        // does a poll-all and reaches it. Needed for BOTH devices: the ROM-boot
+        // System 6.0.3 autopolls the keyboard (addr 2), so without a mouse SRQ the
+        // mouse (addr 3) never gets a turn and the cursor won't move; the floppy
+        // System 6.0.8 autopolls the mouse, so the keyboard needs the same.
         const int polled = (cmd_ >> 4) & 0xF;
-        int_ = !(polled != kbdAddr_ && kbdHead_ != kbdTail_);
+        const bool kbdWants   = polled != kbdAddr_   && kbdHead_ != kbdTail_;
+        const bool mouseWants = polled != mouseAddr_ && mousePending_;
+        int_ = !(kbdWants || mouseWants);
         return 0xFF;
     }
 

@@ -290,6 +290,8 @@ public partial class MainWindow : Window
     {
         _settings.BootRomDisk = !_settings.BootRomDisk;
         _settings.Save();
+        // Reboot immediately so the toggle takes effect now (mirrors the RAM menu).
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
         UpdateUi();
     }
 

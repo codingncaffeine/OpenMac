@@ -43,6 +43,9 @@ public sealed class NativeEmulator : IEmulator
         _h = Native.omac_create(rom, (nuint)rom.Length, (uint)ramMB);
         if (_h == IntPtr.Zero)
             throw new InvalidOperationException("core failed to initialize (bad ROM or size?)");
+        // Boot the built-in ROM disk (System 6.0.3 from ROM) instead of an inserted
+        // disk -- the emulated equivalent of holding Cmd-Opt-X-O at power-on.
+        if (bootRomDisk) Native.omac_set_force_rom_disk(_h, 1);
         RomPath = path;
         FloppyPath = null;
         HardDiskAttached = false;

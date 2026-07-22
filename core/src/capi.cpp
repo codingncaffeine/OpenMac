@@ -65,6 +65,7 @@ OMAC_API OMac* omac_create(const uint8_t* rom, size_t rom_len, uint32_t ram_mb)
 
 OMAC_API void omac_destroy(OMac* m) { delete m; }
 OMAC_API void omac_reset(OMac* m) { if (m) m->mac.reset(); }
+OMAC_API void omac_set_force_rom_disk(OMac* m, int on) { if (m) m->mac.setForceRomDisk(on != 0); }
 OMAC_API void omac_run_frame(OMac* m) { if (m) m->mac.runFrame(); }
 OMAC_API void omac_render(OMac* m, uint32_t* argb) { if (m && argb) m->mac.renderScreen(argb); }
 

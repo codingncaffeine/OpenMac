@@ -144,6 +144,7 @@ private:
     u32 findSonyDriver();          // ROM address of the .Sony DRVR, or 0
     bool trySonyTrap();            // dispatch if the PC is a driver routine
     int sonyOpen(u32 pb, u32 dce);
+    void installSonyDrives();      // register floppy + HD drives (also used under ROM boot)
     int sonyPrime(u32 pb, u32 dce);
     int sonyControl(u32 pb, u32 dce);
     int sonyStatus(u32 pb, u32 dce);
@@ -172,6 +173,7 @@ private:
     int hdDriveNum_ = 0;
     u32 hdReads_ = 0, hdWrites_ = 0;   // block-I/O counters (feasibility probe)
     u32 hdMountPb_ = 0;                // system-heap param block for _MountVol
+    u32 sonyForceOpenPb_ = 0;         // PB to force-open .Sony under ROM boot (adds the HD)
     u32 diskEvtPosts_ = 0;             // mount attempts
     u32 diskEvtResult_ = 0xFFFFFFFFu;  // last _MountVol OSErr
     bool hdMounted_ = false;           // volume mounted OK; stop retrying
@@ -182,6 +184,9 @@ private:
     u32 floppyMountPb_ = 0;            // lazily-allocated _MountVol param block
     std::vector<u8> floppyPending_;    // staged swap image, applied next runFrame
     bool floppyPendingRO_ = false;
+    int sonyLogBudget_ = 0;            // trace the next N .Sony driver calls after a swap
+    int floppyEjectSense_ = 0;         // frames to report "no disk" so the ROM sees a swap edge
+    int cstinLogBudget_ = 0;           // trace the next N disk-in-place sense reads after a swap
 
     std::vector<u8> ram_;
     std::vector<u8> rom_;
@@ -211,9 +216,16 @@ private:
 
     void adbMaybeClock();
 
+    // True while all four Cmd-Opt-X-O startup keys are physically held: the
+    // Mac Classic's request to boot the built-in ROM disk. Used (with the
+    // force flag) to drive VIA PA3 low and hold the KeyMap combo through the
+    // ROM's boot-device check.
+    bool romDiskComboHeld() const;
+
     u64 totalCycles_ = 0;
     u64 frameCounter_ = 0;
     bool forceRomDisk_ = false;
+    bool romDiskKeymapHeld_ = false;   // force path is holding Cmd-Opt-X-O in $0174
     u32 keyMapReads_ = 0;
     u32 keyMapReadPc_ = 0;
     u32 keyMapPcs_[12]{};

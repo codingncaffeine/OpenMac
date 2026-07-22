@@ -23,6 +23,9 @@ internal static class Native
     public static extern void omac_reset(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_set_force_rom_disk(IntPtr h, int on);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_run_frame(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

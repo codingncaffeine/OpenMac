@@ -31,6 +31,10 @@ OMAC_API OMac* omac_create(const uint8_t* rom, size_t rom_len, uint32_t ram_mb);
 OMAC_API void  omac_destroy(OMac*);
 OMAC_API void  omac_reset(OMac*);
 
+/* Force the built-in ROM disk (System 6.0.3 from ROM -- the Cmd-Opt-X-O boot)
+   as the boot device. Set before the first omac_run_frame. */
+OMAC_API void  omac_set_force_rom_disk(OMac*, int on);
+
 /* ---- run / video ---- */
 OMAC_API void omac_run_frame(OMac*);
 /* Fill argb with OMAC_SCREEN_W*OMAC_SCREEN_H pixels (0xAARRGGBB). */

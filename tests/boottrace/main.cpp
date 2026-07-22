@@ -620,8 +620,11 @@ int main(int argc, char** argv) {
         // Reproduce the shell hang: a burst of mouse motion early in boot (while
         // the ROM is still in its boot-time ADB idle-wait), then stop, and check
         // the boot recovers to the desktop instead of wedging at $00BB0A.
+        u32 deskBaseReports = 0;
         for (int i = 0; i < frames && !mac.cpu().halted; ++i) {
             if (i >= 200 && i < 340 && (i & 3) == 0) mac.mouseMove(3, 2, false);
+            if (i == frames - 200) deskBaseReports = mac.adbStats().mouseReports;
+            if (i >= frames - 180 && i < frames - 30 && (i & 3) == 0) mac.mouseMove(4, 3, false);
             mac.runFrame();
             if (i % 400 == 0) {
                 const auto s = mac.adbStats();
@@ -629,6 +632,8 @@ int main(int argc, char** argv) {
                             i, mac.cpu().pc, s.kbdPolls, s.mousePolls, s.mouseReports);
             }
         }
+        std::printf("DESKTOP mouse: reports in last ~150 frames = %u\n",
+                    mac.adbStats().mouseReports - deskBaseReports);
         if (!dumpPath.empty()) dumpBmp(mac, dumpPath);
         // If we wedged in low RAM, single-step the spin loop and dump it so we
         // can see exactly which condition the ROM is stuck waiting on.
@@ -658,22 +663,29 @@ int main(int argc, char** argv) {
     }
 
     if (!swapFloppyPath.empty()) {
-        // Boot, then eject + insert a different floppy after the desktop is up and
-        // see whether the System notices (a new VCB) -- i.e. does a swap work?
-        for (int i = 0; i < 2000 && !mac.cpu().halted; ++i) mac.runFrame();
+        // Boot to the INTERACTIVE Finder, then swap a different floppy in and see
+        // whether the System mounts it (a new VCB). Without mouse input the boot
+        // stalls at a mouse-wait spin ($401606) that never reaches the event loop,
+        // so nudge the mouse early (like --boot-nudge) to bring the Finder up, and
+        // keep nudging afterwards so it services the disk change.
         auto vcbq = [&](const char* when) {
             auto rd32 = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
             std::printf("VCBQHdr %-7s head=%06X tail=%06X\n", when, rd32(0x358), rd32(0x35C));
         };
+        for (int i = 0; i < 2500 && !mac.cpu().halted; ++i) {
+            if (i >= 200 && i < 340 && (i & 3) == 0) mac.mouseMove(3, 2, false);
+            mac.runFrame();
+        }
         vcbq("before");
-        // Note: don't eject here -- ejecting the boot floppy the System runs from
-        // wedges this headless test (the real installer runs from RAM). Just swap
-        // the image in, which is enough to exercise the disk-inserted event.
+        std::printf("boot pc=%06X\n", mac.cpu().pc);
         std::ifstream sf(swapFloppyPath, std::ios::binary);
         std::vector<u8> img2{std::istreambuf_iterator<char>(sf), std::istreambuf_iterator<char>()};
         std::printf("swapping in %zu bytes\n", img2.size());
         mac.insertFloppy(std::move(img2), false);
-        for (int i = 0; i < 800 && !mac.cpu().halted; ++i) mac.runFrame();
+        for (int i = 0; i < 1500 && !mac.cpu().halted; ++i) {
+            mac.mouseMove((i & 1) ? 1 : -1, 0, false);   // keep the Finder ticking
+            mac.runFrame();
+        }
         vcbq("after");
         std::printf("swap: halted=%d pc=%06X\n", mac.cpu().halted ? 1 : 0, mac.cpu().pc);
         return 0;
@@ -785,11 +797,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    int bootHold = 0;
+    bool comboDown = false;
     if (bootDisk) {
         mac.keyEvent(0x37, true); mac.keyEvent(0x3A, true);   // Command, Option
         mac.keyEvent(0x07, true); mac.keyEvent(0x1F, true);   // X, O
-        bootHold = 200;
+        comboDown = true;
     }
 
     std::vector<u8> allAudio;
@@ -799,9 +811,16 @@ int main(int argc, char** argv) {
         mac.runFrame();
         mac.drainAudio(tmpAudio);
         allAudio.insert(allAudio.end(), tmpAudio.begin(), tmpAudio.end());
-        if (bootHold > 0 && --bootHold == 0) {
+        // Hold Cmd-Opt-X-O until the ROM disk path is armed ($0CB3 latched to
+        // $0B, i.e. past the RAM test -- $0210 holds RAM-test garbage before
+        // that) AND a boot device has been chosen (BootDrive $0210 leaves the
+        // $FFFF the ROM parks there during the search). Then release: the ROM has
+        // latched the combo, and holding it into Finder load reads as "rebuild
+        // desktop".
+        if (comboDown && mac.read8(0x0CB3) == 0x0B && mac.read16(0x0210) != 0xFFFF) {
             mac.keyEvent(0x37, false); mac.keyEvent(0x3A, false);
             mac.keyEvent(0x07, false); mac.keyEvent(0x1F, false);
+            comboDown = false;
         }
         const auto& cpu = mac.cpu();
 
