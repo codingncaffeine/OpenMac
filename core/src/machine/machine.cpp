@@ -496,7 +496,12 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     // structure -- Driver Descriptor Map + Apple Partition Map + a driver partition --
     // so the ROM's boot scan can read a real map and driver from it. The .Sony shim
     // still does the actual mounting during the transition.
-    scsiImage_ = scsi::buildAppleScsiDisk(hd_, scsi::buildScsiDriver());
+    auto driver = scsi::buildScsiDriver();
+    scsiImage_ = scsi::buildAppleScsiDisk(hd_, driver);
+    // The HFS volume sits after block 0 (DDM) + 3 partition-map blocks + the driver
+    // blocks. Remember its byte offset so hardDiskImage() can sync SCSI writes back out.
+    const std::size_t drvBlocks = driver.empty() ? 1u : (driver.size() + 511) / 512;
+    hfsImageOffset_ = static_cast<u32>((4 + drvBlocks) * 512);
     scsi_->disk.attach(&scsiImage_, 0);
     scsi_->disk.readOnly = readOnly;
 }

@@ -65,7 +65,16 @@ public:
     // Persist writes by reading hardDiskImage() back out after running.
     void insertHardDisk(std::vector<u8> image, bool readOnly = false);
     bool hardDiskPresent() const { return !hd_.empty(); }
-    const std::vector<u8>& hardDiskImage() const { return hd_; }
+    const std::vector<u8>& hardDiskImage() const {
+        // When SCSI owns the disk, runtime writes land in the partitioned image; copy the
+        // HFS volume back out of it so callers persist the current contents, not the stale
+        // original. (The .Sony path writes hd_ directly, so this is a no-op there.)
+        if (scsiHandlesHd_ && !scsiImage_.empty() &&
+            static_cast<std::size_t>(hfsImageOffset_) + hd_.size() <= scsiImage_.size())
+            hd_.assign(scsiImage_.begin() + hfsImageOffset_,
+                       scsiImage_.begin() + hfsImageOffset_ + hd_.size());
+        return hd_;
+    }
     u32 hdAccessCount() const { return hdReads_ + hdWrites_; }
     int hardDiskDriveNum() const { return hdDriveNum_; }   // 0 until Open adds it
     u32 diskEvtPosts() const { return diskEvtPosts_; }
@@ -179,8 +188,9 @@ private:
     int floppyDriveNum_ = 0;
     bool inSony_ = false;          // re-entrancy guard during trap execution
 
-    std::vector<u8> hd_;           // hard-disk image (empty = none)
+    mutable std::vector<u8> hd_;   // hard-disk image (empty = none); synced from scsiImage_ on read-out
     std::vector<u8> scsiImage_;    // hd_ wrapped in an Apple partition structure for the SCSI bus
+    u32 hfsImageOffset_ = 0;       // byte offset of the HFS volume within scsiImage_
     bool scsiHandlesHd_ = true;    // true: SCSI driver owns the HD (skip .Sony HD reg); false: .Sony still mounts
     bool hdRO_ = false;
     u32 hdStatusAddr_ = 0;         // DrvSts record for the hard disk
