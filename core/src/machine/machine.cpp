@@ -496,7 +496,7 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     // structure -- Driver Descriptor Map + Apple Partition Map + a driver partition --
     // so the ROM's boot scan can read a real map and driver from it. The .Sony shim
     // still does the actual mounting during the transition.
-    scsiImage_ = scsi::buildAppleScsiDisk(hd_, /*driver*/ {});
+    scsiImage_ = scsi::buildAppleScsiDisk(hd_, scsi::buildScsiDriver());
     scsi_->disk.attach(&scsiImage_, 0);
     scsi_->disk.readOnly = readOnly;
 }
@@ -724,7 +724,7 @@ void Machine::installSonyDrives() {
     // so the HD gets its OWN driver reference number (-2) and a separate unit-table
     // slot aliased to the .Sony DCE -- the ROM then dispatches the HD's I/O to the
     // same driver code we hook, which serves it from the image by drive number.
-    if (!hd_.empty()) {
+    if (!hd_.empty() && !scsiHandlesHd_) {
         cpu_.d[0] = SIZEOF_DrvSts;
         execute68kTrap(kTrapNewPtrSysClear);
         if (cpu_.a[0] != 0) {

@@ -181,6 +181,7 @@ private:
 
     std::vector<u8> hd_;           // hard-disk image (empty = none)
     std::vector<u8> scsiImage_;    // hd_ wrapped in an Apple partition structure for the SCSI bus
+    bool scsiHandlesHd_ = false;   // true: SCSI driver owns the HD (skip .Sony HD reg); false: .Sony still mounts
     bool hdRO_ = false;
     u32 hdStatusAddr_ = 0;         // DrvSts record for the hard disk
     int hdDriveNum_ = 0;

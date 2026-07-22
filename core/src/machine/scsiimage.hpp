@@ -47,9 +47,18 @@ constexpr u32 kPartBootable = 0x00000008, kPartMountAtStartup = 0x40000000;
 
 // A simple additive checksum of the driver bytes, as pmBootChecksum.
 inline u16 driverChecksum(const std::vector<u8>& driver) {
-    u16 sum = 0;
+    u16 sum = 0;   // matches ROM $40427C: sum += byte; ROL.W #1; and 0 -> 0xFFFF
     for (u8 b : driver) { sum += b; sum = static_cast<u16>((sum << 1) | (sum >> 15)); }
-    return sum;
+    return sum ? sum : static_cast<u16>(0xFFFF);
+}
+
+// The Apple_Driver43 partition holds raw installer code, not a DRVR resource: the ROM
+// JSRs to it at offset 0 (ROM $404110) with A0 = the Apple_HFS partition entry, A3 =
+// the driver. Confirmed live: a probe that dropped a marker at $0CFC and RTS'd ran at
+// RAM $1FBC and the boot reached the desktop cleanly. This stub just returns; the real
+// installer (build the DQE, _AddDrive, wire Prime to SCSI Manager I/O) replaces it.
+inline std::vector<u8> buildScsiDriver() {
+    return { 0x4E, 0x75 };   // RTS
 }
 
 // Wrap `hfs` (a raw HFS volume) and `driver` (68k driver bytes) into a full
@@ -111,12 +120,16 @@ inline std::vector<u8> buildAppleScsiDisk(const std::vector<u8>& hfs,
     // --- blocks 1..3: the partition map --------------------------------
     writeEntry(mapStart + 0, mapStart, mapEntries, "Apple", "Apple_partition_map",
                kPartValid | kPartAlloc | kPartInUse | kPartReadable | kPartWritable, false);
+    // The driver partition carries pmBootSize + pmBootChecksum (set by bootable=true),
+    // which the ROM's driver install (ROM $40427C) validates before running the driver.
+    // But it must NOT carry the kPartBootable status flag, or the ROM tries to *boot*
+    // the disk -- jump to boot code -- and crashes. The HFS partition mounts as data.
     writeEntry(mapStart + 1, driverStart, driverBlocks, "Macintosh", "Apple_Driver43",
-               kPartValid | kPartAlloc | kPartInUse | kPartReadable | kPartWritable | kPartBootable,
+               kPartValid | kPartAlloc | kPartInUse | kPartReadable | kPartWritable,
                true);
     writeEntry(mapStart + 2, hfsStart, hfsBlocks, "MacOS", "Apple_HFS",
                kPartValid | kPartAlloc | kPartInUse | kPartReadable | kPartWritable |
-               kPartBootable | kPartMountAtStartup, false);
+               kPartMountAtStartup, false);
 
     // --- driver + HFS payloads -----------------------------------------
     if (!driver.empty())
