@@ -36,6 +36,7 @@ constexpr u16 kTrapAddDrive = 0xA04E;
 constexpr u16 kTrapInsTime = 0xA058;
 constexpr u16 kTrapPostEvent = 0xA02F;
 constexpr u16 kTrapMountVol = 0xA00F;
+constexpr u16 kTrapUnmountVol = 0xA00E;
 constexpr u16 kTrapEject = 0xA017;
 constexpr u16 kTrapOpen = 0xA000;
 } // namespace
@@ -455,18 +456,18 @@ int Machine::stepInstruction() {
 
 void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
     if (drvStatusAddr_ != 0 && !image.empty()) {
-        // Post-boot swap. The installer has already ejected the old disk (its own
-        // csCode-7 eject cleared dsDiskInPlace). Drop the new image in, flag the
-        // disk present, and post a disk-inserted event next frame so the disk-
-        // switch re-reads it through our .Sony Prime.
-        floppy_ = std::move(image);
-        floppyRO_ = readOnly;
-        write8(drvStatusAddr_ + dsDiskInPlace, 1);      // flag: disk present
+        // Post-boot swap: stage the new image but keep the outgoing disk in place. The
+        // mount trigger (runFrame) unmounts the outgoing volume first -- while its image
+        // is still current, so its data flushes -- then seats and mounts the new disk.
+        // Skipping the unmount leaves the old volume on the drive, so _MountVol returns
+        // volOnLinErr (or the stale volume masks the new one) and nothing appears.
+        floppyPending_ = std::move(image);
+        floppyPendingRO_ = readOnly;
         floppyInsertPending_ = true;
         if (onDiag) {
             char b[128];
-            std::snprintf(b, sizeof b, "floppy: inserted %zu bytes (drvStatus=%06X), disk present",
-                          floppy_.size(), drvStatusAddr_);
+            std::snprintf(b, sizeof b, "floppy: swap staged (%zu bytes) -- unmount old, then mount new",
+                          floppyPending_.size());
             onDiag(b);
         }
         return;
@@ -880,42 +881,63 @@ void Machine::runFrame() {
         }
     }
 
-    // A floppy swapped in after boot. The ROM notices a disk change through the
-    // drive's disk-in-place sense line (IWM CSTIN) + the DrvSts flag, which it
-    // polls -- it has to see the disk leave and return. insertFloppy reports the
-    // drive empty for a short window (floppyEjectSense_); here we count it down,
-    // then drop the new image in and flag the disk present so the ROM runs its OWN
-    // disk-inserted path (offline the old volume, mount the new one via our .Sony
-    // Prime -- the same path the boot floppy took). Mounting it ourselves or
-    // posting a bare diskEvt did not satisfy the "please insert the disk" modal.
+    // A floppy inserted or swapped after boot. Complete it here at a clean frame
+    // boundary the way the ROM's disk-insert interrupt does: unmount any outgoing
+    // volume, seat the new disk, _MountVol it, then post the disk-inserted event with
+    // that result. (A bare diskEvt never mounts; and skipping the unmount leaves the
+    // old volume on the drive, so _MountVol returns volOnLinErr, or the stale volume
+    // masks the new one, and nothing appears in the Finder.)
     if (floppyInsertPending_ && !inSony_ && drvStatusAddr_ != 0) {
-        // A bare diskEvt does not mount anything. The ROM's disk-insert interrupt does
-        // two things: it _MountVols the drive, then posts a disk-inserted event carrying
-        // that result. Do the same -- _MountVol reads the newly inserted volume through
-        // our .Sony Prime and adds its VCB; the event tells the Finder to show the icon.
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
         if (floppyMountPb_ == 0) {
-            cpu_.d[0] = 80;                              // a param block for _MountVol
+            cpu_.d[0] = 80;                              // param block for _UnmountVol/_MountVol
             execute68kTrap(kTrapNewPtrSysClear);
             floppyMountPb_ = cpu_.a[0];
         }
-        u16 mountRes = 0;
-        if (floppyMountPb_ != 0) {
-            write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
-            cpu_.a[0] = floppyMountPb_;
-            execute68kTrap(kTrapMountVol);              // _MountVol the internal drive
-            mountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+        const u32 vcbTailBefore = (static_cast<u32>(read16(0x035C)) << 16) | read16(0x035E);
+        const bool hadOld = !floppy_.empty();           // a disk to eject before the new one
+        u16 unmountRes = 0, mountRes = 0;
+        bool seated = false;
+        if (floppyMountPb_ != 0 && !floppyPending_.empty()) {
+            if (hadOld) {
+                // Eject the outgoing volume first -- its image is still current, so a
+                // flush lands on the right disk. If it is busy (files open) this fails
+                // and we must NOT seat the new disk over a mismatched volume.
+                write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
+                cpu_.a[0] = floppyMountPb_;
+                execute68kTrap(kTrapUnmountVol);
+                unmountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+            }
+            if (!hadOld || unmountRes != 0xFFD1) {
+                // Empty drive, or the outgoing volume no longer holds the drive
+                // (unmounted cleanly, or already offline/gone). Only a *busy* volume
+                // (fBsyErr = -47 = 0xFFD1, files still open) blocks the swap. Seat and
+                // mount the new disk, then post the disk-inserted event for the Finder.
+                floppy_ = std::move(floppyPending_);
+                floppyRO_ = floppyPendingRO_;
+                write8(drvStatusAddr_ + dsDiskInPlace, 1);
+                seated = true;
+                write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
+                cpu_.a[0] = floppyMountPb_;
+                execute68kTrap(kTrapMountVol);
+                mountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+                cpu_.d[0] = 7;                          // diskEvt
+                cpu_.a[0] = (static_cast<u32>(mountRes) << 16) | static_cast<u16>(floppyDriveNum_);
+                execute68kTrap(kTrapPostEvent);         // hi word = mount result, lo = drive
+            }
+            floppyPending_.clear();                     // drop the staged disk either way
         }
-        cpu_.d[0] = 7;                                   // diskEvt
-        cpu_.a[0] = (static_cast<u32>(mountRes) << 16) | static_cast<u16>(floppyDriveNum_);
-        execute68kTrap(kTrapPostEvent);                  // hi word = mount result, lo = drive
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
         floppyInsertPending_ = false;
         if (onDiag) {
-            char b[96];
-            std::snprintf(b, sizeof b, "floppy: _MountVol(drive %d) -> %04X, diskEvt posted",
-                          floppyDriveNum_, mountRes);
+            const u32 vcbTailAfter = (static_cast<u32>(read16(0x035C)) << 16) | read16(0x035E);
+            char b[176];
+            std::snprintf(b, sizeof b,
+                "floppy: unmount=%04X seated=%d _MountVol=%04X (drv %d) VCBtail %06X->%06X%s",
+                unmountRes, seated ? 1 : 0, mountRes, floppyDriveNum_,
+                vcbTailBefore & 0xFFFFFF, vcbTailAfter & 0xFFFFFF,
+                (hadOld && !seated) ? " [outgoing disk busy -- eject it first]" : "");
             onDiag(b);
         }
     }
