@@ -1052,11 +1052,6 @@ void Machine::runFrame() {
         // 0 = mounted; 0xFFC9 = volOnLinErr (-55) = the volume is already
         // on-line (a prior async attempt mounted it). Either way we are done.
         if (diskEvtResult_ == 0 || diskEvtResult_ == 0xFFC9) hdMounted_ = true;
-        if (diskEvtResult_ == 0) {                     // let the Finder show the new volume
-            cpu_.a[0] = 7;                             // diskEvt (A0 = event code)
-            cpu_.d[0] = static_cast<u16>(hdDriveNum_); // D0 = message: result 0 | drive
-            execute68kTrap(kTrapPostEvent);
-        }
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     }
 
