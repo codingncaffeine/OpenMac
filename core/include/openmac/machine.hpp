@@ -105,7 +105,6 @@ public:
     ScsiStats scsiStats() const;
     int scsiWriteTrace(u16* out, int maxN) const;   // first N register writes, (reg<<8)|val
     int scsiCdbHist(u8* out, int maxCdbs) const;     // first N CDBs, 12 bytes each
-    u32 scsiCmdPc() const { return scsiCmdPc_; }     // PC that emitted the first CDB opcode
 
     const std::vector<u8>& adbCmdTrace() const;
     const std::vector<u8>& adbRespTrace() const;
@@ -242,7 +241,6 @@ private:
     bool romDiskKeymapHeld_ = false;   // force path is holding Cmd-Opt-X-O in $0174
     u32 keyMapReads_ = 0;
     u32 keyMapReadPc_ = 0;
-    u32 scsiCmdPc_ = 0;                 // PC of the first SCSI CDB-opcode write (diagnostic)
     u32 keyMapPcs_[12]{};
     int keyMapPcN_ = 0;
     u64 lineTarget_ = 0;

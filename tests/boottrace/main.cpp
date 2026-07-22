@@ -905,7 +905,6 @@ int main(int argc, char** argv) {
             for (int j = 0; j < 12; ++j) std::printf("%02X ", cd[i * 12 + j]);
             std::printf("\n");
         }
-        std::printf("-- SCSI first-CDB-opcode PC = %06X --\n", mac.scsiCmdPc());
     }
     std::printf("-- ADB command trace (addr.op.reg), first %zu: --\n",
                 mac.adbCmdTrace().size());

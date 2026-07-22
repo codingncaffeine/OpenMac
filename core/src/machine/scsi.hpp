@@ -30,7 +30,14 @@ class ScsiDisk {
 public:
     void attach(std::vector<u8>* image, int id) { image_ = image; id_ = id & 7; }
     void detach() { image_ = nullptr; }
-    bool present() const { return image_ != nullptr && !image_->empty(); }
+    bool present() const {
+        // Expose the disk to the SCSI bus only when block 0 carries an Apple Driver
+        // Descriptor Map ('ER', 0x4552) -- a disk the ROM's boot can read a partition
+        // map and driver from. A bare volume with no map is left to the .Sony shim so
+        // the boot scan skips it instead of engaging an unusable disk and hanging.
+        return image_ != nullptr && image_->size() >= 512 &&
+               (*image_)[0] == 0x45 && (*image_)[1] == 0x52;
+    }
     int  id() const { return id_; }
     bool readOnly = false;
 
@@ -317,6 +324,12 @@ private:
     }
 
     bool reqAsserted() const {
+        // Handshake: the target drops /REQ while the initiator holds /ACK, and
+        // re-asserts it once /ACK is released for the next byte. The ROM's per-byte
+        // send/receive loop waits on that /REQ-low edge after asserting /ACK; without
+        // it the loop spins, and interrupts firing during the spin corrupt the
+        // in-flight CDB in low memory.
+        if (icr_ & 0x10) return false;   // /ACK asserted
         switch (phase_) {
             case Command: return cdbPos_ < cdbLen_;
             case DataOut: return xferPos_ < xfer_.size();

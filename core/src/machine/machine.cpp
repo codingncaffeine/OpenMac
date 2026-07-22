@@ -337,7 +337,6 @@ void Machine::write8(u32 addr, u8 value) {
         return;
     }
     if (addr < 0x600000) {          // NCR 5380 SCSI: write bank (odd address)
-        if (((addr >> 4) & 7) == 0 && value == 0x08 && scsiCmdPc_ == 0) scsiCmdPc_ = cpu_.pc;
         scsi_->write((addr >> 4) & 7, value);
         logAccess("SCSI", addr, true, value);
         return;
