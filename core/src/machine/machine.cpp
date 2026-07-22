@@ -939,9 +939,8 @@ void Machine::runFrame() {
             execute68kTrap(kTrapNewPtrSysClear);
             floppyMountPb_ = cpu_.a[0];
         }
-        const u32 vcbTailBefore = (static_cast<u32>(read16(0x035C)) << 16) | read16(0x035E);
         const bool hadOld = !floppy_.empty();           // a disk to eject before the new one
-        u16 unmountRes = 0, mountRes = 0;
+        u16 unmountRes = 0;
         bool seated = false;
         if (floppyMountPb_ != 0 && !floppyPending_.empty()) {
             if (hadOld) {
@@ -956,35 +955,30 @@ void Machine::runFrame() {
             if (!hadOld || unmountRes != 0xFFD1) {
                 // Empty drive, or the outgoing volume no longer holds the drive
                 // (unmounted cleanly, or already offline/gone). Only a *busy* volume
-                // (fBsyErr = -47 = 0xFFD1, files still open) blocks the swap. Seat and
-                // mount the new disk, then post the disk-inserted event for the Finder.
+                // (fBsyErr = -47 = 0xFFD1, files still open) blocks the swap. Seat the
+                // disk and post the disk-inserted event; the SYSTEM mounts it itself
+                // (IM Files: WaitNextEvent -> SystemEvent -> PBMountVol, result into the
+                // event's high word). We must NOT pre-mount -- doing so left a VCB the
+                // System's own mount then tripped over, ejecting the disk as
+                // "unreadable" during an installer disk-switch.
                 floppy_ = std::move(floppyPending_);
                 floppyRO_ = floppyPendingRO_;
                 write8(drvStatusAddr_ + dsDiskInPlace, 1);
                 seated = true;
-                write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
-                cpu_.a[0] = floppyMountPb_;
-                execute68kTrap(kTrapMountVol);
-                mountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
-                // _PostEvent (Inside Macintosh I-257): A0 = event code, D0 = event
-                // message. Putting the code in D0 posted event 2 (mouseUp) instead of 7
-                // (diskEvt), so no disk-inserted event ever reached the Finder or the
-                // installer's disk-switch -- inserted disks mounted but nothing reacted.
+                // _PostEvent (Inside Macintosh I-257): A0 = event code, D0 = message.
                 cpu_.a[0] = 7;                          // diskEvt
-                cpu_.d[0] = (static_cast<u32>(mountRes) << 16) | static_cast<u16>(floppyDriveNum_);
-                execute68kTrap(kTrapPostEvent);         // message: hi word = mount result, lo = drive
+                cpu_.d[0] = static_cast<u16>(floppyDriveNum_);  // message: drive #, result word 0
+                execute68kTrap(kTrapPostEvent);
             }
             floppyPending_.clear();                     // drop the staged disk either way
         }
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
         floppyInsertPending_ = false;
         if (onDiag) {
-            const u32 vcbTailAfter = (static_cast<u32>(read16(0x035C)) << 16) | read16(0x035E);
-            char b[176];
+            char b[160];
             std::snprintf(b, sizeof b,
-                "floppy: unmount=%04X seated=%d _MountVol=%04X (drv %d) VCBtail %06X->%06X%s",
-                unmountRes, seated ? 1 : 0, mountRes, floppyDriveNum_,
-                vcbTailBefore & 0xFFFFFF, vcbTailAfter & 0xFFFFFF,
+                "floppy: unmount=%04X seated=%d diskEvt posted (drv %d) -- System mounts%s",
+                unmountRes, seated ? 1 : 0, floppyDriveNum_,
                 (hadOld && !seated) ? " [outgoing disk busy -- eject it first]" : "");
             onDiag(b);
         }
