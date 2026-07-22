@@ -109,15 +109,10 @@ public partial class MainWindow : Window
             ran++;
         }
         if (_frameAcc > FrameSeconds) _frameAcc = FrameSeconds;   // drop backlog beyond the cap
-        if (ran == 0) return;                     // no whole frame due this refresh — nothing to blit
 
-        _emulator.RenderTo(_bgra);
-        _bitmap.WritePixels(new Int32Rect(0, 0, _emulator.ScreenWidth, _emulator.ScreenHeight),
-                            _bgra, _emulator.ScreenWidth * 4, 0);
-
-        // Once a second, log the real emulated frame rate and audio buffer health,
-        // so a "choppy sound" report comes with hard numbers (fps low => pacing;
-        // underruns high with fps ~60 => buffering).
+        // Account for every refresh (including idle ones) so fps reflects the true
+        // emulated rate; then log once a second. fps ~60 with underruns=0 is healthy;
+        // fps low => pacing, underruns high => buffering.
         _fpsFrames += ran;
         _fpsElapsed += dt;
         if (_fpsElapsed >= 1.0)
@@ -126,6 +121,11 @@ public partial class MainWindow : Window
             _fpsFrames = 0;
             _fpsElapsed = 0;
         }
+
+        if (ran == 0) return;                     // no whole frame due this refresh — nothing to blit
+        _emulator.RenderTo(_bgra);
+        _bitmap.WritePixels(new Int32Rect(0, 0, _emulator.ScreenWidth, _emulator.ScreenHeight),
+                            _bgra, _emulator.ScreenWidth * 4, 0);
     }
 
     [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);

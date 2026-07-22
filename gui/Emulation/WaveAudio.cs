@@ -56,6 +56,14 @@ internal sealed class WaveAudio : IDisposable
     private int _underruns, _drops;
     private long _fed;
     private bool _started;
+    private bool _primed;
+
+    // 8-bit UNSIGNED PCM silence is 0x80, not 0x00. Priming the device with a
+    // couple of these buffers starts playback during silence, so the first real
+    // samples don't trigger a start-of-stream click. (The SDL shell stayed clean
+    // because SDL keeps its audio device continuously fed from the moment it opens.)
+    private static readonly byte[] Silence = MakeSilence();
+    private static byte[] MakeSilence() { var s = new byte[BUFSZ]; for (int i = 0; i < BUFSZ; i++) s[i] = 0x80; return s; }
 
     public WaveAudio(int sampleRate)
     {
@@ -89,6 +97,7 @@ internal sealed class WaveAudio : IDisposable
     public void Feed(byte[] samples, int count)
     {
         if (_h == IntPtr.Zero || count <= 0) return;
+        if (!_primed) { _primed = true; Prime(); }
 
         // 1. Append to the ring; on overflow drop the oldest so latency stays bounded.
         for (int i = 0; i < count; i++)
@@ -112,6 +121,24 @@ internal sealed class WaveAudio : IDisposable
             _rHead = (_rHead + BUFSZ) % _ring.Length;
             _rCount -= BUFSZ;
 
+            var h = Marshal.PtrToStructure<WAVEHDR>(_hdr[slot]);
+            h.dwBufferLength = BUFSZ;
+            h.dwFlags &= ~WHDR_DONE;
+            Marshal.StructureToPtr(h, _hdr[slot], false);
+            waveOutWrite(_h, _hdr[slot], HdrSize);
+            _used[slot] = true;
+            _started = true;
+        }
+    }
+
+    // Start the device playing silence so the first real samples don't click.
+    private void Prime()
+    {
+        for (int k = 0; k < 2; k++)
+        {
+            int slot = FindFree();
+            if (slot < 0) break;
+            Marshal.Copy(Silence, 0, _data[slot], BUFSZ);
             var h = Marshal.PtrToStructure<WAVEHDR>(_hdr[slot]);
             h.dwBufferLength = BUFSZ;
             h.dwFlags &= ~WHDR_DONE;
