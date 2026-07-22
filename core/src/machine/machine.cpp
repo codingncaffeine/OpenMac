@@ -194,6 +194,34 @@ Machine::AdbStats Machine::adbStats() const {
             adb_->kbdReg2(), adb_->kbdReg3(), adb_->mouseReg3()};
 }
 
+Machine::ScsiStats Machine::scsiStats() const {
+    ScsiStats s{};
+    s.reads = scsi_->diagReads;
+    s.writes = scsi_->diagWrites;
+    s.selects = scsi_->diagSelects;
+    s.commands = scsi_->diagCommands;
+    s.dataInBytes = scsi_->diagDataInBytes;
+    s.dataOutBytes = scsi_->diagDataOutBytes;
+    for (int i = 0; i < 12; ++i) s.lastCdb[i] = scsi_->diagLastCdb[i];
+    s.lastCdbLen = scsi_->diagLastCdbLen;
+    return s;
+}
+
+int Machine::scsiWriteTrace(u16* out, int maxN) const {
+    int n = scsi_->diagWriteTraceLen;
+    if (n > maxN) n = maxN;
+    for (int i = 0; i < n; ++i) out[i] = scsi_->diagWriteTrace[i];
+    return n;
+}
+
+int Machine::scsiCdbHist(u8* out, int maxCdbs) const {
+    int n = scsi_->diagCdbHistLen;
+    if (n > maxCdbs) n = maxCdbs;
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < 12; ++j) out[i * 12 + j] = scsi_->diagCdbHist[i][j];
+    return n;
+}
+
 const std::vector<u8>& Machine::adbCmdTrace() const {
     return adb_->cmdTrace();
 }
@@ -309,6 +337,7 @@ void Machine::write8(u32 addr, u8 value) {
         return;
     }
     if (addr < 0x600000) {          // NCR 5380 SCSI: write bank (odd address)
+        if (((addr >> 4) & 7) == 0 && value == 0x08 && scsiCmdPc_ == 0) scsiCmdPc_ = cpu_.pc;
         scsi_->write((addr >> 4) & 7, value);
         logAccess("SCSI", addr, true, value);
         return;
@@ -463,6 +492,11 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hd_ = std::move(image);
     hdRO_ = readOnly;
     hdStatusAddr_ = 0;   // re-added to the drive queue on the next driver Open
+    // Present the same image on the SCSI bus as target ID 0 (the standard internal
+    // drive). During the transition the .Sony shim still does the real mounting; the
+    // SCSI target lets the ROM's bus scan see and read the disk.
+    scsi_->disk.attach(&hd_, 0);
+    scsi_->disk.readOnly = readOnly;
 }
 
 // The 16 IWM addresses each toggle one line; the odd address sets, the even

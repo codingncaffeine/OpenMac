@@ -882,6 +882,31 @@ int main(int argc, char** argv) {
                     "mount attempts=%u last result=%04X --\n",
                     mac.hardDiskImage().size(), mac.hardDiskDriveNum(),
                     mac.hdAccessCount(), mac.diskEvtPosts(), mac.diskEvtResult());
+    {
+        const auto sc = mac.scsiStats();
+        std::printf("-- SCSI: reads=%u writes=%u selects=%u commands=%u dataIn=%u dataOut=%u lastCDB=",
+                    sc.reads, sc.writes, sc.selects, sc.commands, sc.dataInBytes, sc.dataOutBytes);
+        for (int i = 0; i < sc.lastCdbLen; ++i) std::printf("%02X ", sc.lastCdb[i]);
+        std::printf("--\n");
+        u16 wt[320];
+        const int wn = mac.scsiWriteTrace(wt, 320);
+        std::printf("-- SCSI writes (reg=val), first %d: --\n", wn);
+        static const char* rn[8] = {"ODR","ICR","MR ","TCR","SER","d5 ","d6 ","d7 "};
+        for (int i = 0; i < wn; ++i) {
+            std::printf(" %s=%02X", rn[(wt[i] >> 8) & 7], wt[i] & 0xFF);
+            if ((i + 1) % 8 == 0) std::printf("\n");
+        }
+        std::printf("\n");
+        u8 cd[16 * 12];
+        const int cn = mac.scsiCdbHist(cd, 16);
+        std::printf("-- SCSI CDB history (%d): --\n", cn);
+        for (int i = 0; i < cn; ++i) {
+            std::printf("  ");
+            for (int j = 0; j < 12; ++j) std::printf("%02X ", cd[i * 12 + j]);
+            std::printf("\n");
+        }
+        std::printf("-- SCSI first-CDB-opcode PC = %06X --\n", mac.scsiCmdPc());
+    }
     std::printf("-- ADB command trace (addr.op.reg), first %zu: --\n",
                 mac.adbCmdTrace().size());
     const auto& tr = mac.adbCmdTrace();
