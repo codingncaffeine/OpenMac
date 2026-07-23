@@ -39,7 +39,7 @@ internal sealed class WaveAudio : IDisposable
 
     private const uint WHDR_DONE = 0x01;
     private const uint WAVE_MAPPER = 0xFFFFFFFF;
-    private const int NBUF = 5;          // buffers kept in flight
+    private const int NBUF = 8;          // buffers kept in flight (~368 ms of cushion)
     private const int BUFSZ = 1024;      // ~46 ms each at 22254 Hz
     private static readonly int HdrSize = Marshal.SizeOf<WAVEHDR>();
 
@@ -134,7 +134,7 @@ internal sealed class WaveAudio : IDisposable
     // Start the device playing silence so the first real samples don't click.
     private void Prime()
     {
-        for (int k = 0; k < 2; k++)
+        for (int k = 0; k < 3; k++)
         {
             int slot = FindFree();
             if (slot < 0) break;

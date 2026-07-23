@@ -128,7 +128,8 @@ void Machine::wireVia() {
         // again (only a power-on reset does). The ROM later drives PA4 high
         // for its own purposes; the hardware ignores that for the overlay.
         if ((ddr & 0x10) && !(value & 0x10)) overlay_ = false;
-        if (ddr & 0x40) screenAlt_ = (value & 0x40) == 0;   // PA6: 0 = alt buffer
+        if (ddr & 0x40) screenAlt_ = (value & 0x40) == 0;   // PA6 (vPage2): 0 = alt screen buffer
+        if (ddr & 0x08) soundAlt_  = (value & 0x08) == 0;   // PA3 (vSndPg2): 0 = alt sound buffer (independent of video)
     };
     via_->outB = [this](u8 value, u8 ddr) {
         const u8 eff = static_cast<u8>(value | ~ddr);
@@ -245,8 +246,11 @@ u32 Machine::screenBase() const {
 
 u32 Machine::soundBase() const {
     // Main sound/PWM buffer sits just below the top of RAM (alt buffer is
-    // 0x5F00 lower). 370 words, one scanned per horizontal line.
-    return static_cast<u32>(ram_.size()) - (screenAlt_ ? 0x5F00u : 0x0300u);
+    // 0x5F00 lower), selected by PA3 (vSndPg2) -- INDEPENDENT of the video page.
+    // Tying this to screenAlt_ made screen double-buffering (e.g. Dark Castle
+    // flipping PA6 every frame) drag the sound read to the unwritten alt buffer,
+    // producing the garbage/chopping heard in-game. 370 words, one per scanline.
+    return static_cast<u32>(ram_.size()) - (soundAlt_ ? 0x5F00u : 0x0300u);
 }
 
 void Machine::drainAudio(std::vector<u8>& out) {
@@ -1095,9 +1099,17 @@ void Machine::runFrame() {
         // disables the output.
         const u8 raw = ram_[(soundBase() + static_cast<u32>(line) * 2) & ramMask_];
         const int vol = via_->ora() & 0x07;
-        const bool enabled = (via_->orb() & 0x80) == 0;
+        // Gate the Sound-Manager buffer on the CPU-written vSndEnb (ORB bit 7,
+        // low = on) only. The T1->PB7 square wave (Via6522::pb7) is a separate,
+        // rarely-used direct-tone path; a title that sets ACR bit 7 to run the
+        // timer must not silence or chop the buffer, so the buffer gate stays
+        // insensitive to the timer-driven PB7 toggle.
+        const bool enabled = (via_->orb() & 0x80) == 0;   // vSndEnb: 0 = sound on
         int s = 0x80;
-        if (enabled && vol != 0) s = 0x80 + ((static_cast<int>(raw) - 0x80) * vol) / 7;
+        // Reciprocal volume law (matches Mini vMac SNDEMDEV): attenuate by
+        // 1/(8-vol) so volume 0 is 1/8 (quiet but audible) and volume 7 is full
+        // scale, instead of a linear curve that muted volume 0 outright.
+        if (enabled) s = 0x80 + (static_cast<int>(raw) - 0x80) / (8 - vol);
         if (audioOut_.size() < 8192) audioOut_.push_back(static_cast<u8>(s));
     }
 }

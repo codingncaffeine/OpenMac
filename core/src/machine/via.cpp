@@ -23,6 +23,7 @@ void Via6522::reset() {
     acr_ = pcr_ = 0;
     ifr_ = ier_ = 0;
     ca1_ = ca2_ = false;
+    pb7_ = false;
 }
 
 void Via6522::setIFR(u8 bit) { ifr_ |= bit; }
@@ -103,6 +104,7 @@ void Via6522::write(int reg, u8 value) {
         t1c_ = t1l_;
         t1Running_ = true;
         clearIFR(kIrqT1);
+        if (acr_ & 0x80) pb7_ = false;   // loading T1 drives the PB7 output low
         break;
     case 7:
         t1l_ = static_cast<u16>((t1l_ & 0x00FF) | (value << 8));
@@ -159,6 +161,10 @@ void Via6522::tick(int viaClocks) {
         if (t1c_ == 0) {
             if (t1Running_) {
                 setIFR(kIrqT1);
+                if (acr_ & 0x80) {                    // ACR7: T1 output drives PB7
+                    if (acr_ & 0x40) pb7_ = !pb7_;    // free-run: invert -> square wave
+                    else             pb7_ = true;     // one-shot: pulse returns high
+                }
                 if (acr_ & 0x40) {
                     t1c_ = t1l_;             // continuous: reload from latch
                 } else {

@@ -23,11 +23,13 @@ public interface IEmulator : IDisposable
     void LoadRom(string path, int ramMB, bool bootRomDisk);
     void Reset();
 
-    /// <summary>Advance one 60 Hz frame.</summary>
-    void RunFrame();
-
-    /// <summary>Fill a ScreenWidth*ScreenHeight*4 BGRA buffer with the framebuffer.</summary>
-    void RenderTo(byte[] bgra);
+    /// <summary>
+    /// Copy the latest framebuffer into a ScreenWidth*ScreenHeight*4 BGRA buffer.
+    /// Returns false when no new frame is ready since the last call (nothing to
+    /// blit). The backend drives emulation and audio on its own thread; the UI
+    /// only polls this to display the most recent frame.
+    /// </summary>
+    bool TryGetFrame(byte[] bgra);
 
     void InsertFloppy(string path);
     void EjectFloppy();
@@ -37,7 +39,4 @@ public interface IEmulator : IDisposable
     void MouseMove(int dx, int dy, bool button);
     void MouseButton(bool down);
     void KeyEvent(int adbCode, bool down);
-
-    /// <summary>One-line audio buffer health line for the perf log ("" if none).</summary>
-    string AudioStats();
 }

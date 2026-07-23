@@ -19,20 +19,30 @@ public sealed class StubEmulator : IEmulator
     public bool HardDiskAttached { get; private set; }
     public string? HardDiskPath { get; private set; }
 
-    private int _phase;
+    private readonly byte[] _frame = new byte[512 * 342 * 4];
+    private bool _dirty = true;
+
+    public StubEmulator() => RenderPreview();
 
     public void LoadRom(string path, int ramMB, bool bootRomDisk)
     {
         RomPath = path;
         IsRomLoaded = true;
-        _phase = 0;
+        _dirty = true;
     }
 
-    public void Reset() => _phase = 0;
+    public void Reset() => _dirty = true;
 
-    public void RunFrame() => _phase++;
+    public bool TryGetFrame(byte[] bgra)
+    {
+        // The preview is static, so only hand it out when it actually changed.
+        if (!_dirty) return false;
+        Buffer.BlockCopy(_frame, 0, bgra, 0, Math.Min(bgra.Length, _frame.Length));
+        _dirty = false;
+        return true;
+    }
 
-    public void RenderTo(byte[] bgra)
+    private void RenderPreview()
     {
         // A classic-Mac desktop preview: white menu bar over a 50% gray dither.
         for (int y = 0; y < ScreenHeight; y++)
@@ -42,7 +52,7 @@ public sealed class StubEmulator : IEmulator
                 int i = (y * ScreenWidth + x) * 4;
                 bool white = y < 20 || ((x ^ y) & 1) == 0;
                 byte v = white ? (byte)0xFF : (byte)0x00;
-                bgra[i] = v; bgra[i + 1] = v; bgra[i + 2] = v; bgra[i + 3] = 0xFF;
+                _frame[i] = v; _frame[i + 1] = v; _frame[i + 2] = v; _frame[i + 3] = 0xFF;
             }
         }
     }
@@ -65,7 +75,6 @@ public sealed class StubEmulator : IEmulator
     public void MouseMove(int dx, int dy, bool button) { }
     public void MouseButton(bool down) { }
     public void KeyEvent(int adbCode, bool down) { }
-    public string AudioStats() => "";
 
     public void Dispose() { }
 }

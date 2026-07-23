@@ -62,6 +62,16 @@ public:
     u16 t1Counter() const { return t1c_; }
     u16 t2Counter() const { return t2c_; }
 
+    // Effective PB7 pin level. When ACR bit 7 (and DDRB bit 7) enable the T1
+    // output on PB7, the pin follows the timer -- a square wave in free-running
+    // mode, a one-shot pulse otherwise -- rather than the CPU-written ORB latch.
+    // The compact-Mac sound circuit gates its output on this line (low = on),
+    // so timer-driven tones must be read from here, not from orb() alone.
+    bool pb7() const {
+        if ((acr_ & 0x80) && (ddrb_ & 0x80)) return pb7_;
+        return (orb_ & 0x80) != 0;
+    }
+
 private:
     void setIFR(u8 bit);
     void clearIFR(u8 bit);
@@ -79,6 +89,7 @@ private:
     u8 acr_ = 0, pcr_ = 0;
     u8 ifr_ = 0, ier_ = 0;
     bool ca1_ = false, ca2_ = false;
+    bool pb7_ = false;     // T1 output level on PB7 (ACR bit 7 modes)
     int srTicks_ = 0;      // countdown to shift-register completion
     bool srInput_ = false; // completing a shift-in (data arrives from outside)
 };

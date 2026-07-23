@@ -19,16 +19,10 @@ public partial class MainWindow : Window
     private readonly WriteableBitmap _bitmap;
     private readonly byte[] _bgra;
 
-    // Wall-clock-paced frame loop. CompositionTarget.Rendering fires once per
-    // display refresh; a Stopwatch decides how many 60.15 Hz Mac frames are
-    // actually due, so emulation (hence audio production) tracks real time rather
-    // than the low-priority, sub-60 Hz DispatcherTimer that made sound choppy.
-    private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
-    private long _lastTicks;
-    private double _frameAcc;
-    private int _fpsFrames;
-    private double _fpsElapsed;
-    private const double FrameSeconds = 1.0 / 60.15;
+    // The backend runs emulation and audio on its own thread, so playback is never
+    // stalled by this UI thread. The window only displays the latest frame:
+    // CompositionTarget.Rendering fires once per display refresh and blits whatever
+    // new frame the emulator has produced since the previous refresh.
     private EventHandler? _renderHandler;
 
     private bool _mouseLocked;
@@ -54,8 +48,7 @@ public partial class MainWindow : Window
         StatusBackend.Text = _emulator.IsRealCore ? "core: native" : "core: stub (not linked)";
         Log.Line($"GUI ready — {_emulator.BackendName} backend, screen {w}x{h}");
 
-        timeBeginPeriod(1);                       // sharpen OS timer resolution for steady pacing
-        _lastTicks = _clock.ElapsedTicks;
+        timeBeginPeriod(1);                       // sharpen OS timer resolution for the emu thread's pacing
         _renderHandler = (_, _) => Tick();
         CompositionTarget.Rendering += _renderHandler;
 
@@ -73,6 +66,7 @@ public partial class MainWindow : Window
         {
             if (_renderHandler != null) CompositionTarget.Rendering -= _renderHandler;
             timeEndPeriod(1);
+            _emulator.Dispose();   // stop the emulation thread and persist the hard disk
             _settings.Save();
         };
     }
@@ -95,37 +89,12 @@ public partial class MainWindow : Window
 
     private void Tick()
     {
-        long now = _clock.ElapsedTicks;
-        double dt = (now - _lastTicks) / (double)System.Diagnostics.Stopwatch.Frequency;
-        _lastTicks = now;
-        if (dt > 0.25) dt = 0.25;                 // after a stall, resync rather than fast-forward
-        _frameAcc += dt;
-
-        int ran = 0;
-        while (_frameAcc >= FrameSeconds && ran < 4)   // catch up, but cap the burst
-        {
-            _emulator.RunFrame();
-            _frameAcc -= FrameSeconds;
-            ran++;
-        }
-        if (_frameAcc > FrameSeconds) _frameAcc = FrameSeconds;   // drop backlog beyond the cap
-
-        // Account for every refresh (including idle ones) so fps reflects the true
-        // emulated rate; then log once a second. fps ~60 with underruns=0 is healthy;
-        // fps low => pacing, underruns high => buffering.
-        _fpsFrames += ran;
-        _fpsElapsed += dt;
-        if (_fpsElapsed >= 1.0)
-        {
-            Log.Line($"perf: fps={_fpsFrames / _fpsElapsed:F1}  {_emulator.AudioStats()}");
-            _fpsFrames = 0;
-            _fpsElapsed = 0;
-        }
-
-        if (ran == 0) return;                     // no whole frame due this refresh — nothing to blit
-        _emulator.RenderTo(_bgra);
-        _bitmap.WritePixels(new Int32Rect(0, 0, _emulator.ScreenWidth, _emulator.ScreenHeight),
-                            _bgra, _emulator.ScreenWidth * 4, 0);
+        // Display only. The emulator produces frames (and audio) on its own thread;
+        // copy the most recent one and blit it. TryGetFrame returns false when
+        // nothing new has been produced since the previous refresh.
+        if (_emulator.TryGetFrame(_bgra))
+            _bitmap.WritePixels(new Int32Rect(0, 0, _emulator.ScreenWidth, _emulator.ScreenHeight),
+                                _bgra, _emulator.ScreenWidth * 4, 0);
     }
 
     [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);

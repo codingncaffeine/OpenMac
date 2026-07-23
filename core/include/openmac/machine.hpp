@@ -219,6 +219,7 @@ private:
     u32 romMask_ = 0;
     bool overlay_ = true;
     bool screenAlt_ = false;
+    bool soundAlt_  = false;   // PA3 (vSndPg2) sound-page select, independent of screenAlt_
 
     std::unique_ptr<Via6522> via_;
     std::unique_ptr<Rtc> rtc_;
