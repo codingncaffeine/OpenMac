@@ -50,6 +50,7 @@ public:
 
     u32 screenBase() const;
     u32 soundBase() const;
+    u32 ramSize() const { return static_cast<u32>(ram_.size()); }
     // Expand the 1-bit framebuffer to ARGB8888 (kScreenW * kScreenH).
     void renderScreen(u32* argbOut) const;
 
@@ -88,6 +89,14 @@ public:
     void mouseMove(int dx, int dy, bool button);
     void keyEvent(u8 adbCode, bool down);
     bool keyHeld(u8 adbCode) const;
+
+    // Post a mouseDown/mouseUp event into the OS event queue at the current cursor
+    // location (via _PostEvent). On real hardware these events are queued at
+    // interrupt time, so both GetNextEvent and the low-level GetOSEvent see them;
+    // our ADB path only updates the button low-mem, which the ROM's GetNextEvent
+    // re-derives but GetOSEvent (used by e.g. the Installer) does not. Test/driver
+    // helper for headless UI automation.
+    void postMouseButton(bool down);
 
     // Force the built-in ROM disk to boot (System 6) by holding the
     // Cmd-Opt-X-O keys down in the KeyMap through the boot-device search,

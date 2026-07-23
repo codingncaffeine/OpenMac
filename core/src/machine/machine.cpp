@@ -179,6 +179,15 @@ void Machine::keyEvent(u8 adbCode, bool down) {
     adb_->injectKey(adbCode, down);
 }
 
+void Machine::postMouseButton(bool down) {
+    // _PostEvent: A0 = event code (mouseDown=1 / mouseUp=2), D0 = message (0 for
+    // mouse). PostEvent fills evtQWhere from the low-mem mouse location and
+    // evtQWhen from the tick count, so position the cursor first (mouseMove).
+    cpu_.a[0] = down ? 1u : 2u;
+    cpu_.d[0] = 0;
+    execute68kTrap(0xA02F);
+}
+
 bool Machine::keyHeld(u8 adbCode) const {
     return adb_->keyHeld(adbCode);
 }

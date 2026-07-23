@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -109,6 +110,546 @@ void dumpBmp(Machine& mac, const std::string& path) {
         f.write(reinterpret_cast<const char*>(row.data()), rowBytes);
     }
     std::printf("screen dumped to %s\n", path.c_str());
+}
+
+void dumpBmpAt(Machine& mac, const std::string& path, u32 base);   // fwd decl
+
+// ---- drive the real 6.0.8 Installer headlessly (corruption repro) ---------
+//
+// Boots to the Finder, then drives the desktop UI with the ADB mouse to open the
+// System Startup floppy, launch the Installer, run Easy Install onto the HD, and
+// feed the System Additions disk when prompted. The whole point is to reproduce
+// the resource-fork corruption under the real Installer's live heap layout, which
+// no synthetic harness triggers. Everything is closed-loop off low memory so it
+// is deterministic and needs no screen scraping to hit a target.
+struct DriveCfg {
+    std::string floppy1;      // System Startup image (source, re-inserted after Switch Disk)
+    std::string floppy2;      // System Additions image (disk 2)
+    std::string shotBase;     // screenshot base path (stage name appended)
+    std::string hdOut;        // where to write the HD image afterward
+    int t1x = 455, t1y = 22;  // System Startup floppy icon (image center)
+    int t2x = 60,  t2y = 60;  // Installer icon inside the floppy window
+    int t3x = -1,  t3y = -1;  // Install/OK button (default = press Return)
+    int dbGap = 4;            // frames between the two button-downs of a dbl-click
+    int downF = 3, upF = 2;   // settled frames to hold each button state
+    int midGap = 0;           // extra idle frames between the two clicks
+    bool singleOnly = false;  // stage 1: single-click instead of double
+    int bootFrames = 6000;    // frames cap to reach a fully-drawn desktop
+    int stage = 9;            // run up to this stage
+};
+
+int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
+    // Count posted mouse events, and log any oversized memory allocation request
+    // (NewHandle A122 / NewPtr A11E / SetHandleSize A024 / ReallocHandle: D0 = size).
+    // The corruption misreads a resource length as ~7.26 MB; such a request in a 4 MB
+    // heap is exactly what raises the Installer's "Out of memory" -- catch it here.
+    int pMouseDown = 0, pMouseUp = 0;
+    int bigAllocs = 0;
+    mac.cpu().onTrap = [&](u16 trap, u32 pc) {
+        const u16 t = trap & 0x0FFF;
+        if (t == 0x02F || t == 0x12F) {
+            const u16 what = static_cast<u16>(mac.cpu().d[0] & 0xFFFF);
+            if (what == 1) ++pMouseDown;
+            else if (what == 2) ++pMouseUp;
+        }
+        // Any OS trap carrying a 1-16 MB size in D0: the Memory Manager sizing traps
+        // (NewHandle/NewPtr/SetHandleSize/ReallocHandle) put the byte count there, so
+        // a ~7.26 MB request (the corruption's misread length) shows up here.
+        if ((trap & 0xF800) == 0xA000 && bigAllocs < 60) {
+            const u32 sz = mac.cpu().d[0];
+            if (sz >= 0x100000u && sz <= 0x1000000u) {
+                std::printf("  BIG D0 trap=%04X D0=%u (0x%X) A0=%06X pc=%06X\n",
+                            trap, sz, sz, mac.cpu().a[0] & 0xFFFFFF, pc);
+                ++bigAllocs;
+            }
+        }
+    };
+    auto rd16s = [&](u32 a) { return static_cast<int>(static_cast<s16>(mac.read16(a))); };
+    auto rd32  = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
+    auto curX = [&] { return rd16s(0x0832); };   // low-mem Mouse.h
+    auto curY = [&] { return rd16s(0x0830); };   // low-mem Mouse.v
+    auto ticks = [&] { return rd32(0x016A); };
+    auto curAp = [&] {
+        const u8 n = mac.read8(0x0910);
+        std::string s;
+        for (int i = 0; i < n && i < 31; ++i) s += static_cast<char>(mac.read8(0x0911 + i));
+        return s;
+    };
+    auto winList = [&] { return rd32(0x09D6); };
+    // Decode a WindowRecord: portRect (GrafPort+16), visible (+110), title
+    // (titleHandle +134 -> handle -> Str255).
+    auto winDump = [&](u32 w) {
+        if (!w || w == 0xFFFFFFFFu) { std::printf("  win=%06X (none)\n", w); return; }
+        const int t = rd16s(w + 16), l = rd16s(w + 18), b = rd16s(w + 20), r = rd16s(w + 22);
+        const u8 vis = mac.read8(w + 110);
+        const u32 th = rd32(w + 134);
+        std::string title;
+        if (th) { const u32 tp = rd32(th); if (tp) { const u8 n = mac.read8(tp);
+            for (int i = 0; i < n && i < 40; ++i) title += static_cast<char>(mac.read8(tp + 1 + i)); } }
+        const u32 nextW = rd32(w + 144);   // nextWindow
+        std::printf("  win=%06X portRect=(%d,%d,%d,%d) vis=%d kind=%d title='%s' next=%06X\n",
+                    w, t, l, b, r, vis, rd16s(w + 108), title.c_str(), nextW);
+    };
+    auto clampd = [](int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; };
+    // Inject one mouse report and run frames until the ROM actually consumes it
+    // (mouseReports increments), so every button transition is delivered no matter
+    // the poll cadence. Returns frames spent.
+    auto injectReport = [&](int dx, int dy, bool btn, int maxf) {
+        const u32 r0 = mac.adbStats().mouseReports;
+        mac.mouseMove(dx, dy, btn);
+        for (int i = 0; i < maxf && !mac.cpu().halted; ++i) {
+            mac.runFrame();
+            if (mac.adbStats().mouseReports > r0) return i + 1;
+        }
+        return maxf;
+    };
+    auto moveTo = [&](int tx, int ty) {
+        for (int it = 0; it < 120 && !mac.cpu().halted; ++it) {
+            const int dx = tx - curX(), dy = ty - curY();
+            if (dx == 0 && dy == 0) break;
+            injectReport(clampd(dx, -24, 24), clampd(dy, -24, 24), false, 8);
+        }
+    };
+    auto mb = [&] { return mac.read8(0x0172); };   // MBState: bit7=1 up, 0 down
+    (void)injectReport;
+    // Watch the OS event queue tail ($0150): when an event posts, qTail advances to
+    // the new element. Log its what/when/where so we can see the button events the
+    // interrupt-level poster actually generates (they bypass the A-trap dispatcher).
+    bool logEv = false;
+    u32 lastTail = rd32(0x0150);
+    auto tick1 = [&] {
+        mac.runFrame();
+        if (!logEv) return;
+        const u32 t = rd32(0x0150);
+        if (t && t != lastTail) {
+            std::printf("    +EVT what=%u when=%u where=(%d,%d)\n", mac.read16(t + 6),
+                        rd32(t + 12), rd16s(t + 18), rd16s(t + 16));
+            lastTail = t;
+        }
+    };
+    // Hold a button state, re-asserting every frame so every mouse poll sees it,
+    // until low-mem MBState settles to it (the ROM updates MBState a frame or two
+    // after the ADB report is consumed) plus a couple of guard frames so the Finder
+    // event loop actually samples the level.
+    auto holdBtn = [&](bool btn, int minFrames) {
+        const u8 want = btn ? 0x00 : 0x80;
+        int settled = 0;
+        for (int i = 0; i < 30 && !mac.cpu().halted; ++i) {
+            mac.mouseMove(0, 0, btn);
+            tick1();
+            if ((mb() & 0x80) == want) { if (++settled >= minFrames) return; }
+        }
+    };
+    auto doubleClick = [&] {
+        logEv = true; lastTail = rd32(0x0150);
+        const u32 t0 = ticks();
+        holdBtn(true, cfg.downF); holdBtn(false, cfg.upF);
+        const u32 t2 = ticks();
+        for (int i = 0; i < cfg.midGap && !mac.cpu().halted; ++i) tick1();
+        holdBtn(true, cfg.downF); holdBtn(false, cfg.upF);
+        std::printf("  dbl: down1@%u down2@%u gap=%u DoubleTime=%u\n",
+                    t0, t2, t2 - t0, rd32(0x02F0));
+        logEv = false;
+    };
+    auto singleClick = [&] {
+        logEv = true; lastTail = rd32(0x0150);
+        std::printf("  click mb=%02X", mb());
+        holdBtn(true, cfg.downF);  std::printf(" down->%02X", mb());
+        holdBtn(false, cfg.upF);   std::printf(" up->%02X\n", mb());
+        logEv = false;
+    };
+    // Find the frontmost VISIBLE window (skips the always-present invisible Clipboard).
+    auto visibleWin = [&]() -> u32 {
+        for (u32 w = winList(); w && w != 0xFFFFFFFFu; w = rd32(w + 144))
+            if (mac.read8(w + 110) != 0) return w;
+        return 0;
+    };
+    const u32 ramTop = mac.ramSize();
+    auto shot = [&](const char* stage) {
+        if (cfg.shotBase.empty()) return;
+        dumpBmp(mac, cfg.shotBase + "." + stage + ".render.bmp");   // renderScreen (screenBase)
+        dumpBmpAt(mac, cfg.shotBase + "." + stage + ".main.bmp", ramTop - 0x5900u);
+        dumpBmpAt(mac, cfg.shotBase + "." + stage + ".alt.bmp",  ramTop - 0xD900u);
+    };
+    auto report = [&](const char* tag) {
+        std::printf("[%s] t=%u pc=%06X curAp='%s' winList=%06X cursor=(%d,%d) "
+                    "mReports=%u hdW=%u\n", tag, ticks(), mac.cpu().pc, curAp().c_str(),
+                    winList(), curX(), curY(), mac.adbStats().mouseReports,
+                    mac.hdAccessCount());
+    };
+
+    // Is the menu bar drawn? The Finder paints the gray desktop first, then draws
+    // the menu bar (mostly white) + icons once its event loop is being serviced.
+    // A white top strip is a reliable "desktop fully drawn" signal on the live page.
+    // Menu bar drawn? Check BOTH video pages (the Finder can present from either)
+    // -- a mostly-white top strip means the desktop + menu bar are painted.
+    auto menuBarOn = [&](u32 base) {
+        int black = 0;
+        for (int y = 2; y < 17; ++y)
+            for (int x = 60; x < 452; ++x)
+                if (mac.read8(base + static_cast<u32>(y) * 64 + (x >> 3)) & (0x80 >> (x & 7)))
+                    ++black;
+        return black * 100 < 18 * 15 * 392;
+    };
+    auto menuBarDrawn = [&] {
+        return menuBarOn(ramTop - 0x5900u) || menuBarOn(ramTop - 0xD900u);
+    };
+    auto activePage = [&] {
+        return menuBarOn(ramTop - 0x5900u) ? ramTop - 0x5900u : ramTop - 0xD900u;
+    };
+    // The floppy icon has white (mostly-clear) body rows that stand out from the 50%
+    // desktop dither. Count rows in the top-right icon area (strictly BELOW the menu
+    // bar) that are mostly white; the dither has none, a drawn icon has several.
+    auto floppyIconDrawn = [&] {
+        const u32 base = activePage();
+        int whiteRows = 0;
+        for (int y = 22; y < 52; ++y) {
+            int black = 0;
+            for (int x = 435; x < 475; ++x)
+                if (mac.read8(base + static_cast<u32>(y) * 64 + (x >> 3)) & (0x80 >> (x & 7)))
+                    ++black;
+            if (black < 12) ++whiteRows;   // 40-wide row that is mostly clear
+        }
+        return whiteRows >= 4;
+    };
+
+    // Stage 0: boot to the desktop. Nudge the mouse early to clear the boot-time
+    // mouse-wait spin ($401606); then keep the event loop ticking with periodic
+    // net-zero jitter until the Finder finishes drawing the menu bar + icons.
+    for (int i = 0; i < cfg.bootFrames && !mac.cpu().halted; ++i) {
+        if (i >= 200 && i < 340 && (i & 3) == 0) mac.mouseMove(3, 2, false);
+        if (i > 400 && (i & 7) == 0) mac.mouseMove((i & 8) ? 2 : -2, (i & 16) ? 1 : -1, false);
+        mac.runFrame();
+        if (i > 1500 && (i & 31) == 0 && menuBarDrawn() && floppyIconDrawn()) {
+            std::printf("desktop+icons at frame %d\n", i); break;
+        }
+    }
+    std::printf("desktop menuBar=%d floppyIcon=%d activePage=%06X\n", menuBarDrawn(),
+                floppyIconDrawn(), activePage());
+    std::printf("DoubleTime=%u\n", rd32(0x02F0));
+    report("desktop");
+    shot("0desktop");
+    // Locate the desktop icons on the ACTIVE video page (screenBase() -- not a
+    // fixed offset; the Finder can run from either page). Print black-pixel count
+    // per row in the icon column so icon image rows (vs label rows) are visible.
+    {
+        // Locate icons by flagging pixels that deviate from the 50% desktop
+        // checkerboard (black iff (x+y) even). Deviation clusters = icons/labels.
+        const u32 base = activePage();
+        auto pix = [&](int x, int y) {
+            return (mac.read8(base + static_cast<u32>(y) * 64 + (x >> 3)) & (0x80 >> (x & 7))) != 0;
+        };
+        std::printf("icon deviation map (active page %06X, x=410..512):\n", base);
+        for (int y = 20; y < 135; ++y) {
+            int c = 0, minx = 999, maxx = -1;
+            for (int x = 410; x < 512; ++x) {
+                const bool exp = ((x + y) & 1) == 0;
+                if (pix(x, y) != exp) { ++c; if (x < minx) minx = x; if (x > maxx) maxx = x; }
+            }
+            if (c > 2) std::printf("  dev y=%3d cnt=%2d x=[%d..%d]\n", y, c, minx, maxx);
+        }
+    }
+    if (cfg.stage < 1) { report("stop"); return 0; }
+
+    // Count black pixels in a screen rectangle (main video page) -- an icon that
+    // inverts on selection changes this sharply.
+    auto blackIn = [&](int x0, int y0, int x1, int y1) {
+        const u32 base = ramTop - 0x5900u;
+        int n = 0;
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x) {
+                const u8 byte = mac.read8(base + static_cast<u32>(y) * 64 + (x >> 3));
+                if (byte & (0x80 >> (x & 7))) ++n;
+            }
+        return n;
+    };
+
+    (void)blackIn; (void)pMouseDown; (void)pMouseUp;
+    // Stage 1: open the System Startup floppy window (double-click its icon). Poll
+    // for a visible window to appear over the following frames.
+    moveTo(cfg.t1x, cfg.t1y);
+    report("on-floppy");
+    const u32 qh0 = rd32(0x014C);
+    if (cfg.singleOnly) singleClick(); else doubleClick();
+    u32 vw = 0;
+    int openedAt = -1;
+    for (int i = 0; i < 250 && !mac.cpu().halted; ++i) {
+        tick1();
+        if (!vw && (vw = visibleWin()) != 0) openedAt = i;
+    }
+    report("after-dbl1");
+    std::printf("  qHead %06X -> %06X (Finder %s events)\n", qh0, rd32(0x014C),
+                rd32(0x014C) != qh0 ? "CONSUMED" : "did NOT consume");
+    winDump(vw ? vw : winList());
+    shot("1floppywin");
+    std::printf("STAGE1 %s: visibleWin=%06X openedAt=%d\n",
+                vw ? "OPENED" : "NO-WINDOW", vw, openedAt);
+    if (cfg.stage < 2) { report("stop"); return 0; }
+
+    // Stage 2: launch the Installer (double-click its icon inside the window).
+    moveTo(cfg.t2x, cfg.t2y);
+    report("on-installer");
+    doubleClick();
+    for (int i = 0; i < 400 && !mac.cpu().halted; ++i) {
+        mac.runFrame();
+        if (curAp() == "Installer") break;
+    }
+    report("after-dbl2");
+    shot("2installer");
+    std::printf("STAGE2 %s: curAp='%s'\n",
+                curAp() == "Installer" ? "LAUNCHED" : "not-launched", curAp().c_str());
+    if (cfg.stage < 3) { report("stop"); return 0; }
+
+    // Draw a modal dialog (nudge the event loop) then park the cursor centrally.
+    auto drawDialog = [&](int frames) {
+        for (int i = 0; i < frames && !mac.cpu().halted; ++i) {
+            mac.mouseMove((i & 1) ? 2 : -2, (i & 2) ? 1 : -1, false);
+            mac.runFrame();
+        }
+        moveTo(240, 175);
+    };
+    auto clickAt = [&](int x, int y) { moveTo(x, y); singleClick(); };
+    auto pressReturn = [&] {
+        mac.keyEvent(0x24, true);  for (int i = 0; i < 4; ++i) mac.runFrame();
+        mac.keyEvent(0x24, false); for (int i = 0; i < 4; ++i) mac.runFrame();
+    };
+
+    // Post a mouse click into the OS event queue at (x,y): position the cursor (fills
+    // the event's where), drive the physical button down (so the queued mouseDown
+    // carries a button-down modifier and control-tracking works), then up. Apps that
+    // read GetOSEvent (the Installer) never see our ADB button path, so the posted
+    // event is what makes their clicks register.
+    auto postClick = [&](int x, int y) {
+        moveTo(x, y);
+        for (int i = 0; i < 4 && !mac.cpu().halted; ++i) { mac.mouseMove(0, 0, true); mac.runFrame(); }
+        mac.postMouseButton(true);
+        for (int i = 0; i < 6 && !mac.cpu().halted; ++i) { mac.mouseMove(0, 0, true); mac.runFrame(); }
+        for (int i = 0; i < 4 && !mac.cpu().halted; ++i) { mac.mouseMove(0, 0, false); mac.runFrame(); }
+        mac.postMouseButton(false);
+        for (int i = 0; i < 6 && !mac.cpu().halted; ++i) { mac.mouseMove(0, 0, false); mac.runFrame(); }
+    };
+    // Find rounded-rect push buttons in an x/y band by pairing top+bottom border rows
+    // (long horizontal black runs, 14-34px apart, same left edge). Centers, top-down.
+    auto findButtons = [&](int xlo, int xhi, int ylo, int yhi) {
+        const u32 base = activePage();
+        auto pix = [&](int x, int y) {
+            return (mac.read8(base + static_cast<u32>(y) * 64 + (x >> 3)) & (0x80 >> (x & 7))) != 0;
+        };
+        struct Edge { int y, x0, x1; };
+        std::vector<Edge> edges;
+        for (int y = ylo; y < yhi; ++y) {
+            int run = 0, best = 0, b0 = 0, c0 = 0;
+            for (int x = xlo; x < xhi; ++x) {
+                if (pix(x, y)) { if (run == 0) c0 = x; if (++run > best) { best = run; b0 = c0; } }
+                else run = 0;
+            }
+            if (best >= 24) edges.push_back({y, b0, b0 + best});
+        }
+        std::vector<std::pair<int,int>> btns;
+        for (size_t i = 0; i < edges.size(); ++i)
+            for (size_t j = i + 1; j < edges.size(); ++j) {
+                const int dy = edges[j].y - edges[i].y;
+                if (dy < 14) continue;
+                if (dy > 34) break;
+                if (std::abs(edges[i].x0 - edges[j].x0) <= 6 && std::abs(edges[i].x1 - edges[j].x1) <= 6) {
+                    btns.push_back({(edges[i].x0 + edges[i].x1) / 2, (edges[i].y + edges[j].y) / 2});
+                    i = j; break;
+                }
+            }
+        return btns;
+    };
+    auto clickButtonNear = [&](std::vector<std::pair<int,int>>& btns, int yWant, const char* nm) {
+        int best = -1, bestd = 9999;
+        for (size_t i = 0; i < btns.size(); ++i) {
+            const int d = std::abs(btns[i].second - yWant);
+            if (d < bestd) { bestd = d; best = static_cast<int>(i); }
+        }
+        if (best < 0 || bestd > 40) { std::printf("  button '%s' near y=%d NOT FOUND\n", nm, yWant); return false; }
+        std::printf("  click '%s' @(%d,%d)\n", nm, btns[best].first, btns[best].second);
+        postClick(btns[best].first, btns[best].second);
+        return true;
+    };
+
+    // Stage 3: dismiss the Welcome splash, reach Easy Install, retarget the hard disk.
+    drawDialog(700);
+    report("welcome");
+    shot("3welcome");
+    { auto b = findButtons(330, 500, 250, 320);
+      if (b.empty()) { std::printf("STAGE3 FAIL: no Welcome OK button\n"); return 0; }
+      std::printf("  Welcome OK @(%d,%d)\n", b[0].first, b[0].second);
+      postClick(b[0].first, b[0].second); }
+    drawDialog(500);
+    report("easyinstall");
+    shot("3easyinstall");
+    if (visibleWin() == 0) { std::printf("STAGE3 FAIL: Easy Install did not open\n"); return 0; }
+
+    // Retarget the destination to the hard disk: the Installer opens on the boot
+    // floppy (its own disk) with Install disabled, so click "Switch Disk" to cycle to
+    // "OpenMac HD". Switch Disk sits around y=213 in the right button column.
+    { auto b = findButtons(400, 498, 70, 300);
+      std::printf("  Easy Install buttons:");
+      for (auto& bb : b) std::printf(" (%d,%d)", bb.first, bb.second);
+      std::printf("\n");
+      clickButtonNear(b, cfg.t3y >= 0 ? cfg.t3y : 213, "Switch Disk"); }
+    drawDialog(400);
+    report("switched");
+    shot("3switched");
+    if (cfg.stage < 4) { report("stop-after-switch"); return 0; }
+
+    auto insertFloppyPath = [&](const std::string& path, const char* tag) {
+        if (path.empty()) return;
+        std::ifstream sf(path, std::ios::binary);
+        std::vector<u8> img{std::istreambuf_iterator<char>(sf), std::istreambuf_iterator<char>()};
+        if (!img.empty()) {
+            std::printf("  >> insert %s (%zu bytes) f=?\n", tag, img.size());
+            mac.insertFloppy(std::move(img), false);
+        }
+    };
+
+    // Capture the Memory Manager *query* traps and their results around the Install
+    // click -- the Installer's pre-install "enough memory?" check. FreeMem(A01C)/
+    // MaxMem(A11D)/PurgeSpace(A162)/CompactMem(A04C)/StackSpace(A065) return sizes in
+    // D0 (and A0 for grow/contig); a wrong small value is what triggers "Out of memory".
+    struct MemQ { u32 ret; u16 trap; };
+    std::vector<MemQ> memPend;
+    auto isMemQuery = [](u16 t) {
+        return t == 0xA01C || t == 0xA11D || t == 0xA162 || t == 0xA04C ||
+               t == 0xA065 || t == 0xA061 || t == 0xA063 || t == 0xA166;
+    };
+    auto memName = [](u16 t) {
+        switch (t) { case 0xA01C: return "FreeMem"; case 0xA11D: return "MaxMem";
+            case 0xA162: return "PurgeSpace"; case 0xA04C: return "CompactMem";
+            case 0xA065: return "StackSpace"; case 0xA061: return "MaxBlock";
+            case 0xA063: return "MaxApplZone"; case 0xA166: return "MaxSizeRsrc";
+            default: return "?"; }
+    };
+    bool logMemQ = true;
+    // Ring of recent Toolbox/OS traps; when the Installer raises an alert (Alert/
+    // StopAlert/... $A985-$A988) -- e.g. "Out of memory" -- dump the ring to see the
+    // operation that failed just before it.
+    std::vector<std::pair<u16,u32>> trapRing;
+    bool alertDumped = false;
+    auto prevTrapM = mac.cpu().onTrap;
+    mac.cpu().onTrap = [&](u16 trap, u32 pc) {
+        if (prevTrapM) prevTrapM(trap, pc);
+        if (logMemQ && isMemQuery(trap) && memPend.size() < 200) memPend.push_back({pc + 2, trap});
+        if (logMemQ && (trap & 0xF800) == 0xA800) {   // Toolbox trap
+            trapRing.push_back({trap, pc});
+            if (trapRing.size() > 60) trapRing.erase(trapRing.begin());
+        }
+        if (logMemQ && !alertDumped && (trap == 0xA985 || trap == 0xA986 || trap == 0xA987 ||
+                trap == 0xA988 || trap == 0xA97C || trap == 0xA97D || trap == 0xA913 ||
+                trap == 0xA9BD)) {
+            alertDumped = true;
+            std::printf("  DIALOG/ALERT trap %04X at pc=%06X -- preceding Toolbox traps:\n", trap, pc);
+            for (auto& tr : trapRing)
+                std::printf("    %04X %-14s @%06X\n", tr.first,
+                            openmac::dbg::trapName(tr.first), tr.second);
+        }
+    };
+    auto prevStepM = mac.cpu().onStep;
+    mac.cpu().onStep = [&](u32 pc) {
+        if (prevStepM) prevStepM(pc);
+        for (size_t i = memPend.size(); i-- > 0;)
+            if (memPend[i].ret == pc) {
+                std::printf("  MEMQ %-11s -> D0=%d (0x%X)  A0=%06X\n", memName(memPend[i].trap),
+                            static_cast<s32>(mac.cpu().d[0]), mac.cpu().d[0], mac.cpu().a[0] & 0xFFFFFF);
+                memPend.erase(memPend.begin() + static_cast<long>(i));
+                break;
+            }
+    };
+
+    // Stage 4: click Install (target = HD). Switch Disk ejected the source floppy, so
+    // the Installer now asks for it, then for System Additions. Do NOT re-insert the
+    // source before Install -- that reverts the target back to the Installer disk.
+    { auto b = findButtons(400, 498, 70, 160);
+      if (!clickButtonNear(b, 94, "Install")) { std::printf("STAGE4 FAIL: no Install button\n"); return 0; } }
+    for (int i = 0; i < 40 && !mac.cpu().halted; ++i) mac.runFrame();
+    logMemQ = false;
+    mac.cpu().onStep = prevStepM;
+    report("clicked-install");
+    shot("4installing");
+
+    // Feed disks the Installer requests: System Startup (source) shortly after Install,
+    // then System Additions when the Installer ejects Startup to ask for it (.Sony
+    // eject diag). Cycle if it asks repeatedly.
+    int diskState = 0;          // 0=need source, 1=fed source waiting for additions ask, 2+=cycle
+    int oomAt = 0;
+    bool ejectPending = false;
+    mac.onDiag = [&](const char* m) { if (std::strstr(m, "eject")) ejectPending = true; };
+    for (int i = 0; i < 20000 && !mac.cpu().halted; ++i) {
+        if (i == 250 && diskState == 0) {
+            insertFloppyPath(cfg.floppy1, "System Startup (source)");
+            diskState = 1; ejectPending = false;
+        } else if (ejectPending && diskState >= 1) {
+            ejectPending = false;
+            const bool additions = (diskState % 2) == 1;
+            insertFloppyPath(additions ? cfg.floppy2 : cfg.floppy1,
+                             additions ? "System Additions" : "System Startup");
+            ++diskState;
+        }
+        mac.mouseMove((i & 1) ? 1 : -1, 0, false);   // keep the event loop ticking
+        mac.runFrame();
+        if (!oomAt && static_cast<u16>(mac.read16(0x0220)) == 0xFF94) {   // MemError = memFullErr (-108)
+            oomAt = i;
+            std::printf("  *** MemError=-108 (memFullErr) at frame %d pc=%06X; recent PCs:\n   ", i, mac.cpu().pc);
+            for (int b = 24; b >= 0; --b) std::printf(" %06X", mac.cpu().recentPc(b));
+            std::printf("\n");
+        }
+        if (i % 800 == 0) {
+            const u32 memTop = rd32(0x0108), applZone = rd32(0x02AA), applLimit = rd32(0x0130),
+                      heapEnd = rd32(0x0114);
+            std::printf("  merge f=%d pc=%06X hdAcc=%u win=%06X ds=%d | MemTop=%06X ApplZone=%06X "
+                        "HeapEnd=%06X ApplLimit=%06X appHeap=%uKB MemErr=%d\n", i, mac.cpu().pc,
+                        mac.hdAccessCount(), winList(), diskState, memTop, applZone, heapEnd,
+                        applLimit, (heapEnd - applZone) / 1024, static_cast<s16>(mac.read16(0x0220)));
+            if (i % 3200 == 0) shot("4merge");
+        }
+    }
+    std::printf("  install OOM at frame %d\n", oomAt);
+    report("done");
+    shot("4done");
+    if (!cfg.hdOut.empty()) {
+        const auto& hd = mac.hardDiskImage();
+        std::ofstream of(cfg.hdOut, std::ios::binary);
+        of.write(reinterpret_cast<const char*>(hd.data()),
+                 static_cast<std::streamsize>(hd.size()));
+        std::printf("HD image (%zu bytes) -> %s\n", hd.size(), cfg.hdOut.c_str());
+    }
+    return 0;
+}
+
+// Dump a 512x342 1-bpp frame from an explicit RAM base (bypasses renderScreen's
+// page selection, which can point at the stale alternate video page during Finder
+// interactions). base = ram top - 0x5900 (main) or - 0xD900 (alt) for 4 MB.
+void dumpBmpAt(Machine& mac, const std::string& path, u32 base) {
+    const int w = Machine::kScreenW, h = Machine::kScreenH;
+    const int rowBytes = w * 3;
+    const u32 imgSize = static_cast<u32>(rowBytes * h);
+    const u32 fileSize = 54 + imgSize;
+    u8 hdr[54] = {};
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = static_cast<u8>(fileSize); hdr[3] = static_cast<u8>(fileSize >> 8);
+    hdr[4] = static_cast<u8>(fileSize >> 16); hdr[5] = static_cast<u8>(fileSize >> 24);
+    hdr[10] = 54; hdr[14] = 40;
+    hdr[18] = static_cast<u8>(w); hdr[19] = static_cast<u8>(w >> 8);
+    hdr[22] = static_cast<u8>(h); hdr[23] = static_cast<u8>(h >> 8);
+    hdr[26] = 1; hdr[28] = 24;
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(hdr), sizeof hdr);
+    std::vector<u8> row(static_cast<size_t>(rowBytes));
+    for (int y = h - 1; y >= 0; --y) {
+        for (int xb = 0; xb < w / 8; ++xb) {
+            const u8 bits = mac.read8(base + static_cast<u32>(y) * (w / 8) + xb);
+            for (int b = 0; b < 8; ++b) {
+                const bool black = (bits & (0x80 >> b)) != 0;
+                const u8 v = black ? 0 : 255;
+                const int x = xb * 8 + b;
+                row[x * 3 + 0] = v; row[x * 3 + 1] = v; row[x * 3 + 2] = v;
+            }
+        }
+        f.write(reinterpret_cast<const char*>(row.data()), rowBytes);
+    }
 }
 
 void writeWav(const std::string& path, const std::vector<u8>& s, int rate) {
@@ -326,6 +867,8 @@ int main(int argc, char** argv) {
     u32 dumpStructAddr = 0;
     bool traceBranches = false, dumpStructSet = false;
     u32 disasmAddr = 0; int disasmCount = 0; bool disasmSet = false;
+    bool driveInstall = false;
+    DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--rom" && i + 1 < argc) romPath = argv[++i];
@@ -392,6 +935,20 @@ int main(int argc, char** argv) {
             disasmCount = std::atoi(argv[++i]);
             disasmSet = true;
         }
+        else if (arg == "--drive-install") driveInstall = true;
+        else if (arg == "--floppy2" && i + 1 < argc) dcfg.floppy2 = argv[++i];
+        else if (arg == "--di-shot" && i + 1 < argc) dcfg.shotBase = argv[++i];
+        else if (arg == "--di-hdout" && i + 1 < argc) dcfg.hdOut = argv[++i];
+        else if (arg == "--di-t1" && i + 2 < argc) { dcfg.t1x = std::atoi(argv[++i]); dcfg.t1y = std::atoi(argv[++i]); }
+        else if (arg == "--di-t2" && i + 2 < argc) { dcfg.t2x = std::atoi(argv[++i]); dcfg.t2y = std::atoi(argv[++i]); }
+        else if (arg == "--di-t3" && i + 2 < argc) { dcfg.t3x = std::atoi(argv[++i]); dcfg.t3y = std::atoi(argv[++i]); }
+        else if (arg == "--di-gap" && i + 1 < argc) dcfg.dbGap = std::atoi(argv[++i]);
+        else if (arg == "--di-down" && i + 1 < argc) dcfg.downF = std::atoi(argv[++i]);
+        else if (arg == "--di-up" && i + 1 < argc) dcfg.upF = std::atoi(argv[++i]);
+        else if (arg == "--di-mid" && i + 1 < argc) dcfg.midGap = std::atoi(argv[++i]);
+        else if (arg == "--di-single") dcfg.singleOnly = true;
+        else if (arg == "--di-boot" && i + 1 < argc) dcfg.bootFrames = std::atoi(argv[++i]);
+        else if (arg == "--di-stage" && i + 1 < argc) dcfg.stage = std::atoi(argv[++i]);
     }
     if (romPath.empty()) {
         std::fprintf(stderr, "usage: openmac_trace --rom <path> [--frames N] [--ram-mb M]\n");
@@ -593,6 +1150,8 @@ int main(int argc, char** argv) {
             ++excCount;
         }
     };
+
+    if (driveInstall) { dcfg.floppy1 = floppyPath; return runDriveInstall(mac, dcfg); }
 
     if (disasmSet) {
         u32 a = disasmAddr;
