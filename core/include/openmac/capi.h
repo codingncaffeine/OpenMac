@@ -49,6 +49,16 @@ OMAC_API size_t omac_drain_audio(OMac*, uint8_t* out, size_t cap);
 /* ---- disks ---- */
 OMAC_API void omac_insert_floppy(OMac*, const uint8_t* img, size_t len, int read_only);
 OMAC_API void omac_eject_floppy(OMac*);
+
+/* The external drive port. Attaching a mechanism makes the ROM register a
+   second floppy drive; a disk put in after the machine has started mounts like
+   any other. omac_floppy_data copies the medium out so writes can be persisted
+   -- pass a null buffer to ask how large it is. */
+OMAC_API void omac_set_external_drive(OMac*, int attached);
+OMAC_API void omac_insert_floppy2(OMac*, const uint8_t* img, size_t len, int read_only);
+OMAC_API void omac_eject_floppy2(OMac*);
+OMAC_API size_t omac_floppy_data(OMac*, uint8_t* out, size_t cap);
+OMAC_API size_t omac_floppy2_data(OMac*, uint8_t* out, size_t cap);
 OMAC_API void omac_insert_harddisk(OMac*, const uint8_t* img, size_t len, int read_only);
 
 /* Copy the live hard-disk image (including guest writes) into out; returns the

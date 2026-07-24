@@ -83,6 +83,34 @@ OMAC_API void omac_insert_floppy(OMac* m, const uint8_t* img, size_t len, int ro
     if (m && img) m->mac.insertFloppy(std::vector<u8>(img, img + len), ro != 0);
 }
 OMAC_API void omac_eject_floppy(OMac* m) { if (m) m->mac.ejectFloppy(); }
+
+OMAC_API void omac_set_external_drive(OMac* m, int attached)
+{
+    if (m) m->mac.setExternalDriveAttached(attached != 0);
+}
+
+OMAC_API void omac_insert_floppy2(OMac* m, const uint8_t* img, size_t len, int ro)
+{
+    if (m && img) m->mac.insertExternalFloppy(std::vector<u8>(img, img + len), ro != 0);
+}
+
+OMAC_API void omac_eject_floppy2(OMac* m) { if (m) m->mac.ejectExternalFloppy(); }
+
+static size_t copyOut(const std::vector<u8>& src, uint8_t* out, size_t cap)
+{
+    if (out && cap >= src.size()) std::copy(src.begin(), src.end(), out);
+    return src.size();
+}
+
+OMAC_API size_t omac_floppy_data(OMac* m, uint8_t* out, size_t cap)
+{
+    return m ? copyOut(m->mac.floppyImage(), out, cap) : 0;
+}
+
+OMAC_API size_t omac_floppy2_data(OMac* m, uint8_t* out, size_t cap)
+{
+    return m ? copyOut(m->mac.externalFloppyImage(), out, cap) : 0;
+}
 OMAC_API void omac_insert_harddisk(OMac* m, const uint8_t* img, size_t len, int ro)
 {
     if (m && img) m->mac.insertHardDisk(std::vector<u8>(img, img + len), ro != 0);
