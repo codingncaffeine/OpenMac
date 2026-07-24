@@ -104,11 +104,20 @@ inline void interleaveOrder(int n, int* physicalOfLogical) {
 //
 // Three source bytes at a time, each XORed with a rolling accumulator and each
 // accumulator carried into the next. The three accumulators become the sector's
-// 24-bit checksum. This is the one part of the format the primary documentation
-// renders ambiguously (the SWIM reference prints encode and decode side by side
-// in two columns that every surviving scan garbles), so the implementation here
-// is defined by its round trip: decodeData is the exact inverse of encodeData,
-// and the unit test drives real sector data through both.
+// 24-bit checksum. The primary documentation renders this ambiguously (the SWIM
+// reference prints encode and decode side by side in two columns that every
+// surviving scan garbles), so it is taken from the machine that has to read the
+// disk instead. The Classic ROM does both directions in software and both agree:
+//
+//   reader $43D214   MOVE.B D7,D3 / ADD.B D7,D3 / ROL.B #1,D7 / EOR.B D7,D2 / ADDX.B D2,D5
+//   writer $4358F0   MOVE.B D7,D3 / ADD.B D7,D3 / ROL.B #1,D7   (then EOR/ADDX per byte)
+//
+// The ADD doubles the third accumulator purely to leave its old bit 7 in X; the
+// ROL then rotates that same bit into bit 0 (ROL does not disturb X). So the
+// carry folded into the first addition of each group is the accumulator's own
+// old top bit -- not, as this used to have it, whatever carry the previous group
+// happened to leave behind. Round-tripping against ourselves cannot catch that;
+// the ROM-reader oracle in the unit tests can.
 
 struct Checksum { u8 a, b, c; };
 
@@ -117,28 +126,33 @@ inline Checksum encodeData(const u8* in, std::size_t n, u8* out) {
     u8 a = 0, b = 0, c = 0;
     unsigned carry = 0;
     for (std::size_t i = 0; i < n; i += 3) {
-        const u8 v0 = in[i];
-        const u8 v1 = (i + 1 < n) ? in[i + 1] : 0;
-        const u8 v2 = (i + 2 < n) ? in[i + 2] : 0;
-        // Rotate C left through the saved carry, then scramble the group.
-        const unsigned newCarry = (c >> 7) & 1u;
+        // Rotate C left, its top bit becoming both bit 0 and the carry in.
+        carry = (c >> 7) & 1u;
         c = static_cast<u8>((c << 1) | carry);
-        carry = newCarry;
 
+        const u8 v0 = in[i];
         unsigned s = static_cast<unsigned>(a) + v0 + carry;
         a = static_cast<u8>(s);
         carry = (s > 0xFF) ? 1u : 0u;
         out[i] = static_cast<u8>(v0 ^ c);
 
+        // 524 is not a multiple of three, so the last group is short. A byte
+        // that is not on the disk is not folded into the checksum either -- the
+        // ROM leaves its loop the moment the count runs out ($43D296) rather
+        // than accumulating a phantom zero, and a phantom zero still carries.
+        if (i + 1 >= n) break;
+        const u8 v1 = in[i + 1];
         s = static_cast<unsigned>(b) + v1 + carry;
         b = static_cast<u8>(s);
         carry = (s > 0xFF) ? 1u : 0u;
-        if (i + 1 < n) out[i + 1] = static_cast<u8>(v1 ^ a);
+        out[i + 1] = static_cast<u8>(v1 ^ a);
 
+        if (i + 2 >= n) break;
+        const u8 v2 = in[i + 2];
         s = static_cast<unsigned>(c) + v2 + carry;
         c = static_cast<u8>(s);
         carry = (s > 0xFF) ? 1u : 0u;
-        if (i + 2 < n) out[i + 2] = static_cast<u8>(v2 ^ b);
+        out[i + 2] = static_cast<u8>(v2 ^ b);
     }
     return {a, b, c};
 }
@@ -148,9 +162,8 @@ inline Checksum decodeData(const u8* in, std::size_t n, u8* out) {
     u8 a = 0, b = 0, c = 0;
     unsigned carry = 0;
     for (std::size_t i = 0; i < n; i += 3) {
-        const unsigned newCarry = (c >> 7) & 1u;
+        carry = (c >> 7) & 1u;
         c = static_cast<u8>((c << 1) | carry);
-        carry = newCarry;
 
         const u8 v0 = static_cast<u8>(in[i] ^ c);
         unsigned s = static_cast<unsigned>(a) + v0 + carry;
@@ -158,25 +171,37 @@ inline Checksum decodeData(const u8* in, std::size_t n, u8* out) {
         carry = (s > 0xFF) ? 1u : 0u;
         out[i] = v0;
 
-        const u8 v1 = (i + 1 < n) ? static_cast<u8>(in[i + 1] ^ a) : 0;
+        if (i + 1 >= n) break;                 // short final group; see encodeData
+        const u8 v1 = static_cast<u8>(in[i + 1] ^ a);
         s = static_cast<unsigned>(b) + v1 + carry;
         b = static_cast<u8>(s);
         carry = (s > 0xFF) ? 1u : 0u;
-        if (i + 1 < n) out[i + 1] = v1;
+        out[i + 1] = v1;
 
-        const u8 v2 = (i + 2 < n) ? static_cast<u8>(in[i + 2] ^ b) : 0;
+        if (i + 2 >= n) break;
+        const u8 v2 = static_cast<u8>(in[i + 2] ^ b);
         s = static_cast<unsigned>(c) + v2 + carry;
         c = static_cast<u8>(s);
         carry = (s > 0xFF) ? 1u : 0u;
-        if (i + 2 < n) out[i + 2] = v2;
+        out[i + 2] = v2;
     }
     return {a, b, c};
 }
 
 // ---- 6-and-2 nibblization ---------------------------------------------
 //
-// Three scrambled bytes become four disk bytes: one gathering the low two bits
-// of each (bit-reversed into a 6-bit field), then the high six bits of each.
+// Three scrambled bytes become four disk bytes: one gathering the **high** two
+// bits of each into a 6-bit field, then the low six bits of each.
+//
+// Which two bits go where is not the Apple II convention, and the docs do not
+// say; the ROM does. Its reader rebuilds a byte as
+//
+//   43D206  ROL.B #2,D1 / AND.B #$C0,D2   ; the pair lands in bits 7:6
+//   43D210  OR.B  (0,A3,D3.W),D2          ; the value byte fills bits 5:0
+//
+// and its writer masks the byte it encodes with ANDI.B #$3F ($435912) after
+// rotating the top bits away into the gathered byte ($435910 ROL.W #2). So the
+// gathered byte carries bits 7:6 and the value byte carries bits 5:0.
 
 inline void nibblize(const u8* in, std::size_t n, std::vector<u8>& out) {
     const u8* enc = encodeTable();
@@ -184,11 +209,11 @@ inline void nibblize(const u8* in, std::size_t n, std::vector<u8>& out) {
         const u8 v0 = in[i];
         const u8 v1 = (i + 1 < n) ? in[i + 1] : 0;
         const u8 v2 = (i + 2 < n) ? in[i + 2] : 0;
-        const u8 lo = static_cast<u8>(((v0 & 3) << 4) | ((v1 & 3) << 2) | (v2 & 3));
-        out.push_back(enc[lo & 0x3F]);
-        out.push_back(enc[(v0 >> 2) & 0x3F]);
-        if (i + 1 < n) out.push_back(enc[(v1 >> 2) & 0x3F]);
-        if (i + 2 < n) out.push_back(enc[(v2 >> 2) & 0x3F]);
+        const u8 pairs = static_cast<u8>(((v0 >> 6) << 4) | ((v1 >> 6) << 2) | (v2 >> 6));
+        out.push_back(enc[pairs & 0x3F]);
+        out.push_back(enc[v0 & 0x3F]);
+        if (i + 1 < n) out.push_back(enc[v1 & 0x3F]);
+        if (i + 2 < n) out.push_back(enc[v2 & 0x3F]);
     }
 }
 
@@ -205,14 +230,14 @@ inline bool denibblize(const u8* in, u8* out, std::size_t n) {
     const u8* dec = decodeTable();
     std::size_t src = 0, dst = 0;
     while (dst < n) {
-        const u8 lo = dec[in[src++]];
-        if (lo == 0xFF) return false;
+        const u8 pairs = dec[in[src++]];
+        if (pairs == 0xFF) return false;
         const std::size_t take = (n - dst) < 3 ? (n - dst) : 3;
         for (std::size_t k = 0; k < take; ++k) {
-            const u8 hi = dec[in[src++]];
-            if (hi == 0xFF) return false;
-            const u8 bits = static_cast<u8>((lo >> (4 - 2 * k)) & 3);
-            out[dst++] = static_cast<u8>((hi << 2) | bits);
+            const u8 val = dec[in[src++]];
+            if (val == 0xFF) return false;
+            const u8 top = static_cast<u8>((pairs >> (4 - 2 * k)) & 3);
+            out[dst++] = static_cast<u8>((top << 6) | val);
         }
     }
     return true;
@@ -273,12 +298,13 @@ inline std::vector<u8> buildTrack(const std::vector<u8>& image, int track, int s
         u8 scrambled[kPayload];
         const Checksum ck = encodeData(raw, kPayload, scrambled);
         nibblize(scrambled, kPayload, trk);
-        // The 24-bit checksum rides in four disk bytes: the gathered low bits
-        // first, then the high six of each accumulator.
-        trk.push_back(enc[(((ck.a & 3) << 4) | ((ck.b & 3) << 2) | (ck.c & 3)) & 0x3F]);
-        trk.push_back(enc[(ck.a >> 2) & 0x3F]);
-        trk.push_back(enc[(ck.b >> 2) & 0x3F]);
-        trk.push_back(enc[(ck.c >> 2) & 0x3F]);
+        // The 24-bit checksum rides in four disk bytes, in the same group format
+        // as the data: the gathered top bits first, then the low six of each
+        // accumulator (the ROM checks them at $43D318-$43D36C).
+        trk.push_back(enc[(((ck.a >> 6) << 4) | ((ck.b >> 6) << 2) | (ck.c >> 6)) & 0x3F]);
+        trk.push_back(enc[ck.a & 0x3F]);
+        trk.push_back(enc[ck.b & 0x3F]);
+        trk.push_back(enc[ck.c & 0x3F]);
         trk.push_back(0xDE); trk.push_back(0xAA); trk.push_back(0xFF);
     }
     return trk;
@@ -320,12 +346,12 @@ inline int decodeTrack(const std::vector<u8>& trk, std::vector<u8>& image,
                 u8 raw[kPayload];
                 const Checksum ck = decodeData(scrambled, kPayload, raw);
                 const std::size_t cp = p + nibs;
-                const u8 lo = dec[trk[cp]], ha = dec[trk[cp + 1]],
-                         hb = dec[trk[cp + 2]], hc = dec[trk[cp + 3]];
-                if (lo != 0xFF && ha != 0xFF && hb != 0xFF && hc != 0xFF) {
-                    const u8 a = static_cast<u8>((ha << 2) | ((lo >> 4) & 3));
-                    const u8 b = static_cast<u8>((hb << 2) | ((lo >> 2) & 3));
-                    const u8 c = static_cast<u8>((hc << 2) | (lo & 3));
+                const u8 pr = dec[trk[cp]], va = dec[trk[cp + 1]],
+                         vb = dec[trk[cp + 2]], vc = dec[trk[cp + 3]];
+                if (pr != 0xFF && va != 0xFF && vb != 0xFF && vc != 0xFF) {
+                    const u8 a = static_cast<u8>((((pr >> 4) & 3) << 6) | va);
+                    const u8 b = static_cast<u8>((((pr >> 2) & 3) << 6) | vb);
+                    const u8 c = static_cast<u8>(((pr & 3) << 6) | vc);
                     if (a == ck.a && b == ck.b && c == ck.c && curSector < n) {
                         const std::size_t off =
                             static_cast<std::size_t>(before + curSide * n + curSector) * kSectorBytes;

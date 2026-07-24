@@ -23,6 +23,85 @@ std::vector<u8> makeVolume(int sides) {
     return img;
 }
 
+// ---- the oracle -------------------------------------------------------
+//
+// Our encoder and decoder are inverses of each other, so a round-trip test
+// happily round-trips a mistake. The only authority on the format is the
+// machine that has to read the disk, so this is the Classic ROM's own data-field
+// reader ($43D1B8-$43D376), transcribed from its instructions:
+//
+//   43D202  MOVE.B (0,A3,D3.W),D1   ; D1 = 6-bit value of the gathered byte
+//   43D206  ROL.B  #2,D1
+//   43D20A  AND.B  D0,D2            ; D0 = $C0 -> the pair lands in bits 7:6
+//   43D210  OR.B   (0,A3,D3.W),D2   ; the value byte supplies bits 5:0
+//   43D214  MOVE.B D7,D3 / ADD.B D7,D3 / ROL.B #1,D7   ; X = old bit 7 of c3
+//   43D21A  EOR.B  D7,D2            ; unscramble with the rotated c3
+//   43D21E  ADDX.B D2,D5            ; c1 += raw + X
+//
+// so: byte = (pair << 6) | value6, c3 rotates plainly (bit 7 -> bit 0), and the
+// carry folded into the first addition is c3's own old bit 7. The write side at
+// $4358CC-$435930 does the exact inverse, which cross-checks all three.
+struct RomRead {
+    bool addrMark = false, dataMark = false, checksumOk = false;
+    u8 payload[gcr::kPayload] = {};
+};
+
+RomRead romReadFirstSector(const std::vector<u8>& trk) {
+    const u8* dec = gcr::decodeTable();
+    RomRead r;
+    std::size_t i = 0;
+    for (; i + 3 < trk.size(); ++i)
+        if (trk[i] == 0xD5 && trk[i + 1] == 0xAA && trk[i + 2] == 0x96) break;
+    if (i + 3 >= trk.size()) return r;
+    r.addrMark = true;
+    for (; i + 3 < trk.size(); ++i)
+        if (trk[i] == 0xD5 && trk[i + 1] == 0xAA && trk[i + 2] == 0xAD) break;
+    if (i + 3 >= trk.size()) return r;
+    r.dataMark = true;
+
+    std::size_t p = i + 4;                     // prologue + the sector byte
+    unsigned c1 = 0, c2 = 0, c3 = 0, x = 0;
+    // One group: the gathered byte, then `count` value bytes. 524 is not a
+    // multiple of three, so the last group of the payload is short -- the ROM
+    // handles that at $43D296 (TST.W D4; BEQ -> the checksum), reading only the
+    // bytes it still needs and never a fourth.
+    auto group = [&](u8* out, int count) {
+        const u8 pairs = dec[trk[p++]];
+        for (int k = 0; k < count; ++k) {
+            const u8 val = dec[trk[p++]];
+            out[k] = static_cast<u8>((((pairs >> (4 - 2 * k)) & 3) << 6) | val);
+        }
+    };
+    for (std::size_t done = 0; done < gcr::kPayload;) {
+        const std::size_t left = gcr::kPayload - done;
+        const int cnt = static_cast<int>(left < 3 ? left : 3);
+        u8 scr[3] = {};
+        group(scr, cnt);
+        const unsigned bit7 = (c3 >> 7) & 1u;
+        c3 = ((c3 << 1) | bit7) & 0xFF;        // ROL.B #1
+        x = bit7;
+        unsigned s;
+        const u8 v0 = static_cast<u8>(scr[0] ^ c3);
+        s = c1 + v0 + x; c1 = s & 0xFF; x = s >> 8;
+        r.payload[done] = v0;
+        if (cnt > 1) {
+            const u8 v1 = static_cast<u8>(scr[1] ^ c1);
+            s = c2 + v1 + x; c2 = s & 0xFF; x = s >> 8;
+            r.payload[done + 1] = v1;
+        }
+        if (cnt > 2) {
+            const u8 v2 = static_cast<u8>(scr[2] ^ c2);
+            s = c3 + v2 + x; c3 = s & 0xFF; x = s >> 8;
+            r.payload[done + 2] = v2;
+        }
+        done += static_cast<std::size_t>(cnt);
+    }
+    u8 want[3];
+    group(want, 3);                             // same group format for the checksum
+    r.checksumOk = (want[0] == c1 && want[1] == c2 && want[2] == c3);
+    return r;
+}
+
 } // namespace
 
 TEST_CASE("gcr: the disk-byte alphabet matches the ROM's table") {
@@ -122,6 +201,77 @@ TEST_CASE("gcr: every sector of an 800K volume survives encode then decode") {
     }
     CHECK(totalSectors == gcr::sectorsPerSide() * sides);   // 1600
     CHECK(dst == src);
+}
+
+TEST_CASE("gcr: the ROM's own reader recovers what we wrote") {
+    const std::vector<u8> src = makeVolume(2);
+    // Physical slot 0 on any track holds logical sector 0 under 2:1 interleave.
+    for (int track : {0, 1, 20, 40, 60, 79}) {
+        for (int side : {0, 1}) {
+            const std::vector<u8> trk = gcr::buildTrack(src, track, side, 2, 0x22);
+            const RomRead r = romReadFirstSector(trk);
+            INFO("track " << track << " side " << side);
+            REQUIRE(r.addrMark);
+            REQUIRE(r.dataMark);
+            CHECK(r.checksumOk);
+            const std::size_t off =
+                static_cast<std::size_t>(gcr::trackStartSector(track) * 2 +
+                                         side * gcr::sectorsOnTrack(track)) * 512;
+            bool same = true;
+            for (std::size_t i = 0; i < 512; ++i)
+                if (r.payload[gcr::kTagBytes + i] != src[off + i]) { same = false; break; }
+            CHECK(same);
+        }
+    }
+}
+
+TEST_CASE("gcr: every sector of a track lands where the driver will look for it") {
+    // The checksums can all be right and the disk still be unreadable if a
+    // sector carries the wrong 512 bytes. The driver locates a block by the
+    // track/side/sector triple in the address field, so walk each track the way
+    // it does and check that the triple it finds selects the image offset the
+    // File Manager expects for that logical block.
+    const std::vector<u8> src = makeVolume(2);
+    const u8* dec = gcr::decodeTable();
+    for (int track : {0, 1, 15, 16, 31, 32, 47, 48, 63, 64, 79}) {
+        for (int side : {0, 1}) {
+            const std::vector<u8> trk = gcr::buildTrack(src, track, side, 2, 0x22);
+            const int n = gcr::sectorsOnTrack(track);
+            std::vector<int> seen(static_cast<std::size_t>(n), 0);
+            int found = 0;
+            for (std::size_t i = 0; i + 8 < trk.size(); ++i) {
+                if (!(trk[i] == 0xD5 && trk[i + 1] == 0xAA && trk[i + 2] == 0x96)) continue;
+                const u8 t = dec[trk[i + 3]], s = dec[trk[i + 4]];
+                const u8 sh = dec[trk[i + 5]], f = dec[trk[i + 6]], ck = dec[trk[i + 7]];
+                INFO("track " << track << " side " << side << " address field at " << i);
+                REQUIRE(t != 0xFF); REQUIRE(s != 0xFF); REQUIRE(sh != 0xFF);
+                REQUIRE(f != 0xFF); REQUIRE(ck != 0xFF);
+                CHECK(((t ^ s ^ sh ^ f) & 0x3F) == ck);       // $43D146-$43D17A
+                CHECK(t == (track & 0x3F));
+                CHECK(((sh >> 5) & 1) == side);               // side bit
+                CHECK((sh & 1) == (track >= 64 ? 1 : 0));     // track bit 6
+                CHECK(f == 0x22);                             // 800K double sided
+                REQUIRE(s < n);
+                ++seen[s];
+                ++found;
+
+                // Now the data field that follows, and where it must live.
+                std::vector<u8> tail(trk.begin() + static_cast<std::ptrdiff_t>(i), trk.end());
+                const RomRead r = romReadFirstSector(tail);
+                REQUIRE(r.dataMark);
+                CHECK(r.checksumOk);
+                const std::size_t off =
+                    static_cast<std::size_t>(gcr::trackStartSector(track) * 2 +
+                                             side * n + s) * 512;
+                bool same = true;
+                for (std::size_t k = 0; k < 512; ++k)
+                    if (r.payload[gcr::kTagBytes + k] != src[off + k]) { same = false; break; }
+                CHECK(same);
+            }
+            CHECK(found == n);
+            for (int s = 0; s < n; ++s) CHECK(seen[static_cast<std::size_t>(s)] == 1);
+        }
+    }
 }
 
 TEST_CASE("gcr: a built track is well formed") {
