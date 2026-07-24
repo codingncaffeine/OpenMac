@@ -166,6 +166,13 @@ public:
     // present minimal IWM the ROM cannot read a disk, so this will not boot.
     void setSonyShimEnabled(bool on) { sonyShim_ = on; }
 
+    // Let the disk chip answer the ROM's SWIM probe and unlock its ISM register
+    // set. The probe's outcome decides whether the driver works the chip as an
+    // IWM (software GCR) or as a SWIM (hardware MFM), so this switches the whole
+    // disk path over; it stays off until the ISM data path is finished.
+    void setSwimEnabled(bool on);
+    bool iwmInIsmMode() const;
+
     // Force individual Sony drive status lines on the internal drive (bit n of
     // mask selects line n, bit n of value is the level). Investigation aid for
     // the drive-register assignments the documentation never pinned down.

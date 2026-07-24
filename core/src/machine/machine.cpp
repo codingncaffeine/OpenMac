@@ -562,6 +562,9 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     scsi_->disk.readOnly = readOnly;
 }
 
+void Machine::setSwimEnabled(bool on) { iwm_->swimEnabled = on; }
+bool Machine::iwmInIsmMode() const { return iwm_->ismSelected(); }
+
 void Machine::setSonyLineOverride(u16 mask, u16 value) {
     drive0_->overrideMask = mask;
     drive0_->overrideValue = value;

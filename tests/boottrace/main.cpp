@@ -863,7 +863,7 @@ int main(int argc, char** argv) {
     bool traceBranches = false, dumpStructSet = false;
     u32 disasmAddr = 0; int disasmCount = 0; bool disasmSet = false;
     bool driveInstall = false;
-    int traceIwm = 0; bool noSonyShim = false;
+    int traceIwm = 0; bool noSonyShim = false; bool swimOn = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
     bool floppy800k = false, insert800k = false, insert800kRW = false;
     std::string floppy800kPath, insert800kOut;
@@ -885,6 +885,7 @@ int main(int argc, char** argv) {
         else if (arg == "--trace-iwm" && i + 1 < argc)
             traceIwm = std::atoi(argv[++i]);
         else if (arg == "--no-sony-shim") noSonyShim = true;
+        else if (arg == "--swim") swimOn = true;
         else if (arg == "--floppy-800k") {
             floppy800k = true;
             // Optional path: a real 800K image rather than a synthetic volume.
@@ -980,6 +981,10 @@ int main(int argc, char** argv) {
     Machine mac(std::move(rom), {ramMB * 1024u * 1024u});
     mac.onDiag = [](const char* s) { std::printf("[diag] %s\n", s); };
     if (forceRom) mac.setForceRomDisk(true);
+    if (swimOn) {
+        mac.setSwimEnabled(true);
+        std::printf("SWIM/ISM register set ENABLED -- the ROM will drive the chip as a SWIM\n");
+    }
     if (noSonyShim) {
         mac.setSonyShimEnabled(false);
         std::printf(".Sony high-level shim DISABLED -- the ROM's own driver runs the hardware\n");
@@ -1013,13 +1018,25 @@ int main(int argc, char** argv) {
             if (!write && (reg & 15) == 0xE && (lines & 0x40)) ++driveRegReads[drvReg & 15];
             if (std::find(iwmPcs.begin(), iwmPcs.end(), pc) == iwmPcs.end() && iwmPcs.size() < 64)
                 iwmPcs.push_back(pc);
-            if (iwmTotal <= traceIwm)
-                std::printf("IWM %5lld pc=%06X %-10s %s %02X  lines=%02X [lstrb=%d enbl=%d "
+            if (iwmTotal <= traceIwm) {
+                // Once the chip is unlocked into ISM mode the same sixteen
+                // addresses are a different register file: A3 is the read/write
+                // line, so n is written at +512*n and read at +512*(n+8).
+                static const char* kIsmW[8] = {"W Data", "W Mark", "W CRC/cfg", "W ParamRAM",
+                                               "W Phase", "W Setup", "W Mode-0", "W Mode-1"};
+                static const char* kIsmR[8] = {"R Data", "R Mark", "R Error", "R ParamRAM",
+                                               "R Phase", "R Setup", "R Status", "R Handshake"};
+                const bool ism = mac.iwmInIsmMode();
+                const char* name = ism ? ((reg & 8) ? kIsmR[reg & 7] : kIsmW[reg & 7])
+                                       : kIwmReg[reg & 15];
+                std::printf("%s %5lld pc=%06X %-11s %s %02X  lines=%02X [lstrb=%d enbl=%d "
                             "drv=%d q6=%d q7=%d] drvReg=%X %s\n",
-                            iwmTotal, pc, kIwmReg[reg & 15], write ? "W" : "R", data, lines,
+                            ism ? "ISM" : "IWM",
+                            iwmTotal, pc, name, write ? "W" : "R", data, lines,
                             (lines >> 3) & 1, (lines >> 4) & 1, (lines >> 5) & 1,
                             (lines >> 6) & 1, (lines >> 7) & 1, drvReg & 15,
                             kDriveReg[drvReg & 15]);
+            }
         };
     }
     if (!floppyPath.empty()) {
