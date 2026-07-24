@@ -205,11 +205,12 @@ public:
     // they are driven from the Phase register.
     //
     // Reference: SWIM Chip User's Reference Rev 1.5 pp.12-13, 20-25.
-    // Whether the chip will unlock into ISM mode at all. The ROM's probe decides
-    // between the GCR path and the MFM path on the strength of it, so answering
-    // "SWIM" commits the driver to the ISM register set for every disk -- GCR
-    // media included. Off until the ISM data path can carry them.
-    bool swimEnabled = false;
+    // Whether the chip will unlock into ISM mode at all -- that is, whether it
+    // is a SWIM or a plain IWM. The Classic carries a SWIM (Developer Note pp.2,
+    // 5), so this is on; the switch exists because the ROM's probe decides the
+    // whole disk path on the strength of it, which makes "answer as a plain IWM"
+    // a useful thing to be able to force when bisecting.
+    bool swimEnabled = true;
 
     bool ismSelected() const { return ism_; }
     u8 ismMode() const { return ismMode_; }

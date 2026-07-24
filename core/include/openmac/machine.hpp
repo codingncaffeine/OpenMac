@@ -229,6 +229,7 @@ private:
     void findGcrErrorSites(u32 drvrBase);   // locate the driver's error exits in the ROM
     void noteGcrError(u32 pc);     // one of them was reached
     void watchSonyPrime();         // log a read/write the ROM's own driver is about to do
+    void watchSonyResult();        // log the result the ROM's own driver hands back
     void flushFloppyTrack();       // decode a written track back into the image
     void ismService(SonyDrive& d); // move bytes between the ISM FIFO and the surface
     int sonyOpen(u32 pb, u32 dce);
@@ -257,6 +258,9 @@ private:
     u32 gcrErrors_[8] = {};
     int gcrErrLog_ = 12;           // diag budget: report the first few, then count only
     int sonyPrimeLog_ = 40;        // diag budget for the ROM driver's own I/O requests
+    u32 sonyResultPc_ = 0;         // where the ROM's own driver hands its result back
+    int sonyResultLog_ = 40;
+    u32 sonyResults_ = 0, sonyResultErrs_ = 0;
     u32 drvStatusAddr_ = 0;        // Mac address of our DrvSts record
     int floppyDriveNum_ = 0;
     bool inSony_ = false;          // re-entrancy guard during trap execution

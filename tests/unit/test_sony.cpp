@@ -153,7 +153,13 @@ TEST_CASE("sony: status lines answer the way the ROM's driver expects") {
     // Active low throughout, so false means the condition is asserted.
     CHECK(s.drive.sense(0x1, s.now) == false);   // CSTIN: disk in place
     CHECK(s.drive.sense(0xE, s.now) == false);   // INSTALLED: drive present
-    CHECK(s.drive.sense(0xF, s.now) == false);   // DRVIN: drive connected
+    // $F is the high-density aperture, not DRVIN: low only when the medium is
+    // high density. Answering it from the drive rather than the disk makes a
+    // SWIM-mode driver refuse an 800K disk with gcrOnMFMErr.
+    CHECK(s.drive.sense(0xF, s.now) == true);    // an 800K disk is not HD
+    s.drive.hdMedia = true;
+    CHECK(s.drive.sense(0xF, s.now) == false);   // a 1.4MB disk is
+    s.drive.hdMedia = false;
     CHECK(s.drive.sense(0xC, s.now) == true);    // SIDES: high = double sided
     CHECK(s.drive.sense(0x5, s.now) == false);   // TK0: at track 0
     CHECK(s.drive.sense(0x4, s.now) == false);   // MOTORON: motor running

@@ -863,7 +863,7 @@ int main(int argc, char** argv) {
     bool traceBranches = false, dumpStructSet = false;
     u32 disasmAddr = 0; int disasmCount = 0; bool disasmSet = false;
     bool driveInstall = false;
-    int traceIwm = 0; bool noSonyShim = false; bool swimOn = false;
+    int traceIwm = 0; bool noSonyShim = false; bool swimOn = false, swimOff = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
     bool floppy800k = false, insert800k = false, insert800kRW = false;
     std::string floppy800kPath, insert800kOut;
@@ -886,6 +886,7 @@ int main(int argc, char** argv) {
             traceIwm = std::atoi(argv[++i]);
         else if (arg == "--no-sony-shim") noSonyShim = true;
         else if (arg == "--swim") swimOn = true;
+        else if (arg == "--no-swim") swimOff = true;
         else if (arg == "--floppy-800k") {
             floppy800k = true;
             // Optional path: a real 800K image rather than a synthetic volume.
@@ -981,9 +982,14 @@ int main(int argc, char** argv) {
     Machine mac(std::move(rom), {ramMB * 1024u * 1024u});
     mac.onDiag = [](const char* s) { std::printf("[diag] %s\n", s); };
     if (forceRom) mac.setForceRomDisk(true);
-    if (swimOn) {
-        mac.setSwimEnabled(true);
-        std::printf("SWIM/ISM register set ENABLED -- the ROM will drive the chip as a SWIM\n");
+    // The Classic has a SWIM, so the chip answers the ROM's probe by default.
+    // --no-swim makes it answer as a plain IWM instead, which is worth being
+    // able to force: the probe's outcome decides the whole disk path.
+    if (swimOff) {
+        mac.setSwimEnabled(false);
+        std::printf("SWIM answer SUPPRESSED -- the chip reports itself a plain IWM\n");
+    } else if (swimOn) {
+        std::printf("SWIM/ISM register set enabled (the default)\n");
     }
     if (noSonyShim) {
         mac.setSonyShimEnabled(false);

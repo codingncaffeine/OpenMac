@@ -485,6 +485,7 @@ int Machine::stepInstruction() {
     // and it is the only direct read on whether our nibble stream is right.
     if (gcrErrSpan_ && (cpu_.pc - gcrErrLo_) <= gcrErrSpan_) noteGcrError(cpu_.pc);
     if (!sonyShim_ && sonyPrimePc_ && cpu_.pc == sonyPrimePc_) watchSonyPrime();
+    if (!sonyShim_ && sonyResultPc_ && cpu_.pc == sonyResultPc_) watchSonyResult();
     cpu_.setIrqLevel(via_->irqAsserted() ? 1 : 0);
     const int c = cpu_.step();
     tickDevices(c);
@@ -884,10 +885,33 @@ void Machine::findGcrErrorSites(u32 drvrBase) {
         if (code < 0xAC || code > 0xBF) continue;
         if (rom_[a + 2] != 0x60) continue;                        // followed by BRA.s
         gcrErrSites_.push_back({0x400000u + a, code});
+        // Every one of these paths branches to its routine's common exit, and
+        // the offLinErr site lives in Prime -- so its branch target is where
+        // Prime hands its result back. Watching that reports the driver's own
+        // verdict on a request instead of leaving us to infer one, which is the
+        // only way to see a read that gives up without setting an error code.
+        if (code == 0xBF && !sonyResultPc_) {
+            const auto disp = static_cast<signed char>(rom_[a + 3]);
+            sonyResultPc_ = 0x400000u + a + 2 + 2 + static_cast<u32>(disp);
+        }
     }
     if (gcrErrSites_.empty()) return;
     gcrErrLo_ = gcrErrSites_.front().pc;
     gcrErrSpan_ = gcrErrSites_.back().pc - gcrErrLo_;
+}
+
+// The .Sony driver is about to return: D0 holds the result code.
+void Machine::watchSonyResult() {
+    const u16 res = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+    ++sonyResults_;
+    if (res) ++sonyResultErrs_;
+    if (sonyResultLog_ <= 0 || !onDiag) return;
+    --sonyResultLog_;
+    char b[128];
+    std::snprintf(b, sizeof b, "sony result: %04X %s (track %d side %d)", res,
+                  res == 0 ? "ok" : Machine::gcrErrorName(static_cast<u8>(res & 0xFF)),
+                  drive0_->track, drive0_->headUpper ? 1 : 0);
+    onDiag(b);
 }
 
 const char* Machine::gcrErrorName(u8 code) {

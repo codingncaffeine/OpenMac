@@ -119,9 +119,7 @@ public:
             case 0x8: return true;                 // RDDATA lower head (P3)
             case 0x9: return true;                 // RDDATA upper head (P3)
             case 0xA: return !superDrive;          // 0 = drive handles HD media
-            // HD media in the drive, active low: the driver reads it at $4354EC
-            // and only runs the SWIM's ISM initialisation when it reads low.
-            case 0xB: return !hdMedia;
+            case 0xB: return !hdMedia;             // unsettled; not the media sense
             case 0xC: return doubleSided;          // SIDES: 1 = double sided
             // READY: high once the spindle is at speed. The driver polls this
             // right after turning the motor on and waits for it to go high,
@@ -129,7 +127,18 @@ public:
             // disk is in the drive costs that whole timeout on every spin-up.
             case 0xD: return motorRunning(now);
             case 0xE: return false;                // INSTALLED: 0 = drive present
-            case 0xF: return false;                // DRVIN: 0 = drive connected
+            // The high-density aperture in the medium, low when one is there.
+            // Inside Macintosh III-36 calls this address DRVIN ("0 if the drive
+            // is physically connected"), but on a SuperDrive the driver reads it
+            // as the media sense: $435BF4-$435BFA reads it and stores the result
+            // into the per-drive "this disk is high density" flag, and a chip
+            // that has identified itself as a SWIM then refuses an 800K disk
+            // outright with gcrOnMFMErr (-400) -- a GCR disk in a drive it
+            // believes is set up for MFM -- without ever attempting a read.
+            // Answering it from the medium satisfies both uses: the drive-present
+            // check at $43F7AA takes its early exit on a high reading and accepts
+            // the drive either way.
+            case 0xF: return !hdMedia;
             default:  return true;
         }
     }

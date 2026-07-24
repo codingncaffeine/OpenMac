@@ -39,7 +39,15 @@ public:
         kbdAddr_ = 2;
         mouseAddr_ = 3;
         kbdHead_ = kbdTail_ = 0;
-        for (auto& k : keyState_) k = false;
+        // Preserve physical key state across an ADB reset -- on real hardware the keys
+        // are still held -- and re-queue the held keys so the ROM re-learns them via
+        // Talk R0 after it re-inits the ADB during boot. This is what makes "hold
+        // Shift/Option/Cmd while booting" (skip extensions, zap PRAM, etc.) register.
+        for (u8 c = 0; c < 0x80; ++c)
+            if (keyState_[c]) {
+                const int n = (kbdTail_ + 1) % kKbdQ;
+                if (n != kbdHead_) { kbdQ_[kbdTail_] = c; kbdTail_ = n; }
+            }
         mouseDx_ = mouseDy_ = 0;
         mouseButton_ = false;
         mousePending_ = false;
