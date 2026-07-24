@@ -408,11 +408,6 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
         }
         moveTo(240, 175);
     };
-    auto clickAt = [&](int x, int y) { moveTo(x, y); singleClick(); };
-    auto pressReturn = [&] {
-        mac.keyEvent(0x24, true);  for (int i = 0; i < 4; ++i) mac.runFrame();
-        mac.keyEvent(0x24, false); for (int i = 0; i < 4; ++i) mac.runFrame();
-    };
 
     // Post a mouse click into the OS event queue at (x,y): position the cursor (fills
     // the event's where), drive the physical button down (so the queued mouseDown
@@ -868,6 +863,7 @@ int main(int argc, char** argv) {
     bool traceBranches = false, dumpStructSet = false;
     u32 disasmAddr = 0; int disasmCount = 0; bool disasmSet = false;
     bool driveInstall = false;
+    int traceIwm = 0; bool noSonyShim = false;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -883,6 +879,9 @@ int main(int argc, char** argv) {
         else if (arg == "--trace-adb") traceAdb = true;
         else if (arg == "--trace-os-traps") traceOsTraps = true;
         else if (arg == "--trace-devio") traceDevIo = true;
+        else if (arg == "--trace-iwm" && i + 1 < argc)
+            traceIwm = std::atoi(argv[++i]);
+        else if (arg == "--no-sony-shim") noSonyShim = true;
         else if (arg == "--break-pc" && i + 1 < argc)
             breakPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
         else if (arg == "--watch-mem" && i + 1 < argc)
@@ -966,6 +965,44 @@ int main(int argc, char** argv) {
     Machine mac(std::move(rom), {ramMB * 1024u * 1024u});
     mac.onDiag = [](const char* s) { std::printf("[diag] %s\n", s); };
     if (forceRom) mac.setForceRomDisk(true);
+    if (noSonyShim) {
+        mac.setSonyShimEnabled(false);
+        std::printf(".Sony high-level shim DISABLED -- the ROM's own driver runs the hardware\n");
+    }
+    // Disk-chip bus survey: what does the ROM actually ask the IWM/SWIM for?
+    // The 16 soft switches (IWM mode); each odd address sets a line, each even clears it.
+    static const char* kIwmReg[16] = {
+        "ca0 off", "ca0 ON ", "ca1 off", "ca1 ON ", "ca2 off", "ca2 ON ",
+        "LSTRB off", "LSTRB ON", "ENABLE off", "ENABLE ON", "sel int", "sel ext",
+        "q6 off", "q6 ON ", "q7 off(rd)", "q7 ON(wr)"};
+    // Sony drive status lines, addressed CA2:CA1:CA0:SEL (Inside Macintosh III-35).
+    // The five unlisted addresses are the SuperDrive-era extensions, which that
+    // 1985 table predates -- the ROM polls two of them ($A and $E).
+    static const char* kDriveReg[16] = {
+        "DIRTN", "CSTIN", "STEP", "WRTPRT", "MOTORON", "TK0", "(unlisted 6)", "TACH",
+        "RDDATA0", "RDDATA1", "(unlisted A)", "(unlisted B)", "SIDES", "(unlisted D)",
+        "(unlisted E)", "DRVIN"};
+    long long iwmTotal = 0;
+    unsigned iwmRegHits[16] = {}, driveRegReads[16] = {};
+    std::vector<u32> iwmPcs;
+    if (traceIwm > 0 || noSonyShim) {
+        mac.onIwmAccess = [&, traceIwm](int reg, bool write, u8 data, u8 lines, u32 pc, int drvReg) {
+            ++iwmTotal;
+            ++iwmRegHits[reg & 15];
+            // A q7-off read with q6 on selects the Status register, which carries the
+            // currently addressed drive sense line in bit 7.
+            if (!write && (reg & 15) == 0xE && (lines & 0x40)) ++driveRegReads[drvReg & 15];
+            if (std::find(iwmPcs.begin(), iwmPcs.end(), pc) == iwmPcs.end() && iwmPcs.size() < 64)
+                iwmPcs.push_back(pc);
+            if (iwmTotal <= traceIwm)
+                std::printf("IWM %5lld pc=%06X %-10s %s %02X  lines=%02X [lstrb=%d enbl=%d "
+                            "drv=%d q6=%d q7=%d] drvReg=%X %s\n",
+                            iwmTotal, pc, kIwmReg[reg & 15], write ? "W" : "R", data, lines,
+                            (lines >> 3) & 1, (lines >> 4) & 1, (lines >> 5) & 1,
+                            (lines >> 6) & 1, (lines >> 7) & 1, drvReg & 15,
+                            kDriveReg[drvReg & 15]);
+        };
+    }
     if (!floppyPath.empty()) {
         std::ifstream ff(floppyPath, std::ios::binary);
         std::vector<u8> img{std::istreambuf_iterator<char>(ff),
@@ -1482,6 +1519,18 @@ int main(int argc, char** argv) {
                     allAudio.size(), lo, hi, nonSilent);
         if (!allAudio.empty())
             writeWav("I:/Visual Studio Projects/scratch/openmac/shots/boot.wav", allAudio, 22254);
+    }
+
+    if (iwmTotal > 0) {
+        std::printf("\n-- IWM/SWIM: %lld accesses; per soft-switch: --\n", iwmTotal);
+        for (int i = 0; i < 16; ++i)
+            if (iwmRegHits[i]) std::printf("   %-11s %u\n", kIwmReg[i], iwmRegHits[i]);
+        std::printf("   drive status lines sampled (CA2:CA1:CA0:SEL):\n");
+        for (int i = 0; i < 16; ++i)
+            if (driveRegReads[i]) std::printf("     %X %-14s %u\n", i, kDriveReg[i], driveRegReads[i]);
+        std::printf("   accessing PCs (%zu distinct):", iwmPcs.size());
+        for (u32 p : iwmPcs) std::printf(" %06X", p);
+        std::printf("\n");
     }
 
     std::printf("\n-- KeyMap ($174) reads: %u  from PCs:", mac.keyMapReads());

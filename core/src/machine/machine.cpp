@@ -532,6 +532,7 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
 // clears. A q7-off read returns the register selected by q6/q7.
 u8 Machine::iwmAccess(int reg, bool write, u8 data) {
     u8 ret = data;
+    const u32 accessPc = cpu_.recentPc(0);
     switch (reg) {
         case 0x0: iwmLines_ &= ~0x01u; break;   // ca0 off
         case 0x1: iwmLines_ |=  0x01u; break;   // ca0 on
@@ -556,6 +557,7 @@ u8 Machine::iwmAccess(int reg, bool write, u8 data) {
             iwmLines_ |= 0x80u;
             break;
     }
+    if (onIwmAccess) onIwmAccess(reg, write, write ? data : ret, iwmLines_, accessPc, iwmDriveReg());
     return ret;
 }
 
@@ -566,12 +568,22 @@ u8 Machine::iwmReadReg() {
     }
 }
 
-u8 Machine::iwmStatus() {
+// The Sony drive multiplexes its status lines onto one wire; which one is
+// selected by a 4-bit address CA2:CA1:CA0:SEL, where CA0-CA2 are IWM phase
+// lines and SEL is VIA PA5. Confirmed against the ROM's own .Sony driver:
+// its address packer at $435154 unpacks D0 as CA1:CA0:SEL:CA2, and its Prime
+// routine asks for D0=2 before I/O (-> CSTIN, disk in place) and D0=6 before a
+// write (-> WRTPRT, write protect), which is exactly this table.
+int Machine::iwmDriveReg() const {
     const bool sel = ((via_->ora() >> 5) & 1) != 0;   // VIA PA5 selects the line
-    const int idx = ((iwmLines_ & 0x04) ? 8 : 0) |    // ca2
-                    ((iwmLines_ & 0x02) ? 4 : 0) |    // ca1
-                    ((iwmLines_ & 0x01) ? 2 : 0) |    // ca0
-                    (sel ? 1 : 0);
+    return ((iwmLines_ & 0x04) ? 8 : 0) |    // ca2
+           ((iwmLines_ & 0x02) ? 4 : 0) |    // ca1
+           ((iwmLines_ & 0x01) ? 2 : 0) |    // ca0
+           (sel ? 1 : 0);
+}
+
+u8 Machine::iwmStatus() {
+    const int idx = iwmDriveReg();
     bool high = false;   // active-low lines: false (0) = asserted
     switch (idx) {
         case 0x1:
@@ -614,7 +626,7 @@ u32 Machine::findSonyDriver() {
 }
 
 bool Machine::trySonyTrap() {
-    if (inSony_ || sonyPrimePc_ == 0) return false;
+    if (!sonyShim_ || inSony_ || sonyPrimePc_ == 0) return false;
     const u32 pc = cpu_.pc;
     int (Machine::*fn)(u32, u32) = nullptr;
     if (pc == sonyOpenPc_)         fn = &Machine::sonyOpen;
@@ -1120,6 +1132,25 @@ void Machine::runFrame() {
         // scale, instead of a linear curve that muted volume 0 outright.
         if (enabled) s = 0x80 + (static_cast<int>(raw) - 0x80) / (8 - vol);
         if (audioOut_.size() < 8192) audioOut_.push_back(static_cast<u8>(s));
+    }
+
+    // Boot-trace: while the OS boots, emit a periodic state line to the log (onDiag ->
+    // openmac.log) so a stuck or failing boot is visible instead of a black box. PC/SR
+    // show where the CPU is, hdAcc shows disk progress, and scr is a framebuffer hash
+    // that changes as the screen draws (Happy Mac -> Welcome -> desktop). ~50 lines over
+    // the first 3000 frames, then it goes quiet.
+    if (bootTraceFrame_ < 3000) {
+        if (onDiag && (bootTraceFrame_ % 60) == 0) {
+            const u32 sb = screenBase();
+            u32 scr = 2166136261u;
+            for (u32 i = 0; i < 21888u; i += 64) scr = (scr ^ ram_[(sb + i) & ramMask_]) * 16777619u;
+            char b[112];
+            std::snprintf(b, sizeof b, "boot f=%u pc=%06X sr=%04X hdAcc=%u scr=%08X%s",
+                          bootTraceFrame_, cpu_.pc, cpu_.getSR(), hdAccessCount(), scr,
+                          cpu_.halted ? " HALTED" : "");
+            onDiag(b);
+        }
+        ++bootTraceFrame_;
     }
 }
 

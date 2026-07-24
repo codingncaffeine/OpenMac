@@ -145,6 +145,18 @@ public:
     // GUI log so a "swap didn't work" report has hard numbers behind it.
     std::function<void(const char* msg)> onDiag;
 
+    // Disk-chip (IWM/SWIM) bus trace: every soft-switch access, with the register
+    // index 0-15, direction, the byte, the line state after the access, the PC and
+    // the Sony drive-register address the phase lines currently select (CA2 CA1 CA0
+    // SEL, 0-15). Diagnostics only -- used to survey what the ROM's real .Sony
+    // driver demands of the hardware before the shim is replaced by real emulation.
+    std::function<void(int reg, bool write, u8 data, u8 lines, u32 pc, int driveReg)> onIwmAccess;
+
+    // Disable the high-level .Sony driver interception so the ROM's own driver
+    // runs against the emulated disk hardware. Investigation switch: with the
+    // present minimal IWM the ROM cannot read a disk, so this will not boot.
+    void setSonyShimEnabled(bool on) { sonyShim_ = on; }
+
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }
@@ -187,8 +199,10 @@ private:
     u8 iwmAccess(int reg, bool write, u8 data);
     u8 iwmReadReg();
     u8 iwmStatus();
+    int iwmDriveReg() const;   // Sony drive-register address CA2:CA1:CA0:SEL (0-15)
     u8 iwmLines_ = 0;   // b0-3 ca0-3, b4 motor, b5 drivesel, b6 q6, b7 q7
     u8 iwmMode_ = 0;    // Mode register, read back in Status bits 0-4
+    bool sonyShim_ = true;   // false: let the ROM's own .Sony driver drive the hardware
 
     std::vector<u8> floppy_;
     bool floppyRO_ = false;
@@ -229,6 +243,7 @@ private:
     bool overlay_ = true;
     bool screenAlt_ = false;
     bool soundAlt_  = false;   // PA3 (vSndPg2) sound-page select, independent of screenAlt_
+    u32  bootTraceFrame_ = 0;  // boot-trace heartbeat frame counter (restarts each reset())
 
     std::unique_ptr<Via6522> via_;
     std::unique_ptr<Rtc> rtc_;
