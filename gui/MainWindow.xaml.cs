@@ -95,6 +95,8 @@ public partial class MainWindow : Window
         if (_emulator.TryGetFrame(_bgra))
             _bitmap.WritePixels(new Int32Rect(0, 0, _emulator.ScreenWidth, _emulator.ScreenHeight),
                                 _bgra, _emulator.ScreenWidth * 4, 0);
+        // The machine ejects disks on its own; keep the menus and status honest.
+        if (_emulator.ConsumeDiskStateChanged()) UpdateUi();
     }
 
     [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
@@ -451,6 +453,8 @@ public partial class MainWindow : Window
         string machine = _emulator.IsRomLoaded
             ? $"{_settings.RamMB} MB"
               + (_emulator.FloppyPath is { } f ? $"  •  Floppy: {Path.GetFileName(f)}" : "")
+              + (_emulator.ExternalFloppyPath is { } f2
+                  ? $"  •  External: {Path.GetFileName(f2)}" : "")
               + (_emulator.HardDiskAttached && _emulator.HardDiskPath is { } hd
                   ? $"  •  HD: {Path.GetFileName(hd)}" : "")
             : "No ROM loaded";
@@ -470,7 +474,8 @@ public partial class MainWindow : Window
 
         EjectFloppyItem.IsEnabled = _emulator.FloppyPath is not null;
         ExternalDriveItem.IsChecked = _emulator.ExternalDriveAttached;
-        InsertFloppy2Item.IsEnabled = _emulator.ExternalDriveAttached;
+        // Inserting into the external drive connects one if there isn't one, so
+        // the item stays reachable rather than making the checkbox a prerequisite.
         EjectFloppy2Item.IsEnabled = _emulator.ExternalFloppyPath is not null;
         DetachHdItem.IsEnabled = _emulator.HardDiskAttached;
     }

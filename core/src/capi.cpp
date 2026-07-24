@@ -96,6 +96,12 @@ OMAC_API void omac_insert_floppy2(OMac* m, const uint8_t* img, size_t len, int r
 
 OMAC_API void omac_eject_floppy2(OMac* m) { if (m) m->mac.ejectExternalFloppy(); }
 
+OMAC_API int omac_floppy_present(OMac* m, int drive)
+{
+    if (!m) return 0;
+    return (drive == 1 ? m->mac.externalFloppyInserted() : m->mac.floppyInserted()) ? 1 : 0;
+}
+
 static size_t copyOut(const std::vector<u8>& src, uint8_t* out, size_t cap)
 {
     if (out && cap >= src.size()) std::copy(src.begin(), src.end(), out);

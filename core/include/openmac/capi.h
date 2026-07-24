@@ -57,6 +57,12 @@ OMAC_API void omac_eject_floppy(OMac*);
 OMAC_API void omac_set_external_drive(OMac*, int attached);
 OMAC_API void omac_insert_floppy2(OMac*, const uint8_t* img, size_t len, int read_only);
 OMAC_API void omac_eject_floppy2(OMac*);
+
+/* Is there a disk in that drive right now? 0 = internal, 1 = external. The guest
+   ejects disks on its own -- the startup scan drops a non-bootable one, an
+   installer swaps between them, the Finder obeys a drag to the Trash -- so a
+   front end has to ask rather than assume its own last action still holds. */
+OMAC_API int omac_floppy_present(OMac*, int drive);
 OMAC_API size_t omac_floppy_data(OMac*, uint8_t* out, size_t cap);
 OMAC_API size_t omac_floppy2_data(OMac*, uint8_t* out, size_t cap);
 OMAC_API void omac_insert_harddisk(OMac*, const uint8_t* img, size_t len, int read_only);

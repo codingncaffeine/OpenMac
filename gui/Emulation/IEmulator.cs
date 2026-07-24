@@ -42,6 +42,13 @@ public interface IEmulator : IDisposable
     void InsertExternalFloppy(string path);
     void EjectExternalFloppy();
 
+    /// <summary>
+    /// True once since the last call if a drive's contents changed without the
+    /// front end asking -- the guest ejected a disk. The caller refreshes its
+    /// menus; the backend has already saved whatever was written to it.
+    /// </summary>
+    bool ConsumeDiskStateChanged();
+
     void AttachHardDisk(string path);
     void DetachHardDisk();
 

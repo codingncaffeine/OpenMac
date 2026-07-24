@@ -165,6 +165,47 @@ public sealed class NativeEmulator : IEmulator
             DrainLog();
             DrainAudio();
         }
+        NoticeGuestEjects();
+    }
+
+    private volatile bool _diskStateDirty;
+
+    /// <summary>True once per change; the UI polls this to refresh its menus.</summary>
+    public bool ConsumeDiskStateChanged()
+    {
+        if (!_diskStateDirty) return false;
+        _diskStateDirty = false;
+        return true;
+    }
+
+    // The guest takes disks out by itself: the startup scan drops a floppy with
+    // no System on it, an installer swaps between disks, the Finder obeys a drag
+    // to the Trash. Nothing tells the front end, so notice it here -- otherwise
+    // the menu keeps offering to eject an empty drive and, worse, whatever the
+    // guest wrote to that disk is never saved back to the file it came from.
+    private void NoticeGuestEjects()
+    {
+        bool internalGone, externalGone;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return;
+            internalGone = FloppyPath is not null && Native.omac_floppy_present(_h, 0) == 0;
+            externalGone = ExternalFloppyPath is not null && Native.omac_floppy_present(_h, 1) == 0;
+        }
+        if (internalGone)
+        {
+            WriteBackFloppy();      // the core keeps the medium after an eject
+            Log.Line($"[disk] the machine ejected {Path.GetFileName(FloppyPath)}");
+            FloppyPath = null;
+        }
+        if (externalGone)
+        {
+            WriteBackExternalFloppy();
+            Log.Line("[disk] the machine ejected " +
+                     $"{Path.GetFileName(ExternalFloppyPath)} (external drive)");
+            ExternalFloppyPath = null;
+        }
+        if (internalGone || externalGone) _diskStateDirty = true;
     }
 
     private void PublishFrame()

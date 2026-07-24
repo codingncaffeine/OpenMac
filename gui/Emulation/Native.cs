@@ -52,6 +52,11 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_eject_floppy2(IntPtr h);
 
+    // Is there a disk in that drive right now? 0 = internal, 1 = external. The
+    // guest ejects disks on its own, so this has to be asked rather than assumed.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_floppy_present(IntPtr h, int drive);
+
     // Copy a medium back out so a session's writes can be saved to the file the
     // disk came from. Pass a null buffer to ask how large it is.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

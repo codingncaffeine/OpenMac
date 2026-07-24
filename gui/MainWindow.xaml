@@ -15,8 +15,7 @@
                 <Separator />
                 <MenuItem x:Name="ExternalDriveItem" Header="External Drive Connected"
                           IsCheckable="True" Click="ExternalDrive_Click" />
-                <MenuItem x:Name="InsertFloppy2Item" Header="Insert Floppy (External)…"
-                          Click="InsertExternalFloppy_Click" />
+                <MenuItem Header="Insert Floppy (External)…" Click="InsertExternalFloppy_Click" />
                 <MenuItem x:Name="EjectFloppy2Item" Header="Eject Floppy (External)"
                           Click="EjectExternalFloppy_Click" />
                 <Separator />
