@@ -28,6 +28,7 @@ add_executable(openmac_unit
     unit/test_hfs.cpp
     unit/test_gcr.cpp
     unit/test_sony.cpp
+    unit/test_mfm.cpp
 )
 target_link_libraries(openmac_unit PRIVATE openmac_core doctest::doctest openmac_warnings)
 add_test(NAME unit COMMAND openmac_unit)

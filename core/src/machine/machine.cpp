@@ -4,6 +4,7 @@
 #include "iwm.hpp"
 #include "rtc.hpp"
 #include "gcr.hpp"
+#include "mfm.hpp"
 #include "scsi.hpp"
 #include "sony.hpp"
 #include "scsiimage.hpp"
@@ -614,11 +615,37 @@ void Machine::iwmUpdateTrack() {
     // there is a write path, lay GCR sectors over a 1.4 MB volume. Those disks
     // stay with the high-level driver until the ISM path exists.
     if (d.hdMedia) {
-        d.invalidateTrack();
-        if (hdMediaLog_ > 0 && onDiag) {
-            --hdMediaLog_;
-            onDiag("sony: 1.4MB media needs the SWIM's MFM path; the GCR surface "
-                   "stays blank");
+        // High-density media is MFM: framed by the SWIM in hardware, not by the
+        // byte-level GCR surface. Without the ISM path there is nothing to hand
+        // the driver -- laying a GCR track over an MFM image would let it read a
+        // plausible prefix and, with a write path, ruin a 1.4 MB volume.
+        if (!iwm_->swimEnabled) {
+            d.invalidateTrack();
+            if (hdMediaLog_ > 0 && onDiag) {
+                --hdMediaLog_;
+                onDiag("sony: 1.4MB media needs the SWIM's MFM path; the GCR surface "
+                       "stays blank");
+            }
+            return;
+        }
+        const int mside = d.headUpper ? 1 : 0;
+        if (d.trackLoaded() && trackCacheTrack_ == d.track &&
+            trackCacheSide_ == mside && trackCacheGen_ == floppyGen_)
+            return;
+        flushFloppyTrack();
+        if (d.track < 0 || d.track >= mfm::kTracks) { d.invalidateTrack(); return; }
+        std::vector<u8> bytes, marks;
+        mfm::buildTrack(floppy_, d.track, mside, bytes, marks);
+        d.setTrackData(std::move(bytes), std::move(marks));
+        trackCacheTrack_ = d.track;
+        trackCacheSide_  = mside;
+        trackCacheGen_   = floppyGen_;
+        if (trackLogBudget_ > 0 && onDiag) {
+            --trackLogBudget_;
+            char b[96];
+            std::snprintf(b, sizeof b, "sony: MFM track %d side %d framed (%zu bytes)",
+                          d.track, mside, d.trackData().size());
+            onDiag(b);
         }
         return;
     }
@@ -669,6 +696,56 @@ void Machine::flushFloppyTrack() {
     }
 }
 
+// Move bytes between the ISM's one-deep FIFO and the rotating surface.
+//
+// The chip does the framing in MFM mode, so this is where "the search for the
+// mark byte is invisible to the software" (SWIM ref p.23) lives: setting ACTION
+// on a read parks the head on the next mark byte, and from there the FIFO simply
+// follows the surface. On a write, a byte the CPU hands over goes down at the
+// head, and the Mark and CRC registers put a mark byte or the two CRC bytes on
+// the disk instead.
+void Machine::ismService(SonyDrive& d) {
+    const bool action = iwm_->ismAction();
+    if (action && !ismActionPrev_) {
+        if (!iwm_->ismWriting()) d.syncToMark(totalCycles_);
+        ismCrcOut_ = 0xFFFF;
+    }
+    ismActionPrev_ = action;
+    if (!action) return;
+
+    if (!iwm_->ismWriting()) {
+        if (!iwm_->ismDataReady) {
+            u8 b = 0;
+            bool mark = false;
+            if (d.nextByte(totalCycles_, &b, &mark)) {
+                iwm_->ismData = b;
+                iwm_->ismMarkNext = mark;
+                iwm_->ismDataReady = true;
+                iwm_->ismCrcAdd(b);
+                ++iwmDataBytes_;
+            }
+        }
+        return;
+    }
+
+    // Write side: the handshake reports room for a byte, and whatever the CPU
+    // pushed goes down at the head.
+    iwm_->ismDataReady = d.writeReady(totalCycles_);
+    if (iwm_->ismWroteData || iwm_->ismWroteMark) {
+        const bool mark = iwm_->ismWroteMark;
+        d.writeByte(totalCycles_, iwm_->ismWritten, mark);
+        ismCrcOut_ = mfm::crc16Update(ismCrcOut_, iwm_->ismWritten);
+        iwm_->ismWroteData = iwm_->ismWroteMark = false;
+        ++iwmDataWrites_;
+    }
+    if (iwm_->ismWroteCrc) {
+        iwm_->ismWroteCrc = false;
+        d.writeByte(totalCycles_, static_cast<u8>(ismCrcOut_ >> 8), false);
+        d.writeByte(totalCycles_, static_cast<u8>(ismCrcOut_), false);
+        iwmDataWrites_ += 2;
+    }
+}
+
 // One IWM soft-switch access. The chip decodes the address and registers; the
 // machine supplies the drive status line the phase lines currently select,
 // because only it knows the drives.
@@ -681,17 +758,26 @@ u8 Machine::iwmAccess(int reg, bool write, u8 data) {
     iwm_->senseHigh = iwmSenseLine();
     iwmUpdateTrack();
     SonyDrive& d = selectedDrive();
-    // Q7 high means the chip is driving the write head. Reading the surface then
-    // would consume the bytes the driver is in the middle of laying down, so the
-    // read path stands aside while a write is in progress; the surface still
-    // advances with time, because writing advances it too.
-    if (!(iwm_->lines() & Iwm::kQ7)) {
-        iwm_->dataByte = d.readNibble(totalCycles_);
-        if (iwm_->dataByte) ++iwmDataBytes_;
+    if (iwm_->ismSelected()) ismService(d);
+    else {
+        // Q7 high means the chip is driving the write head. Reading the surface
+        // then would consume the bytes the driver is in the middle of laying
+        // down, so the read path stands aside while a write is in progress; the
+        // surface still advances with time, because writing advances it too.
+        // A drive reading high-density media in GCR mode gets nothing off it:
+        // MFM is framed by the chip, and the track under the head is legible
+        // only through the ISM path. Handing those bytes to the software GCR
+        // reader lets it find marks in MFM noise, which takes the driver's own
+        // media probe down the wrong branch.
+        if (!(iwm_->lines() & Iwm::kQ7) && !d.hdMedia) {
+            iwm_->dataByte = d.readNibble(totalCycles_);
+            if (iwm_->dataByte) ++iwmDataBytes_;
+        }
+        iwm_->writeReady = d.writeReady(totalCycles_);
     }
-    iwm_->writeReady = d.writeReady(totalCycles_);
     const u8 ret = iwm_->access(reg, write, data);
-    if (iwm_->writeLatched) {
+    if (iwm_->ismSelected()) ismService(d);
+    else if (iwm_->writeLatched) {
         iwm_->writeLatched = false;
         d.writeNibble(totalCycles_, iwm_->writeData);
         ++iwmDataWrites_;

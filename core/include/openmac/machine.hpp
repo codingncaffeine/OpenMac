@@ -230,6 +230,7 @@ private:
     void noteGcrError(u32 pc);     // one of them was reached
     void watchSonyPrime();         // log a read/write the ROM's own driver is about to do
     void flushFloppyTrack();       // decode a written track back into the image
+    void ismService(SonyDrive& d); // move bytes between the ISM FIFO and the surface
     int sonyOpen(u32 pb, u32 dce);
     void installSonyDrives();      // register floppy + HD drives (also used under ROM boot)
     int sonyPrime(u32 pb, u32 dce);
@@ -311,6 +312,8 @@ private:
     u32  trackCacheGen_ = 0;
     u32  floppyGen_ = 1;           // bumped whenever the medium is swapped or removed
     int  hdMediaLog_ = 1;          // one-shot note that HD media needs the MFM path
+    bool ismActionPrev_ = false;   // edge detect on the ISM ACTION bit
+    u16  ismCrcOut_ = 0xFFFF;      // CRC accumulated over bytes written in MFM mode
     int  writeLogBudget_ = 12;     // diag budget for tracks written back to the image
     u32  floppyWrites_ = 0;        // tracks the driver has written through the surface
     u32  iwmDataWrites_ = 0;       // bytes the driver has pushed at the write head

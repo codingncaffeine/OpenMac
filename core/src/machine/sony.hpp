@@ -119,7 +119,9 @@ public:
             case 0x8: return true;                 // RDDATA lower head (P3)
             case 0x9: return true;                 // RDDATA upper head (P3)
             case 0xA: return !superDrive;          // 0 = drive handles HD media
-            case 0xB: return !hdMedia;             // 0 = HD disk in the drive
+            // HD media in the drive, active low: the driver reads it at $4354EC
+            // and only runs the SWIM's ISM initialisation when it reads low.
+            case 0xB: return !hdMedia;
             case 0xC: return doubleSided;          // SIDES: 1 = double sided
             // READY: high once the spindle is at speed. The driver polls this
             // right after turning the motor on and waits for it to go high,
@@ -208,12 +210,24 @@ public:
     // machine whenever the track, side or medium changes.
     void setTrackData(std::vector<u8> nibbles) {
         trackData_ = std::move(nibbles);
+        trackMark_.clear();
         if (bytePos_ >= trackData_.size()) bytePos_ = 0;
         trackDirty_ = false;
     }
+
+    // MFM media carries a flag per byte as well: a mark byte is written with a
+    // transition missing between adjacent zero bits, which is how the controller
+    // tells an address mark from data that happens to look like one.
+    void setTrackData(std::vector<u8> bytes, std::vector<u8> marks) {
+        trackData_ = std::move(bytes);
+        trackMark_ = std::move(marks);
+        if (bytePos_ >= trackData_.size()) bytePos_ = 0;
+        trackDirty_ = false;
+    }
+    const std::vector<u8>& trackMarks() const { return trackMark_; }
     const std::vector<u8>& trackData() const { return trackData_; }
     bool trackLoaded() const { return !trackData_.empty(); }
-    void invalidateTrack() { trackData_.clear(); bytePos_ = 0; trackDirty_ = false; }
+    void invalidateTrack() { trackData_.clear(); trackMark_.clear(); bytePos_ = 0; trackDirty_ = false; }
 
     // Advance the surface to `now` and return the byte under the head, or 0 if
     // the motor is stopped or the track is blank. Each byte is handed out once.
@@ -226,16 +240,61 @@ public:
     // every other disk byte -- enough to look like data is flowing while no
     // address mark can ever match.
     u8 readNibble(u64 now) {
-        if (!motorRunning(now) || trackData_.empty()) { lastByteAt_ = now; return 0; }
-        if (now < lastByteAt_ + kCyclesPerByte) return 0;
-        const std::size_t n = trackData_.size();
-        const u64 steps = (now - lastByteAt_) / kCyclesPerByte;
-        bytePos_ = (bytePos_ + static_cast<std::size_t>((steps - 1) % n)) % n;
-        lastByteAt_ += steps * kCyclesPerByte;
-        const u8 b = trackData_[bytePos_];
-        bytePos_ = (bytePos_ + 1) % n;
-        return b;
+        u8 b = 0;
+        bool mark = false;
+        return nextByte(now, &b, &mark) ? b : 0;
     }
+
+    // The same rotation, reporting whether a byte actually came round and, for
+    // MFM media, whether it is a mark byte. GCR's "0 means nothing is ready"
+    // cannot serve there, because $00 is an ordinary sync byte in MFM.
+    bool nextByte(u64 now, u8* byte, bool* isMark) {
+        if (!motorRunning(now) || trackData_.empty()) { lastByteAt_ = now; return false; }
+        const u64 per = cyclesPerByte();
+        if (now < lastByteAt_ + per) return false;
+        const std::size_t n = trackData_.size();
+        const u64 steps = (now - lastByteAt_) / per;
+        bytePos_ = (bytePos_ + static_cast<std::size_t>((steps - 1) % n)) % n;
+        lastByteAt_ += steps * per;
+        *byte = trackData_[bytePos_];
+        *isMark = bytePos_ < trackMark_.size() && trackMark_[bytePos_] != 0;
+        bytePos_ = (bytePos_ + 1) % n;
+        return true;
+    }
+
+    // Roll forward to the next mark byte and stop just before it, which is what
+    // the controller does when a read is started: "the first byte that will be
+    // returned will be a mark byte ... the search is handled entirely by the
+    // chip" (SWIM ref p.23).
+    void syncToMark(u64 now) {
+        if (trackData_.empty() || trackMark_.empty()) return;
+        const std::size_t n = trackData_.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t p = (bytePos_ + i) % n;
+            if (!trackMark_[p]) continue;
+            bytePos_ = p;
+            lastByteAt_ = now;
+            return;
+        }
+    }
+
+    // Lay a byte down at the head, marked or not, for an MFM write.
+    void writeByte(u64 now, u8 b, bool mark) {
+        if (!writeReady(now)) return;
+        const std::size_t n = trackData_.size();
+        const u64 per = cyclesPerByte();
+        const u64 steps = (now - lastByteAt_) / per;
+        bytePos_ = (bytePos_ + static_cast<std::size_t>((steps - 1) % n)) % n;
+        lastByteAt_ += steps * per;
+        trackData_[bytePos_] = b;
+        if (trackMark_.size() == n) trackMark_[bytePos_] = mark ? 1 : 0;
+        bytePos_ = (bytePos_ + 1) % n;
+        trackDirty_ = true;
+    }
+
+    // A GCR disk byte is 2 us of cells; high-density MFM runs at 500 kbit/s,
+    // which is a byte every 16 us, so 125 CPU cycles against GCR's 128.
+    u64 cyclesPerByte() const { return hdMedia ? 125u : kCyclesPerByte; }
 
     // The write side of the same surface. The controller's write buffer is one
     // byte deep and the driver polls the handshake register until it empties
@@ -246,19 +305,10 @@ public:
     // data field that follows it -- landing where the driver intends.
     bool writeReady(u64 now) const {
         if (!motorRunning(now) || trackData_.empty() || readOnly) return false;
-        return now >= lastByteAt_ + kCyclesPerByte;
+        return now >= lastByteAt_ + cyclesPerByte();
     }
 
-    void writeNibble(u64 now, u8 b) {
-        if (!writeReady(now)) return;
-        const std::size_t n = trackData_.size();
-        const u64 steps = (now - lastByteAt_) / kCyclesPerByte;
-        bytePos_ = (bytePos_ + static_cast<std::size_t>((steps - 1) % n)) % n;
-        lastByteAt_ += steps * kCyclesPerByte;
-        trackData_[bytePos_] = b;
-        bytePos_ = (bytePos_ + 1) % n;
-        trackDirty_ = true;
-    }
+    void writeNibble(u64 now, u8 b) { writeByte(now, b, false); }
 
     // Set once anything has been written to the track under the head, so the
     // machine knows to decode it back into the image before the head moves.
@@ -324,7 +374,8 @@ private:
     u64  motorUpAt_  = 0;
     u64  ejectAt_ = 0;
 
-    std::vector<u8> trackData_;   // nibble stream of the track under the head
+    std::vector<u8> trackData_;   // byte stream of the track under the head
+    std::vector<u8> trackMark_;   // MFM only: 1 where that byte is a mark byte
     std::size_t bytePos_ = 0;
     u64 lastByteAt_ = 0;
     bool trackDirty_ = false;

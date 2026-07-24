@@ -221,7 +221,7 @@ public:
     // ISM data path, driven by the machine the way dataByte/writeReady are in
     // IWM mode: the FIFO holds what the framer has produced or wants.
     mutable u8 ismData = 0;      // next byte the FIFO would return
-    bool ismDataReady = false;   // a byte is available to read / room to write
+    mutable bool ismDataReady = false;   // a byte is available to read
     bool ismMarkNext = false;    // the next byte to read is a mark byte
     bool ismCrcOk = true;        // running CRC is zero
     mutable bool ismMarkLatched = false;   // last read came from the Mark register
@@ -264,20 +264,33 @@ private:
                 case 6:                                  // Mode: clear the set bits
                     ismMode_ = static_cast<u8>(ismMode_ & ~data);
                     ismParamIdx_ = 0;                    // any Mode-0 access resets it
+                    if (data & 0x01) ismFifoArmed_ = false;
                     if (!(ismMode_ & 0x40)) leaveIsm();
                     break;
-                case 7: ismMode_ = static_cast<u8>(ismMode_ | data); break;  // Mode: set
+                case 7:                                  // Mode: set
+                    ismMode_ = static_cast<u8>(ismMode_ | data);
+                    // "Toggling the clear FIFO bit high then low clears the FIFO
+                    // and initialises the CRC generator" -- and the read/write
+                    // bit has to be right before the toggle, which is why the
+                    // driver sets it first (SWIM ref p.23).
+                    if (data & 0x01) {
+                        ismFifoArmed_ = true;
+                        ismDataReady = false;
+                        ismMarkNext = false;
+                        ismCrc_ = 0xFFFF;
+                    }
+                    break;
             }
             return data;
         }
         switch (reg & 7) {                           // A3 = 1: read registers
             case 0:                                  // Data (or Correction)
-                ismDataTaken = true;
-                return ismData;
+                // Reading a mark byte through the Data register is an error;
+                // that is what the Mark register is for (SWIM ref p.20, p.24).
+                if (ismMarkNext && !ismError_) ismError_ = 0x02;
+                return takeFifoByte();
             case 1:                                  // Mark
-                ismDataTaken = true;
-                ismMarkLatched = true;
-                return ismData;
+                return takeFifoByte();
             case 2: { const u8 e = ismError_; ismError_ = 0; return e; }   // Error
             case 3: return ismParam_[(ismParamIdx_++) & 15];
             case 4: return ismPhase_;
@@ -287,6 +300,32 @@ private:
         }
         return 0;
     }
+
+    u8 takeFifoByte() const {
+        ismDataReady = false;
+        ismDataTaken = true;
+        return ismData;
+    }
+
+public:
+    // Run a byte through the CRC generator. The CRC is seeded to all ones by the
+    // Clear-FIFO toggle and taken over every byte that comes off the disk, so it
+    // reads back zero exactly when a field and its own two CRC bytes are intact.
+    //
+    // This happens as the byte lands in the FIFO, not as the CPU takes it out:
+    // the driver latches the handshake while the *second* CRC byte is still
+    // waiting to be read and tests bit 1 there (SWIM ref p.25, and the read
+    // sequence on p.32), so by then the chip must already have clocked both CRC
+    // bytes through. Crediting them on the way out instead leaves the check one
+    // byte early, and every sector fails its CRC.
+    void ismCrcAdd(u8 b) {
+        ismCrc_ ^= static_cast<u16>(static_cast<u16>(b) << 8);
+        for (int i = 0; i < 8; ++i)
+            ismCrc_ = static_cast<u16>((ismCrc_ & 0x8000) ? ((ismCrc_ << 1) ^ 0x1021)
+                                                          : (ismCrc_ << 1));
+    }
+
+private:
 
     void leaveIsm() {
         ism_ = false;
@@ -310,7 +349,7 @@ private:
     u8 ismHandshake() const {
         u8 h = 0;
         if (ismMarkNext) h |= 0x01;
-        if (!ismCrcOk)   h |= 0x02;
+        if (ismCrc_ != 0) h |= 0x02;
         if (senseHigh)   h |= 0x08;
         if (ismMode_ & 0x80) h |= 0x10;              // MotorOn
         if (ismError_)   h |= 0x20;
@@ -324,6 +363,8 @@ private:
     u8 unlock_ = 0;
     int unlockN_ = 0;
     u8 ismMode_ = 0, ismPhase_ = 0xF0, ismSetup_ = 0, ismError_ = 0, ismIwmCfg_ = 0;
+    mutable u16 ismCrc_ = 0xFFFF;
+    bool ismFifoArmed_ = false;
     u8 ismParam_[16] = {};
     int ismParamIdx_ = 0;
 };
