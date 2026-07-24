@@ -866,7 +866,8 @@ int main(int argc, char** argv) {
     int traceIwm = 0; bool noSonyShim = false; bool sonyShimOn = false; bool swimOn = false, swimOff = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
     bool floppy800k = false, insert800k = false, insert800kRW = false;
-    std::string floppy800kPath, insert800kOut;
+    std::string floppy800kPath, insert800kOut, externalPath;
+    bool externalEmpty = false;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -888,6 +889,8 @@ int main(int argc, char** argv) {
         else if (arg == "--sony-shim") sonyShimOn = true;
         else if (arg == "--swim") swimOn = true;
         else if (arg == "--no-swim") swimOff = true;
+        else if (arg == "--external" && i + 1 < argc) externalPath = argv[++i];
+        else if (arg == "--external-empty") externalEmpty = true;
         else if (arg == "--floppy-800k") {
             floppy800k = true;
             // Optional path: a real 800K image rather than a synthetic volume.
@@ -999,6 +1002,21 @@ int main(int argc, char** argv) {
         std::printf(".Sony high-level shim RE-ENABLED -- disk I/O bypasses the chip\n");
     } else if (noSonyShim) {
         std::printf(".Sony driver: the ROM's own runs the hardware (the default)\n");
+    }
+    if (externalEmpty || (!externalPath.empty() && insert800k)) {
+        mac.setExternalDriveAttached(true);
+        std::printf("EXTERNAL drive attached, no disk\n");
+    }
+    if (!externalPath.empty()) {
+        std::ifstream ef(externalPath, std::ios::binary);
+        std::vector<u8> eimg{std::istreambuf_iterator<char>(ef),
+                             std::istreambuf_iterator<char>()};
+        if (eimg.empty()) {
+            std::fprintf(stderr, "cannot read external disk: %s\n", externalPath.c_str());
+            return 2;
+        }
+        std::printf("EXTERNAL drive: %zu bytes inserted\n", eimg.size());
+        mac.insertExternalFloppy(std::move(eimg), false);
     }
     if (sonyLineMask) {
         mac.setSonyLineOverride(sonyLineMask, sonyLineValue);
@@ -1407,6 +1425,13 @@ int main(int argc, char** argv) {
         std::printf("inserting %zu bytes (800K HFS, GCR, %s)\n", img.size(),
                     insert800kRW ? "writable" : "write-protected");
         mac.insertFloppy(std::move(img), !insert800kRW);
+        if (!externalPath.empty()) {
+            std::ifstream ef(externalPath, std::ios::binary);
+            std::vector<u8> eimg{std::istreambuf_iterator<char>(ef),
+                                 std::istreambuf_iterator<char>()};
+            std::printf("external drive: inserting %zu bytes\n", eimg.size());
+            mac.insertExternalFloppy(std::move(eimg), false);
+        }
         for (int i = 0; i < 1800 && !mac.cpu().halted; ++i) {
             mac.mouseMove((i & 1) ? 1 : -1, 0, false);
             mac.runFrame();

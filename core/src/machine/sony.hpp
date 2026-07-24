@@ -49,6 +49,11 @@ public:
     bool headUpper = false;     // side select
     bool stepIn    = true;      // step direction: true = toward track 79
 
+    // Which track is currently framed under the head. Per mechanism, because
+    // each drive has its own head over its own disk.
+    int  cacheTrack = -1, cacheSide = -1;
+    u32  cacheGen = 0;
+
     void reset() {
         track = 0;
         headUpper = false;
@@ -68,13 +73,22 @@ public:
         hdMedia = hd;
         diskSwitched_ = true;
         track = 0;
+        ++mediaGen;
+        invalidateTrack();
     }
 
     void removeDisk() {
         image = nullptr;
         diskSwitched_ = true;
         motorWanted_ = false;
+        ++mediaGen;
+        invalidateTrack();
     }
+
+    // Bumped whenever the medium changes, so a track framed from the previous
+    // disk is never left under the head -- a different image of the same length
+    // would otherwise look identical to the cache.
+    u32 mediaGen = 1;
 
     // True once the medium has been ejected by an EJECT command (the machine
     // polls this to drop the image and tell the host).

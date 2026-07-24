@@ -518,6 +518,58 @@ void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
     }
 }
 
+
+// ---- external drive port -------------------------------------------------
+//
+// A Classic has one, and the ROM probes it on every boot -- an empty port floats
+// every status line high, which is what tells the drive scan to move on. Attach
+// a mechanism and the scan registers a second floppy drive; its disk then
+// behaves exactly like the internal one, because it is the same mechanism model
+// over the same chip and the same track framing.
+
+void Machine::setExternalDriveAttached(bool on) {
+    if (!on) {
+        flushTrack(*drive1_);
+        drive1_->removeDisk();
+        floppy2_.clear();
+    } else {
+        drive1_->image = &floppy2_;
+        // The same mechanism as the internal one: an 800K/1.4 MB double-sided
+        // drive. Status line $A has to read high, or the drive-present check at
+        // $43F7AA skips a connected drive outright.
+        drive1_->doubleSided = true;
+        drive1_->superDrive = false;
+    }
+    drive1_->installed = on;
+    if (onDiag) onDiag(on ? "sony: external drive attached" : "sony: external drive removed");
+}
+
+bool Machine::externalDriveAttached() const { return drive1_->installed; }
+
+void Machine::insertExternalFloppy(std::vector<u8> image, bool readOnly) {
+    flushTrack(*drive1_);
+    floppy2_ = std::move(image);
+    setExternalDriveAttached(true);
+    drive1_->insert(&floppy2_, readOnly, floppy2_.size() >= 1440u * 1024u);
+    if (onDiag) {
+        char b[128];
+        std::snprintf(b, sizeof b, "sony: %zu bytes seated in the external drive",
+                      floppy2_.size());
+        onDiag(b);
+    }
+}
+
+void Machine::ejectExternalFloppy() {
+    flushTrack(*drive1_);
+    drive1_->removeDisk();
+    floppy2_.clear();
+    if (onDiag) onDiag("sony: external disk taken out");
+}
+
+const std::vector<u8>& Machine::externalFloppyImage() {
+    flushTrack(*drive1_);
+    return floppy2_;
+}
 // Take the disk out from the host side, as if the button on the front were a
 // thing this machine had. The System does its own ejecting through the drive's
 // EJECT register; this is for the emulator's UI, and it keeps the medium so its
@@ -594,13 +646,10 @@ void Machine::iwmUpdateTrack() {
     // only then rather than on every SEL change, which would thrash the surface.
     const int addr = iwmDriveReg();
     if ((addr & 0xE) == 0x8) d.headUpper = (addr & 1) != 0;
-    if (&d != drive0_.get() || !d.hasDisk()) return;
-    // High-density media is MFM, and MFM is framed by the SWIM in hardware, not
-    // by this byte-level GCR surface. A real SuperDrive in IWM/GCR mode gets
-    // nothing off such a disk, so neither does the driver: laying a GCR track
-    // over an MFM image would let it read a plausible-looking prefix and, once
-    // there is a write path, lay GCR sectors over a 1.4 MB volume. Those disks
-    // stay with the high-level driver until the ISM path exists.
+    if (!d.hasDisk()) return;
+    const std::vector<u8>& img = *d.image;
+    const int side = d.headUpper ? 1 : 0;
+
     if (d.hdMedia) {
         // High-density media is MFM: framed by the SWIM in hardware, not by the
         // byte-level GCR surface. Without the ISM path there is nothing to hand
@@ -615,43 +664,38 @@ void Machine::iwmUpdateTrack() {
             }
             return;
         }
-        const int mside = d.headUpper ? 1 : 0;
-        if (d.trackLoaded() && trackCacheTrack_ == d.track &&
-            trackCacheSide_ == mside && trackCacheGen_ == floppyGen_)
+        if (d.trackLoaded() && d.cacheTrack == d.track && d.cacheSide == side &&
+            d.cacheGen == d.mediaGen)
             return;
-        flushFloppyTrack();
+        flushTrack(d);
         if (d.track < 0 || d.track >= mfm::kTracks) { d.invalidateTrack(); return; }
         std::vector<u8> bytes, marks;
-        mfm::buildTrack(floppy_, d.track, mside, bytes, marks);
+        mfm::buildTrack(img, d.track, side, bytes, marks);
         d.setTrackData(std::move(bytes), std::move(marks));
-        trackCacheTrack_ = d.track;
-        trackCacheSide_  = mside;
-        trackCacheGen_   = floppyGen_;
+        d.cacheTrack = d.track; d.cacheSide = side; d.cacheGen = d.mediaGen;
         if (trackLogBudget_ > 0 && onDiag) {
             --trackLogBudget_;
             char b[96];
             std::snprintf(b, sizeof b, "sony: MFM track %d side %d framed (%zu bytes)",
-                          d.track, mside, d.trackData().size());
+                          d.track, side, d.trackData().size());
             onDiag(b);
         }
         return;
     }
-    const int side = d.headUpper ? 1 : 0;
-    const int sides = floppy_.size() > 440u * 1024u ? 2 : 1;
+
+    const int sides = img.size() > 440u * 1024u ? 2 : 1;
     const u8 format = sides == 2 ? 0x22 : 0x02;
     // Keyed on the medium's generation, not its length: swapping in a different
     // image of the same size would otherwise leave the old track under the head.
-    if (d.trackLoaded() && trackCacheTrack_ == d.track &&
-        trackCacheSide_ == side && trackCacheGen_ == floppyGen_)
+    if (d.trackLoaded() && d.cacheTrack == d.track && d.cacheSide == side &&
+        d.cacheGen == d.mediaGen)
         return;
     // The head is about to move off a track the driver wrote to, so put what it
     // wrote back into the image first.
-    flushFloppyTrack();
+    flushTrack(d);
     if (d.track < 0 || d.track > 79 || side >= sides) { d.invalidateTrack(); return; }
-    d.setTrackData(gcr::buildTrack(floppy_, d.track, side, sides, format));
-    trackCacheTrack_ = d.track;
-    trackCacheSide_  = side;
-    trackCacheGen_   = floppyGen_;
+    d.setTrackData(gcr::buildTrack(img, d.track, side, sides, format));
+    d.cacheTrack = d.track; d.cacheSide = side; d.cacheGen = d.mediaGen;
     if (trackLogBudget_ > 0 && onDiag) {
         --trackLogBudget_;
         char b[96];
@@ -667,21 +711,26 @@ void Machine::iwmUpdateTrack() {
 // whole tracks including their address fields. So the image is reconstructed by
 // parsing the stream the same way a drive would, which makes both cases the same
 // code path and keeps a formatted-from-inside-the-OS disk readable.
-void Machine::flushFloppyTrack() {
-    SonyDrive& d = *drive0_;
-    if (!d.trackDirty() || floppy_.empty() || floppyRO_) { d.clearTrackDirty(); return; }
-    const int sides = floppy_.size() > 440u * 1024u ? 2 : 1;
-    const int wrote = gcr::decodeTrack(d.trackData(), floppy_, trackCacheTrack_, sides);
+void Machine::flushTrack(SonyDrive& d) {
+    if (!d.trackDirty() || !d.hasDisk() || d.readOnly) { d.clearTrackDirty(); return; }
+    std::vector<u8>& img = *d.image;
+    const int wrote = d.hdMedia
+        ? mfm::decodeTrack(d.trackData(), d.trackMarks(), img, d.cacheTrack, d.cacheSide)
+        : gcr::decodeTrack(d.trackData(), img, d.cacheTrack,
+                           img.size() > 440u * 1024u ? 2 : 1);
     d.clearTrackDirty();
     ++floppyWrites_;
     if (writeLogBudget_ > 0 && onDiag) {
         --writeLogBudget_;
         char b[96];
         std::snprintf(b, sizeof b, "sony: track %d side %d written back (%d sectors)",
-                      trackCacheTrack_, trackCacheSide_, wrote);
+                      d.cacheTrack, d.cacheSide, wrote);
         onDiag(b);
     }
 }
+
+// The internal drive's track, which is the one the host persists.
+void Machine::flushFloppyTrack() { flushTrack(*drive0_); }
 
 // Move bytes between the ISM's one-deep FIFO and the rotating surface.
 //

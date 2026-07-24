@@ -74,6 +74,18 @@ public:
     // How many times the drive has thrown a disk out on its own.
     u32 floppyEjectCount() const { return floppyEjects_; }
 
+    // The external drive port. A Classic has one, and the ROM probes it on every
+    // boot -- an empty port floats every status line high, which is what tells
+    // the drive scan to move on. Attach a mechanism and the scan registers a
+    // second floppy drive; its disk then behaves exactly like the internal one,
+    // because it is the same mechanism model over the same chip.
+    void setExternalDriveAttached(bool on);
+    bool externalDriveAttached() const;
+    void insertExternalFloppy(std::vector<u8> image, bool readOnly = false);
+    void ejectExternalFloppy();
+    bool externalFloppyInserted() const { return !floppy2_.empty(); }
+    const std::vector<u8>& externalFloppyImage();
+
     // Hard disk: a second, fixed (non-removable) image mounted through the same
     // high-level .Sony interception as a hard-disk volume. Empty = no hard disk.
     // Persist writes by reading hardDiskImage() back out after running.
@@ -235,7 +247,8 @@ private:
     void noteGcrError(u32 pc);     // one of them was reached
     void watchSonyPrime();         // log a read/write the ROM's own driver is about to do
     void watchSonyResult();        // log the result the ROM's own driver hands back
-    void flushFloppyTrack();       // decode a written track back into the image
+    void flushTrack(SonyDrive& d);  // decode a written track back into that drive's image
+    void flushFloppyTrack();       // ...the internal drive's, which the host persists
     void ismService(SonyDrive& d); // move bytes between the ISM FIFO and the surface
     int sonyOpen(u32 pb, u32 dce);
     void installSonyDrives();      // register floppy + HD drives (also used under ROM boot)
@@ -253,6 +266,7 @@ private:
     bool sonyShim_ = false;  // true: put the old high-level .Sony interception back
 
     std::vector<u8> floppy_;
+    std::vector<u8> floppy2_;      // the external drive's medium
     bool floppyRO_ = false;
     u32 sonyOpenPc_ = 0, sonyPrimePc_ = 0, sonyControlPc_ = 0, sonyStatusPc_ = 0;
     // Error exits of the ROM's GCR reader, kept as a span plus a short list so
