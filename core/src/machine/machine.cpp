@@ -1,6 +1,7 @@
 #include "openmac/machine.hpp"
 
 #include "adb.hpp"
+#include "iwm.hpp"
 #include "rtc.hpp"
 #include "scsi.hpp"
 #include "scsiimage.hpp"
@@ -48,6 +49,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
       rtc_(std::make_unique<Rtc>()),
       adb_(std::make_unique<AdbTransceiver>()),
       scsi_(std::make_unique<Ncr5380>()),
+      iwm_(std::make_unique<Iwm>()),
       cpu_(*this) {
     ramMask_ = cfg.ramSize - 1;
     // ROM sizes are powers of two (Classic: 512K); mirror across its window.
@@ -164,6 +166,7 @@ void Machine::reset() {
     rtc_->reset();
     adb_->reset();
     scsi_->reset();
+    iwm_->reset();
     adbPending_ = 0;
     cpu_.reset();
     lineTarget_ = 0;
@@ -528,82 +531,42 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     scsi_->disk.readOnly = readOnly;
 }
 
-// The 16 IWM addresses each toggle one line; the odd address sets, the even
-// clears. A q7-off read returns the register selected by q6/q7.
+// One IWM soft-switch access. The chip decodes the address and registers; the
+// machine supplies the drive status line the phase lines currently select,
+// because only it knows the drives.
 u8 Machine::iwmAccess(int reg, bool write, u8 data) {
-    u8 ret = data;
     const u32 accessPc = cpu_.recentPc(0);
-    switch (reg) {
-        case 0x0: iwmLines_ &= ~0x01u; break;   // ca0 off
-        case 0x1: iwmLines_ |=  0x01u; break;   // ca0 on
-        case 0x2: iwmLines_ &= ~0x02u; break;   // ca1 off
-        case 0x3: iwmLines_ |=  0x02u; break;   // ca1 on
-        case 0x4: iwmLines_ &= ~0x04u; break;   // ca2 off
-        case 0x5: iwmLines_ |=  0x04u; break;   // ca2 on
-        case 0x6: iwmLines_ &= ~0x08u; break;   // ca3/LSTRB off
-        case 0x7: iwmLines_ |=  0x08u; break;   // ca3/LSTRB on
-        case 0x8: iwmLines_ &= ~0x10u; break;   // motor off
-        case 0x9: iwmLines_ |=  0x10u; break;   // motor on
-        case 0xA: iwmLines_ &= ~0x20u; break;   // internal drive
-        case 0xB: iwmLines_ |=  0x20u; break;   // external drive
-        case 0xC: iwmLines_ &= ~0x40u; break;   // q6 off
-        case 0xD: iwmLines_ |=  0x40u; break;   // q6 on
-        case 0xE:                               // q7 off (read register)
-            if (!write) ret = iwmReadReg();
-            iwmLines_ &= ~0x80u;
-            break;
-        case 0xF:                               // q7 on (write mode/data)
-            if (write && (iwmLines_ & 0x10) == 0) iwmMode_ = data;  // motor off: mode reg
-            iwmLines_ |= 0x80u;
-            break;
-    }
-    if (onIwmAccess) onIwmAccess(reg, write, write ? data : ret, iwmLines_, accessPc, iwmDriveReg());
+    iwm_->senseHigh = iwmSenseLine();
+    const u8 ret = iwm_->access(reg, write, data);
+    if (onIwmAccess)
+        onIwmAccess(reg, write, ret, iwm_->lines(), accessPc, iwmDriveReg());
     return ret;
 }
 
-u8 Machine::iwmReadReg() {
-    switch ((iwmLines_ >> 6) & 3) {   // q6 = bit6, q7 = bit7
-        case 1:  return iwmStatus();  // q6 only: Status (holds the sense bit)
-        default: return 0;            // Data / Handshake: no encoded stream
-    }
-}
-
-// The Sony drive multiplexes its status lines onto one wire; which one is
-// selected by a 4-bit address CA2:CA1:CA0:SEL, where CA0-CA2 are IWM phase
-// lines and SEL is VIA PA5. Confirmed against the ROM's own .Sony driver:
-// its address packer at $435154 unpacks D0 as CA1:CA0:SEL:CA2, and its Prime
-// routine asks for D0=2 before I/O (-> CSTIN, disk in place) and D0=6 before a
-// write (-> WRTPRT, write protect), which is exactly this table.
 int Machine::iwmDriveReg() const {
-    const bool sel = ((via_->ora() >> 5) & 1) != 0;   // VIA PA5 selects the line
-    return ((iwmLines_ & 0x04) ? 8 : 0) |    // ca2
-           ((iwmLines_ & 0x02) ? 4 : 0) |    // ca1
-           ((iwmLines_ & 0x01) ? 2 : 0) |    // ca0
-           (sel ? 1 : 0);
+    return iwm_->driveRegister(((via_->ora() >> 5) & 1) != 0);   // SEL = VIA PA5
 }
 
-u8 Machine::iwmStatus() {
-    const int idx = iwmDriveReg();
-    bool high = false;   // active-low lines: false (0) = asserted
-    switch (idx) {
-        case 0x1:
-            high = floppy_.empty();   // CSTIN: 0 = disk in place
+// Level of the addressed Sony drive status line. These are active low, so false
+// means asserted. Still the minimal set the startup probe needs -- the full
+// mechanism arrives with the drive model.
+bool Machine::iwmSenseLine() {
+    switch (iwmDriveReg()) {
+        case 0x1: {                         // CSTIN: 0 = disk in place
+            const bool noDisk = floppy_.empty();
             if (cstinLogBudget_ > 0 && onDiag) {
                 --cstinLogBudget_;
                 char b[64];
-                std::snprintf(b, sizeof b, "CSTIN poll: %s", high ? "no-disk" : "disk-in");
+                std::snprintf(b, sizeof b, "CSTIN poll: %s", noDisk ? "no-disk" : "disk-in");
                 onDiag(b);
             }
-            break;
-        case 0x3: high = !floppyRO_;      break;   // WRPROT: 0 = protected
-        case 0x5: high = false;           break;   // TK0: 0 = on track 0
-        case 0xE: high = false;           break;   // INSTALLED: 0 = drive present
-        default:  high = false;           break;
+            return noDisk;
+        }
+        case 0x3: return !floppyRO_;        // WRTPRT: 0 = write protected
+        case 0x5: return false;             // TK0: 0 = head at track 0
+        case 0xE: return false;             // INSTALLED: 0 = drive present
+        default:  return false;
     }
-    u8 s = high ? 0x80 : 0x00;
-    if (iwmLines_ & 0x10) s |= 0x20;   // motor on
-    s |= (iwmMode_ & 0x1F);            // Mode register reads back in bits 0-4
-    return s;
 }
 
 u32 Machine::findSonyDriver() {

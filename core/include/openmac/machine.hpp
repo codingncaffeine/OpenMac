@@ -18,6 +18,7 @@ class Via6522;
 class Rtc;
 class AdbTransceiver;
 class Ncr5380;
+class Iwm;
 
 class Machine final : public IBus {
 public:
@@ -193,15 +194,11 @@ private:
     // Run a Mac A-line trap synchronously from within a driver handler.
     void execute68kTrap(u16 trap);
 
-    // Minimal IWM: track the phase/mode lines the ROM pokes and answer its
-    // disk-sense reads so the startup probe finds the drive and disk. The
-    // actual sector I/O is handled by the .Sony interception, not here.
+    // IWM/SWIM disk controller. The chip itself lives in Iwm; the machine owns
+    // the drives and feeds it the selected drive status line before each access.
     u8 iwmAccess(int reg, bool write, u8 data);
-    u8 iwmReadReg();
-    u8 iwmStatus();
     int iwmDriveReg() const;   // Sony drive-register address CA2:CA1:CA0:SEL (0-15)
-    u8 iwmLines_ = 0;   // b0-3 ca0-3, b4 motor, b5 drivesel, b6 q6, b7 q7
-    u8 iwmMode_ = 0;    // Mode register, read back in Status bits 0-4
+    bool iwmSenseLine();       // level of the drive status line that address selects
     bool sonyShim_ = true;   // false: let the ROM's own .Sony driver drive the hardware
 
     std::vector<u8> floppy_;
@@ -249,6 +246,7 @@ private:
     std::unique_ptr<Rtc> rtc_;
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<Ncr5380> scsi_;
+    std::unique_ptr<Iwm> iwm_;
     M68000 cpu_;
 
     // The CPU arms a shift; the transceiver clocks it only in an active
