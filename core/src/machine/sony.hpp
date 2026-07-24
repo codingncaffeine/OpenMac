@@ -121,11 +121,12 @@ public:
             case 0xA: return !superDrive;          // 0 = drive handles HD media
             case 0xB: return !hdMedia;             // unsettled; not the media sense
             case 0xC: return doubleSided;          // SIDES: 1 = double sided
-            // READY: high once the spindle is at speed. The driver polls this
-            // right after turning the motor on and waits for it to go high,
-            // giving up after a thousand tries ($435366); answering low while a
-            // disk is in the drive costs that whole timeout on every spin-up.
-            case 0xD: return motorRunning(now);
+            // READY, active low like the rest of the 1985 set: low once the
+            // spindle is at speed. The driver polls it right after turning the
+            // motor on and leaves the loop when it reads LOW ($43536C is BPL),
+            // giving up after a thousand delayed tries. Answering it the other
+            // way up burns that entire timeout on every single spin-up.
+            case 0xD: return !motorRunning(now);
             case 0xE: return false;                // INSTALLED: 0 = drive present
             // The high-density aperture in the medium, low when one is there.
             // Inside Macintosh III-36 calls this address DRVIN ("0 if the drive

@@ -850,10 +850,16 @@ void Machine::iwmStrobe() {
             if (&d == drive0_.get()) flushFloppyTrack();   // before the medium goes
             d.removeDisk();
             if (&d == drive0_.get()) {
+                // Ejecting a disk does not destroy it. Keep the medium's final
+                // contents so the host can still write them back to the file it
+                // came from -- everything the guest wrote up to this moment has
+                // just been flushed into it.
+                floppyEjected_ = std::move(floppy_);
                 floppy_.clear();
                 ++floppyGen_;
                 floppyRO_ = false;
-                if (onDiag) onDiag("sony: drive ejected the disk (LSTRB held)");
+                ++floppyEjects_;
+                if (onDiag) onDiag("sony: drive ejected the disk");
             }
         }
     }

@@ -67,8 +67,12 @@ public:
     // is still a nibble stream; flushing decodes it back into the image first.
     const std::vector<u8>& floppyImage() {
         flushFloppyTrack();
-        return floppy_;
+        // If the drive has ejected the disk, the medium still exists -- hand back
+        // what was on it, so the host can persist the guest's writes.
+        return floppy_.empty() && !floppyEjected_.empty() ? floppyEjected_ : floppy_;
     }
+    // How many times the drive has thrown a disk out on its own.
+    u32 floppyEjectCount() const { return floppyEjects_; }
 
     // Hard disk: a second, fixed (non-removable) image mounted through the same
     // high-level .Sony interception as a hard-disk volume. Empty = no hard disk.
@@ -320,6 +324,8 @@ private:
     u16  ismCrcOut_ = 0xFFFF;      // CRC accumulated over bytes written in MFM mode
     int  writeLogBudget_ = 12;     // diag budget for tracks written back to the image
     u32  floppyWrites_ = 0;        // tracks the driver has written through the surface
+    u32  floppyEjects_ = 0;        // times the drive threw a disk out on its own
+    std::vector<u8> floppyEjected_;// the last medium the drive ejected
     u32  iwmDataWrites_ = 0;       // bytes the driver has pushed at the write head
     int  trackLogBudget_ = 12;
     u32  iwmDataReads_ = 0, iwmDataBytes_ = 0;
