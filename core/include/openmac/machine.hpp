@@ -165,6 +165,9 @@ public:
     void setSonyLineOverride(u16 mask, u16 value);
     // How many commands the ROM has issued to each mechanism, by register.
     u32 sonyCommandCount(int drive, int reg) const;
+    // Data-register reads the ROM made, and disk bytes the surface handed over.
+    u32 iwmDataReads() const { return iwmDataReads_; }
+    u32 iwmDataBytes() const { return iwmDataBytes_; }
 
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
@@ -260,6 +263,11 @@ private:
     std::unique_ptr<SonyDrive> drive0_, drive1_;
     SonyDrive& selectedDrive();
     void iwmStrobe();          // service an LSTRB-latched drive command
+    void iwmUpdateTrack();     // keep the nibble stream matched to the head
+    int  trackCacheTrack_ = -1, trackCacheSide_ = -1;
+    std::size_t trackCacheSize_ = 0;
+    int  trackLogBudget_ = 12;
+    u32  iwmDataReads_ = 0, iwmDataBytes_ = 0;
     bool lstrbPrev_ = false;   // edge detector for the command strobe
     int  sonyCmdLog_ = 40;     // log the first N drive commands to the diag
     u32  sonyCmds_[2][8] = {}; // per-drive, per-register command counts

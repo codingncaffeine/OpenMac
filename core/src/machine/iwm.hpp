@@ -129,10 +129,26 @@ public:
             case Reg::AllOnes:   return 0xFF;
             case Reg::Status:    return status();
             case Reg::Handshake: return handshake();
-            case Reg::Data:      return 0;   // no encoded stream yet (P3)
+            case Reg::Data:      return readData();
             default:             return 0;
         }
     }
+
+    // Reading the Data register consumes the byte currently assembled under the
+    // head. A byte is only valid once its most significant bit is a one -- that
+    // is how the controller finds byte boundaries in a self-clocking GCR stream,
+    // and the ROM's read loops spin on exactly that (SWIM ref p.5). Returning 0
+    // while no byte is ready is what makes those loops wait rather than consume
+    // garbage.
+    u8 readData() const {
+        const u8 b = dataByte;
+        dataByte = 0;          // consumed; the drive supplies the next one
+        return b;
+    }
+
+    // The byte currently under the head, or 0 if none is ready. Driven by the
+    // machine from the rotating track buffer.
+    mutable u8 dataByte = 0;
 
     // Status: bit 7 = the selected drive sense line, bit 5 = a drive enable is
     // active, bits 4-0 echo the low five bits of Mode (SWIM ref p.11).

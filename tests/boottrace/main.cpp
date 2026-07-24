@@ -865,6 +865,7 @@ int main(int argc, char** argv) {
     bool driveInstall = false;
     int traceIwm = 0; bool noSonyShim = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
+    bool floppy800k = false;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -883,6 +884,7 @@ int main(int argc, char** argv) {
         else if (arg == "--trace-iwm" && i + 1 < argc)
             traceIwm = std::atoi(argv[++i]);
         else if (arg == "--no-sony-shim") noSonyShim = true;
+        else if (arg == "--floppy-800k") floppy800k = true;
         else if (arg == "--sony-lines" && i + 2 < argc) {
             sonyLineMask  = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
             sonyLineValue = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
@@ -1021,6 +1023,14 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::printf("FLOPPY %zu bytes inserted\n", img.size());
+        mac.insertFloppy(std::move(img), false);
+    }
+    if (floppy800k) {
+        // A real 800K GCR volume: 1600 sectors, the geometry the IWM read path
+        // encodes. The user's own disk images are all 1.44MB MFM, which needs
+        // the SWIM's ISM mode, so this is the medium the GCR path is exercised on.
+        auto img = openmac::hfs::formatVolume(819200u, "OpenMac 800K");
+        std::printf("FLOPPY %zu bytes (800K HFS) inserted\n", img.size());
         mac.insertFloppy(std::move(img), false);
     }
     if (hdBlankMB > 0) {
@@ -1545,6 +1555,8 @@ int main(int argc, char** argv) {
                 if (mac.sonyCommandCount(d, r))
                     std::printf("     drive%d %-8s %u\n", d + 1, kCmdName[r],
                                 mac.sonyCommandCount(d, r));
+        std::printf("   data register: %u reads, %u disk bytes delivered\n",
+                    mac.iwmDataReads(), mac.iwmDataBytes());
         std::printf("   accessing PCs (%zu distinct):", iwmPcs.size());
         for (u32 p : iwmPcs) std::printf(" %06X", p);
         std::printf("\n");

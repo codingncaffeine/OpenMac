@@ -3,6 +3,7 @@
 #include "adb.hpp"
 #include "iwm.hpp"
 #include "rtc.hpp"
+#include "gcr.hpp"
 #include "scsi.hpp"
 #include "sony.hpp"
 #include "scsiimage.hpp"
@@ -562,6 +563,38 @@ SonyDrive& Machine::selectedDrive() {
     return iwm_->externalDrive() ? *drive1_ : *drive0_;
 }
 
+// Keep the nibble stream under the head in step with the head position, the
+// side the SEL line selects and the medium in the drive. Encoding a track costs
+// real work, so it is only redone when one of those actually changes.
+void Machine::iwmUpdateTrack() {
+    SonyDrive& d = selectedDrive();
+    // SEL is multiplexed: it addresses the status registers AND selects the head.
+    // The drive latches the head when the phase lines address the read-data line
+    // (RDDATA0 = lower, RDDATA1 = upper -- Inside Macintosh III-35), so follow it
+    // only then rather than on every SEL change, which would thrash the surface.
+    const int addr = iwmDriveReg();
+    if ((addr & 0xE) == 0x8) d.headUpper = (addr & 1) != 0;
+    if (&d != drive0_.get() || !d.hasDisk()) return;
+    const int side = d.headUpper ? 1 : 0;
+    const int sides = floppy_.size() > 440u * 1024u ? 2 : 1;
+    const u8 format = sides == 2 ? 0x22 : 0x02;
+    if (d.trackLoaded() && trackCacheTrack_ == d.track &&
+        trackCacheSide_ == side && trackCacheSize_ == floppy_.size())
+        return;
+    if (d.track < 0 || d.track > 79 || side >= sides) { d.invalidateTrack(); return; }
+    d.setTrackData(gcr::buildTrack(floppy_, d.track, side, sides, format));
+    trackCacheTrack_ = d.track;
+    trackCacheSide_  = side;
+    trackCacheSize_  = floppy_.size();
+    if (trackLogBudget_ > 0 && onDiag) {
+        --trackLogBudget_;
+        char b[96];
+        std::snprintf(b, sizeof b, "sony: track %d side %d encoded (%zu nibbles)",
+                      d.track, side, d.trackData().size());
+        onDiag(b);
+    }
+}
+
 // One IWM soft-switch access. The chip decodes the address and registers; the
 // machine supplies the drive status line the phase lines currently select,
 // because only it knows the drives.
@@ -572,6 +605,10 @@ u8 Machine::iwmAccess(int reg, bool write, u8 data) {
     drive0_->readOnly = floppyRO_;
     drive0_->hdMedia  = floppy_.size() >= 1440u * 1024u;
     iwm_->senseHigh = iwmSenseLine();
+    iwmUpdateTrack();
+    iwm_->dataByte = selectedDrive().readNibble(totalCycles_);
+    if (iwm_->dataByte) ++iwmDataBytes_;
+    if (!write && iwm_->selected() == Iwm::Reg::Data) ++iwmDataReads_;
     const u8 ret = iwm_->access(reg, write, data);
     iwmStrobe();
     if (onIwmAccess)

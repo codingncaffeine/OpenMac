@@ -137,6 +137,19 @@ public:
             case 0x0:   // DIRTN: 0 steps toward track 79, 1 toward track 0
                 stepIn = !data;
                 break;
+            case 0x1:
+                // UNSETTLED. Inside Macintosh III-35 lists only the four SEL=0
+                // registers below; this is a SEL=1 extended register that the
+                // 1985 table predates. The Classic ROM's .Sony driver writes it
+                // (and nothing else) to the internal drive before every attempt
+                // to read, ~36 times per boot, and never writes MOTORON at all.
+                // Treating it as a motor enable is what makes the surface start
+                // delivering disk bytes, so it is at least motor-related -- but
+                // it has not been confirmed, and the driver still does not
+                // complete a sector read, so do not treat this as settled.
+                if (!motorWanted_) motorUpAt_ = now + kSpinUpCycles;
+                motorWanted_ = true;
+                break;
             case 0x2:   // STEP: writing 0 steps one track; done after ~12 ms
                 if (!data) {
                     const int next = track + (stepIn ? 1 : -1);
@@ -173,6 +186,42 @@ public:
 
     // Reading the disk-switched line is what clears it.
     void clearSwitched() { diskSwitched_ = false; }
+
+    // ---- the rotating surface -------------------------------------------
+    //
+    // The track under the head is held as a nibble stream and rotates past at a
+    // fixed bit-cell rate: at 7.8336 MHz with 2 us cells a disk byte arrives
+    // every 128 CPU cycles, and the zone's rotational speed decides how many
+    // bytes fit on the track rather than how fast they arrive.
+
+    static constexpr u64 kCyclesPerByte = 128;
+
+    // Install the nibble stream for the current head position. Called by the
+    // machine whenever the track, side or medium changes.
+    void setTrackData(std::vector<u8> nibbles) {
+        trackData_ = std::move(nibbles);
+        if (bytePos_ >= trackData_.size()) bytePos_ = 0;
+    }
+    const std::vector<u8>& trackData() const { return trackData_; }
+    bool trackLoaded() const { return !trackData_.empty(); }
+    void invalidateTrack() { trackData_.clear(); bytePos_ = 0; }
+
+    // Advance the surface to `now` and return the byte under the head, or 0 if
+    // the motor is stopped or the track is blank. Each byte is handed out once.
+    u8 readNibble(u64 now) {
+        if (!motorRunning(now) || trackData_.empty()) { lastByteAt_ = now; return 0; }
+        if (now < lastByteAt_ + kCyclesPerByte) return 0;
+        const u64 elapsed = now - lastByteAt_;
+        const u64 steps = elapsed / kCyclesPerByte;
+        bytePos_ = (bytePos_ + static_cast<std::size_t>(steps % trackData_.size()))
+                   % trackData_.size();
+        lastByteAt_ += steps * kCyclesPerByte;
+        const u8 b = trackData_[bytePos_];
+        bytePos_ = (bytePos_ + 1) % trackData_.size();
+        return b;
+    }
+
+    std::size_t bytePos() const { return bytePos_; }
 
 private:
     // 7.8336 MHz CPU/FCLK. Step ~12 ms (Inside Macintosh III-36 "about 12 msec"),
@@ -220,6 +269,10 @@ private:
     u64  stepDoneAt_ = 0;
     u64  motorUpAt_  = 0;
     u64  ejectSince_ = 0;
+
+    std::vector<u8> trackData_;   // nibble stream of the track under the head
+    std::size_t bytePos_ = 0;
+    u64 lastByteAt_ = 0;
 };
 
 } // namespace openmac
