@@ -13,6 +13,13 @@
                 <MenuItem Header="Insert Floppy…" Click="InsertFloppy_Click" />
                 <MenuItem x:Name="EjectFloppyItem" Header="Eject Floppy" Click="EjectFloppy_Click" />
                 <Separator />
+                <MenuItem x:Name="ExternalDriveItem" Header="External Drive Connected"
+                          IsCheckable="True" Click="ExternalDrive_Click" />
+                <MenuItem x:Name="InsertFloppy2Item" Header="Insert Floppy (External)…"
+                          Click="InsertExternalFloppy_Click" />
+                <MenuItem x:Name="EjectFloppy2Item" Header="Eject Floppy (External)"
+                          Click="EjectExternalFloppy_Click" />
+                <Separator />
                 <MenuItem Header="Attach Hard Disk…" Click="AttachHardDisk_Click" />
                 <MenuItem Header="Create Hard Disk…" Click="CreateHardDisk_Click" />
                 <MenuItem x:Name="DetachHdItem" Header="Detach Hard Disk" Click="DetachHardDisk_Click" />

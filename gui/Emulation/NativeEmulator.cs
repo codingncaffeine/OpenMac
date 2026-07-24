@@ -25,6 +25,8 @@ public sealed class NativeEmulator : IEmulator
     public bool IsRomLoaded => _h != IntPtr.Zero;
     public string? RomPath { get; private set; }
     public string? FloppyPath { get; private set; }
+    public string? ExternalFloppyPath { get; private set; }
+    public bool ExternalDriveAttached { get; private set; }
     public bool HardDiskAttached { get; private set; }
     public string? HardDiskPath { get; private set; }
 
@@ -62,7 +64,9 @@ public sealed class NativeEmulator : IEmulator
 
     public void LoadRom(string path, int ramMB, bool bootRomDisk)
     {
-        WriteBackHardDisk();   // persist the current disk's guest writes before teardown
+        WriteBackFloppy();
+        WriteBackExternalFloppy();
+        WriteBackHardDisk();   // persist guest writes on every medium before teardown
         byte[] rom = File.ReadAllBytes(path);
         lock (_sync)
         {
@@ -81,6 +85,8 @@ public sealed class NativeEmulator : IEmulator
         }
         RomPath = path;
         FloppyPath = null;
+        ExternalFloppyPath = null;
+        ExternalDriveAttached = false;
         HardDiskAttached = false;
         HardDiskPath = null;
         Log.Line($"[core] created — {ramMB} MB, ROM {Path.GetFileName(path)}");
@@ -213,6 +219,7 @@ public sealed class NativeEmulator : IEmulator
     public void InsertFloppy(string path)
     {
         if (_h == IntPtr.Zero) return;
+        WriteBackFloppy();   // save the outgoing disk before it is replaced
         byte[] img = File.ReadAllBytes(path);
         lock (_sync)
         {
@@ -224,8 +231,71 @@ public sealed class NativeEmulator : IEmulator
 
     public void EjectFloppy()
     {
+        WriteBackFloppy();
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_eject_floppy(_h); }
         FloppyPath = null;
+    }
+
+    // ---- external drive ----
+    public void SetExternalDrive(bool attached)
+    {
+        if (!attached) { WriteBackExternalFloppy(); ExternalFloppyPath = null; }
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return;
+            Native.omac_set_external_drive(_h, attached ? 1 : 0);
+        }
+        ExternalDriveAttached = attached;
+    }
+
+    public void InsertExternalFloppy(string path)
+    {
+        if (_h == IntPtr.Zero) return;
+        WriteBackExternalFloppy();
+        byte[] img = File.ReadAllBytes(path);
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return;
+            Native.omac_insert_floppy2(_h, img, (nuint)img.Length, 0);
+        }
+        ExternalDriveAttached = true;
+        ExternalFloppyPath = path;
+    }
+
+    public void EjectExternalFloppy()
+    {
+        WriteBackExternalFloppy();
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_eject_floppy2(_h); }
+        ExternalFloppyPath = null;
+    }
+
+    // The guest writes to the disk itself now -- the ROM's own driver puts
+    // sectors down through the emulated chip -- so whatever it changed has to be
+    // copied back to the file the disk came from, or the session's work is lost
+    // when the image is replaced or the machine goes away.
+    private void WriteBackFloppy() => WriteBack(FloppyPath, Native.omac_floppy_data);
+    private void WriteBackExternalFloppy() =>
+        WriteBack(ExternalFloppyPath, Native.omac_floppy2_data);
+
+    private delegate nuint MediumReader(IntPtr h, byte[]? outBuf, nuint cap);
+
+    private void WriteBack(string? path, MediumReader read)
+    {
+        if (string.IsNullOrEmpty(path)) return;
+        byte[]? buf = null;
+        try
+        {
+            lock (_sync)
+            {
+                if (_h == IntPtr.Zero) return;
+                nuint size = read(_h, null, 0);          // query size
+                if (size == 0) return;
+                buf = new byte[size];
+                if (read(_h, buf, size) == 0) return;
+            }
+            File.WriteAllBytes(path!, buf!);   // outside the lock: don't stall the worker
+        }
+        catch { /* best-effort persistence */ }
     }
 
     public void AttachHardDisk(string path)
@@ -300,6 +370,8 @@ public sealed class NativeEmulator : IEmulator
     {
         _stop = true;
         _worker.Join();        // stop the frame loop before touching _h or _audio
+        WriteBackFloppy();
+        WriteBackExternalFloppy();
         WriteBackHardDisk();
         Destroy();
         _audio.Dispose();

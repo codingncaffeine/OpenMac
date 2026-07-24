@@ -40,6 +40,26 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_eject_floppy(IntPtr h);
 
+    // The external drive port. Attaching a mechanism makes the ROM register a
+    // second floppy drive; a disk put in after the machine has started mounts
+    // like any other.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_set_external_drive(IntPtr h, int attached);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_insert_floppy2(IntPtr h, byte[] img, nuint len, int readOnly);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_eject_floppy2(IntPtr h);
+
+    // Copy a medium back out so a session's writes can be saved to the file the
+    // disk came from. Pass a null buffer to ask how large it is.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_floppy_data(IntPtr h, byte[]? outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_floppy2_data(IntPtr h, byte[]? outBuf, nuint cap);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_insert_harddisk(IntPtr h, byte[] img, nuint len, int readOnly);
 

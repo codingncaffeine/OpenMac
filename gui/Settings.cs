@@ -11,6 +11,9 @@ public sealed class Settings
     public int Scale { get; set; } = 2;              // 0 = fit, else fixed multiplier
     public string? LastRom { get; set; }
     public string? LastFloppy { get; set; }
+    /// <summary>Disk left in the external drive, and whether that drive is connected.</summary>
+    public string? LastExternalFloppy { get; set; }
+    public bool ExternalDrive { get; set; }
     public string? LastHardDisk { get; set; }
     public List<string> RecentRoms { get; set; } = new();
 

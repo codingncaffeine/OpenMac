@@ -201,6 +201,10 @@ public partial class MainWindow : Window
             _emulator.LoadRom(path, _settings.RamMB, _settings.BootRomDisk);
             if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy))
                 _emulator.InsertFloppy(_settings.LastFloppy!);
+            if (_settings.ExternalDrive) _emulator.SetExternalDrive(true);
+            if (!string.IsNullOrEmpty(_settings.LastExternalFloppy) &&
+                File.Exists(_settings.LastExternalFloppy))
+                _emulator.InsertExternalFloppy(_settings.LastExternalFloppy!);
             if (!string.IsNullOrEmpty(_settings.LastHardDisk) && File.Exists(_settings.LastHardDisk))
                 _emulator.AttachHardDisk(_settings.LastHardDisk!);
         }
@@ -291,6 +295,46 @@ public partial class MainWindow : Window
     {
         _emulator.EjectFloppy();
         _settings.LastFloppy = null;
+        _settings.Save();
+        UpdateUi();
+    }
+
+    // ---- external drive ----
+    // A Classic has a second drive port. Connecting a mechanism makes the ROM
+    // register a second floppy drive, and a disk put in after the machine has
+    // started mounts like any other. A disk already sitting in it at power-on is
+    // thrown out by the ROM's own port probe, so put one in after booting.
+    private void ExternalDrive_Click(object sender, RoutedEventArgs e)
+    {
+        bool on = ExternalDriveItem.IsChecked;
+        _emulator.SetExternalDrive(on);
+        if (!on) _settings.LastExternalFloppy = null;
+        _settings.ExternalDrive = on;
+        _settings.Save();
+        UpdateUi();
+    }
+
+    private void InsertExternalFloppy_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFileDialog
+        {
+            Title = "Insert Floppy (External Drive)",
+            Filter = "Disk image (*.img;*.image;*.dsk;*.dc42)|*.img;*.image;*.dsk;*.dc42|All files (*.*)|*.*",
+        };
+        if (dlg.ShowDialog(this) == true)
+        {
+            _emulator.InsertExternalFloppy(dlg.FileName);
+            _settings.ExternalDrive = true;
+            _settings.LastExternalFloppy = dlg.FileName;
+            _settings.Save();
+            UpdateUi();
+        }
+    }
+
+    private void EjectExternalFloppy_Click(object sender, RoutedEventArgs e)
+    {
+        _emulator.EjectExternalFloppy();
+        _settings.LastExternalFloppy = null;
         _settings.Save();
         UpdateUi();
     }
@@ -425,6 +469,9 @@ public partial class MainWindow : Window
         Scale3Item.IsChecked = _settings.Scale == 3;
 
         EjectFloppyItem.IsEnabled = _emulator.FloppyPath is not null;
+        ExternalDriveItem.IsChecked = _emulator.ExternalDriveAttached;
+        InsertFloppy2Item.IsEnabled = _emulator.ExternalDriveAttached;
+        EjectFloppy2Item.IsEnabled = _emulator.ExternalFloppyPath is not null;
         DetachHdItem.IsEnabled = _emulator.HardDiskAttached;
     }
 }

@@ -33,6 +33,15 @@ public interface IEmulator : IDisposable
 
     void InsertFloppy(string path);
     void EjectFloppy();
+
+    /// <summary>Path of the disk in the external drive, or null.</summary>
+    string? ExternalFloppyPath { get; }
+    /// <summary>Whether a drive is connected to the machine's external port.</summary>
+    bool ExternalDriveAttached { get; }
+    void SetExternalDrive(bool attached);
+    void InsertExternalFloppy(string path);
+    void EjectExternalFloppy();
+
     void AttachHardDisk(string path);
     void DetachHardDisk();
 

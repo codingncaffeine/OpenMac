@@ -60,6 +60,20 @@ public sealed class StubEmulator : IEmulator
     public void InsertFloppy(string path) => FloppyPath = path;
     public void EjectFloppy() => FloppyPath = null;
 
+    public string? ExternalFloppyPath { get; private set; }
+    public bool ExternalDriveAttached { get; private set; }
+    public void SetExternalDrive(bool attached)
+    {
+        ExternalDriveAttached = attached;
+        if (!attached) ExternalFloppyPath = null;
+    }
+    public void InsertExternalFloppy(string path)
+    {
+        ExternalDriveAttached = true;
+        ExternalFloppyPath = path;
+    }
+    public void EjectExternalFloppy() => ExternalFloppyPath = null;
+
     public void AttachHardDisk(string path)
     {
         HardDiskPath = path;
