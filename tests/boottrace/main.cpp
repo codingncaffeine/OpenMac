@@ -863,7 +863,7 @@ int main(int argc, char** argv) {
     bool traceBranches = false, dumpStructSet = false;
     u32 disasmAddr = 0; int disasmCount = 0; bool disasmSet = false;
     bool driveInstall = false;
-    int traceIwm = 0; bool noSonyShim = false; bool swimOn = false, swimOff = false;
+    int traceIwm = 0; bool noSonyShim = false; bool sonyShimOn = false; bool swimOn = false, swimOff = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
     bool floppy800k = false, insert800k = false, insert800kRW = false;
     std::string floppy800kPath, insert800kOut;
@@ -885,6 +885,7 @@ int main(int argc, char** argv) {
         else if (arg == "--trace-iwm" && i + 1 < argc)
             traceIwm = std::atoi(argv[++i]);
         else if (arg == "--no-sony-shim") noSonyShim = true;
+        else if (arg == "--sony-shim") sonyShimOn = true;
         else if (arg == "--swim") swimOn = true;
         else if (arg == "--no-swim") swimOff = true;
         else if (arg == "--floppy-800k") {
@@ -991,9 +992,13 @@ int main(int argc, char** argv) {
     } else if (swimOn) {
         std::printf("SWIM/ISM register set enabled (the default)\n");
     }
-    if (noSonyShim) {
-        mac.setSonyShimEnabled(false);
-        std::printf(".Sony high-level shim DISABLED -- the ROM's own driver runs the hardware\n");
+    // The ROM's own .Sony driver runs the hardware by default now; --sony-shim
+    // puts the old high-level interception back for bisecting.
+    if (sonyShimOn) {
+        mac.setSonyShimEnabled(true);
+        std::printf(".Sony high-level shim RE-ENABLED -- disk I/O bypasses the chip\n");
+    } else if (noSonyShim) {
+        std::printf(".Sony driver: the ROM's own runs the hardware (the default)\n");
     }
     if (sonyLineMask) {
         mac.setSonyLineOverride(sonyLineMask, sonyLineValue);

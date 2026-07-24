@@ -476,10 +476,9 @@ void Machine::tickDevices(int cpuCycles) {
 }
 
 int Machine::stepInstruction() {
-    if (!floppy_.empty() && trySonyTrap()) {
-        tickDevices(40);
-        return 40;
-    }
+    // No .Sony interception here any more. Disk I/O goes to the ROM's own driver
+    // and out through the chip, so the PC no longer has to be compared against
+    // four driver entry points on every single instruction the machine executes.
     // One unsigned compare to see whether the ROM's GCR reader is about to give
     // up on a sector, and if so which check failed. Always on: it costs nothing
     // and it is the only direct read on whether our nibble stream is right.
@@ -499,51 +498,38 @@ int Machine::stepInstruction() {
 // service a raw disk image directly, which sidesteps the IWM and the GCR/MFM
 // encoding entirely (the same approach mature Mac emulators take).
 
+// Put a disk in the drive. That is the whole operation: the mechanism latches
+// its disk-switched line and the ROM's own driver notices on its next pass --
+// its per-VBL task polls CSTIN, posts the disk-inserted event and lets the
+// System mount the volume, exactly as on the desk. Nothing here stages a mount,
+// unmounts the outgoing volume or drives a trap; all of that belonged to the
+// high-level driver replacement that the real hardware has now displaced.
 void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
     flushFloppyTrack();   // whatever the driver wrote to the outgoing disk
-    if (drvStatusAddr_ != 0 && !image.empty()) {
-        // Post-boot swap: stage the new image but keep the outgoing disk in place. The
-        // mount trigger (runFrame) unmounts the outgoing volume first -- while its image
-        // is still current, so its data flushes -- then seats and mounts the new disk.
-        // Skipping the unmount leaves the old volume on the drive, so _MountVol returns
-        // volOnLinErr (or the stale volume masks the new one) and nothing appears.
-        floppyPending_ = std::move(image);
-        floppyPendingRO_ = readOnly;
-        floppyInsertPending_ = true;
-        if (onDiag) {
-            char b[128];
-            std::snprintf(b, sizeof b, "floppy: swap staged (%zu bytes) -- unmount old, then mount new",
-                          floppyPending_.size());
-            onDiag(b);
-        }
-        return;
-    }
-    // Pre-boot (or an empty image): take effect immediately. The .Sony driver's
-    // Open adds the drive later (drvStatusAddr_ == 0 until then).
     floppy_ = std::move(image);
+    floppyEjected_.clear();
     ++floppyGen_;
     floppyRO_ = readOnly;
+    drive0_->insert(&floppy_, readOnly, floppy_.size() >= 1440u * 1024u);
     if (onDiag) {
         char b[128];
-        std::snprintf(b, sizeof b, "floppy: inserted %zu bytes pre-boot (driver Open adds the drive)",
-                      floppy_.size());
+        std::snprintf(b, sizeof b, "floppy: %zu bytes seated in the drive", floppy_.size());
         onDiag(b);
     }
 }
 
+// Take the disk out from the host side, as if the button on the front were a
+// thing this machine had. The System does its own ejecting through the drive's
+// EJECT register; this is for the emulator's UI, and it keeps the medium so its
+// contents can still be written back to the file they came from.
 void Machine::ejectFloppy() {
     flushFloppyTrack();
-    // A floppy that mounted after boot must be UNMOUNTED (its VCB dropped) to leave the
-    // desktop -- merely reporting the disk out keeps the volume on-line and the Finder
-    // asking for it back. Defer to a clean frame boundary; keep the image until then so
-    // the unmount's flush lands on the right disk. Pre-boot / empty drive: clear now.
-    if (drvStatusAddr_ != 0 && !floppy_.empty()) {
-        floppyEjectPending_ = true;
-        return;
-    }
+    if (!floppy_.empty()) floppyEjected_ = std::move(floppy_);
     floppy_.clear();
     ++floppyGen_;
-    if (drvStatusAddr_) write8(drvStatusAddr_ + dsDiskInPlace, 0);
+    floppyRO_ = false;
+    drive0_->removeDisk();
+    if (onDiag) onDiag("floppy: taken out of the drive");
 }
 
 void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
@@ -998,22 +984,28 @@ u32 Machine::findSonyDriver() {
     return 0;
 }
 
+// What is left of the high-level driver replacement, and it is not for floppies
+// any more: the ROM's own .Sony driver runs the disk hardware. The hard disk is
+// still presented to the System as a drive aliased to that driver, and the ROM's
+// code delegates any drive it does not own straight into an address error, so a
+// request aimed at the hard disk has to be answered here. Everything else --
+// every floppy request, and the driver's Open -- goes to the ROM.
 bool Machine::trySonyTrap() {
-    if (!sonyShim_ || inSony_ || sonyPrimePc_ == 0) return false;
+    if (inSony_ || sonyPrimePc_ == 0 || hdDriveNum_ == 0) return false;
     const u32 pc = cpu_.pc;
     int (Machine::*fn)(u32, u32) = nullptr;
-    if (pc == sonyOpenPc_)         fn = &Machine::sonyOpen;
-    else if (pc == sonyPrimePc_)   fn = &Machine::sonyPrime;
+    if (pc == sonyPrimePc_)        fn = &Machine::sonyPrime;
     else if (pc == sonyControlPc_) fn = &Machine::sonyControl;
     else if (pc == sonyStatusPc_)  fn = &Machine::sonyStatus;
     else return false;
+    // Only the hard disk. A floppy request belongs to the real driver.
+    if (static_cast<s16>(read16(cpu_.a[0] + ioVRefNum)) != hdDriveNum_) return false;
 
     inSony_ = true;
     const u32 pb = cpu_.a[0], dce = cpu_.a[1];
     if (sonyLogBudget_ > 0 && onDiag) {
         --sonyLogBudget_;
-        const char* nm = fn == &Machine::sonyOpen ? "Open" :
-                         fn == &Machine::sonyPrime ? "Prime" :
+        const char* nm = fn == &Machine::sonyPrime ? "Prime" :
                          fn == &Machine::sonyControl ? "Ctrl" : "Status";
         const s16 drive = pb ? static_cast<s16>(read16(pb + ioVRefNum)) : 0;
         const u16 code = pb ? read16(pb + csCode) : 0;       // csCode for Ctrl/Status
@@ -1287,102 +1279,7 @@ void Machine::runFrame() {
         }
     }
 
-    // An eject requested from the UI: unmount the volume so it leaves the desktop,
-    // rather than just reporting the disk out (which leaves the Finder wanting it back).
-    // A busy volume (files open, fBsyErr) can't be put away -- leave it, as a real Mac does.
-    if (floppyEjectPending_ && !inSony_ && drvStatusAddr_ != 0) {
-        u32 sd[8], sa[8];
-        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-        if (floppyMountPb_ == 0) {
-            cpu_.d[0] = 80;
-            execute68kTrap(kTrapNewPtrSysClear);
-            floppyMountPb_ = cpu_.a[0];
-        }
-        const u32 vcbTailBefore = (static_cast<u32>(read16(0x035C)) << 16) | read16(0x035E);
-        u16 unmountRes = 0;
-        if (floppyMountPb_ != 0) {
-            write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
-            cpu_.a[0] = floppyMountPb_;
-            execute68kTrap(kTrapUnmountVol);
-            unmountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
-        }
-        const bool ejected = (unmountRes != 0xFFD1);   // fBsyErr (-47) => busy, keep it
-        if (ejected) {
-            floppy_.clear();
-            ++floppyGen_;
-            write8(drvStatusAddr_ + dsDiskInPlace, 0);
-        }
-        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
-        floppyEjectPending_ = false;
-        if (onDiag) {
-            const u32 vcbTailAfter = (static_cast<u32>(read16(0x035C)) << 16) | read16(0x035E);
-            char b[160];
-            std::snprintf(b, sizeof b, "floppy: eject unmount=%04X ejected=%d VCBtail %06X->%06X%s",
-                          unmountRes, ejected ? 1 : 0, vcbTailBefore & 0xFFFFFF,
-                          vcbTailAfter & 0xFFFFFF, ejected ? "" : " [disk busy -- close its windows first]");
-            onDiag(b);
-        }
-    }
 
-    // A floppy inserted or swapped after boot. Complete it here at a clean frame
-    // boundary the way the ROM's disk-insert interrupt does: unmount any outgoing
-    // volume, seat the new disk, _MountVol it, then post the disk-inserted event with
-    // that result. (A bare diskEvt never mounts; and skipping the unmount leaves the
-    // old volume on the drive, so _MountVol returns volOnLinErr, or the stale volume
-    // masks the new one, and nothing appears in the Finder.)
-    if (floppyInsertPending_ && !inSony_ && drvStatusAddr_ != 0) {
-        u32 sd[8], sa[8];
-        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-        if (floppyMountPb_ == 0) {
-            cpu_.d[0] = 80;                              // param block for _UnmountVol/_MountVol
-            execute68kTrap(kTrapNewPtrSysClear);
-            floppyMountPb_ = cpu_.a[0];
-        }
-        const bool hadOld = !floppy_.empty();           // a disk to eject before the new one
-        u16 unmountRes = 0;
-        bool seated = false;
-        if (floppyMountPb_ != 0 && !floppyPending_.empty()) {
-            if (hadOld) {
-                // Eject the outgoing volume first -- its image is still current, so a
-                // flush lands on the right disk. If it is busy (files open) this fails
-                // and we must NOT seat the new disk over a mismatched volume.
-                write16(floppyMountPb_ + ioVRefNum, static_cast<u16>(floppyDriveNum_));
-                cpu_.a[0] = floppyMountPb_;
-                execute68kTrap(kTrapUnmountVol);
-                unmountRes = static_cast<u16>(cpu_.d[0] & 0xFFFF);
-            }
-            if (!hadOld || unmountRes != 0xFFD1) {
-                // Empty drive, or the outgoing volume no longer holds the drive
-                // (unmounted cleanly, or already offline/gone). Only a *busy* volume
-                // (fBsyErr = -47 = 0xFFD1, files still open) blocks the swap. Seat the
-                // disk and post the disk-inserted event; the SYSTEM mounts it itself
-                // (IM Files: WaitNextEvent -> SystemEvent -> PBMountVol, result into the
-                // event's high word). We must NOT pre-mount -- doing so left a VCB the
-                // System's own mount then tripped over, ejecting the disk as
-                // "unreadable" during an installer disk-switch.
-                floppy_ = std::move(floppyPending_);
-                ++floppyGen_;
-                floppyRO_ = floppyPendingRO_;
-                write8(drvStatusAddr_ + dsDiskInPlace, 1);
-                seated = true;
-                // _PostEvent (Inside Macintosh I-257): A0 = event code, D0 = message.
-                cpu_.a[0] = 7;                          // diskEvt
-                cpu_.d[0] = static_cast<u16>(floppyDriveNum_);  // message: drive #, result word 0
-                execute68kTrap(kTrapPostEvent);
-            }
-            floppyPending_.clear();                     // drop the staged disk either way
-        }
-        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
-        floppyInsertPending_ = false;
-        if (onDiag) {
-            char b[160];
-            std::snprintf(b, sizeof b,
-                "floppy: unmount=%04X seated=%d diskEvt posted (drv %d) -- System mounts%s",
-                unmountRes, seated ? 1 : 0, floppyDriveNum_,
-                (hadOld && !seated) ? " [outgoing disk busy -- eject it first]" : "");
-            onDiag(b);
-        }
-    }
 
     // Under ROM-disk boot with no floppy, the System never opens the .Sony driver
     // itself, so sonyOpen (which registers the hard disk) never runs and an attached

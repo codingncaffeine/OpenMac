@@ -165,9 +165,10 @@ public:
     // driver demands of the hardware before the shim is replaced by real emulation.
     std::function<void(int reg, bool write, u8 data, u8 lines, u32 pc, int driveReg)> onIwmAccess;
 
-    // Disable the high-level .Sony driver interception so the ROM's own driver
-    // runs against the emulated disk hardware. Investigation switch: with the
-    // present minimal IWM the ROM cannot read a disk, so this will not boot.
+    // The ROM's own .Sony driver runs the emulated disk hardware. This switch
+    // puts the old high-level interception back in its place -- it serviced disk
+    // I/O from the sector image in C++ and sidestepped the chip entirely -- which
+    // is worth keeping for bisecting until it is deleted outright.
     void setSonyShimEnabled(bool on) { sonyShim_ = on; }
 
     // Let the disk chip answer the ROM's SWIM probe and unlock its ISM register
@@ -249,7 +250,7 @@ private:
     u8 iwmAccess(int reg, bool write, u8 data);
     int iwmDriveReg() const;   // Sony drive-register address CA2:CA1:CA0:SEL (0-15)
     bool iwmSenseLine();       // level of the drive status line that address selects
-    bool sonyShim_ = true;   // false: let the ROM's own .Sony driver drive the hardware
+    bool sonyShim_ = false;  // true: put the old high-level .Sony interception back
 
     std::vector<u8> floppy_;
     bool floppyRO_ = false;
