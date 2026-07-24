@@ -518,6 +518,7 @@ void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
     // Pre-boot (or an empty image): take effect immediately. The .Sony driver's
     // Open adds the drive later (drvStatusAddr_ == 0 until then).
     floppy_ = std::move(image);
+    ++floppyGen_;
     floppyRO_ = readOnly;
     if (onDiag) {
         char b[128];
@@ -537,6 +538,7 @@ void Machine::ejectFloppy() {
         return;
     }
     floppy_.clear();
+    ++floppyGen_;
     if (drvStatusAddr_) write8(drvStatusAddr_ + dsDiskInPlace, 0);
 }
 
@@ -600,17 +602,34 @@ void Machine::iwmUpdateTrack() {
     const int addr = iwmDriveReg();
     if ((addr & 0xE) == 0x8) d.headUpper = (addr & 1) != 0;
     if (&d != drive0_.get() || !d.hasDisk()) return;
+    // High-density media is MFM, and MFM is framed by the SWIM in hardware, not
+    // by this byte-level GCR surface. A real SuperDrive in IWM/GCR mode gets
+    // nothing off such a disk, so neither does the driver: laying a GCR track
+    // over an MFM image would let it read a plausible-looking prefix and, once
+    // there is a write path, lay GCR sectors over a 1.4 MB volume. Those disks
+    // stay with the high-level driver until the ISM path exists.
+    if (d.hdMedia) {
+        d.invalidateTrack();
+        if (hdMediaLog_ > 0 && onDiag) {
+            --hdMediaLog_;
+            onDiag("sony: 1.4MB media needs the SWIM's MFM path; the GCR surface "
+                   "stays blank");
+        }
+        return;
+    }
     const int side = d.headUpper ? 1 : 0;
     const int sides = floppy_.size() > 440u * 1024u ? 2 : 1;
     const u8 format = sides == 2 ? 0x22 : 0x02;
+    // Keyed on the medium's generation, not its length: swapping in a different
+    // image of the same size would otherwise leave the old track under the head.
     if (d.trackLoaded() && trackCacheTrack_ == d.track &&
-        trackCacheSide_ == side && trackCacheSize_ == floppy_.size())
+        trackCacheSide_ == side && trackCacheGen_ == floppyGen_)
         return;
     if (d.track < 0 || d.track > 79 || side >= sides) { d.invalidateTrack(); return; }
     d.setTrackData(gcr::buildTrack(floppy_, d.track, side, sides, format));
     trackCacheTrack_ = d.track;
     trackCacheSide_  = side;
-    trackCacheSize_  = floppy_.size();
+    trackCacheGen_   = floppyGen_;
     if (trackLogBudget_ > 0 && onDiag) {
         --trackLogBudget_;
         char b[96];
@@ -633,8 +652,11 @@ u8 Machine::iwmAccess(int reg, bool write, u8 data) {
     iwmUpdateTrack();
     iwm_->dataByte = selectedDrive().readNibble(totalCycles_);
     if (iwm_->dataByte) ++iwmDataBytes_;
-    if (!write && iwm_->selected() == Iwm::Reg::Data) ++iwmDataReads_;
     const u8 ret = iwm_->access(reg, write, data);
+    // Count the register the access actually landed on: every access toggles its
+    // latch first, so the register a read returns is the one the NEW line state
+    // selects, and sampling before the access counts the previous one.
+    if (!write && iwm_->selected() == Iwm::Reg::Data) ++iwmDataReads_;
     iwmStrobe();
     if (onIwmAccess)
         onIwmAccess(reg, write, ret, iwm_->lines(), accessPc, iwmDriveReg());
@@ -692,6 +714,7 @@ void Machine::iwmStrobe() {
             d.removeDisk();
             if (&d == drive0_.get()) {
                 floppy_.clear();
+                ++floppyGen_;
                 floppyRO_ = false;
                 if (onDiag) onDiag("sony: drive ejected the disk (LSTRB held)");
             }
@@ -1120,6 +1143,7 @@ void Machine::runFrame() {
         const bool ejected = (unmountRes != 0xFFD1);   // fBsyErr (-47) => busy, keep it
         if (ejected) {
             floppy_.clear();
+            ++floppyGen_;
             write8(drvStatusAddr_ + dsDiskInPlace, 0);
         }
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
@@ -1171,6 +1195,7 @@ void Machine::runFrame() {
                 // System's own mount then tripped over, ejecting the disk as
                 // "unreadable" during an installer disk-switch.
                 floppy_ = std::move(floppyPending_);
+                ++floppyGen_;
                 floppyRO_ = floppyPendingRO_;
                 write8(drvStatusAddr_ + dsDiskInPlace, 1);
                 seated = true;

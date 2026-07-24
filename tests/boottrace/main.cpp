@@ -866,6 +866,7 @@ int main(int argc, char** argv) {
     int traceIwm = 0; bool noSonyShim = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
     bool floppy800k = false, insert800k = false, insert800kRW = false;
+    std::string floppy800kPath;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -884,7 +885,11 @@ int main(int argc, char** argv) {
         else if (arg == "--trace-iwm" && i + 1 < argc)
             traceIwm = std::atoi(argv[++i]);
         else if (arg == "--no-sony-shim") noSonyShim = true;
-        else if (arg == "--floppy-800k") floppy800k = true;
+        else if (arg == "--floppy-800k") {
+            floppy800k = true;
+            // Optional path: a real 800K image rather than a synthetic volume.
+            if (i + 1 < argc && argv[i + 1][0] != '-') floppy800kPath = argv[++i];
+        }
         else if (arg == "--insert-800k") insert800k = true;
         else if (arg == "--insert-800k-rw") { insert800k = true; insert800kRW = true; }
         else if (arg == "--sony-lines" && i + 2 < argc) {
@@ -1028,11 +1033,24 @@ int main(int argc, char** argv) {
         mac.insertFloppy(std::move(img), false);
     }
     if (floppy800k) {
-        // A real 800K GCR volume: 1600 sectors, the geometry the IWM read path
-        // encodes. The user's own disk images are all 1.44MB MFM, which needs
-        // the SWIM's ISM mode, so this is the medium the GCR path is exercised on.
-        auto img = openmac::hfs::formatVolume(819200u, "OpenMac 800K");
-        std::printf("FLOPPY %zu bytes (800K HFS) inserted\n", img.size());
+        // An 800K GCR volume: 1600 sectors, the geometry the IWM read path
+        // encodes. 1.44MB media is MFM and needs the SWIM's ISM mode, so this is
+        // the medium the GCR path is exercised on. With a path, a real 800K
+        // image is used instead of a freshly formatted one.
+        std::vector<u8> img;
+        if (!floppy800kPath.empty()) {
+            std::ifstream f8(floppy800kPath, std::ios::binary);
+            img.assign(std::istreambuf_iterator<char>(f8), std::istreambuf_iterator<char>());
+            if (img.empty()) {
+                std::fprintf(stderr, "cannot read 800K image: %s\n", floppy800kPath.c_str());
+                return 2;
+            }
+            std::printf("FLOPPY %zu bytes from %s inserted\n", img.size(),
+                        floppy800kPath.c_str());
+        } else {
+            img = openmac::hfs::formatVolume(819200u, "OpenMac 800K");
+            std::printf("FLOPPY %zu bytes (800K HFS) inserted\n", img.size());
+        }
         mac.insertFloppy(std::move(img), false);
     }
     if (hdBlankMB > 0) {

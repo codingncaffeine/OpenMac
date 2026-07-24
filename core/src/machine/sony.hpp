@@ -121,7 +121,11 @@ public:
             case 0xA: return !superDrive;          // 0 = drive handles HD media
             case 0xB: return !hdMedia;             // 0 = HD disk in the drive
             case 0xC: return doubleSided;          // SIDES: 1 = double sided
-            case 0xD: return !hasDisk();           // READY (follows the medium)
+            // READY: high once the spindle is at speed. The driver polls this
+            // right after turning the motor on and waits for it to go high,
+            // giving up after a thousand tries ($435366); answering low while a
+            // disk is in the drive costs that whole timeout on every spin-up.
+            case 0xD: return motorRunning(now);
             case 0xE: return false;                // INSTALLED: 0 = drive present
             case 0xF: return false;                // DRVIN: 0 = drive connected
             default:  return true;

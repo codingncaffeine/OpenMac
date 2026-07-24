@@ -290,7 +290,9 @@ private:
     void iwmStrobe();          // service an LSTRB-latched drive command
     void iwmUpdateTrack();     // keep the nibble stream matched to the head
     int  trackCacheTrack_ = -1, trackCacheSide_ = -1;
-    std::size_t trackCacheSize_ = 0;
+    u32  trackCacheGen_ = 0;
+    u32  floppyGen_ = 1;           // bumped whenever the medium is swapped or removed
+    int  hdMediaLog_ = 1;          // one-shot note that HD media needs the MFM path
     int  trackLogBudget_ = 12;
     u32  iwmDataReads_ = 0, iwmDataBytes_ = 0;
     bool lstrbPrev_ = false;   // edge detector for the command strobe
