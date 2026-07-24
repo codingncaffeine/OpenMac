@@ -169,6 +169,18 @@ public:
     u32 iwmDataReads() const { return iwmDataReads_; }
     u32 iwmDataBytes() const { return iwmDataBytes_; }
 
+    // The ROM's own GCR sector reader says why a read failed: each bail-out
+    // loads a Sony driver error code into D0 and branches to a common exit.
+    // Watching those exits turns "the disk is unreadable" into "the address
+    // mark was never found", which is the difference between guessing at the
+    // nibble stream and measuring it. Codes are $B8-$BE (-72..-66).
+    std::function<void(u8 code, u32 pc)> onGcrError;
+    u32 gcrErrorCount(u8 code) const {
+        const int i = static_cast<int>(code) - 0xB8;
+        return (i >= 0 && i < 8) ? gcrErrors_[i] : 0;
+    }
+    static const char* gcrErrorName(u8 code);
+
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }
@@ -197,6 +209,9 @@ private:
     // directly. Locating the driver yields its four routine entry points.
     u32 findSonyDriver();          // ROM address of the .Sony DRVR, or 0
     bool trySonyTrap();            // dispatch if the PC is a driver routine
+    void findGcrErrorSites(u32 drvrBase);   // locate the driver's error exits in the ROM
+    void noteGcrError(u32 pc);     // one of them was reached
+    void watchSonyPrime();         // log a read/write the ROM's own driver is about to do
     int sonyOpen(u32 pb, u32 dce);
     void installSonyDrives();      // register floppy + HD drives (also used under ROM boot)
     int sonyPrime(u32 pb, u32 dce);
@@ -215,6 +230,14 @@ private:
     std::vector<u8> floppy_;
     bool floppyRO_ = false;
     u32 sonyOpenPc_ = 0, sonyPrimePc_ = 0, sonyControlPc_ = 0, sonyStatusPc_ = 0;
+    // Error exits of the ROM's GCR reader, kept as a span plus a short list so
+    // the per-instruction test is a single unsigned compare.
+    struct GcrErrSite { u32 pc; u8 code; };
+    std::vector<GcrErrSite> gcrErrSites_;
+    u32 gcrErrLo_ = 0, gcrErrSpan_ = 0;
+    u32 gcrErrors_[8] = {};
+    int gcrErrLog_ = 12;           // diag budget: report the first few, then count only
+    int sonyPrimeLog_ = 40;        // diag budget for the ROM driver's own I/O requests
     u32 drvStatusAddr_ = 0;        // Mac address of our DrvSts record
     int floppyDriveNum_ = 0;
     bool inSony_ = false;          // re-entrancy guard during trap execution

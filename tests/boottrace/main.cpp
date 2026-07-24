@@ -865,7 +865,7 @@ int main(int argc, char** argv) {
     bool driveInstall = false;
     int traceIwm = 0; bool noSonyShim = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
-    bool floppy800k = false;
+    bool floppy800k = false, insert800k = false, insert800kRW = false;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -885,6 +885,8 @@ int main(int argc, char** argv) {
             traceIwm = std::atoi(argv[++i]);
         else if (arg == "--no-sony-shim") noSonyShim = true;
         else if (arg == "--floppy-800k") floppy800k = true;
+        else if (arg == "--insert-800k") insert800k = true;
+        else if (arg == "--insert-800k-rw") { insert800k = true; insert800kRW = true; }
         else if (arg == "--sony-lines" && i + 2 < argc) {
             sonyLineMask  = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
             sonyLineValue = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
@@ -1316,6 +1318,56 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (insert800k) {
+        // The P3 milestone. Boot the machine first, THEN insert an 800K GCR
+        // volume the way a user would, and see whether the System mounts it
+        // through the ROM's own .Sony driver.
+        //
+        // Inserting before boot is a different test: while the Start Manager is
+        // choosing a boot device it ejects a floppy that has no System on it,
+        // exactly as a real Mac does, so the disk is gone before the desktop
+        // exists. Pair this with --force-rom so the machine has a System to boot
+        // from and the floppy is purely a data disk.
+        auto vcbq = [&](const char* when) {
+            auto rd32 = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
+            std::printf("VCBQHdr %-7s head=%06X tail=%06X\n", when, rd32(0x358), rd32(0x35C));
+        };
+        for (int i = 0; i < 2400 && !mac.cpu().halted; ++i) {
+            if (i >= 200 && i < 340 && (i & 3) == 0) mac.mouseMove(3, 2, false);
+            mac.runFrame();
+        }
+        vcbq("before");
+        std::printf("boot pc=%06X\n", mac.cpu().pc);
+        // Write-protected on purpose. Mounting an HFS volume is not a read-only
+        // operation: the System clears the "volume unmounted" attribute and
+        // writes the MDB, bitmap and catalog straight back (blocks 2, 3, 16, 17,
+        // 28 in this volume). Until the write path exists those writes vanish,
+        // the System reads the MDB back unchanged and gives up. A locked disk
+        // mounts read-only and needs none of them, which is exactly the isolation
+        // the read path wants. --insert-800k-rw drops the lock for the write path.
+        auto img = openmac::hfs::formatVolume(819200u, "OpenMac 800K");
+        std::printf("inserting %zu bytes (800K HFS, GCR, %s)\n", img.size(),
+                    insert800kRW ? "writable" : "write-protected");
+        mac.insertFloppy(std::move(img), !insert800kRW);
+        for (int i = 0; i < 1800 && !mac.cpu().halted; ++i) {
+            mac.mouseMove((i & 1) ? 1 : -1, 0, false);
+            mac.runFrame();
+        }
+        vcbq("after");
+        std::printf("data register: %u reads, %u disk bytes delivered\n",
+                    mac.iwmDataReads(), mac.iwmDataBytes());
+        unsigned gcrTotal = 0;
+        for (int c = 0xAC; c <= 0xBF; ++c) gcrTotal += mac.gcrErrorCount(static_cast<u8>(c));
+        std::printf("GCR read failures reported by the ROM: %u\n", gcrTotal);
+        for (int c = 0xAC; c <= 0xBF; ++c) {
+            const u32 n = mac.gcrErrorCount(static_cast<u8>(c));
+            if (n) std::printf("   %02X %-52s %u\n", c,
+                               Machine::gcrErrorName(static_cast<u8>(c)), n);
+        }
+        std::printf("insert-800k: halted=%d pc=%06X\n", mac.cpu().halted ? 1 : 0, mac.cpu().pc);
+        return 0;
+    }
+
     if (keyTest) {
         // Boot, then inject a key AFTER the desktop is up and watch the ROM's
         // KeyMap ($174) -- i.e. does keyboard input register post-boot?
@@ -1560,6 +1612,21 @@ int main(int argc, char** argv) {
         std::printf("   accessing PCs (%zu distinct):", iwmPcs.size());
         for (u32 p : iwmPcs) std::printf(" %06X", p);
         std::printf("\n");
+    }
+
+    // What the ROM's own GCR reader made of the nibble stream we handed it.
+    {
+        unsigned gcrTotal = 0;
+        for (int c = 0xB8; c <= 0xBF; ++c) gcrTotal += mac.gcrErrorCount(static_cast<u8>(c));
+        if (gcrTotal) {
+            std::printf("\n-- GCR read failures reported by the ROM (%u): --\n", gcrTotal);
+            for (int c = 0xB8; c <= 0xBF; ++c) {
+                const u32 n = mac.gcrErrorCount(static_cast<u8>(c));
+                if (n)
+                    std::printf("   %02X %-52s %u\n", c,
+                                Machine::gcrErrorName(static_cast<u8>(c)), n);
+            }
+        }
     }
 
     std::printf("\n-- KeyMap ($174) reads: %u  from PCs:", mac.keyMapReads());

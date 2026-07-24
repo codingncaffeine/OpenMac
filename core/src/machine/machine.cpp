@@ -73,6 +73,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     rom_.resize(rs, 0xFF);
     romMask_ = rs - 1;
     wireVia();
+    findGcrErrorSites(findSonyDriver());
     if (u32 drvr = findSonyDriver()) {
         auto off = [&](u32 h) {
             return (static_cast<u32>(rom_[h & romMask_]) << 8) | rom_[(h + 1) & romMask_];
@@ -475,6 +476,11 @@ int Machine::stepInstruction() {
         tickDevices(40);
         return 40;
     }
+    // One unsigned compare to see whether the ROM's GCR reader is about to give
+    // up on a sector, and if so which check failed. Always on: it costs nothing
+    // and it is the only direct read on whether our nibble stream is right.
+    if (gcrErrSpan_ && (cpu_.pc - gcrErrLo_) <= gcrErrSpan_) noteGcrError(cpu_.pc);
+    if (!sonyShim_ && sonyPrimePc_ && cpu_.pc == sonyPrimePc_) watchSonyPrime();
     cpu_.setIrqLevel(via_->irqAsserted() ? 1 : 0);
     const int c = cpu_.step();
     tickDevices(c);
@@ -673,6 +679,96 @@ void Machine::iwmStrobe() {
         }
     }
     lstrbPrev_ = lstrb;
+}
+
+// The ROM does GCR decoding in software, which means it also reports its own
+// failures: every bail-out in the sector reader loads a Sony driver error code
+// ($B8-$BE, i.e. -72..-66) into D0 and branches to a common tail. Finding those
+// exits turns an opaque "this disk is unreadable" into a specific verdict on the
+// nibble stream we synthesise. Anchor on the reader's own mark table -- the six
+// bytes D5 AA 96 DE AA FF, the address-field prologue and epilogue it matches
+// against -- then scan the code that follows for MOVEQ #$Bx,D0 immediately
+// followed by a short branch. Anchoring on data rather than on fixed addresses
+// keeps this working if the ROM is ever swapped.
+void Machine::findGcrErrorSites(u32 drvrBase) {
+    if (!drvrBase) return;
+    // The driver and its GCR routines occupy roughly 40 KB from the DRVR header
+    // (in this ROM, header $434680, sector reader $43D0xx).
+    const u32 begin = drvrBase & romMask_;
+    const u32 limit = static_cast<u32>(rom_.size()) - 4;
+    const u32 end = (begin + 0xA000 < limit) ? begin + 0xA000 : limit;
+    for (u32 a = begin & ~1u; a < end; a += 2) {
+        if (rom_[a] != 0x70) continue;                            // MOVEQ #imm,D0
+        const u8 code = rom_[a + 1];
+        // $AC-$BF is the whole Sony driver error range, -84 (verErr) through -65
+        // (offLinErr): not only the nibble-level failures but the ones the sector
+        // search itself reports, seekErr and sectNFErr.
+        if (code < 0xAC || code > 0xBF) continue;
+        if (rom_[a + 2] != 0x60) continue;                        // followed by BRA.s
+        gcrErrSites_.push_back({0x400000u + a, code});
+    }
+    if (gcrErrSites_.empty()) return;
+    gcrErrLo_ = gcrErrSites_.front().pc;
+    gcrErrSpan_ = gcrErrSites_.back().pc - gcrErrLo_;
+}
+
+const char* Machine::gcrErrorName(u8 code) {
+    switch (code) {
+        case 0xAC: return "verErr(-84) track failed to verify";
+        case 0xAD: return "fmt2Err(-83) can't get enough sync";
+        case 0xAE: return "fmt1Err(-82) can't find sector 0 after format";
+        case 0xAF: return "sectNFErr(-81) sector never found on this track";
+        case 0xB0: return "seekErr(-80) wrong track number in the address mark";
+        case 0xB1: return "spdAdjErr(-79) can't adjust disk speed";
+        case 0xB2: return "twoSideErr(-78) second side on a one-sided drive";
+        case 0xB3: return "initIWMErr(-77) unable to initialize the IWM";
+        case 0xB4: return "tk0BadErr(-76) track 0 detect doesn't change";
+        case 0xB5: return "cantStepErr(-75) step handshake failed";
+        case 0xB6: return "wrUnderrun(-74) write underrun";
+        case 0xB7: return "badDBtSlp(-73) data field bit-slip nibbles";
+        case 0xBF: return "offLinErr(-65) drive off-line";
+        case 0xBE: return "noNybErr(-66) no disk bytes under the head";
+        case 0xBD: return "noAdrMkErr(-67) address mark D5 AA 96 not found";
+        case 0xBC: return "dataVerErr(-68) read verify compare failed";
+        case 0xBB: return "badCksmErr(-69) address field checksum";
+        case 0xBA: return "badBtSlpErr(-70) address field epilogue DE AA";
+        case 0xB9: return "noDtaMkErr(-71) data mark D5 AA AD not found";
+        case 0xB8: return "badDCksum(-72) data field checksum";
+        default:   return "(not a disk error)";
+    }
+}
+
+void Machine::noteGcrError(u32 pc) {
+    for (const auto& s : gcrErrSites_) {
+        if (s.pc != pc) continue;
+        ++gcrErrors_[s.code - 0xB8];
+        if (onGcrError) onGcrError(s.code, pc);
+        if (gcrErrLog_ > 0 && onDiag) {
+            --gcrErrLog_;
+            char b[128];
+            std::snprintf(b, sizeof b, "gcr: read failed, ROM says %02X %s (at %06X)",
+                          s.code, gcrErrorName(s.code), pc);
+            onDiag(b);
+        }
+        return;
+    }
+}
+
+// With the shim disabled the ROM's own driver services disk I/O, so the only
+// way to see what the File Manager actually asked the disk for is to watch its
+// Prime entry: A0 is the parameter block, A1 the device control entry.
+void Machine::watchSonyPrime() {
+    if (sonyPrimeLog_ <= 0 || !onDiag) return;
+    --sonyPrimeLog_;
+    const u32 pb = cpu_.a[0], dce = cpu_.a[1];
+    const int drive = static_cast<s16>(read16(pb + ioVRefNum));
+    const u32 length = read32(pb + ioReqCount);
+    const u32 position = read32(dce + dCtlPosition);
+    const bool isRead = (read16(pb + ioTrap) & 0xFF) == kARdCmd;
+    char b[128];
+    std::snprintf(b, sizeof b, "sony Prime(rom): drive=%d %s block %u len=%u",
+                  drive, isRead ? "read " : "write", position / 512u, length);
+    onDiag(b);
 }
 
 u32 Machine::findSonyDriver() {
