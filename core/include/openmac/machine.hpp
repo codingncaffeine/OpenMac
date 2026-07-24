@@ -19,6 +19,7 @@ class Rtc;
 class AdbTransceiver;
 class Ncr5380;
 class Iwm;
+class SonyDrive;
 
 class Machine final : public IBus {
 public:
@@ -158,6 +159,13 @@ public:
     // present minimal IWM the ROM cannot read a disk, so this will not boot.
     void setSonyShimEnabled(bool on) { sonyShim_ = on; }
 
+    // Force individual Sony drive status lines on the internal drive (bit n of
+    // mask selects line n, bit n of value is the level). Investigation aid for
+    // the drive-register assignments the documentation never pinned down.
+    void setSonyLineOverride(u16 mask, u16 value);
+    // How many commands the ROM has issued to each mechanism, by register.
+    u32 sonyCommandCount(int drive, int reg) const;
+
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }
@@ -247,6 +255,14 @@ private:
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<Ncr5380> scsi_;
     std::unique_ptr<Iwm> iwm_;
+    // Internal (drive 1) and external (drive 2) Sony mechanisms. The Classic ships
+    // one internal SuperDrive; the external port is empty unless a drive is added.
+    std::unique_ptr<SonyDrive> drive0_, drive1_;
+    SonyDrive& selectedDrive();
+    void iwmStrobe();          // service an LSTRB-latched drive command
+    bool lstrbPrev_ = false;   // edge detector for the command strobe
+    int  sonyCmdLog_ = 40;     // log the first N drive commands to the diag
+    u32  sonyCmds_[2][8] = {}; // per-drive, per-register command counts
     M68000 cpu_;
 
     // The CPU arms a shift; the transceiver clocks it only in an active

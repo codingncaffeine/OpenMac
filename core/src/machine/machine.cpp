@@ -4,6 +4,7 @@
 #include "iwm.hpp"
 #include "rtc.hpp"
 #include "scsi.hpp"
+#include "sony.hpp"
 #include "scsiimage.hpp"
 #include "via.hpp"
 
@@ -50,7 +51,20 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
       adb_(std::make_unique<AdbTransceiver>()),
       scsi_(std::make_unique<Ncr5380>()),
       iwm_(std::make_unique<Iwm>()),
+      drive0_(std::make_unique<SonyDrive>()),
+      drive1_(std::make_unique<SonyDrive>()),
       cpu_(*this) {
+    // The Classic has one internal 1.4 MB SuperDrive; the external port is empty.
+    // The internal mechanism always reads its medium out of floppy_, so an empty
+    // floppy_ simply means no disk is in the drive.
+    drive0_->installed = true;
+    drive0_->image = &floppy_;
+    drive1_->installed = false;
+    // Report an 800K double-sided mechanism, not a SuperDrive, until the SWIM's
+    // ISM/MFM path exists. Drive status line $A is what the ROM asks: answering
+    // "SuperDrive" sends its .Sony driver down the MFM path and it stalls before
+    // it ever spins the motor. Answering "plain GCR drive" makes it proceed.
+    drive0_->superDrive = false;
     ramMask_ = cfg.ramSize - 1;
     // ROM sizes are powers of two (Classic: 512K); mirror across its window.
     u32 rs = 1;
@@ -167,6 +181,9 @@ void Machine::reset() {
     adb_->reset();
     scsi_->reset();
     iwm_->reset();
+    drive0_->reset();
+    drive1_->reset();
+    lstrbPrev_ = false;
     adbPending_ = 0;
     cpu_.reset();
     lineTarget_ = 0;
@@ -531,13 +548,32 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     scsi_->disk.readOnly = readOnly;
 }
 
+void Machine::setSonyLineOverride(u16 mask, u16 value) {
+    drive0_->overrideMask = mask;
+    drive0_->overrideValue = value;
+}
+
+u32 Machine::sonyCommandCount(int drive, int reg) const {
+    return sonyCmds_[drive & 1][reg & 7];
+}
+
+// Which mechanism the controller's drive-select latch currently addresses.
+SonyDrive& Machine::selectedDrive() {
+    return iwm_->externalDrive() ? *drive1_ : *drive0_;
+}
+
 // One IWM soft-switch access. The chip decodes the address and registers; the
 // machine supplies the drive status line the phase lines currently select,
 // because only it knows the drives.
 u8 Machine::iwmAccess(int reg, bool write, u8 data) {
     const u32 accessPc = cpu_.recentPc(0);
+    // The medium lives in floppy_, which the .Sony shim and the host swap under
+    // us; keep the mechanism's view of it current.
+    drive0_->readOnly = floppyRO_;
+    drive0_->hdMedia  = floppy_.size() >= 1440u * 1024u;
     iwm_->senseHigh = iwmSenseLine();
     const u8 ret = iwm_->access(reg, write, data);
+    iwmStrobe();
     if (onIwmAccess)
         onIwmAccess(reg, write, ret, iwm_->lines(), accessPc, iwmDriveReg());
     return ret;
@@ -547,26 +583,59 @@ int Machine::iwmDriveReg() const {
     return iwm_->driveRegister(((via_->ora() >> 5) & 1) != 0);   // SEL = VIA PA5
 }
 
-// Level of the addressed Sony drive status line. These are active low, so false
-// means asserted. Still the minimal set the startup probe needs -- the full
-// mechanism arrives with the drive model.
+// Level of the addressed Sony drive status line, from the mechanism itself.
 bool Machine::iwmSenseLine() {
-    switch (iwmDriveReg()) {
-        case 0x1: {                         // CSTIN: 0 = disk in place
-            const bool noDisk = floppy_.empty();
-            if (cstinLogBudget_ > 0 && onDiag) {
-                --cstinLogBudget_;
-                char b[64];
-                std::snprintf(b, sizeof b, "CSTIN poll: %s", noDisk ? "no-disk" : "disk-in");
+    const int addr = iwmDriveReg();
+    SonyDrive& d = selectedDrive();
+    const bool level = d.sense(addr, totalCycles_);
+    if (addr == 0x1 && cstinLogBudget_ > 0 && onDiag) {
+        --cstinLogBudget_;
+        char b[64];
+        std::snprintf(b, sizeof b, "CSTIN poll: %s", level ? "no-disk" : "disk-in");
+        onDiag(b);
+    }
+    if (addr == 0x6 && !level) d.clearSwitched();   // reading the line clears it
+    return level;
+}
+
+// A drive command is latched on the rising edge of LSTRB, with the register in
+// CA1:CA0:SEL and the data bit on CA2. While the strobe stays high a held eject
+// can mature (it needs ~750 ms, which is what stops the brief pulse some ROMs
+// emit at boot from ejecting the disk).
+void Machine::iwmStrobe() {
+    const bool lstrb = iwm_->lstrb();
+    if (lstrb) {
+        // addr is CA2:CA1:CA0:SEL. The command register is CA1:CA0:SEL -- the
+        // low three bits -- and CA2 (the top bit) carries the data written to it.
+        const int addr = iwmDriveReg();
+        const int cmd  = addr & 7;
+        const bool bit = (addr & 8) != 0;
+        SonyDrive& d = selectedDrive();
+        if (!lstrbPrev_) {
+            d.command(cmd, bit, totalCycles_);
+            ++sonyCmds_[iwm_->externalDrive() ? 1 : 0][cmd & 7];
+            if (sonyCmdLog_ > 0 && onDiag) {
+                --sonyCmdLog_;
+                static const char* kCmd[8] = {"DIRTN", "?1", "STEP", "?3",
+                                              "MOTORON", "?5", "EJECT", "?7"};
+                char b[96];
+                std::snprintf(b, sizeof b, "sony cmd: drive%d %s=%d (track=%d)",
+                              iwm_->externalDrive() ? 2 : 1, kCmd[cmd & 7],
+                              bit ? 1 : 0, d.track);
                 onDiag(b);
             }
-            return noDisk;
         }
-        case 0x3: return !floppyRO_;        // WRTPRT: 0 = write protected
-        case 0x5: return false;             // TK0: 0 = head at track 0
-        case 0xE: return false;             // INSTALLED: 0 = drive present
-        default:  return false;
+        d.tickStrobe(totalCycles_);
+        if (d.takeEjectRequest()) {
+            d.removeDisk();
+            if (&d == drive0_.get()) {
+                floppy_.clear();
+                floppyRO_ = false;
+                if (onDiag) onDiag("sony: drive ejected the disk (LSTRB held)");
+            }
+        }
     }
+    lstrbPrev_ = lstrb;
 }
 
 u32 Machine::findSonyDriver() {

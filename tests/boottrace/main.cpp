@@ -864,6 +864,7 @@ int main(int argc, char** argv) {
     u32 disasmAddr = 0; int disasmCount = 0; bool disasmSet = false;
     bool driveInstall = false;
     int traceIwm = 0; bool noSonyShim = false;
+    u16 sonyLineMask = 0, sonyLineValue = 0;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -882,6 +883,10 @@ int main(int argc, char** argv) {
         else if (arg == "--trace-iwm" && i + 1 < argc)
             traceIwm = std::atoi(argv[++i]);
         else if (arg == "--no-sony-shim") noSonyShim = true;
+        else if (arg == "--sony-lines" && i + 2 < argc) {
+            sonyLineMask  = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
+            sonyLineValue = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
+        }
         else if (arg == "--break-pc" && i + 1 < argc)
             breakPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
         else if (arg == "--watch-mem" && i + 1 < argc)
@@ -968,6 +973,10 @@ int main(int argc, char** argv) {
     if (noSonyShim) {
         mac.setSonyShimEnabled(false);
         std::printf(".Sony high-level shim DISABLED -- the ROM's own driver runs the hardware\n");
+    }
+    if (sonyLineMask) {
+        mac.setSonyLineOverride(sonyLineMask, sonyLineValue);
+        std::printf("Sony line override: mask=%04X value=%04X\n", sonyLineMask, sonyLineValue);
     }
     // Disk-chip bus survey: what does the ROM actually ask the IWM/SWIM for?
     // The 16 soft switches (IWM mode); each odd address sets a line, each even clears it.
@@ -1528,6 +1537,14 @@ int main(int argc, char** argv) {
         std::printf("   drive status lines sampled (CA2:CA1:CA0:SEL):\n");
         for (int i = 0; i < 16; ++i)
             if (driveRegReads[i]) std::printf("     %X %-14s %u\n", i, kDriveReg[i], driveRegReads[i]);
+        static const char* kCmdName[8] = {"DIRTN", "?1", "STEP", "?3",
+                                          "MOTORON", "?5", "EJECT", "?7"};
+        std::printf("   drive commands issued (LSTRB-latched):\n");
+        for (int d = 0; d < 2; ++d)
+            for (int r = 0; r < 8; ++r)
+                if (mac.sonyCommandCount(d, r))
+                    std::printf("     drive%d %-8s %u\n", d + 1, kCmdName[r],
+                                mac.sonyCommandCount(d, r));
         std::printf("   accessing PCs (%zu distinct):", iwmPcs.size());
         for (u32 p : iwmPcs) std::printf(" %06X", p);
         std::printf("\n");
