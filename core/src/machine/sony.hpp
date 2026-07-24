@@ -208,16 +208,23 @@ public:
 
     // Advance the surface to `now` and return the byte under the head, or 0 if
     // the motor is stopped or the track is blank. Each byte is handed out once.
+    //
+    // `steps` counts byte times since the byte we last handed over, so `steps-1`
+    // bytes rotated past unread and the steps'th is the one now under the head.
+    // Skipping `steps` instead would drop a byte every time the caller keeps up
+    // (steps == 1), which is the normal case: the ROM's read loop polls roughly
+    // every 40 cycles against a 128-cycle byte time. The driver would then see
+    // every other disk byte -- enough to look like data is flowing while no
+    // address mark can ever match.
     u8 readNibble(u64 now) {
         if (!motorRunning(now) || trackData_.empty()) { lastByteAt_ = now; return 0; }
         if (now < lastByteAt_ + kCyclesPerByte) return 0;
-        const u64 elapsed = now - lastByteAt_;
-        const u64 steps = elapsed / kCyclesPerByte;
-        bytePos_ = (bytePos_ + static_cast<std::size_t>(steps % trackData_.size()))
-                   % trackData_.size();
+        const std::size_t n = trackData_.size();
+        const u64 steps = (now - lastByteAt_) / kCyclesPerByte;
+        bytePos_ = (bytePos_ + static_cast<std::size_t>((steps - 1) % n)) % n;
         lastByteAt_ += steps * kCyclesPerByte;
         const u8 b = trackData_[bytePos_];
-        bytePos_ = (bytePos_ + 1) % trackData_.size();
+        bytePos_ = (bytePos_ + 1) % n;
         return b;
     }
 
