@@ -283,7 +283,9 @@ private:
     std::unique_ptr<Iwm> iwm_;
     // Internal (drive 1) and external (drive 2) Sony mechanisms. The Classic ships
     // one internal SuperDrive; the external port is empty unless a drive is added.
-    std::unique_ptr<SonyDrive> drive0_, drive1_;
+    // Internal mechanism, external mechanism, and the Classic's empty second
+    // internal bay (see selectedDrive).
+    std::unique_ptr<SonyDrive> drive0_, drive1_, driveBay2_;
     SonyDrive& selectedDrive();
     void iwmStrobe();          // service an LSTRB-latched drive command
     void iwmUpdateTrack();     // keep the nibble stream matched to the head

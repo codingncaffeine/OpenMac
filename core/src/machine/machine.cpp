@@ -54,6 +54,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
       iwm_(std::make_unique<Iwm>()),
       drive0_(std::make_unique<SonyDrive>()),
       drive1_(std::make_unique<SonyDrive>()),
+      driveBay2_(std::make_unique<SonyDrive>()),
       cpu_(*this) {
     // The Classic has one internal 1.4 MB SuperDrive; the external port is empty.
     // The internal mechanism always reads its medium out of floppy_, so an empty
@@ -61,6 +62,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     drive0_->installed = true;
     drive0_->image = &floppy_;
     drive1_->installed = false;
+    driveBay2_->installed = false;   // the Classic has one internal drive
     // Report an 800K double-sided mechanism, not a SuperDrive, until the SWIM's
     // ISM/MFM path exists. Drive status line $A is what the ROM asks: answering
     // "SuperDrive" sends its .Sony driver down the MFM path and it stalls before
@@ -185,6 +187,7 @@ void Machine::reset() {
     iwm_->reset();
     drive0_->reset();
     drive1_->reset();
+    driveBay2_->reset();
     lstrbPrev_ = false;
     adbPending_ = 0;
     cpu_.reset();
@@ -564,9 +567,25 @@ u32 Machine::sonyCommandCount(int drive, int reg) const {
     return sonyCmds_[drive & 1][reg & 7];
 }
 
-// Which mechanism the controller's drive-select latch currently addresses.
+// Which mechanism the controller currently addresses.
+//
+// The IWM's drive-select latch only chooses between the internal port and the
+// external one. The internal port is the SE's two-bay design, and which bay
+// answers is picked by VIA PA4: the driver's drive-select routine drives it
+// high for the first internal drive and low for the second ($43F806, reached
+// through $436C20 from $435534). The Classic ships one internal mechanism, so
+// the other bay has to read as empty -- otherwise the ROM's drive scan finds
+// the same drive twice and registers a floppy drive that is not there, and the
+// System then chases the same disk through two drive-queue entries.
+//
+// The mechanism sits on the bay PA4 selects when it is low, which is also where
+// PA4 rests: the same pin is the boot overlay latch, and the driver deliberately
+// leaves it alone while the ROM disk is in use ($43F806 returns early when
+// $0CB3 says so), so a drive that needed PA4 driven high would be unreachable
+// under a ROM-disk boot.
 SonyDrive& Machine::selectedDrive() {
-    return iwm_->externalDrive() ? *drive1_ : *drive0_;
+    if (iwm_->externalDrive()) return *drive1_;
+    return ((via_->ora() >> 4) & 1) ? *driveBay2_ : *drive0_;
 }
 
 // Keep the nibble stream under the head in step with the head position, the
