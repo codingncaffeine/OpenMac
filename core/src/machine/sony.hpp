@@ -56,8 +56,8 @@ public:
         motorWanted_ = false;
         stepDoneAt_ = motorUpAt_ = 0;
         diskSwitched_ = false;
-        ejectAsserted_ = false;
-        ejectSince_ = 0;
+        ejectPending_ = false;
+        ejectAt_ = 0;
     }
 
     // A disk was inserted: latch the disk-switched line the driver polls to
@@ -169,23 +169,27 @@ public:
                     motorWanted_ = false;
                 }
                 break;
-            case 0x6:   // EJECT: writing 1 ejects, but LSTRB must be held ~750 ms
-                ejectAsserted_ = data;
-                if (data) ejectSince_ = now;
+            case 0x6:   // EJECT: writing 1 starts an eject, writing 0 cancels it
+                if (data) { ejectPending_ = true; ejectAt_ = now + kEjectDelayCycles; }
+                else      { ejectPending_ = false; }
                 break;
             default:
                 break;
         }
     }
 
-    // Called while LSTRB stays asserted, so a held eject strobe can mature. The
-    // Macintosh Plus is known to pulse eject briefly during boot without ejecting
-    // anything, which is exactly what the hold time protects against.
-    void tickStrobe(u64 now) {
-        if (ejectAsserted_ && hasDisk() && now - ejectSince_ >= kEjectHoldCycles) {
-            ejectAsserted_ = false;
-            ejectRequested_ = true;
-        }
+    // Advance the eject mechanism. Inside Macintosh III-35 pairs ejecting with
+    // ~750 ms where every other drive command needs only microseconds, and that
+    // is the mechanism physically throwing the disk out, not a strobe the CPU
+    // has to hold: measured against this ROM, its EJECT strobe is the same
+    // sub-millisecond pulse it uses for DIRTN, STEP and MOTORON. Timing the
+    // eject from the strobe's width instead means the driver can never eject
+    // anything, and leaving the request armed between strobes means an unrelated
+    // command much later throws out a disk nobody asked to eject.
+    void tickEject(u64 now) {
+        if (!ejectPending_ || now < ejectAt_) return;
+        ejectPending_ = false;
+        if (hasDisk()) ejectRequested_ = true;
     }
 
     // Reading the disk-switched line is what clears it.
@@ -205,10 +209,11 @@ public:
     void setTrackData(std::vector<u8> nibbles) {
         trackData_ = std::move(nibbles);
         if (bytePos_ >= trackData_.size()) bytePos_ = 0;
+        trackDirty_ = false;
     }
     const std::vector<u8>& trackData() const { return trackData_; }
     bool trackLoaded() const { return !trackData_.empty(); }
-    void invalidateTrack() { trackData_.clear(); bytePos_ = 0; }
+    void invalidateTrack() { trackData_.clear(); bytePos_ = 0; trackDirty_ = false; }
 
     // Advance the surface to `now` and return the byte under the head, or 0 if
     // the motor is stopped or the track is blank. Each byte is handed out once.
@@ -232,15 +237,53 @@ public:
         return b;
     }
 
+    // The write side of the same surface. The controller's write buffer is one
+    // byte deep and the driver polls the handshake register until it empties
+    // ($4358D0: TST.B (A4); BPL back), so readiness is simply "a byte time has
+    // gone by since the last one went down". Bytes land under the head and the
+    // head moves on, exactly as reading advances it, which is what keeps a
+    // read-then-write sequence -- find the address field, then overwrite the
+    // data field that follows it -- landing where the driver intends.
+    bool writeReady(u64 now) const {
+        if (!motorRunning(now) || trackData_.empty() || readOnly) return false;
+        return now >= lastByteAt_ + kCyclesPerByte;
+    }
+
+    void writeNibble(u64 now, u8 b) {
+        if (!writeReady(now)) return;
+        const std::size_t n = trackData_.size();
+        const u64 steps = (now - lastByteAt_) / kCyclesPerByte;
+        bytePos_ = (bytePos_ + static_cast<std::size_t>((steps - 1) % n)) % n;
+        lastByteAt_ += steps * kCyclesPerByte;
+        trackData_[bytePos_] = b;
+        bytePos_ = (bytePos_ + 1) % n;
+        trackDirty_ = true;
+    }
+
+    // Set once anything has been written to the track under the head, so the
+    // machine knows to decode it back into the image before the head moves.
+    bool trackDirty() const { return trackDirty_; }
+    void clearTrackDirty() { trackDirty_ = false; }
+
     std::size_t bytePos() const { return bytePos_; }
 
 private:
-    // 7.8336 MHz CPU/FCLK. Step ~12 ms (Inside Macintosh III-36 "about 12 msec"),
-    // motor up to speed within 400 ms, eject needs LSTRB held ~750 ms.
+    // 7.8336 MHz CPU/FCLK. Motor up to speed within 400 ms, eject needs LSTRB
+    // held ~750 ms.
+    //
+    // Step: ~3 ms, not the "about 12 msec" Inside Macintosh III-36 quotes for
+    // the 400K single-sided mechanism. The driver's recalibrate loop delays,
+    // checks TK0, and then requires the STEP status line to have gone idle
+    // before strobing the next step, failing with cantStepErr if it has not
+    // ($43543A-$43544E) -- and it halves that delay for a drive that answers
+    // status line $A high ($43542C). This drive answers $A high because the
+    // drive-present check skips a connected drive that answers it low
+    // ($43F7B6-$43F7BE), so a 12 ms step contradicts the mechanism we report:
+    // the head would still be moving every time the driver looked.
     static constexpr u64 kCpuHz          = 7833600ull;
-    static constexpr u64 kStepCycles     = kCpuHz * 12 / 1000;
+    static constexpr u64 kStepCycles     = kCpuHz * 3 / 1000;
     static constexpr u64 kSpinUpCycles   = kCpuHz * 400 / 1000;
-    static constexpr u64 kEjectHoldCycles = kCpuHz * 750 / 1000;
+    static constexpr u64 kEjectDelayCycles = kCpuHz * 750 / 1000;
 
     // TACH produces 60 pulses per revolution. GCR media spins at a speed set by
     // which of the five zones the head is over; HD/MFM media spins at a constant
@@ -275,15 +318,16 @@ public:
 private:
     bool motorWanted_   = false;
     bool diskSwitched_  = false;
-    bool ejectAsserted_ = false;
+    bool ejectPending_  = false;
     bool ejectRequested_ = false;
     u64  stepDoneAt_ = 0;
     u64  motorUpAt_  = 0;
-    u64  ejectSince_ = 0;
+    u64  ejectAt_ = 0;
 
     std::vector<u8> trackData_;   // nibble stream of the track under the head
     std::size_t bytePos_ = 0;
     u64 lastByteAt_ = 0;
+    bool trackDirty_ = false;
 };
 
 } // namespace openmac

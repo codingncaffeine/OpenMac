@@ -62,6 +62,9 @@ public:
     void reset() {
         lines_ = 0;
         mode_ = 0;
+        writeReady = false;
+        writeLatched = false;
+        writeData = 0;
     }
 
     u8 lines() const { return lines_; }
@@ -117,7 +120,14 @@ public:
             case 0xF: lines_ |=  kQ7;     break;
         }
         if (write) {
-            if (selected() == Reg::SetMode) mode_ = data;
+            switch (selected()) {
+                case Reg::SetMode:   mode_ = data; break;
+                // The write buffer is one byte deep. The machine takes the byte
+                // straight after this call and hands it to the drive, which is
+                // what "the buffer emptied" means to the handshake register.
+                case Reg::WriteData: writeData = data; writeLatched = true; break;
+                default: break;
+            }
             return data;
         }
         return read();
@@ -158,10 +168,19 @@ public:
         return static_cast<u8>(s | (mode_ & 0x1F));
     }
 
-    // Write-Handshake: bit 7 = write buffer empty, bit 6 = write state (cleared by
-    // an underrun), bits 5-0 always read as ones (SWIM ref p.11). With no write
-    // path yet, report "ready, never underran".
-    u8 handshake() const { return 0xFF; }
+    // Write-Handshake: bit 7 = write buffer empty, bit 6 = write state (cleared
+    // by an underrun), bits 5-0 always read as ones (SWIM ref p.11). The driver
+    // spins on bit 7 before handing over each byte ($4358D0), so this is what
+    // paces a write to the surface's byte rate; bit 6 stays set because the
+    // machine only accepts a byte when the surface is ready for one, which is
+    // the condition an underrun reports having missed.
+    u8 handshake() const { return static_cast<u8>((writeReady ? 0x80 : 0x00) | 0x7F); }
+
+    // Owned by the machine, like senseHigh: whether the drive can take a byte.
+    bool writeReady = false;
+    // A byte the CPU has just written to the Data register, waiting to go down.
+    bool writeLatched = false;
+    u8 writeData = 0;
 
     // Sampled by status(): the level of whichever drive status line the phase
     // lines currently address. Owned by the machine, which knows the drives.

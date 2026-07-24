@@ -866,7 +866,7 @@ int main(int argc, char** argv) {
     int traceIwm = 0; bool noSonyShim = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
     bool floppy800k = false, insert800k = false, insert800kRW = false;
-    std::string floppy800kPath;
+    std::string floppy800kPath, insert800kOut;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -892,6 +892,7 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--insert-800k") insert800k = true;
         else if (arg == "--insert-800k-rw") { insert800k = true; insert800kRW = true; }
+        else if (arg == "--insert-800k-out" && i + 1 < argc) insert800kOut = argv[++i];
         else if (arg == "--sony-lines" && i + 2 < argc) {
             sonyLineMask  = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
             sonyLineValue = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
@@ -1032,7 +1033,7 @@ int main(int argc, char** argv) {
         std::printf("FLOPPY %zu bytes inserted\n", img.size());
         mac.insertFloppy(std::move(img), false);
     }
-    if (floppy800k) {
+    if (floppy800k && !insert800k) {
         // An 800K GCR volume: 1600 sectors, the geometry the IWM read path
         // encodes. 1.44MB media is MFM and needs the SWIM's ISM mode, so this is
         // the medium the GCR path is exercised on. With a path, a real 800K
@@ -1363,7 +1364,18 @@ int main(int argc, char** argv) {
         // the System reads the MDB back unchanged and gives up. A locked disk
         // mounts read-only and needs none of them, which is exactly the isolation
         // the read path wants. --insert-800k-rw drops the lock for the write path.
-        auto img = openmac::hfs::formatVolume(819200u, "OpenMac 800K");
+        std::vector<u8> img;
+        if (!floppy800kPath.empty()) {
+            std::ifstream f8(floppy800kPath, std::ios::binary);
+            img.assign(std::istreambuf_iterator<char>(f8), std::istreambuf_iterator<char>());
+            if (img.empty()) {
+                std::fprintf(stderr, "cannot read 800K image: %s\n", floppy800kPath.c_str());
+                return 2;
+            }
+        } else {
+            img = openmac::hfs::formatVolume(819200u, "OpenMac 800K");
+        }
+        const std::vector<u8> pristine = img;      // to diff against afterwards
         std::printf("inserting %zu bytes (800K HFS, GCR, %s)\n", img.size(),
                     insert800kRW ? "writable" : "write-protected");
         mac.insertFloppy(std::move(img), !insert800kRW);
@@ -1372,6 +1384,40 @@ int main(int argc, char** argv) {
             mac.runFrame();
         }
         vcbq("after");
+        // Did the guest's writes actually reach the medium? The System clears the
+        // volume-unmounted attribute (MDB @0x0A, logical block 2) the moment it
+        // mounts read-write, so that bit is the cheapest end-to-end proof that a
+        // nibble the driver wrote came back as a byte in the image.
+        {
+            const std::vector<u8>& now = mac.floppyImage();
+            std::size_t changed = 0, firstBlk = 0;
+            bool haveFirst = false;
+            if (now.size() == pristine.size()) {
+                for (std::size_t i = 0; i < now.size(); ++i)
+                    if (now[i] != pristine[i]) {
+                        ++changed;
+                        if (!haveFirst) { firstBlk = i / 512; haveFirst = true; }
+                    }
+                const u16 atrbWas = static_cast<u16>((pristine[2 * 512 + 0x0A] << 8) |
+                                                     pristine[2 * 512 + 0x0B]);
+                const u16 atrbNow = static_cast<u16>((now[2 * 512 + 0x0A] << 8) |
+                                                     now[2 * 512 + 0x0B]);
+                std::printf("image: %zu bytes changed (first in block %zu); "
+                            "MDB drAtrb %04X -> %04X\n",
+                            changed, haveFirst ? firstBlk : 0, atrbWas, atrbNow);
+            } else {
+                std::printf("image: gone (%zu bytes)\n", now.size());
+            }
+        }
+        std::printf("surface: %u bytes written, %u tracks decoded back\n",
+                    mac.iwmDataWrites(), mac.floppyTrackWrites());
+        if (!insert800kOut.empty()) {
+            const std::vector<u8>& out = mac.floppyImage();
+            std::ofstream of(insert800kOut, std::ios::binary);
+            of.write(reinterpret_cast<const char*>(out.data()),
+                     static_cast<std::streamsize>(out.size()));
+            std::printf("wrote %zu bytes to %s\n", out.size(), insert800kOut.c_str());
+        }
         std::printf("data register: %u reads, %u disk bytes delivered\n",
                     mac.iwmDataReads(), mac.iwmDataBytes());
         unsigned gcrTotal = 0;

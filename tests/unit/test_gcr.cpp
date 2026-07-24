@@ -274,6 +274,71 @@ TEST_CASE("gcr: every sector of a track lands where the driver will look for it"
     }
 }
 
+TEST_CASE("gcr: a rewritten sector decodes back into the image, alone") {
+    // What the write path does: the driver finds a sector's address field, lays
+    // a fresh data field over the one that follows, and the machine decodes the
+    // whole track back into the image. One sector must change and no other.
+    const std::vector<u8> src = makeVolume(2);
+    std::vector<u8> image = src;
+    std::vector<u8> trk = gcr::buildTrack(src, 3, 0, 2, 0x22);
+
+    // New contents for logical sector 5 of track 3, side 0.
+    const int n = gcr::sectorsOnTrack(3);
+    const std::size_t off = static_cast<std::size_t>(gcr::trackStartSector(3) * 2 + 5) * 512;
+    u8 fresh[gcr::kPayload] = {};
+    for (std::size_t i = 0; i < 512; ++i) fresh[gcr::kTagBytes + i] = static_cast<u8>(0xA5 ^ i);
+
+    // Re-encode that sector's data field in place, the way the driver would.
+    const u8* dec = gcr::decodeTable();
+    const u8* enc = gcr::encodeTable();
+    bool patched = false;
+    for (std::size_t i = 0; i + 8 < trk.size() && !patched; ++i) {
+        if (!(trk[i] == 0xD5 && trk[i + 1] == 0xAA && trk[i + 2] == 0x96)) continue;
+        if (dec[trk[i + 4]] != 5) continue;                 // the sector byte
+        for (std::size_t j = i; j + 3 < trk.size(); ++j) {
+            if (!(trk[j] == 0xD5 && trk[j + 1] == 0xAA && trk[j + 2] == 0xAD)) continue;
+            std::size_t p = j + 4;                          // past the sector byte
+            u8 scrambled[gcr::kPayload];
+            const auto ck = gcr::encodeData(fresh, gcr::kPayload, scrambled);
+            std::vector<u8> nib;
+            gcr::nibblize(scrambled, gcr::kPayload, nib);
+            for (u8 b : nib) trk[p++] = b;
+            trk[p++] = enc[(((ck.a >> 6) << 4) | ((ck.b >> 6) << 2) | (ck.c >> 6)) & 0x3F];
+            trk[p++] = enc[ck.a & 0x3F];
+            trk[p++] = enc[ck.b & 0x3F];
+            trk[p++] = enc[ck.c & 0x3F];
+            patched = true;
+            break;
+        }
+    }
+    REQUIRE(patched);
+
+    CHECK(gcr::decodeTrack(trk, image, 3, 2) == n);
+    for (std::size_t i = 0; i < 512; ++i)
+        CHECK(image[off + i] == static_cast<u8>(0xA5 ^ i));
+    // Everything outside that sector is untouched.
+    std::size_t elsewhere = 0;
+    for (std::size_t i = 0; i < image.size(); ++i)
+        if (i < off || i >= off + 512)
+            if (image[i] != src[i]) ++elsewhere;
+    CHECK(elsewhere == 0);
+}
+
+TEST_CASE("gcr: a corrupted sector is refused rather than written back") {
+    const std::vector<u8> src = makeVolume(2);
+    std::vector<u8> image = src;
+    std::vector<u8> trk = gcr::buildTrack(src, 0, 0, 2, 0x22);
+    const int n = gcr::sectorsOnTrack(0);
+    // Flip one byte inside the first data field: its checksum no longer holds.
+    std::size_t j = 0;
+    for (; j + 3 < trk.size(); ++j)
+        if (trk[j] == 0xD5 && trk[j + 1] == 0xAA && trk[j + 2] == 0xAD) break;
+    REQUIRE(j + 3 < trk.size());
+    trk[j + 10] = gcr::encodeTable()[(gcr::decodeTable()[trk[j + 10]] + 1) & 0x3F];
+    CHECK(gcr::decodeTrack(trk, image, 0, 2) == n - 1);   // that one is dropped
+    CHECK(image == src);                                  // and nothing was corrupted
+}
+
 TEST_CASE("gcr: a built track is well formed") {
     const std::vector<u8> src = makeVolume(2);
     const std::vector<u8> trk = gcr::buildTrack(src, 0, 0, 2, 0x22);

@@ -92,6 +92,62 @@ TEST_CASE("sony: a stopped motor delivers nothing") {
     CHECK(s.drive.readNibble(s.now) != 0);
 }
 
+TEST_CASE("sony: the write head takes one byte per byte time") {
+    SpunUp s;
+    s.drive.readNibble(s.now);                    // sync to the surface
+    // The driver polls the handshake until the buffer empties, so readiness has
+    // to follow the same byte clock the read side does.
+    CHECK(s.drive.writeReady(s.now + SonyDrive::kCyclesPerByte - 1) == false);
+    CHECK(s.drive.writeReady(s.now + SonyDrive::kCyclesPerByte) == true);
+
+    // Bytes land under the head and the head moves on, so a run of writes ends
+    // up contiguous on the track.
+    const std::size_t start = s.drive.bytePos();
+    for (int i = 0; i < 16; ++i) {
+        s.now += SonyDrive::kCyclesPerByte;
+        REQUIRE(s.drive.writeReady(s.now));
+        s.drive.writeNibble(s.now, static_cast<u8>(0xC0 | i));
+    }
+    CHECK(s.drive.trackDirty());
+    for (int i = 0; i < 16; ++i)
+        CHECK(s.drive.trackData()[(start + static_cast<std::size_t>(i)) % s.track.size()] ==
+              static_cast<u8>(0xC0 | i));
+}
+
+TEST_CASE("sony: a locked disk takes no writes at all") {
+    SpunUp s;
+    s.drive.readOnly = true;
+    const std::vector<u8> before = s.drive.trackData();
+    for (int i = 0; i < 8; ++i) {
+        s.now += SonyDrive::kCyclesPerByte;
+        CHECK(s.drive.writeReady(s.now) == false);
+        s.drive.writeNibble(s.now, 0xFF);
+    }
+    CHECK(s.drive.trackData() == before);
+    CHECK(s.drive.trackDirty() == false);
+    CHECK(s.drive.sense(0x3, s.now) == false);    // WRTPRT: 0 = write protected
+}
+
+TEST_CASE("sony: an eject is a mechanism, not a strobe width") {
+    SpunUp s;
+    s.drive.command(0x6, true, s.now);            // EJECT: the driver's pulse is short
+    CHECK(s.drive.takeEjectRequest() == false);   // ...and nothing happens yet
+    s.now += 7833600ull * 700 / 1000;             // 700 ms: still on its way out
+    s.drive.tickEject(s.now);
+    CHECK(s.drive.takeEjectRequest() == false);
+    s.now += 7833600ull * 100 / 1000;             // past 750 ms
+    s.drive.tickEject(s.now);
+    CHECK(s.drive.takeEjectRequest() == true);
+
+    // A cancelled eject stays cancelled, however long the machine runs after.
+    SpunUp t;
+    t.drive.command(0x6, true, t.now);
+    t.drive.command(0x6, false, t.now + 1000);
+    t.now += 7833600ull * 5;                      // five seconds later
+    t.drive.tickEject(t.now);
+    CHECK(t.drive.takeEjectRequest() == false);
+}
+
 TEST_CASE("sony: status lines answer the way the ROM's driver expects") {
     SpunUp s;
     // Active low throughout, so false means the condition is asserted.

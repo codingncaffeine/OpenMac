@@ -498,6 +498,7 @@ int Machine::stepInstruction() {
 // encoding entirely (the same approach mature Mac emulators take).
 
 void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
+    flushFloppyTrack();   // whatever the driver wrote to the outgoing disk
     if (drvStatusAddr_ != 0 && !image.empty()) {
         // Post-boot swap: stage the new image but keep the outgoing disk in place. The
         // mount trigger (runFrame) unmounts the outgoing volume first -- while its image
@@ -529,6 +530,7 @@ void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
 }
 
 void Machine::ejectFloppy() {
+    flushFloppyTrack();
     // A floppy that mounted after boot must be UNMOUNTED (its VCB dropped) to leave the
     // desktop -- merely reporting the disk out keeps the volume on-line and the Finder
     // asking for it back. Defer to a clean frame boundary; keep the image until then so
@@ -625,6 +627,9 @@ void Machine::iwmUpdateTrack() {
     if (d.trackLoaded() && trackCacheTrack_ == d.track &&
         trackCacheSide_ == side && trackCacheGen_ == floppyGen_)
         return;
+    // The head is about to move off a track the driver wrote to, so put what it
+    // wrote back into the image first.
+    flushFloppyTrack();
     if (d.track < 0 || d.track > 79 || side >= sides) { d.invalidateTrack(); return; }
     d.setTrackData(gcr::buildTrack(floppy_, d.track, side, sides, format));
     trackCacheTrack_ = d.track;
@@ -635,6 +640,28 @@ void Machine::iwmUpdateTrack() {
         char b[96];
         std::snprintf(b, sizeof b, "sony: track %d side %d encoded (%zu nibbles)",
                       d.track, side, d.trackData().size());
+        onDiag(b);
+    }
+}
+
+// Decode the track under the head back into the disk image. The driver writes
+// nibbles, not sectors: it finds an address field by reading, switches the head
+// to write and lays down the data field that follows, and a format pass writes
+// whole tracks including their address fields. So the image is reconstructed by
+// parsing the stream the same way a drive would, which makes both cases the same
+// code path and keeps a formatted-from-inside-the-OS disk readable.
+void Machine::flushFloppyTrack() {
+    SonyDrive& d = *drive0_;
+    if (!d.trackDirty() || floppy_.empty() || floppyRO_) { d.clearTrackDirty(); return; }
+    const int sides = floppy_.size() > 440u * 1024u ? 2 : 1;
+    const int wrote = gcr::decodeTrack(d.trackData(), floppy_, trackCacheTrack_, sides);
+    d.clearTrackDirty();
+    ++floppyWrites_;
+    if (writeLogBudget_ > 0 && onDiag) {
+        --writeLogBudget_;
+        char b[96];
+        std::snprintf(b, sizeof b, "sony: track %d side %d written back (%d sectors)",
+                      trackCacheTrack_, trackCacheSide_, wrote);
         onDiag(b);
     }
 }
@@ -650,9 +677,22 @@ u8 Machine::iwmAccess(int reg, bool write, u8 data) {
     drive0_->hdMedia  = floppy_.size() >= 1440u * 1024u;
     iwm_->senseHigh = iwmSenseLine();
     iwmUpdateTrack();
-    iwm_->dataByte = selectedDrive().readNibble(totalCycles_);
-    if (iwm_->dataByte) ++iwmDataBytes_;
+    SonyDrive& d = selectedDrive();
+    // Q7 high means the chip is driving the write head. Reading the surface then
+    // would consume the bytes the driver is in the middle of laying down, so the
+    // read path stands aside while a write is in progress; the surface still
+    // advances with time, because writing advances it too.
+    if (!(iwm_->lines() & Iwm::kQ7)) {
+        iwm_->dataByte = d.readNibble(totalCycles_);
+        if (iwm_->dataByte) ++iwmDataBytes_;
+    }
+    iwm_->writeReady = d.writeReady(totalCycles_);
     const u8 ret = iwm_->access(reg, write, data);
+    if (iwm_->writeLatched) {
+        iwm_->writeLatched = false;
+        d.writeNibble(totalCycles_, iwm_->writeData);
+        ++iwmDataWrites_;
+    }
     // Count the register the access actually landed on: every access toggles its
     // latch first, so the register a read returns is the one the NEW line state
     // selects, and sampling before the access counts the previous one.
@@ -709,8 +749,15 @@ void Machine::iwmStrobe() {
                 onDiag(b);
             }
         }
-        d.tickStrobe(totalCycles_);
+    }
+    {
+        // The eject is a mechanism, not a strobe: it runs on its own clock once
+        // commanded, so it is advanced on every access rather than only while
+        // LSTRB is asserted.
+        SonyDrive& d = selectedDrive();
+        d.tickEject(totalCycles_);
         if (d.takeEjectRequest()) {
+            if (&d == drive0_.get()) flushFloppyTrack();   // before the medium goes
             d.removeDisk();
             if (&d == drive0_.get()) {
                 floppy_.clear();

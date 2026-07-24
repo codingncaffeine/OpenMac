@@ -62,6 +62,13 @@ public:
     void insertFloppy(std::vector<u8> image, bool readOnly = false);
     void ejectFloppy();
     bool floppyInserted() const { return !floppy_.empty(); }
+    // Persist writes by reading this back out. When the ROM's own driver is
+    // running the hardware, whatever it has written to the track under the head
+    // is still a nibble stream; flushing decodes it back into the image first.
+    const std::vector<u8>& floppyImage() {
+        flushFloppyTrack();
+        return floppy_;
+    }
 
     // Hard disk: a second, fixed (non-removable) image mounted through the same
     // high-level .Sony interception as a hard-disk volume. Empty = no hard disk.
@@ -168,6 +175,9 @@ public:
     // Data-register reads the ROM made, and disk bytes the surface handed over.
     u32 iwmDataReads() const { return iwmDataReads_; }
     u32 iwmDataBytes() const { return iwmDataBytes_; }
+    // Bytes pushed at the write head, and tracks decoded back into the image.
+    u32 iwmDataWrites() const { return iwmDataWrites_; }
+    u32 floppyTrackWrites() const { return floppyWrites_; }
 
     // The ROM's own GCR sector reader says why a read failed: each bail-out
     // loads a Sony driver error code into D0 and branches to a common exit.
@@ -212,6 +222,7 @@ private:
     void findGcrErrorSites(u32 drvrBase);   // locate the driver's error exits in the ROM
     void noteGcrError(u32 pc);     // one of them was reached
     void watchSonyPrime();         // log a read/write the ROM's own driver is about to do
+    void flushFloppyTrack();       // decode a written track back into the image
     int sonyOpen(u32 pb, u32 dce);
     void installSonyDrives();      // register floppy + HD drives (also used under ROM boot)
     int sonyPrime(u32 pb, u32 dce);
@@ -293,6 +304,9 @@ private:
     u32  trackCacheGen_ = 0;
     u32  floppyGen_ = 1;           // bumped whenever the medium is swapped or removed
     int  hdMediaLog_ = 1;          // one-shot note that HD media needs the MFM path
+    int  writeLogBudget_ = 12;     // diag budget for tracks written back to the image
+    u32  floppyWrites_ = 0;        // tracks the driver has written through the surface
+    u32  iwmDataWrites_ = 0;       // bytes the driver has pushed at the write head
     int  trackLogBudget_ = 12;
     u32  iwmDataReads_ = 0, iwmDataBytes_ = 0;
     bool lstrbPrev_ = false;   // edge detector for the command strobe
