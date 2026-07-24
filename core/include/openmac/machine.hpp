@@ -177,12 +177,6 @@ public:
     // driver demands of the hardware before the shim is replaced by real emulation.
     std::function<void(int reg, bool write, u8 data, u8 lines, u32 pc, int driveReg)> onIwmAccess;
 
-    // The ROM's own .Sony driver runs the emulated disk hardware. This switch
-    // puts the old high-level interception back in its place -- it serviced disk
-    // I/O from the sector image in C++ and sidestepped the chip entirely -- which
-    // is worth keeping for bisecting until it is deleted outright.
-    void setSonyShimEnabled(bool on) { sonyShim_ = on; }
-
     // Let the disk chip answer the ROM's SWIM probe and unlock its ISM register
     // set. The probe's outcome decides whether the driver works the chip as an
     // IWM (software GCR) or as a SWIM (hardware MFM), so this switches the whole
@@ -250,8 +244,7 @@ private:
     void flushTrack(SonyDrive& d);  // decode a written track back into that drive's image
     void flushFloppyTrack();       // ...the internal drive's, which the host persists
     void ismService(SonyDrive& d); // move bytes between the ISM FIFO and the surface
-    int sonyOpen(u32 pb, u32 dce);
-    void installSonyDrives();      // register floppy + HD drives (also used under ROM boot)
+    void installHardDisk();       // give the hard disk its deferred mount
     int sonyPrime(u32 pb, u32 dce);
     int sonyControl(u32 pb, u32 dce);
     int sonyStatus(u32 pb, u32 dce);
@@ -263,7 +256,6 @@ private:
     u8 iwmAccess(int reg, bool write, u8 data);
     int iwmDriveReg() const;   // Sony drive-register address CA2:CA1:CA0:SEL (0-15)
     bool iwmSenseLine();       // level of the drive status line that address selects
-    bool sonyShim_ = false;  // true: put the old high-level .Sony interception back
 
     std::vector<u8> floppy_;
     std::vector<u8> floppy2_;      // the external drive's medium
@@ -281,7 +273,6 @@ private:
     int sonyResultLog_ = 40;
     u32 sonyResults_ = 0, sonyResultErrs_ = 0;
     u32 drvStatusAddr_ = 0;        // Mac address of our DrvSts record
-    int floppyDriveNum_ = 0;
     bool inSony_ = false;          // re-entrancy guard during trap execution
 
     mutable std::vector<u8> hd_;   // hard-disk image (empty = none); synced from scsiImage_ on read-out
@@ -289,22 +280,16 @@ private:
     u32 hfsImageOffset_ = 0;       // byte offset of the HFS volume within scsiImage_
     bool scsiHandlesHd_ = true;    // true: SCSI driver owns the HD (skip .Sony HD reg); false: .Sony still mounts
     bool hdRO_ = false;
-    u32 hdStatusAddr_ = 0;         // DrvSts record for the hard disk
+    bool hdInstalled_ = false;     // the hard disk's deferred mount is set up
     int hdDriveNum_ = 0;
     u32 hdReads_ = 0, hdWrites_ = 0;   // block-I/O counters (feasibility probe)
     u32 hdMountPb_ = 0;                // system-heap param block for _MountVol
-    u32 sonyForceOpenPb_ = 0;         // PB to force-open .Sony under ROM boot (adds the HD)
     u32 diskEvtPosts_ = 0;             // mount attempts
     u32 diskEvtResult_ = 0xFFFFFFFFu;  // last _MountVol OSErr
     bool hdMounted_ = false;           // volume mounted OK; stop retrying
     // Enabled by sonyOpen once a hard disk is configured; the mount trigger then
     // runs _MountVol with the .Sony intercept consulted (see execute68kTrap).
     bool hdAutoMount_ = false;
-    bool floppyInsertPending_ = false; // a floppy was swapped in after boot
-    bool floppyEjectPending_ = false;  // eject requested; unmount the volume next runFrame
-    u32 floppyMountPb_ = 0;            // lazily-allocated _MountVol param block
-    std::vector<u8> floppyPending_;    // staged swap image, applied next runFrame
-    bool floppyPendingRO_ = false;
     int sonyLogBudget_ = 0;            // trace the next N .Sony driver calls after a swap
     int floppyEjectSense_ = 0;         // frames to report "no disk" so the ROM sees a swap edge
     int cstinLogBudget_ = 0;           // trace the next N disk-in-place sense reads after a swap

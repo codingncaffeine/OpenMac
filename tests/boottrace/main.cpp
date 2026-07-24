@@ -995,14 +995,10 @@ int main(int argc, char** argv) {
     } else if (swimOn) {
         std::printf("SWIM/ISM register set enabled (the default)\n");
     }
-    // The ROM's own .Sony driver runs the hardware by default now; --sony-shim
-    // puts the old high-level interception back for bisecting.
-    if (sonyShimOn) {
-        mac.setSonyShimEnabled(true);
-        std::printf(".Sony high-level shim RE-ENABLED -- disk I/O bypasses the chip\n");
-    } else if (noSonyShim) {
-        std::printf(".Sony driver: the ROM's own runs the hardware (the default)\n");
-    }
+    // The ROM's own .Sony driver runs the hardware; there is no longer anything
+    // to switch. --no-sony-shim is kept as a no-op so old command lines still run.
+    if (noSonyShim || sonyShimOn)
+        std::printf(".Sony driver: the ROM's own runs the hardware\n");
     if (externalEmpty || (!externalPath.empty() && insert800k)) {
         mac.setExternalDriveAttached(true);
         std::printf("EXTERNAL drive attached, no disk\n");

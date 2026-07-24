@@ -483,8 +483,8 @@ int Machine::stepInstruction() {
     // up on a sector, and if so which check failed. Always on: it costs nothing
     // and it is the only direct read on whether our nibble stream is right.
     if (gcrErrSpan_ && (cpu_.pc - gcrErrLo_) <= gcrErrSpan_) noteGcrError(cpu_.pc);
-    if (!sonyShim_ && sonyPrimePc_ && cpu_.pc == sonyPrimePc_) watchSonyPrime();
-    if (!sonyShim_ && sonyResultPc_ && cpu_.pc == sonyResultPc_) watchSonyResult();
+    if (sonyPrimePc_ && cpu_.pc == sonyPrimePc_) watchSonyPrime();
+    if (sonyResultPc_ && cpu_.pc == sonyResultPc_) watchSonyResult();
     cpu_.setIrqLevel(via_->irqAsserted() ? 1 : 0);
     const int c = cpu_.step();
     tickDevices(c);
@@ -587,7 +587,7 @@ void Machine::ejectFloppy() {
 void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hd_ = std::move(image);
     hdRO_ = readOnly;
-    hdStatusAddr_ = 0;   // re-added to the drive queue on the next driver Open
+    hdInstalled_ = false;   // set up again for the new disk
     // Present the volume on the SCSI bus (target ID 0) wrapped in an Apple partition
     // structure -- Driver Descriptor Map + Apple Partition Map + a driver partition --
     // so the ROM's boot scan can read a real map and driver from it. The .Sony shim
@@ -1118,140 +1118,54 @@ void Machine::execute68kTrap(u16 trap) {
     cpu_.setSR(savedSr);
 }
 
-int Machine::sonyOpen(u32 /*pb*/, u32 dce) {
-    write32(dce + dCtlPosition, 0);
-    // Queue version must be >= 3 or System 8 replaces the driver.
-    write16(dce + dCtlQHdr, static_cast<u16>((read16(dce + dCtlQHdr) & 0xFF00) | 3));
-    write32(0x134, 0xDEADBEEF);   // fake SonyVars pointer
-    installSonyDrives();
-    return kNoErr;
-}
 
-// Register the floppy (drive 2) and, if present, the hard disk (drive 3) in the
-// drive queue. Reached through sonyOpen when the System opens the .Sony driver;
-// also called directly for boot paths that never open it (ROM-disk boot with no
-// floppy), where the ROM driver is pre-marked open so its Open routine never runs.
-void Machine::installSonyDrives() {
-    if (drvStatusAddr_ != 0) return;   // already installed
-
-    // Allocate the drive-status record from the system heap.
-    cpu_.d[0] = SIZEOF_DrvSts;
+// Set up the hard disk's place in the System's world.
+//
+// This used to register a floppy drive too, hand-writing a drive-status record
+// and calling _AddDrive for it, because a high-level replacement driver owned
+// the floppy. The ROM's own driver owns it now and registers it itself, so doing
+// that here only put a second, fictional floppy drive in the queue.
+//
+// What is left is the hard disk, and only the part the SCSI path cannot do for
+// itself: the disk's own driver -- loaded by the ROM out of the Apple_Driver43
+// partition -- runs _DrvrInstall and _AddDrive for the drive, so all that is
+// needed is the deferred _MountVol trigger for drive 4, which is the number the
+// installer expects.
+void Machine::installHardDisk() {
+    if (hdInstalled_ || hd_.empty()) return;
+    hdInstalled_ = true;
+    hdDriveNum_ = 4;
+    cpu_.d[0] = 80;                          // a param block for _MountVol
     execute68kTrap(kTrapNewPtrSysClear);
-    if (cpu_.a[0] == 0) return;
-    drvStatusAddr_ = cpu_.a[0];
-
-    write16(drvStatusAddr_ + dsQType, static_cast<u16>(kSonyType));
-    write8(drvStatusAddr_ + dsInstalled, 1);
-    write8(drvStatusAddr_ + dsSides, 0xFF);       // double-sided
-    write8(drvStatusAddr_ + dsTwoSideFmt, 0xFF);
-    write8(drvStatusAddr_ + dsNewIntf, 0xFF);
-    write8(drvStatusAddr_ + dsMFMDrive, 0xFF);    // SuperDrive
-    write8(drvStatusAddr_ + dsMFMDisk, 0xFF);     // MFM disk
-    write8(drvStatusAddr_ + dsTwoMegFmt, 0xFF);   // 1.44MB
-    write8(drvStatusAddr_ + dsDiskInPlace, floppy_.empty() ? 0 : 1);
-    write8(drvStatusAddr_ + dsWriteProt, floppyRO_ ? 0xFF : 0);
-
-    // Add to the drive queue: D0 = (driveNum << 16) | refNum, A0 = &dsQLink.
-    floppyDriveNum_ = 2;   // internal floppy
-    cpu_.d[0] = (static_cast<u32>(floppyDriveNum_) << 16) |
-                (static_cast<u32>(kSonyRefNum) & 0xFFFF);
-    cpu_.a[0] = drvStatusAddr_ + dsQLink;
-    execute68kTrap(kTrapAddDrive);
-
-    // Install a Time Manager task, as the real .Sony Open does (ROM $434778):
-    // the driver's disk-motor spin-down timer. System 6's extended Time Manager
-    // patch walks tm_var+8 and re-installs every existing timer, so an empty
-    // queue there address-errors it. A standalone zeroed TMTask keeps it valid;
-    // the task is never Primed, so it never fires.
-    cpu_.d[0] = 32;                          // >= extended TMTask size (22)
-    execute68kTrap(kTrapNewPtrSysClear);     // A0 = zeroed system-heap block
-    if (cpu_.a[0] != 0) {
-        const u32 tmTask = cpu_.a[0];
-        write32(tmTask + 6, 0x43469A);       // tmAddr -> a harmless ROM RTS
-        cpu_.a[0] = tmTask;
-        execute68kTrap(kTrapInsTime);        // _InsTime -> enqueues into tm_var+8
-    }
-
-    // A second, fixed drive for the hard disk, if one is mounted. Following Mini
-    // vMac's SONYEMDV model: the ROM's .Sony driver only owns its floppy drives,
-    // so the HD gets its OWN driver reference number (-2) and a separate unit-table
-    // slot aliased to the .Sony DCE -- the ROM then dispatches the HD's I/O to the
-    // same driver code we hook, which serves it from the image by drive number.
-    if (!hd_.empty() && !scsiHandlesHd_) {
-        cpu_.d[0] = SIZEOF_DrvSts;
-        execute68kTrap(kTrapNewPtrSysClear);
-        if (cpu_.a[0] != 0) {
-            hdStatusAddr_ = cpu_.a[0];
-            write16(hdStatusAddr_ + dsQType, static_cast<u16>(kSonyType));
-            write8(hdStatusAddr_ + dsInstalled, 1);
-            write8(hdStatusAddr_ + dsSides, 0xFF);
-            write8(hdStatusAddr_ + dsDiskInPlace, 8);   // 8 = non-ejectable disk
-            write8(hdStatusAddr_ + dsWriteProt, hdRO_ ? 0xFF : 0);
-            hdDriveNum_ = floppyDriveNum_ + 1;          // drive 3
-            cpu_.d[0] = (static_cast<u32>(hdDriveNum_) << 16) |
-                        (static_cast<u32>(kHdRefNum) & 0xFFFF);
-            cpu_.a[0] = hdStatusAddr_ + dsQLink;
-            execute68kTrap(kTrapAddDrive);
-
-            // Alias unit-table slot 1 (refNum -2, the HD) to slot 4 (refNum -5,
-            // .Sony) so the HD's I/O dispatches to the .Sony driver code we hook.
-            const u32 utb = read32(0x011C);             // UTableBase
-            if (utb != 0) write32(utb + 4 * 1, read32(utb + 4 * 4));
-
-            cpu_.d[0] = 80;                      // a param block for _MountVol
-            execute68kTrap(kTrapNewPtrSysClear);
-            hdMountPb_ = cpu_.a[0];
-            hdAutoMount_ = true;   // HD configured; allow the auto-mount trigger
-        }
-    } else if (!hd_.empty() && scsiHandlesHd_) {
-        // SCSI owns the HD: the disk's own driver (loaded by the ROM from its
-        // Apple_Driver43 partition) runs _DrvrInstall + _AddDrive for the drive. We
-        // only set up the deferred _MountVol trigger for that drive (number 4, matching
-        // the installer), so the System mounts it through the disk driver's own Prime.
-        hdDriveNum_ = floppyDriveNum_ + 2;   // drive 4
-        cpu_.d[0] = 80;
-        execute68kTrap(kTrapNewPtrSysClear);
-        hdMountPb_ = cpu_.a[0];
-        hdAutoMount_ = true;
-    }
+    hdMountPb_ = cpu_.a[0];
+    hdAutoMount_ = true;
 }
 
+// These three only ever see the hard disk: trySonyTrap checks the drive number
+// and lets every floppy request through to the ROM's driver, which reads and
+// writes the disk itself through the chip.
 int Machine::sonyPrime(u32 pb, u32 dce) {
     write32(pb + ioActCount, 0);
-
-    // Route to the drive named in the parameter block: the fixed hard disk if
-    // its number matches, otherwise the floppy.
-    const s16 drive = static_cast<s16>(read16(pb + ioVRefNum));
-    const bool toHd = hdDriveNum_ != 0 && drive == hdDriveNum_;
-    std::vector<u8>* img = toHd ? &hd_ : &floppy_;
-    const u32 statusAddr = toHd ? hdStatusAddr_ : drvStatusAddr_;
-    const bool ro = toHd ? hdRO_ : floppyRO_;
-
-    if (statusAddr == 0 || read8(statusAddr + dsDiskInPlace) == 0)
-        return kOffLinErr;
-    if (!toHd) write8(statusAddr + dsDiskInPlace, 2);   // floppy: disk accessed
-
     const u32 buffer = read32(pb + ioBuffer);
     const u32 length = read32(pb + ioReqCount);
     const u32 position = read32(dce + dCtlPosition);
     if ((length & 0x1FF) || (position & 0x1FF)) return kParamErr;
 
-    const bool isRead = (read16(pb + ioTrap) & 0xFF) == kARdCmd;
-    if (isRead) {
-        if (toHd) ++hdReads_;
+    if ((read16(pb + ioTrap) & 0xFF) == kARdCmd) {
+        ++hdReads_;
         for (u32 i = 0; i < length; ++i) {
             const u32 src = position + i;
-            write8(buffer + i, src < img->size() ? (*img)[src] : 0);
+            write8(buffer + i, src < hd_.size() ? hd_[src] : 0);
         }
         write32(0x2FC, 0);   // clear TagBuf
         write32(0x300, 0);
         write32(0x304, 0);
     } else {
-        if (ro) return kWPrErr;
-        if (toHd) ++hdWrites_;
+        if (hdRO_) return kWPrErr;
+        ++hdWrites_;
         for (u32 i = 0; i < length; ++i) {
             const u32 dst = position + i;
-            if (dst < img->size()) (*img)[dst] = read8(buffer + i);
+            if (dst < hd_.size()) hd_[dst] = read8(buffer + i);
         }
     }
     write32(pb + ioActCount, length);
@@ -1260,38 +1174,17 @@ int Machine::sonyPrime(u32 pb, u32 dce) {
 }
 
 int Machine::sonyControl(u32 pb, u32 /*dce*/) {
-    const u16 code = read16(pb + csCode);
-    switch (code) {
-        case 1:    // KillIO
-            return kControlErr;
-        case 7:    // eject
-            if (drvStatusAddr_) write8(drvStatusAddr_ + dsDiskInPlace, 0);
-            sonyLogBudget_ = 600;   // trace the disk-switch wait that follows an eject
-            cstinLogBudget_ = 200;
-            if (onDiag) onDiag("sony: eject (csCode 7) -> disk-switch wait begins");
-            return kNoErr;
-        default:   // verify / format / tag buffer / track cache: accept
-            return kNoErr;
-    }
+    // KillIO is the only one worth refusing; a fixed disk cannot be ejected and
+    // the rest (verify, format, tag buffer, track cache) are accepted as done.
+    return read16(pb + csCode) == 1 ? kControlErr : kNoErr;
 }
 
 int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
-    const u16 code = read16(pb + csCode);
-    const s16 drive = static_cast<s16>(read16(pb + ioVRefNum));
-    const bool toHd = hdDriveNum_ != 0 && drive == hdDriveNum_;
-    const u32 statusAddr = toHd ? hdStatusAddr_ : drvStatusAddr_;
-    switch (code) {
-        case 8:    // return the drive status record
-            if (statusAddr)
-                for (int i = 0; i < 22; ++i)
-                    write8(pb + csParam + i, read8(statusAddr + dsWriteProt + i));
-            return kNoErr;
-        case 6: {  // format list: one format spanning the whole medium
-            const u32 blocks = toHd ? static_cast<u32>(hd_.size() / 512) : 2880u;
+    switch (read16(pb + csCode)) {
+        case 6:    // format list: one format spanning the whole disk
             write16(pb + csParam, 1);
-            write32(pb + csParam + 2, blocks);
+            write32(pb + csParam + 2, static_cast<u32>(hd_.size() / 512));
             return kNoErr;
-        }
         default:
             return kNoErr;
     }
@@ -1330,41 +1223,21 @@ void Machine::runFrame() {
 
 
 
-    // Under ROM-disk boot with no floppy, the System never opens the .Sony driver
-    // itself, so sonyOpen (which registers the hard disk) never runs and an attached
-    // HD won't appear. Force .Sony open once the Device Manager is up, so the HD is
-    // added exactly as a floppy insertion would have. Only fires while .Sony is NOT
-    // already open (drvStatusAddr_ == 0), so it never runs under a floppy boot.
-    if (!hd_.empty() && drvStatusAddr_ == 0 && sonyOpenPc_ != 0 && !inSony_ &&
-        frameCounter_ > 1600 && (frameCounter_ % 60) == 0 &&
+    // Arrange the hard disk's mount once the System is far enough along to
+    // allocate from the system heap. This used to force the .Sony driver open
+    // first, because the drive registration hung off that driver's Open; the
+    // disk's own driver registers the drive now, so there is nothing to open and
+    // nothing to alias.
+    if (!hd_.empty() && !hdInstalled_ && frameCounter_ > 1600 &&
+        (frameCounter_ % 60) == 0 &&
         read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-        if (sonyForceOpenPb_ == 0) {
-            cpu_.d[0] = 96;
-            execute68kTrap(kTrapNewPtrSysClear);
-            sonyForceOpenPb_ = cpu_.a[0];
-            if (sonyForceOpenPb_ != 0) {
-                static const u8 nm[6] = {0x05, '.', 'S', 'o', 'n', 'y'};
-                for (int i = 0; i < 6; ++i) write8(sonyForceOpenPb_ + 64 + i, nm[i]);
-            }
-        }
-        if (sonyForceOpenPb_ != 0) {
-            write32(sonyForceOpenPb_ + ioNamePtr, sonyForceOpenPb_ + 64);
-            write8(sonyForceOpenPb_ + ioPermssn, 0);
-            cpu_.a[0] = sonyForceOpenPb_;
-            execute68kTrap(kTrapOpen);   // ensure the .Sony DCE exists (the alias target)
-        }
-        // The ROM driver is pre-open so _Open never ran our sonyOpen; register the
-        // drives directly against the now-valid .Sony unit-table slot.
-        inSony_ = true;
-        installSonyDrives();
-        inSony_ = false;
+        installHardDisk();
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
         if (onDiag) {
             char b[96];
-            std::snprintf(b, sizeof b, "hd: ROM-boot drive install -> drvStatus=%06X hdDrive=%d",
-                          drvStatusAddr_, hdDriveNum_);
+            std::snprintf(b, sizeof b, "hd: drive %d set up for mounting", hdDriveNum_);
             onDiag(b);
         }
     }
