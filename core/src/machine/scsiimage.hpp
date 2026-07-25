@@ -103,53 +103,88 @@ inline std::vector<u8> buildScsiDriver() {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // delay/emask/menu
         0x00, 0x1A,                         // drvrOpen   = 0x1A
         0x00, 0x1E,                         // drvrPrime  = 0x1E
-        0x00, 0x78,                         // drvrCtl    = 0x78
-        0x00, 0x80,                         // drvrStatus = 0x80
-        0x00, 0x88,                         // drvrClose  = 0x88
+        0x00, 0xB0,                         // drvrCtl    = 0xB0
+        0x00, 0xB8,                         // drvrStatus = 0xB8
+        0x00, 0xC0,                         // drvrClose  = 0xC0
         0x07, '.', 'S', 'c', 's', 'i', 'H', 'D',   // drvrName ".ScsiHD", ends even at 0x1A
         // Open (0x1A): dOpened is preset, so this is only a safety no-op
         0x70, 0x00, 0x4E, 0x75,             // MOVEQ #0,D0; RTS
-        // Prime (0x1E): read/write blocks over SCSI via the ROM's block routine ($4041D4).
-        // A0 = I/O param block, A1 = DCE. Save the callee-preserved regs we touch, plus A1
-        // -- $4041D4 clobbers A1, but jIODone needs A1 = DCE at completion.
-        0x2F, 0x09,                         // MOVE.L A1,-(A7)   save DCE across the SCSI call
+        // Prime (0x1E): read/write blocks over SCSI, at most 64 blocks per bus
+        // transaction. A READ(6)/WRITE(6) CDB carries a ONE-BYTE block count: the
+        // File Manager routinely asks for hundreds of KB in one request (the
+        // Resource Manager writing a big System file), and a count that truncates
+        // to the low byte moves the wrong number of blocks -- the transfer ends in
+        // the wrong bus phase, the request completes with scPhaseErr, and the data
+        // silently never lands (that was the installed-System corruption). All loop
+        // state lives in the param block itself (ioActCount accumulates per chunk),
+        // because the ROM's read helper clobbers registers freely.
+        // A0 = I/O param block, A1 = DCE.
+        0x2F, 0x09,                         // MOVE.L A1,-(A7)
         0x2F, 0x03,                         // MOVE.L D3,-(A7)
         0x2F, 0x04,                         // MOVE.L D4,-(A7)
         0x2F, 0x05,                         // MOVE.L D5,-(A7)
         0x2F, 0x06,                         // MOVE.L D6,-(A7)
+        0x2F, 0x07,                         // MOVE.L D7,-(A7)
         0x2F, 0x0A,                         // MOVE.L A2,-(A7)
+        0x42, 0xA8, 0x00, 0x28,             // CLR.L $28(A0)          ioActCount = 0
+        // .loop (p+18):
+        0x2E, 0x28, 0x00, 0x24,             // MOVE.L $24(A0),D7      ioReqCount
+        0x9E, 0xA8, 0x00, 0x28,             // SUB.L $28(A0),D7       - done so far
+        0xE0, 0x8F,                         // LSR.L #8,D7
+        0xE2, 0x8F,                         // LSR.L #1,D7            D7 = blocks remaining
+        0x67, 0x00, 0x00, 0x5C,             // BEQ.W .done            nothing left -> noErr
+        0x74, 0x40,                         // MOVEQ #64,D2
+        0xBE, 0x82,                         // CMP.L D2,D7
+        0x6C, 0x02,                         // BGE.S .have            chunk = min(remaining, 64)
+        0x24, 0x07,                         // MOVE.L D7,D2
+        // .have (p+42):
         0x26, 0x28, 0x00, 0x2E,             // MOVE.L $2E(A0),D3      ioPosOffset (bytes)
+        0xD6, 0xA8, 0x00, 0x28,             // ADD.L $28(A0),D3       + progress
         0xE0, 0x8B,                         // LSR.L #8,D3
-        0xE2, 0x8B,                         // LSR.L #1,D3            D3 = block within partition (/512)
+        0xE2, 0x8B,                         // LSR.L #1,D3            D3 = partition block
         0xD6, 0xA9, 0x00, 0x14,             // ADD.L $14(A1),D3       + dCtlStorage -> absolute LBA
-        0x24, 0x28, 0x00, 0x24,             // MOVE.L $24(A0),D2      ioReqCount (bytes)
-        0xE0, 0x8A,                         // LSR.L #8,D2
-        0xE2, 0x8A,                         // LSR.L #1,D2            D2 = block count
-        0x24, 0x68, 0x00, 0x20,             // MOVEA.L $20(A0),A2     ioBuffer -> A2
-        0x21, 0x68, 0x00, 0x24, 0x00, 0x28, // MOVE.L $24(A0),$28(A0) ioActCount = ioReqCount
-        0x7A, 0x00,                         // MOVEQ #0,D5            SCSI target id 0 (both paths)
-        0x28, 0x3C, 0x00, 0x00, 0x02, 0x00, // MOVE.L #512,D4         block size (both paths; MULU'd to bytes)
+        0x24, 0x68, 0x00, 0x20,             // MOVEA.L $20(A0),A2     ioBuffer
+        0xD5, 0xE8, 0x00, 0x28,             // ADDA.L $28(A0),A2      + progress
+        0x28, 0x3C, 0x00, 0x00, 0x02, 0x00, // MOVE.L #512,D4         block size
+        0x7A, 0x00,                         // MOVEQ #0,D5            SCSI target id 0
+        0x2F, 0x08,                         // MOVE.L A0,-(A7)        PB/DCE/chunk survive the call
+        0x2F, 0x09,                         // MOVE.L A1,-(A7)
+        0x2F, 0x02,                         // MOVE.L D2,-(A7)
         0x30, 0x28, 0x00, 0x06,             // MOVE.W $06(A0),D0      ioTrap: _Read=$A002, _Write=$A003
-        0x08, 0x00, 0x00, 0x00,             // BTST #0,D0             odd trap number => write
-        0x67, 0x06,                         // BEQ.S .read
-        0x61, 0x00, 0x00, 0x30,             // BSR.W wr6 (@ +0x8C)    write: real SCSI WRITE(6)
-        0x60, 0x06,                         // BRA.S .done
+        0x08, 0x00, 0x00, 0x00,             // BTST #0,D0             odd trap => write. MOVE sets CCR,
+        0x67, 0x06,                         // BEQ.S .read            so the test sits RIGHT before the branch
+        0x61, 0x00, 0x00, 0x4A,             // BSR.W wr6 (@ 0xC4)     write: real SCSI WRITE(6)
+        0x60, 0x06,                         // BRA.S .chk
         0x4E, 0xB9, 0x00, 0x40, 0x41, 0xD4, // .read: JSR $004041D4   SCSI READ(6); D0 = result
-        0x24, 0x5F,                         // .done: MOVEA.L (A7)+,A2
+        // .chk (p+102):
+        0x24, 0x1F,                         // MOVE.L (A7)+,D2
+        0x22, 0x5F,                         // MOVEA.L (A7)+,A1
+        0x20, 0x5F,                         // MOVEA.L (A7)+,A0
+        0x4A, 0x40,                         // TST.W D0
+        0x66, 0x0E,                         // BNE.S .out             error completes with D0
+        0xE1, 0x8A,                         // LSL.L #8,D2
+        0xE3, 0x8A,                         // LSL.L #1,D2            D2 = chunk bytes
+        0xD5, 0xA8, 0x00, 0x28,             // ADD.L D2,$28(A0)       ioActCount += chunk
+        0x60, 0x00, 0xFF, 0x98,             // BRA.W .loop
+        // .done (p+124):
+        0x70, 0x00,                         // MOVEQ #0,D0
+        // .out (p+126):
+        0x24, 0x5F,                         // MOVEA.L (A7)+,A2
+        0x2E, 0x1F,                         // MOVE.L (A7)+,D7
         0x2C, 0x1F,                         // MOVE.L (A7)+,D6
         0x2A, 0x1F,                         // MOVE.L (A7)+,D5
         0x28, 0x1F,                         // MOVE.L (A7)+,D4
         0x26, 0x1F,                         // MOVE.L (A7)+,D3
-        0x22, 0x5F,                         // MOVEA.L (A7)+,A1  restore DCE ($4041D4 clobbered it)
+        0x22, 0x5F,                         // MOVEA.L (A7)+,A1       DCE back for jIODone
         0x20, 0x78, 0x08, 0xFC,             // MOVEA.L (jIODone).W,A0  A1=DCE, D0=result
         0x4E, 0xD0,                         // JMP (A0)  -- IODone dequeues the request + sets ioResult
-        // Control (0x78): accept + complete with noErr via IODone
+        // Control (0xB0): accept + complete with noErr via IODone
         0x70, 0x00, 0x20, 0x78, 0x08, 0xFC, 0x4E, 0xD0,
-        // Status (0x80): accept + complete with noErr via IODone
+        // Status (0xB8): accept + complete with noErr via IODone
         0x70, 0x00, 0x20, 0x78, 0x08, 0xFC, 0x4E, 0xD0,
-        // Close (0x88): immediate no-op
+        // Close (0xC0): immediate no-op
         0x70, 0x00, 0x4E, 0x75,
-        // wr6 (0x8C): SCSI WRITE(6) subroutine -- same shape as the ROM's read at $4041D4
+        // wr6 (0xC4): SCSI WRITE(6) subroutine -- same shape as the ROM's read at $4041D4
         // but CDB opcode $0A and SCSIWrite (selector 6). In: D3=block, D2=count, D4=block
         // size, D5=target, A2=buffer. Out: D0 = SCSI status (0 = GOOD). Uses $09FA CDB/
         // status scratch and the reserved-stack discipline of $4041D4; leaves A1 intact.
