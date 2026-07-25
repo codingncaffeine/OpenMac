@@ -94,7 +94,7 @@ public:
     // refused with its nature named rather than framed as noise.
     InsertVerdict insertFloppy(std::vector<u8> image, bool readOnly = false);
     void ejectFloppy();
-    bool floppyInserted() const { return !floppy_.empty(); }
+    bool floppyInserted() const { return !floppy_.empty() || !floppyStaged_.empty(); }
     // Persist writes by reading this back out. When the ROM's own driver is
     // running the hardware, whatever it has written to the track under the head
     // is still a nibble stream; flushing decodes it back into the image first.
@@ -317,6 +317,16 @@ private:
         std::vector<u8> reassemble(const std::vector<u8>& data) const;
     };
     MediumWrapper floppyWrap_, floppy2Wrap_;
+    // A floppy put in before the ROM-boot System is running. The ROM's early
+    // drive poll announces a power-on disk while the System is still coming up,
+    // and startup flushes the event queue -- the announcement is discarded and
+    // nothing ever repeats it, so the disk sits in the drive unmounted. Staging
+    // the disk until the System can act makes its insertion the same event a
+    // user's insertion is, which is the path that demonstrably mounts.
+    std::vector<u8> floppyStaged_;
+    MediumWrapper floppyStagedWrap_;
+    bool floppyStagedRO_ = false;
+    void seatFloppy(std::vector<u8> image, MediumWrapper wrap, bool readOnly);
     std::vector<u8> mediumOut_;
     char mediumText_[2][224] = {{0}, {0}};
     // Peel MacBinary and DiskCopy wrappers off `image` into `wrap` and judge

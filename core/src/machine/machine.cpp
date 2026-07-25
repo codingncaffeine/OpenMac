@@ -34,6 +34,12 @@ enum {
 constexpr int kNoErr = 0, kControlErr = -17, kReadErr = -19, kWritErr = -20,
               kWPrErr = -44, kParamErr = -50, kOffLinErr = -65;
 constexpr int kSonyType = 0;      // dsQType value for a Sony (floppy) drive
+// When a floppy staged through a forced ROM-disk boot is finally put in the
+// drive. The ROM-boot System has mounted its own volume and the Finder is
+// servicing events by here (the boot reaches the desktop around frame 2300 at
+// 4 MB, earlier with less memory to test), so the insertion is noticed the way
+// a user's is; the volume-queue check alongside it keeps a slow path honest.
+constexpr u64 kRomBootFloppySeat = 2400;
 constexpr int kARdCmd = 2;        // low byte of ioTrap for a Read
 constexpr int kSonyRefNum = -5;   // .Sony driver reference number
 constexpr int kHdRefNum   = -2;   // hard disk's own driver refNum (unit-table alias)
@@ -621,6 +627,24 @@ Machine::InsertVerdict Machine::insertFloppy(std::vector<u8> image, bool readOnl
     const char* refusal = classifyMedium(0, image, wrap);
     describeMedium(0, "floppy", refusal);
     if (refusal) return InsertVerdict::kRefused;
+    // Under a forced ROM-disk boot, a disk put in before the System is running
+    // is announced by the ROM's early drive poll and the announcement is then
+    // flushed with the rest of the startup events -- nothing repeats it, and
+    // the disk sits unmounted. Hold the disk out of the drive until the System
+    // is up; its insertion then is the same event a user's insertion is.
+    if (forceRomDisk_ && frameCounter_ < kRomBootFloppySeat) {
+        floppyStaged_ = std::move(image);
+        floppyStagedWrap_ = std::move(wrap);
+        floppyStagedRO_ = readOnly;
+        if (onDiag)
+            onDiag("floppy: held until the ROM-boot System is up, then inserted");
+        return InsertVerdict::kAccepted;
+    }
+    seatFloppy(std::move(image), std::move(wrap), readOnly);
+    return InsertVerdict::kAccepted;
+}
+
+void Machine::seatFloppy(std::vector<u8> image, MediumWrapper wrap, bool readOnly) {
     flushFloppyTrack();   // whatever the driver wrote to the outgoing disk
     floppy_ = std::move(image);
     floppyWrap_ = std::move(wrap);
@@ -628,7 +652,6 @@ Machine::InsertVerdict Machine::insertFloppy(std::vector<u8> image, bool readOnl
     ++floppyGen_;
     floppyRO_ = readOnly;
     drive0_->insert(&floppy_, readOnly, floppy_.size() >= 1440u * 1024u);
-    return InsertVerdict::kAccepted;
 }
 
 // Report the classification: what was recognised, or why the file was turned
@@ -700,6 +723,12 @@ void Machine::ejectExternalFloppy() {
 // together the same way, so the file it is written back to stays the format it
 // came in as rather than silently becoming a raw image.
 const std::vector<u8>& Machine::floppyImage() {
+    // A disk still staged for a ROM-boot System has not been touched; hand back
+    // exactly what came in.
+    if (!floppyStaged_.empty()) {
+        mediumOut_ = floppyStagedWrap_.reassemble(floppyStaged_);
+        return mediumOut_;
+    }
     flushFloppyTrack();
     const std::vector<u8>& data =
         floppy_.empty() && !floppyEjected_.empty() ? floppyEjected_ : floppy_;
@@ -721,6 +750,14 @@ const std::vector<u8>& Machine::externalFloppyImage() {
 // EJECT register; this is for the emulator's UI, and it keeps the medium so its
 // contents can still be written back to the file they came from.
 void Machine::ejectFloppy() {
+    if (!floppyStaged_.empty()) {
+        // Never made it into the drive; there is nothing the guest could have
+        // written to keep.
+        floppyStaged_.clear();
+        floppyStagedWrap_.clear();
+        if (onDiag) onDiag("floppy: staged disk taken back");
+        return;
+    }
     flushFloppyTrack();
     if (!floppy_.empty()) floppyEjected_ = std::move(floppy_);
     floppy_.clear();
@@ -1632,6 +1669,18 @@ void Machine::runFrame() {
     }
 
 
+
+    // A floppy staged through a forced ROM-disk boot goes into the drive once
+    // the System is up -- the volume queue existing says the boot volume has
+    // mounted, and by kRomBootFloppySeat the Finder is servicing events, so the
+    // insertion is announced and acted on like any other.
+    if (!floppyStaged_.empty() && frameCounter_ >= kRomBootFloppySeat &&
+        (((static_cast<u32>(read16(0x358)) << 16) | read16(0x35A)) != 0xFFFFFFFFu)) {
+        seatFloppy(std::move(floppyStaged_), std::move(floppyStagedWrap_), floppyStagedRO_);
+        floppyStaged_.clear();
+        floppyStagedWrap_.clear();
+        if (onDiag) onDiag("floppy: staged disk now in the drive");
+    }
 
     // Arrange the hard disk's mount once the System is far enough along to
     // allocate from the system heap. This used to force the .Sony driver open
