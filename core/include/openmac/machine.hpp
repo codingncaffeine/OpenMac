@@ -65,12 +65,7 @@ public:
     // Persist writes by reading this back out. When the ROM's own driver is
     // running the hardware, whatever it has written to the track under the head
     // is still a nibble stream; flushing decodes it back into the image first.
-    const std::vector<u8>& floppyImage() {
-        flushFloppyTrack();
-        // If the drive has ejected the disk, the medium still exists -- hand back
-        // what was on it, so the host can persist the guest's writes.
-        return floppy_.empty() && !floppyEjected_.empty() ? floppyEjected_ : floppy_;
-    }
+    const std::vector<u8>& floppyImage();
     // How many times the drive has thrown a disk out on its own.
     u32 floppyEjectCount() const { return floppyEjects_; }
 
@@ -241,6 +236,7 @@ private:
     void noteGcrError(u32 pc);     // one of them was reached
     void watchSonyPrime();         // log a read/write the ROM's own driver is about to do
     void watchSonyResult();        // log the result the ROM's own driver hands back
+    void describeMedium(const char* which, const std::vector<u8>& img, bool diskCopy);
     void flushTrack(SonyDrive& d);  // decode a written track back into that drive's image
     void flushFloppyTrack();       // ...the internal drive's, which the host persists
     void ismService(SonyDrive& d); // move bytes between the ISM FIFO and the surface
@@ -259,6 +255,9 @@ private:
 
     std::vector<u8> floppy_;
     std::vector<u8> floppy2_;      // the external drive's medium
+    // DiskCopy 4.2 wrapper stripped on insertion, put back when the image is
+    // handed out so the file stays the format it arrived in.
+    std::vector<u8> floppyHeader_, floppy2Header_, mediumOut_;
     bool floppyRO_ = false;
     u32 sonyOpenPc_ = 0, sonyPrimePc_ = 0, sonyControlPc_ = 0, sonyStatusPc_ = 0;
     // Error exits of the ROM's GCR reader, kept as a span plus a short list so

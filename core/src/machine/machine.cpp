@@ -3,6 +3,7 @@
 #include "adb.hpp"
 #include "iwm.hpp"
 #include "rtc.hpp"
+#include "dc42.hpp"
 #include "gcr.hpp"
 #include "mfm.hpp"
 #include "scsi.hpp"
@@ -507,15 +508,36 @@ int Machine::stepInstruction() {
 void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
     flushFloppyTrack();   // whatever the driver wrote to the outgoing disk
     floppy_ = std::move(image);
+    floppyHeader_ = dc42::takeHeader(floppy_);   // DiskCopy wrapper, if that is what it is
     floppyEjected_.clear();
     ++floppyGen_;
     floppyRO_ = readOnly;
     drive0_->insert(&floppy_, readOnly, floppy_.size() >= 1440u * 1024u);
-    if (onDiag) {
-        char b[128];
-        std::snprintf(b, sizeof b, "floppy: %zu bytes seated in the drive", floppy_.size());
+    describeMedium("floppy", floppy_, !floppyHeader_.empty());
+}
+
+// Say what was actually recognised. Getting this wrong looks exactly like a
+// broken drive: a disk whose sectors are not where the geometry says they are
+// never mounts, and the machine shows the flashing question mark of a disk with
+// no System on it -- with nothing anywhere to say why.
+void Machine::describeMedium(const char* which, const std::vector<u8>& img, bool diskCopy) {
+    if (!onDiag) return;
+    char b[224];
+    if (img.empty()) {
+        std::snprintf(b, sizeof b, "%s: drive is empty", which);
         onDiag(b);
+        return;
     }
+    const char* geometry =
+        img.size() == 1474560u ? "1.4MB MFM, 80 x 2 x 18" :
+        img.size() ==  819200u ? "800K GCR, 80 x 2 zoned" :
+        img.size() ==  409600u ? "400K GCR, 80 x 1 zoned" : nullptr;
+    std::snprintf(b, sizeof b, "%s: %zu bytes, %s -- %s", which, img.size(),
+                  diskCopy ? "DiskCopy 4.2 (84-byte header stripped)" : "raw image",
+                  geometry ? geometry
+                           : "UNRECOGNISED SIZE, no geometry fits it: the drive cannot frame "
+                             "its sectors, so nothing will mount");
+    onDiag(b);
 }
 
 
@@ -549,14 +571,10 @@ bool Machine::externalDriveAttached() const { return drive1_->installed; }
 void Machine::insertExternalFloppy(std::vector<u8> image, bool readOnly) {
     flushTrack(*drive1_);
     floppy2_ = std::move(image);
+    floppy2Header_ = dc42::takeHeader(floppy2_);
     setExternalDriveAttached(true);
     drive1_->insert(&floppy2_, readOnly, floppy2_.size() >= 1440u * 1024u);
-    if (onDiag) {
-        char b[128];
-        std::snprintf(b, sizeof b, "sony: %zu bytes seated in the external drive",
-                      floppy2_.size());
-        onDiag(b);
-    }
+    describeMedium("external floppy", floppy2_, !floppy2Header_.empty());
 }
 
 void Machine::ejectExternalFloppy() {
@@ -566,9 +584,26 @@ void Machine::ejectExternalFloppy() {
     if (onDiag) onDiag("sony: external disk taken out");
 }
 
+
+
+// Hand the medium out for the host to save. If the drive has thrown the disk
+// out, the medium still exists -- give back what was on it. A disk that arrived
+// wrapped in a DiskCopy header is rewrapped, so the file it is written back to
+// stays the format it came in as rather than silently becoming a raw image.
+const std::vector<u8>& Machine::floppyImage() {
+    flushFloppyTrack();
+    const std::vector<u8>& data =
+        floppy_.empty() && !floppyEjected_.empty() ? floppyEjected_ : floppy_;
+    if (floppyHeader_.empty() || data.empty()) return data;
+    mediumOut_ = dc42::rewrap(floppyHeader_, data);
+    return mediumOut_;
+}
+
 const std::vector<u8>& Machine::externalFloppyImage() {
     flushTrack(*drive1_);
-    return floppy2_;
+    if (floppy2Header_.empty() || floppy2_.empty()) return floppy2_;
+    mediumOut_ = dc42::rewrap(floppy2Header_, floppy2_);
+    return mediumOut_;
 }
 // Take the disk out from the host side, as if the button on the front were a
 // thing this machine had. The System does its own ejecting through the drive's
