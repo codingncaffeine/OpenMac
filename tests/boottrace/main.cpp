@@ -604,6 +604,20 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
                         trap == 0xA02B ? "EmptyHandle" : "DisposHandle",
                         mac.cpu().a[0], mac.cpu().d[0], pc);
         }
+        if (((trap & 0xF0FFu) == 0xA002u || (trap & 0xF0FFu) == 0xA003u) &&
+            tinyWrites < 400) {
+            // A WRITE(6)/READ(6) CDB carries a one-byte block count: any request
+            // over 255 blocks is where a truncating driver loses data.
+            const u32 pb = mac.cpu().a[0];
+            const u32 breq = rd32t(pb + 36);
+            if (breq > 255u * 512u) {
+                std::printf("  BIGIO %s ref=%d req=%u (%u blocks) posOff=%u pc=%06X frame=%u\n",
+                            (trap & 1) ? "write" : "read ",
+                            static_cast<s16>(mac.read16(pb + 24)), breq, breq / 512,
+                            rd32t(pb + 46), pc, static_cast<unsigned>(mac.frameCount()));
+                ++tinyWrites;
+            }
+        }
         if ((trap & 0xF0FFu) == 0xA003u && tinyWrites < 400) {     // _Write, any variant
             const u32 pb = mac.cpu().a[0];
             const u32 req = rd32t(pb + 36);
@@ -635,9 +649,30 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
                             openmac::dbg::trapName(tr.first), tr.second);
         }
     };
+    // Every driver request in the machine finishes by jumping through jIODone
+    // ($08FC). A completion with a NONZERO result is either a legitimate error
+    // the File Manager will see -- or, when D0 is a small positive number, a
+    // request that a driver ABANDONED (SCSI-manager busy paths complete with
+    // scMgrBusyErr=7 and friends) while its ioActCount claims success. Those
+    // are the silent losses that turn into zero-length resources.
+    const u32 jIODoneTarget = (u32(mac.read16(0x08FC)) << 16) | mac.read16(0x08FE);
+    int ioDoneErrs = 0;
+    std::printf("  jIODone target=%06X\n", jIODoneTarget);
     auto prevStepM = mac.cpu().onStep;
     mac.cpu().onStep = [&](u32 pc) {
         if (prevStepM) prevStepM(pc);
+        if (pc == jIODoneTarget && (mac.cpu().d[0] & 0xFFFF) != 0 && ioDoneErrs < 200) {
+            const u32 dce = mac.cpu().a[1] & 0xFFFFFF;
+            const u32 pb = ((u32(mac.read16(dce + 6)) << 16) | mac.read16(dce + 8)) & 0xFFFFFF;
+            std::printf("  IODONE D0=%d dce=%06X refNum=%d pb=%06X trap=%04X posOff=%u req=%u frame=%u\n",
+                        static_cast<s16>(mac.cpu().d[0] & 0xFFFF), dce,
+                        static_cast<s16>(mac.read16(dce + 0x18)), pb,
+                        mac.read16(pb + 6),
+                        (u32(mac.read16(pb + 46)) << 16) | mac.read16(pb + 48),
+                        (u32(mac.read16(pb + 36)) << 16) | mac.read16(pb + 38),
+                        static_cast<unsigned>(mac.frameCount()));
+            ++ioDoneErrs;
+        }
         for (size_t i = getPend.size(); i-- > 0;)
             if (getPend[i].ret == pc) {
                 // Pascal result: the handle sits on the stack top after return.
@@ -1092,6 +1127,7 @@ int main(int argc, char** argv) {
     u32 liveDisasmAddr = 0; int liveDisasmCount = 0;
     bool driveInstall = false;
     s64 watchHfsOff = -1;   // --watch-hfs-off: log SCSI I/O touching this HFS-volume byte
+    bool dumpSysHeap = false;   // --dump-sysheap: walk the system zone at exit
     bool writeTest = false;   // --write-test: guest-side FM write exercise + host verify
     int traceIwm = 0; bool noSonyShim = false; bool sonyShimOn = false; bool swimOn = false, swimOff = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
@@ -1211,6 +1247,7 @@ int main(int argc, char** argv) {
         else if (arg == "--drive-install") driveInstall = true;
         else if (arg == "--watch-hfs-off" && i + 1 < argc)
             watchHfsOff = std::strtoll(argv[++i], nullptr, 0);
+        else if (arg == "--dump-sysheap") dumpSysHeap = true;
         else if (arg == "--write-test") writeTest = true;
         else if (arg == "--floppy2" && i + 1 < argc) dcfg.floppy2 = argv[++i];
         else if (arg == "--di-shot" && i + 1 < argc) dcfg.shotBase = argv[++i];
@@ -2450,6 +2487,44 @@ int main(int argc, char** argv) {
                                 mac.gcrErrorExternal(static_cast<u8>(c)));
             }
         }
+    }
+
+    if (dumpSysHeap) {
+        // Walk the system zone's blocks (24-bit Memory Manager: 8-byte block
+        // header, tag byte bits 7-6 = free/nonrelocatable/relocatable, low 24
+        // bits of the first long = physical size). The question this answers:
+        // what is the system heap FULL of.
+        const u32 sysZone = (u32(mac.read16(0x2A6)) << 16) | mac.read16(0x2A8);
+        const u32 bkLim = (u32(mac.read16(sysZone)) << 16) | mac.read16(sysZone + 2);
+        const u32 zcbFree = (u32(mac.read16(sysZone + 12)) << 16) | mac.read16(sysZone + 14);
+        std::printf("\n-- system heap: zone=%06X bkLim=%06X size=%u free=%u --\n",
+                    sysZone, bkLim, bkLim - sysZone, zcbFree);
+        u32 p = sysZone + 52;
+        int blocks = 0;
+        u32 freeB = 0, relB = 0, nonrelB = 0;
+        while (p + 8 < bkLim && blocks < 4000) {
+            const u8 tag = mac.read8(p);
+            const u32 phys = (u32(mac.read8(p + 1)) << 16) |
+                             (u32(mac.read8(p + 2)) << 8) | mac.read8(p + 3);
+            if (phys < 8 || p + phys > bkLim) {
+                std::printf("   [walk broke at %06X tag=%02X phys=%u]\n", p, tag, phys);
+                break;
+            }
+            const int type = (tag >> 6) & 3;
+            ++blocks;
+            if (type == 0) freeB += phys; else if (type == 1) nonrelB += phys; else relB += phys;
+            if (phys >= 1024) {
+                char content[64];
+                int n = 0;
+                for (int i = 0; i < 16 && n < 48; ++i)
+                    n += std::snprintf(content + n, sizeof content - static_cast<std::size_t>(n),
+                                       "%02X", mac.read8(p + 8 + static_cast<u32>(i)));
+                std::printf("   %06X %s %6u  %s\n", p,
+                            type == 0 ? "FREE" : type == 1 ? "PTR " : "HDL ", phys, content);
+            }
+            p += phys;
+        }
+        std::printf("   blocks=%d  free=%u  nonrel=%u  rel=%u\n", blocks, freeB, nonrelB, relB);
     }
 
     std::printf("\n-- KeyMap ($174) reads: %u  from PCs:", mac.keyMapReads());
