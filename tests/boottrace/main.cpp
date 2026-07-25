@@ -136,7 +136,8 @@ struct DriveCfg {
     bool singleOnly = false;  // stage 1: single-click instead of double
     int bootFrames = 6000;    // frames cap to reach a fully-drawn desktop
     int stage = 9;            // run up to this stage
-    int switches = 1;         // Switch Disk clicks to reach the hard disk
+    int switches = 0;         // extra Switch Disk pre-clicks (stage 4 now walks
+                              // the ring itself until a target takes the install)
 };
 
 int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
@@ -155,8 +156,10 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
         }
         // Any OS trap carrying a 1-16 MB size in D0: the Memory Manager sizing traps
         // (NewHandle/NewPtr/SetHandleSize/ReallocHandle) put the byte count there, so
-        // a ~7.26 MB request (the corruption's misread length) shows up here.
-        if ((trap & 0xF800) == 0xA000 && bigAllocs < 60) {
+        // a ~7.26 MB request (the corruption's misread length) shows up here. A126
+        // (HFSDispatch) is excluded: it passes ROM addresses in D0 at boot, and those
+        // false hits were burning the whole print budget before the install began.
+        if ((trap & 0xF800) == 0xA000 && trap != 0xA126 && bigAllocs < 120) {
             const u32 sz = mac.cpu().d[0];
             if (sz >= 0x100000u && sz <= 0x1000000u) {
                 std::printf("  BIG D0 trap=%04X D0=%u (0x%X) A0=%06X pc=%06X\n",
@@ -553,9 +556,70 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
     // operation that failed just before it.
     std::vector<std::pair<u16,u32>> trapRing;
     bool alertDumped = false;
+    // Resource-Manager + memory-query trap traffic: the Installer's space
+    // calculation runs for many seconds with NO disk I/O, and this counter is
+    // what says "still working" during that silence.
+    u64 rmTraffic = 0;
+    // The DSAT id 0 lifecycle: the corrupt install writes it as an EMPTY handle
+    // (the hd watch caught length 0 already in the write buffer), so what needs
+    // seeing is every Resource Manager touch of a DSAT between the source read
+    // and the target write -- plus any tiny _Write, which is what a bare length
+    // word would look like if the RM wrote them separately.
+    std::set<u32> dsatHandles;
+    struct GetPend { u32 ret; u16 id; };
+    std::vector<GetPend> getPend;
+    int tinyWrites = 0;
+    auto rd32t = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
     auto prevTrapM = mac.cpu().onTrap;
     mac.cpu().onTrap = [&](u16 trap, u32 pc) {
         if (prevTrapM) prevTrapM(trap, pc);
+        if (isMemQuery(trap) || (trap & 0xFFF0u) == 0xA9A0u) ++rmTraffic;
+        const u32 sp = mac.cpu().a[7];
+        if ((trap == 0xA9A0 || trap == 0xA81F) &&                  // GetResource/Get1Resource
+            rd32t(sp + 2) == 0x44534154u) {                        //   ('DSAT', id)
+            const s16 rid = static_cast<s16>(mac.read16(sp));
+            std::printf("  DSAT %s id=%d pc=%06X\n",
+                        trap == 0xA9A0 ? "GetResource" : "Get1Resource", rid, pc);
+            if (getPend.size() < 32) getPend.push_back({pc + 2, static_cast<u16>(rid)});
+        }
+        if (trap == 0xA9AB && rd32t(sp + 6) == 0x44534154u) {      // AddResource(h,'DSAT',id,nm)
+            const s16 rid = static_cast<s16>(mac.read16(sp + 4));
+            const u32 h = rd32t(sp + 10);
+            std::printf("  DSAT AddResource id=%d h=%06X pc=%06X\n", rid, h, pc);
+            dsatHandles.insert(h);
+        }
+        if (trap == 0xA9B0 || trap == 0xA9A2 || trap == 0xA9A3) {  // WriteResource/LoadResource/ReleaseResource
+            const u32 h = rd32t(sp);
+            if (dsatHandles.count(h)) {
+                const u32 mp = rd32t(h) & 0xFFFFFFu;
+                std::printf("  DSAT %s h=%06X mp=%06X pc=%06X\n",
+                            trap == 0xA9B0 ? "WriteResource" :
+                            trap == 0xA9A2 ? "LoadResource" : "ReleaseResource", h, mp, pc);
+            }
+        }
+        if ((trap == 0xA024 || trap == 0xA02B || trap == 0xA023) &&
+            dsatHandles.count(mac.cpu().a[0])) {                   // SetHandleSize/EmptyHandle/DisposHandle
+            std::printf("  DSAT %s h=%06X D0=%u pc=%06X\n",
+                        trap == 0xA024 ? "SetHandleSize" :
+                        trap == 0xA02B ? "EmptyHandle" : "DisposHandle",
+                        mac.cpu().a[0], mac.cpu().d[0], pc);
+        }
+        if ((trap & 0xF0FFu) == 0xA003u && tinyWrites < 400) {     // _Write, any variant
+            const u32 pb = mac.cpu().a[0];
+            const u32 req = rd32t(pb + 36);
+            if (req > 0 && req <= 16) {
+                char hx[64];
+                int n = 0;
+                const u32 buf = rd32t(pb + 32);
+                for (u32 i = 0; i < req && i < 8 && n < 56; ++i)
+                    n += std::snprintf(hx + n, sizeof hx - static_cast<std::size_t>(n),
+                                       " %02X", mac.read8(buf + i));
+                std::printf("  tinyW ref=%d req=%u mode=%u off=%u pc=%06X:%s\n",
+                            static_cast<s16>(mac.read16(pb + 24)), req, mac.read16(pb + 44),
+                            rd32t(pb + 46), pc, hx);
+                ++tinyWrites;
+            }
+        }
         if (logMemQ && isMemQuery(trap) && memPend.size() < 200) memPend.push_back({pc + 2, trap});
         if (logMemQ && (trap & 0xF800) == 0xA800) {   // Toolbox trap
             trapRing.push_back({trap, pc});
@@ -574,6 +638,17 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
     auto prevStepM = mac.cpu().onStep;
     mac.cpu().onStep = [&](u32 pc) {
         if (prevStepM) prevStepM(pc);
+        for (size_t i = getPend.size(); i-- > 0;)
+            if (getPend[i].ret == pc) {
+                // Pascal result: the handle sits on the stack top after return.
+                const u32 h = rd32t(mac.cpu().a[7]);
+                const u32 mp = h ? rd32t(h) & 0xFFFFFFu : 0;
+                std::printf("  DSAT GetResource id=%d -> h=%06X mp=%06X\n",
+                            static_cast<s16>(getPend[i].id), h, mp);
+                if (h) dsatHandles.insert(h);
+                getPend.erase(getPend.begin() + static_cast<long>(i));
+                break;
+            }
         for (size_t i = memPend.size(); i-- > 0;)
             if (memPend[i].ret == pc) {
                 std::printf("  MEMQ %-11s -> D0=%d (0x%X)  A0=%06X\n", memName(memPend[i].trap),
@@ -595,37 +670,100 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
         const auto s = mac.scsiStats();
         return mac.hdAccessCount() + s.dataInBytes / 512 + s.dataOutBytes / 512;
     };
+    // An alert's OK draws mid-screen, well left of the Easy Install button
+    // column at x~433. Scan the full width so a column button is seen at its
+    // true center -- a band that cuts one in half reads the truncated border
+    // as a mid-screen button and the "dismiss" click lands on Eject Disk --
+    // then keep only genuinely mid-screen hits.
+    auto alertButtons = [&] {
+        auto all = findButtons(200, 500, 185, 300);
+        std::vector<std::pair<int,int>> keep;
+        for (auto& b : all) if (b.first < 412) keep.push_back(b);
+        return keep;
+    };
+    // The install's first act is reading the SOURCE FLOPPY, which moves neither
+    // hdAccessCount nor the SCSI counters -- and its progress dialog has a
+    // mid-screen Cancel button that a button scan happily "dismisses" (that
+    // cancelled two installs before this was understood). Count raw IWM/ISM
+    // register traffic instead: a pseudo-DMA read is thousands of accesses per
+    // frame, idle sense polling a trickle, so floppy motion is unmistakable.
+    u64 iwmHits = 0;
+    mac.onIwmAccess = [&](int, bool, u8, u8, u32, int) { ++iwmHits; };
     bool installing = false;
-    for (int attempt = 0; attempt < 4 && !installing; ++attempt) {
+    for (int attempt = 0; attempt < 6 && !installing; ++attempt) {
         { auto b = waitButtons(400, 498, 70, 160, 4000);
           if (!clickButtonNear(b, cfg.t3y >= 0 ? 121 : 94, "Install")) { std::printf("STAGE4 FAIL: no Install button\n"); return 0; } }
-        // Either the install starts -- the hard disk shows activity -- or the
-        // not-enough-space alert draws its OK mid-screen, well left of the Easy
-        // Install button column. Watch for both; the disk moving means never
-        // touch the screen again (the progress window's Cancel is a button too).
+        // Three outcomes: the install starts (floppy or hard-disk activity
+        // ramps -- but only after a MINUTES-long space calculation that does
+        // no disk I/O at all, just Resource Manager traffic; a dialog is up
+        // the whole time, so no button may be touched while ANY of that is
+        // alive), a not-enough-space alert appears (everything goes quiet),
+        // or nothing happens at all because the target is the Installer disk
+        // and the button is disabled. Only sustained total silence -- no disk
+        // motion AND no RM/memory traps -- puts the screen back in play.
         const u32 hdBefore = diskActivity();
-        std::vector<std::pair<int,int>> alertOk;
-        for (int spent = 0; spent < 900 && !mac.cpu().halted; spent += 30) {
+        const u64 iwmBefore = iwmHits;
+        u32 hdWindow = hdBefore;
+        u64 iwmWindow = iwmHits, rmWindow = rmTraffic;
+        int quiet = 0;
+        for (int spent = 0; spent < 5400 && !mac.cpu().halted; spent += 30) {
             for (int f = 0; f < 30 && !mac.cpu().halted; ++f) {
-                mac.mouseMove((f & 1) ? 2 : -2, 0, false);
+                // A real hand RESTS here. An every-frame wiggle reads as one
+                // endless mouse gesture and can starve the Installer's idle
+                // processing; a net-zero nudge every two seconds keeps events
+                // flowing without ever looking like motion.
+                const int ph = (spent + f) % 120;
+                if (ph == 0) mac.mouseMove(2, 0, false);
+                else if (ph == 1) mac.mouseMove(-2, 0, false);
                 mac.runFrame();
             }
             if (diskActivity() > hdBefore + 32) break;
-            alertOk = findButtons(260, 420, 190, 300);
-            if (!alertOk.empty()) break;
+            if (iwmHits - iwmWindow > 30000) break;   // the floppy is streaming
+            const bool moving = diskActivity() != hdWindow || iwmHits != iwmWindow ||
+                                rmTraffic != rmWindow;
+            hdWindow = diskActivity(); iwmWindow = iwmHits; rmWindow = rmTraffic;
+            if (moving) quiet = 0;
+            else if ((quiet += 30) >= 600) break;     // truly idle: alert or no-op
         }
-        if (diskActivity() > hdBefore + 32 || alertOk.empty()) { installing = true; break; }
-        std::printf("  target has no room (attempt %d): dismissing, switching disk\n", attempt + 1);
-        postClick(alertOk[0].first, alertOk[0].second);
-        drawDialog(200);
+        std::printf("  watch: hd +%u iwm +%llu rm(now)=%llu quiet=%d pc=%06X\n",
+                    diskActivity() - hdBefore,
+                    static_cast<unsigned long long>(iwmHits - iwmBefore),
+                    static_cast<unsigned long long>(rmTraffic), quiet, mac.cpu().pc);
+        if (diskActivity() > hdBefore + 32 || iwmHits - iwmBefore > 30000) {
+            std::printf("  install started (hd +%u, iwm +%llu)\n",
+                        diskActivity() - hdBefore,
+                        static_cast<unsigned long long>(iwmHits - iwmBefore));
+            installing = true;
+            break;
+        }
+        {
+            char sn[24];
+            std::snprintf(sn, sizeof sn, "4watch%d", attempt + 1);
+            shot(sn);   // what the screen shows BEFORE anything is clicked
+        }
+        auto alertOk = alertButtons();
+        if (!alertOk.empty()) {
+            std::printf("  target has no room (attempt %d): dismissing, switching disk\n", attempt + 1);
+            postClick(alertOk[0].first, alertOk[0].second);
+            drawDialog(200);
+        } else {
+            std::printf("  Install did not take (attempt %d): switching disk\n", attempt + 1);
+        }
         { auto b = waitButtons(400, 498, 70, 300, 4000);
           if (!clickButtonNear(b, cfg.t3y >= 0 ? cfg.t3y : 213, "Switch Disk")) {
               std::printf("STAGE4 FAIL: no Switch Disk to retry\n"); return 0; } }
         drawDialog(300);
+        char sn[24];
+        std::snprintf(sn, sizeof sn, "4attempt%d", attempt + 1);
+        shot(sn);
+    }
+    if (!installing) {
+        std::printf("STAGE4 FAIL: no target accepted the install\n");
+        shot("4fail");
+        return 0;
     }
     for (int i = 0; i < 40 && !mac.cpu().halted; ++i) mac.runFrame();
-    logMemQ = false;
-    mac.cpu().onStep = prevStepM;
+    logMemQ = false;   // MEMQ noise off; the DSAT tracker stays live through the install
     report("clicked-install");
     shot("4installing");
 
@@ -635,7 +773,16 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
     int diskState = 0;          // 0=need source, 1=fed source waiting for additions ask, 2+=cycle
     int oomAt = 0;
     bool ejectPending = false;
-    mac.onDiag = [&](const char* m) { if (std::strstr(m, "eject")) ejectPending = true; };
+    // Chain the diag printer instead of replacing it: the install-time disk
+    // diagnostics are the evidence this whole harness exists to capture. Only
+    // an INTERNAL-drive ejection asks for a feed -- the external drive holds
+    // the Additions disk full-time when --external is used, and its
+    // completion-time ejection must not trigger a swap of the source drive.
+    auto prevDiag = mac.onDiag;
+    mac.onDiag = [prevDiag, &ejectPending](const char* m) {
+        if (prevDiag) prevDiag(m);
+        if (std::strstr(m, "internal drive ejected")) ejectPending = true;
+    };
     for (int i = 0; i < 20000 && !mac.cpu().halted; ++i) {
         // Only feed the source disk back if the drive is actually empty. Under a
         // floppy boot, Switch Disk ejected it and the Installer wants it back;
@@ -652,7 +799,10 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
                              additions ? "System Additions" : "System Startup");
             ++diskState;
         }
-        mac.mouseMove((i & 1) ? 1 : -1, 0, false);   // keep the event loop ticking
+        // Sparse net-zero nudges: enough to keep the event loop ticking,
+        // never resembling a continuous gesture (see the watch loop above).
+        if (i % 120 == 0) mac.mouseMove(1, 0, false);
+        else if (i % 120 == 1) mac.mouseMove(-1, 0, false);
         mac.runFrame();
         if (!oomAt && static_cast<u16>(mac.read16(0x0220)) == 0xFF94) {   // MemError = memFullErr (-108)
             oomAt = i;
@@ -941,6 +1091,7 @@ int main(int argc, char** argv) {
     // exactly the code a patched trap or an application lands in.
     u32 liveDisasmAddr = 0; int liveDisasmCount = 0;
     bool driveInstall = false;
+    s64 watchHfsOff = -1;   // --watch-hfs-off: log SCSI I/O touching this HFS-volume byte
     bool writeTest = false;   // --write-test: guest-side FM write exercise + host verify
     int traceIwm = 0; bool noSonyShim = false; bool sonyShimOn = false; bool swimOn = false, swimOff = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
@@ -1058,6 +1209,8 @@ int main(int argc, char** argv) {
             disasmSet = true;
         }
         else if (arg == "--drive-install") driveInstall = true;
+        else if (arg == "--watch-hfs-off" && i + 1 < argc)
+            watchHfsOff = std::strtoll(argv[++i], nullptr, 0);
         else if (arg == "--write-test") writeTest = true;
         else if (arg == "--floppy2" && i + 1 < argc) dcfg.floppy2 = argv[++i];
         else if (arg == "--di-shot" && i + 1 < argc) dcfg.shotBase = argv[++i];
@@ -1118,6 +1271,11 @@ int main(int argc, char** argv) {
     };
     if (forceRom) mac.setForceRomDisk(true);
     if (verifyReads) mac.setVerifyReads(true);
+    if (watchHfsOff >= 0) {
+        mac.setHfsWatch(watchHfsOff);
+        std::printf("HFS watch at volume byte 0x%llX\n",
+                    static_cast<unsigned long long>(watchHfsOff));
+    }
     // The Classic has a SWIM, so the chip answers the ROM's probe by default.
     // --no-swim makes it answer as a plain IWM instead, which is worth being
     // able to force: the probe's outcome decides the whole disk path.
