@@ -1374,6 +1374,12 @@ void Machine::verifyLastRead() {
     if (!img) return;
     const u32 len = verifyLen_;
     if (verifyPos_ + len > img->size()) return;      // past the end; not our business
+    // A sector the guest wrote moments ago may still be sitting in the track
+    // under the head, not yet decoded back into the image -- a read of it is
+    // then correct while the image is stale. Fold the pending track in first,
+    // exactly as the head moving off it would, so the comparison is against
+    // what the disk actually holds.
+    flushFloppyTrack();
     ++readsVerified_;
     for (u32 i = 0; i < len; ++i) {
         const u8 want = (*img)[verifyPos_ + i];

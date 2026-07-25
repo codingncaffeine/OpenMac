@@ -1487,14 +1487,18 @@ int main(int argc, char** argv) {
         std::printf("boot pc=%06X\n", mac.cpu().pc);
         std::ifstream sf(swapFloppyPath, std::ios::binary);
         std::vector<u8> img2{std::istreambuf_iterator<char>(sf), std::istreambuf_iterator<char>()};
-        std::printf("swapping in %zu bytes\n", img2.size());
-        mac.insertFloppy(std::move(img2), false);
+        std::printf("swapping in %zu bytes%s\n", img2.size(),
+                    floppyReadOnly ? " (write-protected)" : "");
+        mac.insertFloppy(std::move(img2), floppyReadOnly);
         for (int i = 0; i < 1500 && !mac.cpu().halted; ++i) {
             mac.mouseMove((i & 1) ? 1 : -1, 0, false);   // keep the Finder ticking
             mac.runFrame();
         }
         vcbq("after");
         std::printf("swap: halted=%d pc=%06X\n", mac.cpu().halted ? 1 : 0, mac.cpu().pc);
+        if (verifyReads)
+            std::printf("reads verified: %u, mismatched: %u\n",
+                        mac.readsVerified(), mac.readMismatches());
         return 0;
     }
 
