@@ -73,7 +73,7 @@ public sealed class StubEmulator : IEmulator
         ExternalFloppyPath = path;
     }
     public void EjectExternalFloppy() => ExternalFloppyPath = null;
-    public bool WriteProtectFloppies { get; set; } = true;
+    public bool WriteProtectFloppies { get; set; }
     public bool ConsumeDiskStateChanged() => false;
 
     public void AttachHardDisk(string path)

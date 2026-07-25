@@ -16,12 +16,13 @@ public sealed class Settings
     public bool ExternalDrive { get; set; }
     public string? LastHardDisk { get; set; }
     /// <summary>
-    /// Put every floppy in with its write-protect tab set. On by default: the
-    /// images people run are masters they did not make and cannot re-make, and
-    /// a disk mounted read-write is written to whether or not anyone asked --
-    /// clearing the volume-unmounted bit in the MDB is the System's first act.
+    /// The write-protect tab, as a physical one: off unless asked for. A Mac
+    /// writes to its floppies constantly and they stay perfectly usable, so
+    /// locking them by default would be papering over a write path that has to
+    /// be correct anyway. This is here for the same reason the tab is on a real
+    /// disk -- to protect a master on purpose -- not as a safety net.
     /// </summary>
-    public bool WriteProtectFloppies { get; set; } = true;
+    public bool WriteProtectFloppies { get; set; }
     public List<string> RecentRoms { get; set; } = new();
 
     /// <summary>

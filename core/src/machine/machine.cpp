@@ -1157,6 +1157,7 @@ void Machine::watchSonyResult() {
     const u16 res = static_cast<u16>(cpu_.d[0] & 0xFFFF);
     ++sonyResults_;
     if (res) ++sonyResultErrs_;
+    if (res == 0) verifyLastRead(); else verifyPending_ = false;
     if (sonyResultLog_ <= 0 || !onDiag) return;
     --sonyResultLog_;
     char b[128];
@@ -1228,17 +1229,63 @@ void Machine::noteGcrError(u32 pc) {
 // way to see what the File Manager actually asked the disk for is to watch its
 // Prime entry: A0 is the parameter block, A1 the device control entry.
 void Machine::watchSonyPrime() {
-    if (sonyPrimeLog_ <= 0 || !onDiag) return;
-    --sonyPrimeLog_;
     const u32 pb = cpu_.a[0], dce = cpu_.a[1];
     const int drive = static_cast<s16>(read16(pb + ioVRefNum));
     const u32 length = read32(pb + ioReqCount);
     const u32 position = read32(dce + dCtlPosition);
     const bool isRead = (read16(pb + ioTrap) & 0xFF) == kARdCmd;
+
+    // Remember what a read was asked for, so the bytes it delivers can be
+    // checked against the medium when it reports success. A read that returns
+    // the wrong bytes without reporting an error is invisible from every other
+    // vantage: the driver is happy, the System is happy, and the damage shows up
+    // later as a file that will not open.
+    verifyPending_ = verifyReads_ && isRead && drive == 1 && length > 0;
+    if (verifyPending_) {
+        verifyPos_ = position;
+        verifyLen_ = length;
+        verifyBuf_ = read32(pb + ioBuffer);
+    }
+
+    if (sonyPrimeLog_ <= 0 || !onDiag) return;
+    --sonyPrimeLog_;
     char b[128];
     std::snprintf(b, sizeof b, "sony Prime(rom): drive=%d %s block %u len=%u",
                   drive, isRead ? "read " : "write", position / 512u, length);
     onDiag(b);
+}
+
+// Compare what the last read actually delivered against what is on the medium.
+void Machine::verifyLastRead() {
+    if (!verifyPending_) return;
+    verifyPending_ = false;
+    const std::vector<u8>* img = drive0_->image;
+    if (!img) return;
+    const u32 len = verifyLen_;
+    if (verifyPos_ + len > img->size()) return;      // past the end; not our business
+    ++readsVerified_;
+    for (u32 i = 0; i < len; ++i) {
+        const u8 want = (*img)[verifyPos_ + i];
+        const u8 got  = read8(verifyBuf_ + i);
+        if (want == got) continue;
+        ++readMismatches_;
+        if (verifyLog_ > 0 && onDiag) {
+            --verifyLog_;
+            // Count how far the damage runs, and say which sector of the request
+            // it starts in -- a whole sector wrong means the transfer landed on
+            // the wrong one, a handful of bytes means it decoded badly.
+            u32 bad = 0;
+            for (u32 j = i; j < len; ++j)
+                if ((*img)[verifyPos_ + j] != read8(verifyBuf_ + j)) ++bad;
+            char b[192];
+            std::snprintf(b, sizeof b,
+                          "READ WRONG: block %u len %u -- first bad byte at +%u "
+                          "(sector %u of the request), got %02X want %02X, %u of %u bytes differ",
+                          verifyPos_ / 512u, len, i, i / 512u, got, want, bad, len);
+            onDiag(b);
+        }
+        return;
+    }
 }
 
 u32 Machine::findSonyDriver() {

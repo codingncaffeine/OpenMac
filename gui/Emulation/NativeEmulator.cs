@@ -259,10 +259,10 @@ public sealed class NativeEmulator : IEmulator
 
     /// <summary>
     /// Put disks in with the write-protect tab set, the way a locked disk goes
-    /// in on a real Mac. Off means the guest's writes are copied back into the
-    /// image file the disk came from.
+    /// in on a real Mac. Off by default: the guest's writes are copied back into
+    /// the image the disk came from, which is what a real floppy does.
     /// </summary>
-    public bool WriteProtectFloppies { get; set; } = true;
+    public bool WriteProtectFloppies { get; set; }
 
     public void InsertFloppy(string path)
     {

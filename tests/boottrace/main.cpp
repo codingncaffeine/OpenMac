@@ -842,6 +842,7 @@ int main(int argc, char** argv) {
     int trapRingSize = 0;
     u16 trapRingMask = 0;      // 0 = every trap; otherwise keep only $A0xx or $A8xx
     int diskLogAt = -1, diskLogBudget = 400;
+    bool verifyReads = false;
     u32 watchAddr = 0xFFFFFFFFu;
     bool mouseWalk = false;
     bool bootNudge = false;
@@ -919,6 +920,7 @@ int main(int argc, char** argv) {
         else if (arg == "--insert-external-at" && i + 1 < argc) insertExternalAt = std::atoi(argv[++i]);
         else if (arg == "--watch-control" && i + 1 < argc) watchControl = std::atoi(argv[++i]);
         else if (arg == "--trap-ring" && i + 1 < argc) trapRingSize = std::atoi(argv[++i]);
+        else if (arg == "--verify-reads") verifyReads = true;
         else if (arg == "--disk-log" && i + 2 < argc) {
             diskLogAt = std::atoi(argv[++i]);
             diskLogBudget = std::atoi(argv[++i]);
@@ -1043,6 +1045,7 @@ int main(int argc, char** argv) {
         if (trapRingSize && std::strstr(s, "EJECT armed")) dumpTrapRing("the eject");
     };
     if (forceRom) mac.setForceRomDisk(true);
+    if (verifyReads) mac.setVerifyReads(true);
     // The Classic has a SWIM, so the chip answers the ROM's probe by default.
     // --no-swim makes it answer as a plain IWM instead, which is worth being
     // able to force: the probe's outcome decides the whole disk path.
@@ -1906,6 +1909,9 @@ int main(int argc, char** argv) {
     std::printf("-- ADB: kbd[enum=%u modifiers=%u transitions=%u] "
                 "mouse[enum=%u polls=%u reports=%u] --\n",
                 s.kbdReg3, s.kbdReg2, s.kbdPolls, s.mouseReg3, s.mousePolls, s.mouseReports);
+    if (verifyReads)
+        std::printf("-- READS VERIFIED against the medium: %u, WRONG: %u --\n",
+                    mac.readsVerified(), mac.readMismatches());
     std::printf("-- SURFACE READS: internal=%u external=%u phantom-bay=%u --\n",
                 mac.surfaceReads(0), mac.surfaceReads(1), mac.surfaceReads(2));
     std::printf("-- ADDRESSED: internal=%u external=%u --\n",

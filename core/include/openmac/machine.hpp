@@ -60,6 +60,14 @@ public:
     void openDiskLog(int budget) {
         gcrErrLog_ = sonyPrimeLog_ = sonyResultLog_ = sonyCmdLog_ = budget;
     }
+
+    // Check every completed read against the medium it came from. A read that
+    // returns the wrong bytes and reports success is invisible from every other
+    // vantage -- the driver is satisfied, the System is satisfied, and it
+    // surfaces much later as a file that will not open.
+    void setVerifyReads(bool on) { verifyReads_ = on; }
+    u32 readsVerified() const { return readsVerified_; }
+    u32 readMismatches() const { return readMismatches_; }
     bool overlayActive() const { return overlay_; }
 
     u32 screenBase() const;
@@ -302,6 +310,13 @@ private:
     u32 sonyResultPc_ = 0;         // where the ROM's own driver hands its result back
     int sonyResultLog_ = 40;
     u32 sonyResults_ = 0, sonyResultErrs_ = 0;
+    // Read verification: what the last Prime was asked for, so what it delivers
+    // can be compared against the medium once it reports success.
+    bool verifyReads_ = false, verifyPending_ = false;
+    u32 verifyPos_ = 0, verifyLen_ = 0, verifyBuf_ = 0;
+    u32 readsVerified_ = 0, readMismatches_ = 0;
+    int verifyLog_ = 20;
+    void verifyLastRead();
     u32 drvStatusAddr_ = 0;        // Mac address of our DrvSts record
     bool inSony_ = false;          // re-entrancy guard during trap execution
 
