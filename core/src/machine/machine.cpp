@@ -18,7 +18,7 @@ namespace openmac {
 
 namespace {
 constexpr u32 kCpuHz = 7833600;
-constexpr size_t kMaxLogEntries = 400;
+constexpr size_t kMaxLogEntries = 4000;
 
 // Device Manager / Sony disk driver structure offsets and result codes
 // (Inside Macintosh: Devices / Files). Used by the replacement .Sony driver.
@@ -259,6 +259,11 @@ Machine::ScsiStats Machine::scsiStats() const {
     s.dataOutBytes = scsi_->diagDataOutBytes;
     for (int i = 0; i < 12; ++i) s.lastCdb[i] = scsi_->diagLastCdb[i];
     s.lastCdbLen = scsi_->diagLastCdbLen;
+    s.phase = scsi_->phase();
+    s.xferPos = scsi_->xferPos();
+    s.xferLen = scsi_->xferLen();
+    s.cdbPos = scsi_->cdbPos();
+    s.cdbLen = scsi_->cdbLen();
     return s;
 }
 
@@ -334,6 +339,23 @@ void Machine::logAccess(const char* what, u32 addr, bool write, u32 value) {
     accessLog_.emplace_back(buf);
 }
 
+// SCSI accesses carry the live bus state -- which phase the target model is in
+// and how far through the current CDB/transfer it is. A polling loop that reads
+// a register forever names its wedged phase right in the log.
+void Machine::logScsiAccess(u32 addr, bool write, u32 value) {
+    if (accessLog_.size() >= kMaxLogEntries) {
+        accessLog_.erase(accessLog_.begin());
+    }
+    static const char* ph[8] = {"Free", "Arb", "Sel", "Cmd", "DOut", "DIn", "Stat", "Msg"};
+    char buf[128];
+    std::snprintf(buf, sizeof(buf),
+                  "%s SCSI @%06X val=%02X pc=%06X %s cdb=%d/%d xfer=%u/%u",
+                  write ? "W" : "R", addr, value, cpu_.pc,
+                  ph[scsi_->phase() & 7], scsi_->cdbPos(), scsi_->cdbLen(),
+                  scsi_->xferPos(), scsi_->xferLen());
+    accessLog_.emplace_back(buf);
+}
+
 u8 Machine::read8(u32 addr) {
     addr &= 0xFFFFFF;
     if (addr >= 0x174 && addr <= 0x183 && !overlay_) {   // KeyMap region
@@ -354,7 +376,7 @@ u8 Machine::read8(u32 addr) {
     if (addr < 0x580000) return rom_[addr & romMask_];
     if (addr < 0x600000) {          // NCR 5380 SCSI: read bank (even address)
         const u8 v = scsi_->read((addr >> 4) & 7);
-        logAccess("SCSI", addr, false, v);
+        logScsiAccess(addr, false, v);
         return v;
     }
     if (addr < 0x800000) {          // RAM alias while the overlay is up
@@ -396,7 +418,7 @@ void Machine::write8(u32 addr, u8 value) {
     }
     if (addr < 0x600000) {          // NCR 5380 SCSI: write bank (odd address)
         scsi_->write((addr >> 4) & 7, value);
-        logAccess("SCSI", addr, true, value);
+        logScsiAccess(addr, true, value);
         return;
     }
     if (addr < 0x800000) {

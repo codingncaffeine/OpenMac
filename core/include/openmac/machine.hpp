@@ -175,6 +175,11 @@ public:
         u32 reads, writes, selects, commands, dataInBytes, dataOutBytes;
         u8 lastCdb[12];
         int lastCdbLen;
+        // Live bus state at sample time -- a run that ends wedged mid-transaction
+        // shows WHERE the bus stuck (phase != 0/BusFree with xferPos < xferLen).
+        int phase;               // Ncr5380::Phase
+        u32 xferPos, xferLen;    // progress through the current data/status transfer
+        int cdbPos, cdbLen;      // progress through the current CDB
     };
     ScsiStats scsiStats() const;
     int scsiWriteTrace(u16* out, int maxN) const;   // first N register writes, (reg<<8)|val
@@ -268,6 +273,7 @@ public:
 private:
     void wireVia();
     void logAccess(const char* what, u32 addr, bool write, u32 value);
+    void logScsiAccess(u32 addr, bool write, u32 value);
     void tickDevices(int cpuCycles);
 
     // 16/32-bit big-endian views over the bus, for reading Mac parameter

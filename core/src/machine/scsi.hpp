@@ -241,6 +241,14 @@ public:
         }
     }
 
+    // Live bus state, for diagnostics: a machine that stops answering SCSI shows
+    // here as a phase wedged off BusFree with an unfinished transfer.
+    int phase() const { return phase_; }
+    u32 xferPos() const { return static_cast<u32>(xferPos_); }
+    u32 xferLen() const { return static_cast<u32>(xfer_.size()); }
+    int cdbPos() const { return cdbPos_; }
+    int cdbLen() const { return cdbLen_; }
+
 private:
     // ---- registers -------------------------------------------------------
     void writeMr(u8 v) {

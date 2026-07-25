@@ -272,10 +272,12 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
         dumpBmpAt(mac, cfg.shotBase + "." + stage + ".alt.bmp",  ramTop - 0xD900u);
     };
     auto report = [&](const char* tag) {
+        const u32 sysZone = rd32(0x02A6);
         std::printf("[%s] t=%u pc=%06X curAp='%s' winList=%06X cursor=(%d,%d) "
-                    "mReports=%u hdW=%u\n", tag, ticks(), mac.cpu().pc, curAp().c_str(),
-                    winList(), curX(), curY(), mac.adbStats().mouseReports,
-                    mac.hdAccessCount());
+                    "mReports=%u hdW=%u sysFree=%d\n", tag, ticks(), mac.cpu().pc,
+                    curAp().c_str(), winList(), curX(), curY(),
+                    mac.adbStats().mouseReports, mac.hdAccessCount(),
+                    sysZone && sysZone < 0x400000 ? static_cast<int>(rd32(sysZone + 0x0C)) : -1);
     };
 
     // Is the menu bar drawn? The Finder paints the gray desktop first, then draws
@@ -465,15 +467,33 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
         return true;
     };
 
+    // Wait for push buttons to appear in a screen band, nudging the event loop.
+    // The Installer loads its faces from the floppy at the drive's real speed
+    // now, so a fixed wait tuned on the high-level shim starves every stage:
+    // the screen is still gray when the old budget expires.
+    auto waitButtons = [&](int xlo, int xhi, int ylo, int yhi, int budget) {
+        std::vector<std::pair<int,int>> b;
+        for (int spent = 0; spent < budget && !mac.cpu().halted; spent += 30) {
+            for (int i = 0; i < 30 && !mac.cpu().halted; ++i) {
+                mac.mouseMove((i & 1) ? 2 : -2, (i & 2) ? 1 : -1, false);
+                mac.runFrame();
+            }
+            b = findButtons(xlo, xhi, ylo, yhi);
+            if (!b.empty()) { drawDialog(60); return findButtons(xlo, xhi, ylo, yhi); }
+        }
+        return b;
+    };
+
     // Stage 3: dismiss the Welcome splash, reach Easy Install, retarget the hard disk.
     drawDialog(700);
     report("welcome");
     shot("3welcome");
-    { auto b = findButtons(330, 500, 250, 320);
+    { auto b = waitButtons(330, 500, 250, 320, 6000);
       if (b.empty()) { std::printf("STAGE3 FAIL: no Welcome OK button\n"); return 0; }
       std::printf("  Welcome OK @(%d,%d)\n", b[0].first, b[0].second);
       postClick(b[0].first, b[0].second); }
-    drawDialog(500);
+    { auto b = waitButtons(400, 498, 70, 300, 6000);
+      (void)b; }
     report("easyinstall");
     shot("3easyinstall");
     if (visibleWin() == 0) { std::printf("STAGE3 FAIL: Easy Install did not open\n"); return 0; }
@@ -481,7 +501,7 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
     // Retarget the destination to the hard disk: the Installer opens on the boot
     // floppy (its own disk) with Install disabled, so click "Switch Disk" to cycle to
     // "OpenMac HD". Switch Disk sits around y=213 in the right button column.
-    { auto b = findButtons(400, 498, 70, 300);
+    { auto b = waitButtons(400, 498, 70, 300, 4000);
       std::printf("  Easy Install buttons:");
       for (auto& bb : b) std::printf(" (%d,%d)", bb.first, bb.second);
       std::printf("\n");
@@ -554,11 +574,40 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
             }
     };
 
-    // Stage 4: click Install (target = HD). Switch Disk ejected the source floppy, so
-    // the Installer now asks for it, then for System Additions. Do NOT re-insert the
-    // source before Install -- that reverts the target back to the Installer disk.
-    { auto b = findButtons(400, 498, 70, 160);
-      if (!clickButtonNear(b, 94, "Install")) { std::printf("STAGE4 FAIL: no Install button\n"); return 0; } }
+    // Stage 4: aim Install at a target with room on it. Switch Disk cycles the
+    // target one volume at a time, and with more than two volumes mounted (ROM
+    // boot: Boot Disk + the hard disk + the source floppy) a single click can
+    // land on the ROM disk, which has 1K free -- Install then raises the
+    // not-enough-space alert. Dismiss it, switch again, and try Install again
+    // until it takes (no alert appears) or the ring has plainly been walked.
+    bool installing = false;
+    for (int attempt = 0; attempt < 4 && !installing; ++attempt) {
+        { auto b = waitButtons(400, 498, 70, 160, 4000);
+          if (!clickButtonNear(b, 94, "Install")) { std::printf("STAGE4 FAIL: no Install button\n"); return 0; } }
+        // Either the install starts -- the hard disk shows activity -- or the
+        // not-enough-space alert draws its OK mid-screen, well left of the Easy
+        // Install button column. Watch for both; the disk moving means never
+        // touch the screen again (the progress window's Cancel is a button too).
+        const u32 hdBefore = mac.hdAccessCount();
+        std::vector<std::pair<int,int>> alertOk;
+        for (int spent = 0; spent < 900 && !mac.cpu().halted; spent += 30) {
+            for (int f = 0; f < 30 && !mac.cpu().halted; ++f) {
+                mac.mouseMove((f & 1) ? 2 : -2, 0, false);
+                mac.runFrame();
+            }
+            if (mac.hdAccessCount() > hdBefore) break;
+            alertOk = findButtons(260, 420, 190, 300);
+            if (!alertOk.empty()) break;
+        }
+        if (mac.hdAccessCount() > hdBefore || alertOk.empty()) { installing = true; break; }
+        std::printf("  target has no room (attempt %d): dismissing, switching disk\n", attempt + 1);
+        postClick(alertOk[0].first, alertOk[0].second);
+        drawDialog(200);
+        { auto b = waitButtons(400, 498, 70, 300, 4000);
+          if (!clickButtonNear(b, cfg.t3y >= 0 ? cfg.t3y : 213, "Switch Disk")) {
+              std::printf("STAGE4 FAIL: no Switch Disk to retry\n"); return 0; } }
+        drawDialog(300);
+    }
     for (int i = 0; i < 40 && !mac.cpu().halted; ++i) mac.runFrame();
     logMemQ = false;
     mac.cpu().onStep = prevStepM;
@@ -573,8 +622,13 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
     bool ejectPending = false;
     mac.onDiag = [&](const char* m) { if (std::strstr(m, "eject")) ejectPending = true; };
     for (int i = 0; i < 20000 && !mac.cpu().halted; ++i) {
+        // Only feed the source disk back if the drive is actually empty. Under a
+        // floppy boot, Switch Disk ejected it and the Installer wants it back;
+        // under a ROM boot it never left, and swapping the mounted source out
+        // from under a running Installer is not a favour.
         if (i == 250 && diskState == 0) {
-            insertFloppyPath(cfg.floppy1, "System Startup (source)");
+            if (!mac.floppyInserted())
+                insertFloppyPath(cfg.floppy1, "System Startup (source)");
             diskState = 1; ejectPending = false;
         } else if (ejectPending && diskState >= 1) {
             ejectPending = false;
@@ -1289,7 +1343,10 @@ int main(int argc, char** argv) {
                     std::printf("\n");
                 }
             }
-            if (traceBranches && branchLines < 5000) {
+            // With a breakpoint set, the branch trace starts at the breakpoint
+            // instead of at power-on -- 5000 branches from the point of
+            // interest instead of 5000 from the boot's first instructions.
+            if (traceBranches && branchLines < 5000 && (!breakPc || bpHits > 0)) {
                 const u16 op = mac.read16(pc);
                 const char* mnem = nullptr;
                 u32 target = 0;
@@ -1988,6 +2045,10 @@ int main(int argc, char** argv) {
                     sc.reads, sc.writes, sc.selects, sc.commands, sc.dataInBytes, sc.dataOutBytes);
         for (int i = 0; i < sc.lastCdbLen; ++i) std::printf("%02X ", sc.lastCdb[i]);
         std::printf("--\n");
+        static const char* ph[8] = {"BusFree","Arbitration","Selection","Command",
+                                    "DataOut","DataIn","Status","MsgIn"};
+        std::printf("-- SCSI bus now: phase=%s xfer=%u/%u cdb=%d/%d --\n",
+                    ph[sc.phase & 7], sc.xferPos, sc.xferLen, sc.cdbPos, sc.cdbLen);
         u16 wt[320];
         const int wn = mac.scsiWriteTrace(wt, 320);
         std::printf("-- SCSI writes (reg=val), first %d: --\n", wn);
@@ -2021,10 +2082,7 @@ int main(int argc, char** argv) {
     std::printf("\n");
 
     std::printf("-- access log (%zu entries) --\n", mac.accessLog().size());
-    int shown = 0;
-    for (const auto& line : mac.accessLog()) {
+    for (const auto& line : mac.accessLog())
         std::printf("%s\n", line.c_str());
-        if (++shown >= 60) { std::printf("...\n"); break; }
-    }
     return 0;
 }

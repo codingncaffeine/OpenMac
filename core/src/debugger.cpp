@@ -810,10 +810,19 @@ bool describeIOTrap(Machine& mac, u16 trap, u32 pc, u32 a0, std::string& out) {
     const int16_t ioResult = int16_t(mac.read16(a0 + 16));
     const int16_t vRef = int16_t(mac.read16(a0 + 22));
     const int16_t refNum = int16_t(mac.read16(a0 + 24));
+    // Where in the fork the request lands: IOParam ioBuffer+32, ioReqCount+36,
+    // ioPosMode+44, ioPosOffset+46. Meaningful for file refNums (> 0).
+    const u32 ioBuffer = (u32(mac.read16(a0 + 32)) << 16) | mac.read16(a0 + 34);
+    const u32 ioReqCount = (u32(mac.read16(a0 + 36)) << 16) | mac.read16(a0 + 38);
+    const int16_t posMode = int16_t(mac.read16(a0 + 44));
+    const int32_t posOffset =
+        int32_t((u32(mac.read16(a0 + 46)) << 16) | mac.read16(a0 + 48));
     std::snprintf(buf, sizeof buf,
-                  "%-8s pc=%06X pb=%06X refNum=%d drive=%d ioResult=%d%s",
+                  "%-8s pc=%06X pb=%06X refNum=%d drive=%d ioResult=%d%s "
+                  "buf=%06X req=%u posMode=%d posOff=%d",
                   nm ? nm : "_IO", pc, a0, refNum, vRef, ioResult,
-                  (ioTrap & 0x0400) ? " ASYNC" : "");
+                  (ioTrap & 0x0400) ? " ASYNC" : "",
+                  ioBuffer, ioReqCount, posMode, posOffset);
     out = buf;
     return true;
 }
