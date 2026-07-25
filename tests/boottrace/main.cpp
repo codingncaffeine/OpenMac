@@ -136,6 +136,7 @@ struct DriveCfg {
     bool singleOnly = false;  // stage 1: single-click instead of double
     int bootFrames = 6000;    // frames cap to reach a fully-drawn desktop
     int stage = 9;            // run up to this stage
+    int switches = 1;         // Switch Disk clicks to reach the hard disk
 };
 
 int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
@@ -500,13 +501,21 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
 
     // Retarget the destination to the hard disk: the Installer opens on the boot
     // floppy (its own disk) with Install disabled, so click "Switch Disk" to cycle to
-    // "OpenMac HD". Switch Disk sits around y=213 in the right button column.
-    { auto b = waitButtons(400, 498, 70, 300, 4000);
-      std::printf("  Easy Install buttons:");
-      for (auto& bb : b) std::printf(" (%d,%d)", bb.first, bb.second);
-      std::printf("\n");
-      clickButtonNear(b, cfg.t3y >= 0 ? cfg.t3y : 213, "Switch Disk"); }
-    drawDialog(400);
+    // the hard disk. Switch Disk's y position differs per boot flavor (213 on the
+    // ROM-boot layout, 238 on the floppy-boot layout -- pass --di-t3), and the ring
+    // may hold several volumes (source + Additions + HD), so click it --di-switches
+    // times, screenshotting each state.
+    for (int sw = 0; sw < cfg.switches; ++sw) {
+        auto b = waitButtons(400, 498, 70, 300, 4000);
+        std::printf("  Easy Install buttons:");
+        for (auto& bb : b) std::printf(" (%d,%d)", bb.first, bb.second);
+        std::printf("\n");
+        clickButtonNear(b, cfg.t3y >= 0 ? cfg.t3y : 213, "Switch Disk");
+        drawDialog(400);
+        char sn[24];
+        std::snprintf(sn, sizeof sn, "3switch%d", sw + 1);
+        shot(sn);
+    }
     report("switched");
     shot("3switched");
     if (cfg.stage < 4) { report("stop-after-switch"); return 0; }
@@ -580,26 +589,32 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
     // land on the ROM disk, which has 1K free -- Install then raises the
     // not-enough-space alert. Dismiss it, switch again, and try Install again
     // until it takes (no alert appears) or the ring has plainly been walked.
+    // Disk activity regardless of transport: .Sony-served drives bump
+    // hdAccessCount, the SCSI-served hard disk bumps the 5380 byte counters.
+    auto diskActivity = [&] {
+        const auto s = mac.scsiStats();
+        return mac.hdAccessCount() + s.dataInBytes / 512 + s.dataOutBytes / 512;
+    };
     bool installing = false;
     for (int attempt = 0; attempt < 4 && !installing; ++attempt) {
         { auto b = waitButtons(400, 498, 70, 160, 4000);
-          if (!clickButtonNear(b, 94, "Install")) { std::printf("STAGE4 FAIL: no Install button\n"); return 0; } }
+          if (!clickButtonNear(b, cfg.t3y >= 0 ? 121 : 94, "Install")) { std::printf("STAGE4 FAIL: no Install button\n"); return 0; } }
         // Either the install starts -- the hard disk shows activity -- or the
         // not-enough-space alert draws its OK mid-screen, well left of the Easy
         // Install button column. Watch for both; the disk moving means never
         // touch the screen again (the progress window's Cancel is a button too).
-        const u32 hdBefore = mac.hdAccessCount();
+        const u32 hdBefore = diskActivity();
         std::vector<std::pair<int,int>> alertOk;
         for (int spent = 0; spent < 900 && !mac.cpu().halted; spent += 30) {
             for (int f = 0; f < 30 && !mac.cpu().halted; ++f) {
                 mac.mouseMove((f & 1) ? 2 : -2, 0, false);
                 mac.runFrame();
             }
-            if (mac.hdAccessCount() > hdBefore) break;
+            if (diskActivity() > hdBefore + 32) break;
             alertOk = findButtons(260, 420, 190, 300);
             if (!alertOk.empty()) break;
         }
-        if (mac.hdAccessCount() > hdBefore || alertOk.empty()) { installing = true; break; }
+        if (diskActivity() > hdBefore + 32 || alertOk.empty()) { installing = true; break; }
         std::printf("  target has no room (attempt %d): dismissing, switching disk\n", attempt + 1);
         postClick(alertOk[0].first, alertOk[0].second);
         drawDialog(200);
@@ -650,7 +665,7 @@ int runDriveInstall(Machine& mac, const DriveCfg& cfg) {
                       heapEnd = rd32(0x0114);
             std::printf("  merge f=%d pc=%06X hdAcc=%u win=%06X ds=%d | MemTop=%06X ApplZone=%06X "
                         "HeapEnd=%06X ApplLimit=%06X appHeap=%uKB MemErr=%d\n", i, mac.cpu().pc,
-                        mac.hdAccessCount(), winList(), diskState, memTop, applZone, heapEnd,
+                        diskActivity(), winList(), diskState, memTop, applZone, heapEnd,
                         applLimit, (heapEnd - applZone) / 1024, static_cast<s16>(mac.read16(0x0220)));
             if (i % 3200 == 0) shot("4merge");
         }
@@ -1057,6 +1072,7 @@ int main(int argc, char** argv) {
         else if (arg == "--di-single") dcfg.singleOnly = true;
         else if (arg == "--di-boot" && i + 1 < argc) dcfg.bootFrames = std::atoi(argv[++i]);
         else if (arg == "--di-stage" && i + 1 < argc) dcfg.stage = std::atoi(argv[++i]);
+        else if (arg == "--di-switches" && i + 1 < argc) dcfg.switches = std::atoi(argv[++i]);
     }
     if (romPath.empty()) {
         std::fprintf(stderr, "usage: openmac_trace --rom <path> [--frames N] [--ram-mb M]\n");
