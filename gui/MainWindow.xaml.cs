@@ -353,9 +353,11 @@ public partial class MainWindow : Window
 
     private void CreateHardDisk_Click(object sender, RoutedEventArgs e)
     {
+        Log.Line("create hard disk: dialog opened");
         var dlg = new CreateHardDiskDialog { Owner = this };
-        if (dlg.ShowDialog() == true && dlg.CreatedPath is { } path)
-            AttachHardDisk(path);
+        bool made = dlg.ShowDialog() == true && dlg.CreatedPath is not null;
+        Log.Line($"create hard disk: dialog closed, created={made}");
+        if (made) AttachHardDisk(dlg.CreatedPath!);
     }
 
     private void AttachHardDisk(string path)

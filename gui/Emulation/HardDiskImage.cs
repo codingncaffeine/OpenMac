@@ -24,22 +24,22 @@ public static class HardDiskImage
     public static void CreateBlank(string path, int sizeMB, string volumeName)
     {
         long sizeBytes = (long)sizeMB * 1024 * 1024;
+        Log.Line($"create hard disk: \"{volumeName}\" {sizeMB} MB -> {path}");
 
-        byte[]? formatted = NativeFormatter.TryFormat(sizeBytes, volumeName);
-        if (formatted is null)
-            throw new InvalidOperationException(
-                "Could not format the disk image: the native HFS formatter " +
-                "(omac_format_hfs in openmac_c.dll) failed or is missing. A blank " +
-                "image would not mount, so no file was written.");
-
+        byte[] formatted = NativeFormatter.Format(sizeBytes, volumeName);
         File.WriteAllBytes(path, formatted);
+
+        long onDisk = new FileInfo(path).Length;
+        Log.Line($"create hard disk: wrote {onDisk:N0} bytes");
+        if (onDisk != sizeBytes)
+            throw new IOException(
+                $"The image should be {sizeBytes:N0} bytes but {onDisk:N0} reached the disk. " +
+                "The drive may be full.");
     }
 }
 
 /// <summary>
-/// Thin seam over the (not-yet-present) native HFS formatter. When the C ABI
-/// export exists, implement <see cref="TryFormat"/> as a P/Invoke and flip
-/// <see cref="IsAvailable"/>.
+/// The native HFS formatter (omac_format_hfs -> openmac::hfs::formatVolume).
 /// </summary>
 internal static class NativeFormatter
 {
@@ -53,21 +53,56 @@ internal static class NativeFormatter
             try
             {
                 var probe = new byte[1024 * 1024];   // 1 MB is a valid HFS size
-                _available = Native.omac_format_hfs((uint)probe.Length, "Probe", probe) == 0;
+                int rc = Native.omac_format_hfs((uint)probe.Length, "Probe", probe);
+                _available = rc == 0;
+                if (rc != 0) Log.Line($"hfs formatter: probe returned {rc}");
             }
-            catch { _available = false; }
+            catch (Exception ex)
+            {
+                // Almost always the DLL failing to load. Saying so beats reporting
+                // "the formatter is missing" for every possible cause.
+                _available = false;
+                Log.Line($"hfs formatter: unavailable -- {ex.GetType().Name}: {ex.Message}");
+            }
             return _available.Value;
         }
     }
 
-    public static byte[]? TryFormat(long sizeBytes, string volumeName)
+    /// <summary>
+    /// Format a volume of <paramref name="sizeBytes"/> bytes. Throws with the
+    /// actual reason rather than returning null: a blank image would not mount,
+    /// so the caller must not write one, and "it failed" is not a diagnosis.
+    /// </summary>
+    public static byte[] Format(long sizeBytes, string volumeName)
     {
-        if (sizeBytes <= 0 || sizeBytes > uint.MaxValue) return null;
-        try
+        if (sizeBytes <= 0 || sizeBytes > uint.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(sizeBytes),
+                $"{sizeBytes:N0} bytes is not a size the formatter can produce.");
+
+        byte[] buf;
+        try { buf = new byte[sizeBytes]; }
+        catch (OutOfMemoryException)
         {
-            var buf = new byte[sizeBytes];
-            return Native.omac_format_hfs((uint)sizeBytes, volumeName, buf) == 0 ? buf : null;
+            throw new InvalidOperationException(
+                $"Not enough memory to build a {sizeBytes / (1024 * 1024)} MB image. " +
+                "Try a smaller size.");
         }
-        catch { return null; }
+
+        int rc;
+        try { rc = Native.omac_format_hfs((uint)sizeBytes, volumeName, buf); }
+        catch (Exception ex)
+        {
+            Log.Line($"hfs formatter: {ex.GetType().Name}: {ex.Message}");
+            throw new InvalidOperationException(
+                "Could not reach the native HFS formatter (omac_format_hfs in " +
+                $"openmac_c.dll): {ex.Message}", ex);
+        }
+
+        if (rc != 0)
+            throw new InvalidOperationException(
+                $"The native HFS formatter rejected a {sizeBytes / (1024 * 1024)} MB " +
+                $"volume named \"{volumeName}\" (code {rc}).");
+
+        return buf;
     }
 }

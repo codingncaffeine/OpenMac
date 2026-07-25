@@ -39,13 +39,28 @@ public partial class CreateHardDiskDialog : Window
         };
         if (dlg.ShowDialog(this) == true)
             PathBox.Text = dlg.FileName;
+        Log.Line($"create hard disk: save-as -> \"{PathBox.Text}\"");
     }
 
     private void Create_Click(object sender, RoutedEventArgs e)
     {
         string name = NameBox.Text.Trim();
         if (name.Length == 0) { Warn("Please enter a volume name."); return; }
-        if (string.IsNullOrWhiteSpace(PathBox.Text)) { Browse_Click(sender, e); if (string.IsNullOrWhiteSpace(PathBox.Text)) return; }
+
+        // The path box is read-only, so the only way to fill it is Browse. If the
+        // user goes straight to Create, offer the file dialog once -- and if they
+        // leave it without choosing, say so. Returning in silence here is
+        // indistinguishable from the button doing nothing at all.
+        if (string.IsNullOrWhiteSpace(PathBox.Text))
+        {
+            Browse_Click(sender, e);
+            if (string.IsNullOrWhiteSpace(PathBox.Text))
+            {
+                Log.Line("create hard disk: cancelled at the file dialog, nothing written");
+                Warn("Choose where to save the image first, with the Browse button.");
+                return;
+            }
+        }
 
         try
         {
@@ -57,7 +72,8 @@ public partial class CreateHardDiskDialog : Window
         catch (Exception ex)
         {
             CreateBtn.IsEnabled = true;
-            Warn("Could not create the image:\n" + ex.Message);
+            Log.Line($"create hard disk FAILED: {ex.GetType().Name}: {ex.Message}");
+            Warn("Could not create the image:\n\n" + ex.Message);
         }
     }
 
