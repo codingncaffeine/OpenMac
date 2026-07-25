@@ -787,6 +787,20 @@ u32 Machine::surfaceReads(int which) const {
 }
 
 SonyDrive& Machine::selectedDrive() {
+    // Each register set has its own idea of which drive is addressed. In IWM
+    // mode it is the drive-select latch; in ISM mode it is Mode register bits
+    // 1 and 2 -- "setting this bit along with bit 7 (MotorOn) will enable
+    // drive 1/2" (SWIM p.23) -- and the IWM latch holds whatever the last
+    // IWM-mode access left in it. Following the latch while the ROM's driver
+    // worked the external drive through ISM sent every command to the internal
+    // mechanism: the disk-switched acknowledgement after a mount cleared the
+    // wrong drive's latch, the external one answered "a disk was just put in"
+    // forever, and twenty-five seconds later the poll posted a disk-inserted
+    // event for the mounted volume -- volOnLinErr, and the Finder ejected it.
+    if (iwm_->ismSelected()) {
+        if (iwm_->ismMode() & 0x04) return *drive1_;
+        return ((via_->ora() >> 4) & 1) ? *driveBay2_ : *drive0_;
+    }
     if (iwm_->externalDrive()) return *drive1_;
     return ((via_->ora() >> 4) & 1) ? *driveBay2_ : *drive0_;
 }
@@ -1039,13 +1053,18 @@ u8 Machine::iwmAccess(int reg, bool write, u8 data) {
     // us; keep the mechanism's view of it current.
     drive0_->readOnly = floppyRO_;
     drive0_->hdMedia  = floppy_.size() >= 1440u * 1024u;
-    // ENABLE powers the mechanism the drive-select latch addresses. Until this was
-    // wired the only thing that ever started a spindle was the driver's write to
-    // the undocumented register 1, which it sends to the drive it booted from --
-    // so a second drive never turned, delivered no bytes, and answered every read
-    // with the ROM's "no disk bytes under the head".
+    // ENABLE powers the mechanism the current register set addresses. Until this
+    // was wired the only thing that ever started a spindle was the driver's write
+    // to the undocumented register 1, which it sends to the drive it booted from
+    // -- so a second drive never turned, delivered no bytes, and answered every
+    // read with the ROM's "no disk bytes under the head". In ISM mode the enables
+    // are Mode bits: /ENBLx goes active when the drive's own bit (1 or 2) is set
+    // together with MotorOn, bit 7 (SWIM p.23).
     ++selectedDrive().selections;
-    selectedDrive().setEnabled(iwm_->motorOn(), totalCycles_);
+    const bool driveEnable = iwm_->ismSelected()
+        ? ((iwm_->ismMode() & 0x80) != 0 && (iwm_->ismMode() & 0x06) != 0)
+        : iwm_->motorOn();
+    selectedDrive().setEnabled(driveEnable, totalCycles_);
     iwm_->senseHigh = iwmSenseLine();
     iwmUpdateTrack();
     SonyDrive& d = selectedDrive();

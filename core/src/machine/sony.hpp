@@ -176,15 +176,18 @@ public:
             case 0xE: return false;                // INSTALLED: 0 = drive present
             // The high-density aperture in the medium, low when one is there.
             // Inside Macintosh III-36 calls this address DRVIN ("0 if the drive
-            // is physically connected"), but on a SuperDrive the driver reads it
-            // as the media sense: $435BF4-$435BFA reads it and stores the result
-            // into the per-drive "this disk is high density" flag, and a chip
-            // that has identified itself as a SWIM then refuses an 800K disk
-            // outright with gcrOnMFMErr (-400) -- a GCR disk in a drive it
+            // is physically connected"), but the driver reads it as the media
+            // sense on every drive this chip serves -- measured on the external
+            // port too: answering "connected" (low) there makes the probe take
+            // an 800K disk for high-density media, register the drive with a
+            // nonsense geometry and never mount the volume. $435BF4-$435BFA
+            // reads it into the per-drive "this disk is high density" flag, and
+            // a chip that has identified itself as a SWIM then refuses an 800K
+            // disk outright with gcrOnMFMErr (-400) -- a GCR disk in a drive it
             // believes is set up for MFM -- without ever attempting a read.
-            // Answering it from the medium satisfies both uses: the drive-present
-            // check at $43F7AA takes its early exit on a high reading and accepts
-            // the drive either way.
+            // Answering it from the medium also satisfies the drive-present
+            // check at $43F7AA, which takes its early exit on a high reading
+            // and accepts the drive either way.
             case 0xF: return !hdMedia;
             default:  return true;
         }

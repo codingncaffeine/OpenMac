@@ -1490,7 +1490,12 @@ int main(int argc, char** argv) {
         std::printf("swapping in %zu bytes%s\n", img2.size(),
                     floppyReadOnly ? " (write-protected)" : "");
         mac.insertFloppy(std::move(img2), floppyReadOnly);
-        for (int i = 0; i < 1500 && !mac.cpu().halted; ++i) {
+        // Run well past the driver's slow periodic checks: the disk-still-there
+        // pass that can eject a mounted disk comes ~1800 frames after an insert,
+        // so a short window proves nothing about staying mounted. --frames
+        // extends it further when asked.
+        const int after = frames > 4000 ? frames - 2500 : 4000;
+        for (int i = 0; i < after && !mac.cpu().halted; ++i) {
             mac.mouseMove((i & 1) ? 1 : -1, 0, false);   // keep the Finder ticking
             mac.runFrame();
         }
@@ -1779,9 +1784,13 @@ int main(int argc, char** argv) {
             mac.insertExternalFloppy(std::move(eimg), false);
         }
         // The Finder only notices a disk while it is running its event loop, and an
-        // idle machine gets no events at all, so keep the mouse alive afterwards.
-        if (!insertExternalPath.empty() && i > insertExternalAt)
-            mac.mouseMove((i & 1) ? 1 : -1, 0, false);
+        // idle machine gets no events at all, so nudge the mouse for a moment after
+        // the insert. A moment, not forever: sixty moves a second held for half a
+        // minute reads to the Finder as one endless gesture, and what it does at
+        // the end of one of those is not what this test is measuring.
+        if (!insertExternalPath.empty() && i > insertExternalAt &&
+            i < insertExternalAt + 240 && (i & 3) == 0)
+            mac.mouseMove(((i >> 2) & 1) ? 1 : -1, 0, false);
         if (i == profileAt) profileFrame(mac);
         // Re-open the driver's own diagnostics for the interesting stretch. The
         // first forty requests of a boot are the media probe; the ones that
