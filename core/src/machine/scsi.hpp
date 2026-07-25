@@ -9,10 +9,11 @@
 //
 // This models the register file, the SCSI bus phase state machine (Bus Free ->
 // Arbitration -> Selection -> Command -> Data In/Out -> Status -> Message In), and
-// one selectable disk target that answers the boot command set. Transfers complete
-// instantly, so we keep the two lines the ROM's transfer loops actually watch --
-// CSR /REQ and BSR DRQ/Phase-Match -- honest, and never leave a byte "pending" past
-// the end of a phase (no /BERR timeout is modelled).
+// the selectable targets on the bus -- the built-in hard disk plus anything added
+// with addTarget (CD-ROM, Ethernet...). Transfers complete instantly, so we keep
+// the two lines the ROM's transfer loops actually watch -- CSR /REQ and BSR
+// DRQ/Phase-Match -- honest, and never leave a byte "pending" past the end of a
+// phase (no /BERR timeout is modelled).
 //
 // Reference: NCR 5380 Design Manual (1985) §6; Guide to the Macintosh Family
 // Hardware 2nd ed. Ch.1/2/11; SCSI-1/2 command set. Clean-room from the specs.
@@ -26,28 +27,25 @@
 
 namespace openmac {
 
-// A direct-access (type 0) SCSI disk backed by a raw 512-byte-sector image.
-class ScsiDisk {
+// A device on the SCSI bus. The controller speaks phases and bytes; a target
+// answers CDBs. Selection finds a target by its ID bit on the data bus (ID 7 is
+// the Mac itself -- the initiator -- so targets live at 0-6).
+class ScsiTarget {
 public:
-    void attach(std::vector<u8>* image, int id) { image_ = image; id_ = id & 7; }
-    void detach() { image_ = nullptr; }
-    bool present() const {
-        // Expose the disk to the SCSI bus only when block 0 carries an Apple Driver
-        // Descriptor Map ('ER', 0x4552) -- a disk the ROM's boot can read a partition
-        // map and driver from. A bare volume with no map is left to the .Sony shim so
-        // the boot scan skips it instead of engaging an unusable disk and hanging.
-        return image_ != nullptr && image_->size() >= 512 &&
-               (*image_)[0] == 0x45 && (*image_)[1] == 0x52;
-    }
-    int  id() const { return id_; }
-    bool readOnly = false;
-    // Spy on committed block I/O: (isWrite, lba, bytes, byteLen), bytes being what
-    // was written to / read from the image. The machine points an offset watch here.
-    std::function<void(bool, u32, const u8*, u32)> onBlockIo;
+    ScsiTarget() = default;
+    virtual ~ScsiTarget() = default;
+    ScsiTarget(const ScsiTarget&) = delete;
+    ScsiTarget& operator=(const ScsiTarget&) = delete;
 
-    u32 blockCount() const {
-        return image_ ? static_cast<u32>(image_->size() / 512u) : 0u;
-    }
+    virtual bool present() const = 0;   // answers selection at its ID right now
+    virtual int  id() const = 0;
+    // Execute a complete CDB. Fill `out` with the Data-In bytes for the
+    // initiator. For a Data-Out command set writeBytes to the count the
+    // initiator will push next; the completed buffer then arrives through
+    // acceptWrite(). Returns the SCSI status byte (0x00 GOOD / 0x02 CHECK
+    // CONDITION).
+    virtual u8   execute(const u8* cdb, std::vector<u8>& out, u32& writeBytes) = 0;
+    virtual void acceptWrite(const std::vector<u8>&) {}
 
     // Number of CDB bytes for an opcode, from its group code (bits 7-5).
     static int cdbLen(u8 opcode) {
@@ -58,16 +56,34 @@ public:
             default: return 6;
         }
     }
+};
 
-    // Execute a complete CDB. `out` receives any Data-In bytes to hand back to the
-    // initiator. Returns the SCSI status byte (0x00 GOOD / 0x02 CHECK CONDITION).
-    // For WRITE, out is left empty and `outIsWrite`/`writeLBA`/`writeBlocks` describe
-    // the Data-Out the initiator will push next.
-    u8 execute(const u8* cdb, std::vector<u8>& out,
-               bool& outIsWrite, u32& writeLBA, u32& writeBlocks) {
+// A direct-access (type 0) SCSI disk backed by a raw 512-byte-sector image.
+class ScsiDisk : public ScsiTarget {
+public:
+    void attach(std::vector<u8>* image, int id) { image_ = image; id_ = id & 7; }
+    void detach() { image_ = nullptr; }
+    bool present() const override {
+        // Expose the disk to the SCSI bus only when block 0 carries an Apple Driver
+        // Descriptor Map ('ER', 0x4552) -- a disk the ROM's boot can read a partition
+        // map and driver from. A bare volume with no map is left to the .Sony shim so
+        // the boot scan skips it instead of engaging an unusable disk and hanging.
+        return image_ != nullptr && image_->size() >= 512 &&
+               (*image_)[0] == 0x45 && (*image_)[1] == 0x52;
+    }
+    int  id() const override { return id_; }
+    bool readOnly = false;
+    // Spy on committed block I/O: (isWrite, lba, bytes, byteLen), bytes being what
+    // was written to / read from the image. The machine points an offset watch here.
+    std::function<void(bool, u32, const u8*, u32)> onBlockIo;
+
+    u32 blockCount() const {
+        return image_ ? static_cast<u32>(image_->size() / 512u) : 0u;
+    }
+
+    u8 execute(const u8* cdb, std::vector<u8>& out, u32& writeBytes) override {
         out.clear();
-        outIsWrite = false;
-        writeLBA = writeBlocks = 0;
+        writeBytes = 0;
         senseKey_ = 0;
         const u8 op = cdb[0];
         switch (op) {
@@ -96,21 +112,22 @@ public:
                 return readBlocks(lba, n, out);
             }
             case 0x0A: {  // WRITE(6)
-                outIsWrite = true;
-                writeLBA = ((cdb[1] & 0x1Fu) << 16) | (cdb[2] << 8) | cdb[3];
-                writeBlocks = cdb[4] ? cdb[4] : 256u;
+                writeLba_ = ((cdb[1] & 0x1Fu) << 16) | (cdb[2] << 8) | cdb[3];
+                writeBytes = (cdb[4] ? cdb[4] : 256u) * 512u;
                 return 0x00;
             }
             case 0x2A: {  // WRITE(10)
-                outIsWrite = true;
-                writeLBA = be32(cdb + 2);
-                writeBlocks = (cdb[7] << 8) | cdb[8];
+                writeLba_ = be32(cdb + 2);
+                writeBytes = static_cast<u32>((cdb[7] << 8) | cdb[8]) * 512u;
                 return 0x00;
             }
             default:
                 return checkCondition(0x05);   // 0x05 = illegal request
         }
     }
+
+    // The staged WRITE's Data-Out arrives here once the initiator has pushed it.
+    void acceptWrite(const std::vector<u8>& data) override { writeData(writeLba_, data); }
 
     // Commit a completed Data-Out (WRITE) into the image.
     void writeData(u32 lba, const std::vector<u8>& data) {
@@ -184,13 +201,25 @@ private:
     std::vector<u8>* image_ = nullptr;
     int id_ = 0;
     u8  senseKey_ = 0;
+    u32 writeLba_ = 0;   // LBA of the staged WRITE awaiting its Data-Out
 };
 
 class Ncr5380 {
 public:
     enum Phase { BusFree, Arbitration, Selection, Command, DataOut, DataIn, Status, MsgIn };
 
-    ScsiDisk disk;
+    Ncr5380() { addTarget(&disk); }
+    Ncr5380(const Ncr5380&) = delete;
+    Ncr5380& operator=(const Ncr5380&) = delete;
+
+    ScsiDisk disk;   // the built-in hard disk, first target on the bus
+
+    // Put another device on the bus alongside the built-in disk. The pointer
+    // must outlive the controller; a device leaves the bus by answering
+    // present() = false, so nothing ever needs removing.
+    void addTarget(ScsiTarget* t) {
+        if (t && nTargets_ < kMaxTargets) targets_[nTargets_++] = t;
+    }
 
     // Diagnostics (persistent; not subject to the machine's rolling stub log).
     u32 diagReads = 0;         // total register reads
@@ -214,7 +243,7 @@ public:
         cdbPos_ = cdbLen_ = 0;
         status_ = 0;
         writeMode_ = false;
-        writeLBA_ = writeBlocks_ = 0;
+        sel_ = nullptr;
     }
 
     u8 read(int reg) {
@@ -279,11 +308,13 @@ private:
         // bus enters Command phase.
         const bool selecting = (v & 0x04) && !(v & 0x08);
         if (selecting &&
-            (phase_ == BusFree || phase_ == Arbitration || phase_ == Selection) &&
-            disk.present() && (odr_ & (1u << disk.id())))
-            enterCommand();
+            (phase_ == BusFree || phase_ == Arbitration || phase_ == Selection)) {
+            if (ScsiTarget* t = findTarget(odr_)) { sel_ = t; enterCommand(); }
+        }
         // A bus reset (/RST, b7) drops everything back to Bus Free.
-        if (v & 0x80) { phase_ = BusFree; xfer_.clear(); xferPos_ = 0; cdbPos_ = 0; }
+        if (v & 0x80) {
+            phase_ = BusFree; xfer_.clear(); xferPos_ = 0; cdbPos_ = 0; sel_ = nullptr;
+        }
     }
 
     u8 readIcr() const {
@@ -316,6 +347,18 @@ private:
         if (icr_ & 0x02) s |= 0x02;                     // /ATN
         if (icr_ & 0x10) s |= 0x01;                     // /ACK
         return s;
+    }
+
+    // The present target whose ID bit is on the data bus. The selection byte
+    // also carries the initiator's own bit (ID 7), which no target answers.
+    ScsiTarget* findTarget(u8 bus) const {
+        for (int i = 0; i < nTargets_; ++i) {
+            ScsiTarget* t = targets_[i];
+            if (t && t->id() >= 0 && t->id() <= 6 && t->present() &&
+                (bus & (1u << t->id())) != 0)
+                return t;
+        }
+        return nullptr;
     }
 
     // ---- bus phase machine ----------------------------------------------
@@ -366,7 +409,7 @@ private:
         odr_ = v;
         if (phase_ == Command) {
             if (cdbPos_ < 12) cdb_[cdbPos_] = v;
-            if (cdbPos_ == 0) cdbLen_ = ScsiDisk::cdbLen(v);
+            if (cdbPos_ == 0) cdbLen_ = ScsiTarget::cdbLen(v);
             if (++cdbPos_ >= cdbLen_) executeCdb();
         } else if (phase_ == DataOut) {
             if (xferPos_ < xfer_.size()) { xfer_[xferPos_++] = v; ++diagDataOutBytes; }
@@ -403,14 +446,15 @@ private:
         std::memcpy(diagLastCdb, cdb_, 12);
         diagLastCdbLen = cdbLen_;
         if (diagCdbHistLen < 16) std::memcpy(diagCdbHist[diagCdbHistLen++], cdb_, 12);
-        bool isWrite = false;
-        status_ = disk.execute(cdb_, xfer_, isWrite, writeLBA_, writeBlocks_);
+        u32 writeBytes = 0;
+        status_ = sel_ ? sel_->execute(cdb_, xfer_, writeBytes)
+                       : static_cast<u8>(0x02);
         xferPos_ = 0;
         if (status_ != 0x00) {           // CHECK CONDITION -> straight to Status
             toStatus();
-        } else if (isWrite) {            // WRITE -> Data Out from the initiator
+        } else if (writeBytes != 0) {    // WRITE -> Data Out from the initiator
             writeMode_ = true;
-            xfer_.assign(static_cast<std::size_t>(writeBlocks_) * 512u, 0);
+            xfer_.assign(writeBytes, 0);
             xferPos_ = 0;
             phase_ = DataOut;
         } else if (!xfer_.empty()) {     // READ/INQUIRY/... -> Data In
@@ -421,7 +465,7 @@ private:
     }
 
     void finishDataOut() {
-        if (writeMode_) disk.writeData(writeLBA_, xfer_);
+        if (writeMode_ && sel_) sel_->acceptWrite(xfer_);
         writeMode_ = false;
         toStatus();
     }
@@ -439,7 +483,11 @@ private:
     u8  status_ = 0;
     bool status_ready_ = false, msg_ready_ = false;
     bool writeMode_ = false;
-    u32 writeLBA_ = 0, writeBlocks_ = 0;
+
+    static constexpr int kMaxTargets = 8;
+    ScsiTarget* targets_[kMaxTargets] = {};
+    int nTargets_ = 0;
+    ScsiTarget* sel_ = nullptr;   // target that answered the last selection
 };
 
 } // namespace openmac

@@ -26,6 +26,7 @@ add_executable(openmac_unit
     unit/test_cpu_reset.cpp
     unit/test_machine.cpp
     unit/test_hfs.cpp
+    unit/test_scsi.cpp
     unit/test_gcr.cpp
     unit/test_sony.cpp
     unit/test_mfm.cpp
