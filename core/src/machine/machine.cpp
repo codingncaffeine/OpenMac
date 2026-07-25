@@ -389,7 +389,15 @@ u8 Machine::read8(u32 addr) {
             const int reg = sccPtr_;
             sccPtr_ = 0;
             u8 v = 0;
-            if (reg == 0) v = 0x04;      // RR0: transmit buffer empty
+            // A channel with nothing on the wire: transmit always completes,
+            // receive never starts. Bit 2 = Tx buffer empty; bit 6 = Tx
+            // underrun/EOM (the frame went out and nothing followed -- SDLC
+            // transmit code waits on this before closing a frame); bit 4 =
+            // Sync/Hunt (hunting, no flags arriving). System 7's LocalTalk
+            // node acquisition spins forever without bits 6 and 4: its probe
+            // frames never "finish" sending, so the silent-wire timeout that
+            // acquires a node address is never reached.
+            if (reg == 0) v = 0x54;      // RR0: underrun/EOM | hunt | Tx empty
             else if (reg == 1) v = 0x01; // RR1: all sent
             return v;
         }
