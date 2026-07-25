@@ -206,6 +206,21 @@ public:
         return (i >= 0 && i < 8) ? gcrErrors_[i] : 0;
     }
     static const char* gcrErrorName(u8 code);
+    // When a read error first and last occurred, and how many came from the
+    // external drive. Errors confined to the boot-time media probe and errors
+    // arriving steadily under a running System mean very different things.
+    u32 gcrErrorFirstFrame(u8 code) const {
+        const int i = static_cast<int>(code) - 0xB8;
+        return (i >= 0 && i < 8) ? gcrErrFirstFrame_[i] : 0;
+    }
+    u32 gcrErrorLastFrame(u8 code) const {
+        const int i = static_cast<int>(code) - 0xB8;
+        return (i >= 0 && i < 8) ? gcrErrLastFrame_[i] : 0;
+    }
+    u32 gcrErrorExternal(u8 code) const {
+        const int i = static_cast<int>(code) - 0xB8;
+        return (i >= 0 && i < 8) ? gcrErrExternal_[i] : 0;
+    }
 
     // Unmapped/stub access log (instrument first): capped, newest last.
     const std::vector<std::string>& accessLog() const { return accessLog_; }
@@ -269,7 +284,8 @@ private:
     std::vector<GcrErrSite> gcrErrSites_;
     u32 gcrErrLo_ = 0, gcrErrSpan_ = 0;
     u32 gcrErrors_[8] = {};
-    int gcrErrLog_ = 12;           // diag budget: report the first few, then count only
+    u32 gcrErrFirstFrame_[8] = {}, gcrErrLastFrame_[8] = {}, gcrErrExternal_[8] = {};
+    int gcrErrLog_ = 40;           // diag budget: report the first few, then count only
     int sonyPrimeLog_ = 40;        // diag budget for the ROM driver's own I/O requests
     u32 sonyResultPc_ = 0;         // where the ROM's own driver hands its result back
     int sonyResultLog_ = 40;
@@ -333,6 +349,7 @@ private:
     int  hdMediaLog_ = 1;          // one-shot note that HD media needs the MFM path
     bool ismActionPrev_ = false;   // edge detect on the ISM ACTION bit
     u16  ismCrcOut_ = 0xFFFF;      // CRC accumulated over bytes written in MFM mode
+    bool ismWriteMarkPrev_ = false;  // last written byte was a mark (a field opener)
     int  writeLogBudget_ = 12;     // diag budget for tracks written back to the image
     u32  floppyWrites_ = 0;        // tracks the driver has written through the surface
     u32  floppyEjects_ = 0;        // times the drive threw a disk out on its own

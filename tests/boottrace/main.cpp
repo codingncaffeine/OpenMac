@@ -1176,6 +1176,19 @@ int main(int argc, char** argv) {
                     openmac::dbg::disasm(mac, pc, dis);
                     std::printf("  %06X  %s\n", pc, dis.c_str());
                     openmac::dbg::dumpBacktrace(mac.cpu(), mac, stdout);
+                    // The path taken to get here. A backtrace shows the frames
+                    // still on the stack, which for interrupt-time code is the
+                    // interrupted program, not the route -- this is the route.
+                    std::printf("-- last 128 instructions (oldest first) --\n");
+                    u32 prev = 0;
+                    int col = 0;
+                    for (int k = 127; k >= 0; --k) {
+                        const u32 p = mac.cpu().recentPc(k);
+                        if (!p || p == prev) continue;
+                        prev = p;
+                        std::printf("%06X%s", p, (++col % 10 == 0) ? "\n" : " ");
+                    }
+                    std::printf("\n");
                 }
             }
             if (traceBranches && branchLines < 5000) {
@@ -1761,8 +1774,11 @@ int main(int argc, char** argv) {
             for (int c = 0xB8; c <= 0xBF; ++c) {
                 const u32 n = mac.gcrErrorCount(static_cast<u8>(c));
                 if (n)
-                    std::printf("   %02X %-52s %u\n", c,
-                                Machine::gcrErrorName(static_cast<u8>(c)), n);
+                    std::printf("   %02X %-46s %6u  frames %u..%u  (%u external)\n", c,
+                                Machine::gcrErrorName(static_cast<u8>(c)), n,
+                                mac.gcrErrorFirstFrame(static_cast<u8>(c)),
+                                mac.gcrErrorLastFrame(static_cast<u8>(c)),
+                                mac.gcrErrorExternal(static_cast<u8>(c)));
             }
         }
     }

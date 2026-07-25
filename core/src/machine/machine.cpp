@@ -788,6 +788,7 @@ void Machine::ismService(SonyDrive& d) {
     if (action && !ismActionPrev_) {
         if (!iwm_->ismWriting()) d.syncToMark(totalCycles_);
         ismCrcOut_ = 0xFFFF;
+        ismWriteMarkPrev_ = false;
     }
     ismActionPrev_ = action;
     if (!action) return;
@@ -812,6 +813,19 @@ void Machine::ismService(SonyDrive& d) {
     iwm_->ismDataReady = d.writeReady(totalCycles_);
     if (iwm_->ismWroteData || iwm_->ismWroteMark) {
         const bool mark = iwm_->ismWroteMark;
+        // A mark opens a field, and the CRC generator restarts there. The driver
+        // lays down sync bytes before every address mark, and those precede the
+        // field rather than belong to it: counting them in produced a CRC that
+        // was wrong for every sector the guest ever wrote. The sector then failed
+        // its own checksum on the next read, the driver retried it for as long as
+        // the disk was mounted, and finally decided the disk was unreadable and
+        // ejected it -- taking the volume off-line under a running System.
+        //
+        // Only the first mark of a run restarts it: an address mark is three A1
+        // bytes and a type byte, and the CRC covers all four (mfm::buildTrack
+        // computes exactly that, and the two agree only if they start together).
+        if (mark && !ismWriteMarkPrev_) ismCrcOut_ = 0xFFFF;
+        ismWriteMarkPrev_ = mark;
         d.writeByte(totalCycles_, iwm_->ismWritten, mark);
         ismCrcOut_ = mfm::crc16Update(ismCrcOut_, iwm_->ismWritten);
         iwm_->ismWroteData = iwm_->ismWroteMark = false;
@@ -1100,15 +1114,30 @@ const char* Machine::gcrErrorName(u8 code) {
 }
 
 void Machine::noteGcrError(u32 pc) {
+    SonyDrive& d = selectedDrive();
     for (const auto& s : gcrErrSites_) {
         if (s.pc != pc) continue;
         ++gcrErrors_[s.code - 0xB8];
         if (onGcrError) onGcrError(s.code, pc);
+        // When each failure happened matters as much as how many: read errors
+        // during the boot-time media probe are expected, and the same error
+        // arriving steadily under a running System is a disk the driver is about
+        // to give up on. Record the first and last frame and which drive was
+        // addressed, so the run summary can tell those apart.
+        const int code = s.code - 0xB8;
+        if (gcrErrors_[code] == 1) gcrErrFirstFrame_[code] = static_cast<u32>(frameCounter_);
+        gcrErrLastFrame_[code] = static_cast<u32>(frameCounter_);
+        if (iwm_->externalDrive()) ++gcrErrExternal_[code];
         if (gcrErrLog_ > 0 && onDiag) {
             --gcrErrLog_;
-            char b[128];
-            std::snprintf(b, sizeof b, "gcr: read failed, ROM says %02X %s (at %06X)",
-                          s.code, gcrErrorName(s.code), pc);
+            char b[160];
+            std::snprintf(b, sizeof b,
+                          "gcr: read failed, ROM says %02X %s (at %06X, frame %u, drive%d, "
+                          "track %d side %d, %s)",
+                          s.code, gcrErrorName(s.code), pc,
+                          static_cast<unsigned>(frameCounter_),
+                          iwm_->externalDrive() ? 2 : 1, d.track, d.headUpper ? 1 : 0,
+                          d.hdMedia ? "MFM" : "GCR");
             onDiag(b);
         }
         return;
