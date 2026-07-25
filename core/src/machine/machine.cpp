@@ -168,17 +168,47 @@ void Machine::wireVia() {
         if (adb_->state() != prev) {
             logAccess("ADBs", static_cast<u32>(adb_->state()), true, 0);
             if (onAdbEvent) onAdbEvent("state", adb_->state(), adb_->lastCommand());
-            if (adb_->state() == 3) {   // idle ends the transaction: a shift
-                adbArmed_ = false;      // still pending would deliver a stale
-                adbPending_ = 0;        // byte and confuse the ROM's ADB manager
+            // Push model, as the real transceiver behaves (and Mini vMac
+            // models): entering a data state clocks the device's next byte
+            // ~260 us later whether or not the CPU has touched the SR. The
+            // ROM's boot-time manager happened to read the SR first, which is
+            // why an arm-driven model booted; the System file's PATCHED ADB
+            // manager (RAM, from ptch resources) does not pre-read, so under
+            // it an arm-driven shift never completed and every keystroke at
+            // the settled desktop was consumed unheard. Listen transfers stay
+            // CPU-driven (the guest writes the SR; see srArmed) -- a pushed
+            // input byte there would collide with the byte being written.
+            const int st = adb_->state();
+            if ((st == 1 || st == 2) && !adb_->listening()) {
+                adbPending_ = 5440;
+                adbPendingInput_ = true;
+                adbArmed_ = false;
+            } else if (st == 3 && adb_->responsePending()) {
+                // The settled-desktop poll collects a flush byte AT idle
+                // before reading the data states; serve it the same way.
+                adbPending_ = 5440;
+                adbPendingInput_ = true;
+                adbArmed_ = false;
+            } else if (st == 3) {
+                // Idle with nothing staged: the transaction is over (or was
+                // abandoned); a shift still pending would deliver a stale
+                // byte later and confuse the ROM's ADB manager.
+                adbArmed_ = false;
+                adbPending_ = 0;
+            } else if (adbPendingInput_) {
+                adbPending_ = 0;   // command window: cancel any stale input shift
             }
-            adbMaybeClock();   // the rule inside decides if this clocks
+            adbMaybeClock();   // output shifts armed by SR writes still clock
         }
     };
     via_->srArmed = [this](bool input) {
-        adbArmed_ = true;
-        adbArmedInput_ = input;
         if (onAdbEvent) onAdbEvent("arm", adb_->state(), input ? 1u : 0u);
+        // Input bytes are pushed by state changes (see outB); an SR read is
+        // just the CPU collecting the latched byte. Only OUTPUT shifts -- the
+        // CPU writing a command or listen data -- arm a transfer here.
+        if (input) return;
+        adbArmed_ = true;
+        adbArmedInput_ = false;
         adbMaybeClock();
     };
     via_->srDisarmed = [this] {
@@ -476,8 +506,10 @@ void Machine::adbMaybeClock() {
     // WITHOUT re-issuing a command (so open_ is still false), and gating the
     // shift there left it spinning on an SR interrupt that never came. Mini
     // vMac's ADB_DoNewState services states 0/1/2 unconditionally; match that.
-    // Stale shifts are still cancelled separately when the bus reaches idle.
-    const bool canClock = st != 3;
+    // Stale shifts are still cancelled separately when the bus reaches idle --
+    // unless a response is staged and unread: the ROM's settled-desktop poll
+    // arms for the reply and then waits AT idle, so that shift must clock.
+    const bool canClock = st != 3 || adb_->responsePending();
     if (canClock && adbArmed_ && adbPending_ == 0) {
         adbArmed_ = false;
         // The ROM's ADB manager expects ~260 us between state change and the
@@ -1823,8 +1855,15 @@ void Machine::runFrame() {
             // the ROM polls, which bumps the count and resets the streak.
             const u32 adbPolls = adb_->mousePolls() + adb_->kbdPolls();
             if (adbPolls != adbLastPollTotal_) { adbLastPollTotal_ = adbPolls; adbWakeStreak_ = 0; }
-            if (adbPending_ == 0 && adb_->state() == 3 && adb_->hasPendingEvent()) {
-                if (adbWakeStreak_ < 8) {
+            if (adbPending_ == 0 && adb_->state() == 3 && adb_->wakeWorthPoking()) {
+                // The leash must outlast the ROM's wake-to-sweep latency: the
+                // settled 6.0.8 desktop services a wake with a poll sweep six
+                // to sixteen frames later, and an 8-frame flush was eating
+                // every clean desktop keypress before the sweep arrived (keys
+                // typed into a quiet Finder simply vanished). 32 frames still
+                // unwedges the boot-time ADB-idle spin, just half a second
+                // later in that one corner.
+                if (adbWakeStreak_ < 32) {
                     adb_->reStageLastTalk();
                     via_->completeShift(true, 0xFF);
                     ++adbWakeStreak_;

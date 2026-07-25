@@ -36,6 +36,7 @@ public:
         len_ = idx_ = 0;
         int_ = true;
         open_ = false;
+        stagedByWake_ = false;
         kbdAddr_ = 2;
         mouseAddr_ = 3;
         kbdHead_ = kbdTail_ = 0;
@@ -77,11 +78,9 @@ public:
     // ---- transceiver state lines ----
     void setState(int state) {
         state_ = state & 3;
-        if (state_ == 0) int_ = true;   // new command window
-        if (state_ == 3) {              // idle ends any transaction
-            int_ = true;
-            open_ = false;
-        }
+        int_ = true;   // every state transition re-raises /INT (the low from an
+                       // empty byte spans only until the next state change)
+        if (state_ == 3) open_ = false;   // idle ends any transaction
     }
     int state() const { return state_; }
     bool transactionOpen() const { return open_; }
@@ -122,41 +121,68 @@ public:
             // two bytes. A mid-transfer LOW makes the ROM's ADB ISR read the
             // poll as unsolicited device data and wedge the boot (see emit()).
             // The ROM tells a real report from an empty address by the byte
-            // value it clocks in (0xFF = empty), never by a /INT edge. This
-            // never bit a clean boot because mouse/keyboard carry no data during
-            // startup, so len_ was always 0 and this branch never ran.
+            // value it clocks in (0xFF = empty), never by a /INT edge.
             return buf_[idx_++];
         }
-        // No (more) data for the polled device. Assert SRQ (/INT low) when a device
-        // that ISN'T the one just polled has data pending, so the ROM's ADB manager
-        // does a poll-all and reaches it. Needed for BOTH devices: the ROM-boot
-        // System 6.0.3 autopolls the keyboard (addr 2), so without a mouse SRQ the
-        // mouse (addr 3) never gets a turn and the cursor won't move; the floppy
-        // System 6.0.8 autopolls the mouse, so the keyboard needs the same.
-        const int polled = (cmd_ >> 4) & 0xF;
-        const bool kbdWants   = polled != kbdAddr_   && kbdHead_ != kbdTail_;
-        const bool mouseWants = polled != mouseAddr_ && mousePending_;
-        int_ = !(kbdWants || mouseWants);
+        if (responsePending()) {
+            // A read OUTSIDE the data states while a response waits: the ROM's
+            // settled-desktop poll arms once at command time and that shift
+            // completes at idle -- it is flushing the register, not collecting
+            // data. Serve 0xFF and keep the response intact for the state-1/2
+            // reads that follow (serving the real bytes here byte-slipped the
+            // whole response and every keystroke vanished).
+            return 0xFF;
+        }
+        // No (more) data: the byte is filler and /INT LOW says so -- that is
+        // how the transceiver marks "nothing here" (and how the System's
+        // patched ADB manager, which trusts /INT rather than byte values,
+        // tells an empty poll from data). /INT re-raises on the next state
+        // change. This same low is what sends the manager around its poll-all
+        // when another device is sitting on input (the old conditional SRQ),
+        // so keyboard and mouse each get their turn either way.
+        int_ = false;
         return 0xFF;
     }
 
     bool intLine() const { return int_; }
+    bool listening() const { return listenReg_ >= 0; }
 
     // A device has movement/keys to report. When the bus is idle the machine
     // must fire a shift-register completion interrupt to wake the ROM into
     // polling (merely asserting /INT has no effect on the ROM's ADB manager).
     bool hasPendingEvent() const { return mousePending_ || kbdHead_ != kbdTail_; }
 
+    // A staged response the ROM has not fully read yet. The ROM's command
+    // sequence dips through the idle state BETWEEN issuing a Talk and reading
+    // its bytes, so "state 3" alone never means the transaction is over --
+    // waking (and restaging) in that window used to wipe the response the ROM
+    // was about to read, which is how keystrokes vanished or swapped under a
+    // busy mouse: the wake destroyed a staged key report, or replaced a DOWN
+    // with the NEXT queued transition.
+    bool responsePending() const { return idx_ < len_; }
+    // ...and one the ROM itself asked for, which nothing may clobber.
+    bool romResponsePending() const { return responsePending() && !stagedByWake_; }
+    // Poke the wake when input waits, or when a wake-staged response is still
+    // sitting unread (the ROM may have missed the previous poke) -- but never
+    // while the ROM is mid-read of its own command's response.
+    bool wakeWorthPoking() const {
+        return !romResponsePending() && (hasPendingEvent() || responsePending());
+    }
+
     // Re-stage the response for the last Talk command, so an idle wake-up
     // presents valid data rather than a bare interrupt (which the ROM treats
-    // as an error and answers with a bus reset).
+    // as an error and answers with a bus reset). An already-staged unread
+    // response is left EXACTLY as it is: restaging a keyboard talk would
+    // dequeue the next transition over the top of the unread one.
     void reStageLastTalk() {
+        if (responsePending()) return;        // re-poke the same bytes, stage nothing
         if (((cmd_ >> 2) & 3) != 3) return;   // last command was not a Talk
         len_ = idx_ = 0;
         const int addr = (cmd_ >> 4) & 0xF;
         const int reg = cmd_ & 3;
         if (addr == kbdAddr_) talkKeyboard(reg);
         else if (addr == mouseAddr_) talkMouse(reg);
+        stagedByWake_ = len_ > 0;
     }
 
     // Discard input the ROM never came back to poll. In normal use the ROM
@@ -169,6 +195,7 @@ public:
         mousePending_ = false;
         mouseDx_ = mouseDy_ = 0;
         kbdHead_ = kbdTail_ = 0;
+        if (stagedByWake_) { len_ = idx_ = 0; stagedByWake_ = false; }
     }
 
 private:
@@ -188,6 +215,7 @@ private:
         len_ = idx_ = 0;
         int_ = true;
         open_ = true;
+        stagedByWake_ = false;   // whatever follows is the ROM's own transaction
         listenReg_ = -1;
         const int addr = (cmd_ >> 4) & 0xF;
         const int op   = (cmd_ >> 2) & 0x3;
@@ -238,6 +266,15 @@ private:
     void talkMouse(int reg) {
         if (reg == 0) {
             ++mousePolls_;
+            // Bus fairness: while the keyboard has transitions waiting, answer
+            // the mouse poll EMPTY. The empty response with /INT low is the one
+            // SRQ shape the ROM's ISR acts on (measured: /INT during a data
+            // response is ignored), so this is what makes the ROM poll-all and
+            // drain the keyboard when a game moves the mouse every frame --
+            // otherwise every poll carries motion and keys starve until the
+            // queue overflows. The motion is deferred, not lost: the deltas
+            // keep accumulating and go out on the next poll.
+            if (kbdHead_ != kbdTail_) return;
             if (!mousePending_) return;
             mousePending_ = false;
             ++mouseReports_;
@@ -269,6 +306,7 @@ private:
     int len_ = 0, idx_ = 0;
     bool int_ = true;
     bool open_ = false;
+    bool stagedByWake_ = false;   // current staged response came from reStageLastTalk
 
     // devices
     int kbdAddr_ = 2, mouseAddr_ = 3;
