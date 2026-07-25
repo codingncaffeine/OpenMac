@@ -33,6 +33,7 @@ public partial class MainWindow : Window
     private EventHandler? _renderHandler;
 
     private bool _mouseLocked;
+    private KeyboardHook? _keyHook;        // swallows host combos while input is captured
     private bool _ignoreUpAfterLock;
     private int _lockCx, _lockCy;          // window-center reference, physical screen px
     private string _baseTitle = "OpenMac";
@@ -61,6 +62,10 @@ public partial class MainWindow : Window
         CompositionTarget.Rendering += _renderHandler;
 
         WireInput();
+        // The captured-input keyboard hook lives for the window's lifetime and
+        // does nothing until capture switches it on. It reads _emulator through
+        // this, so a backend swap never leaves it pointing at a dead machine.
+        _keyHook = new KeyboardHook((code, down) => _emulator.KeyEvent(code, down), ToggleFullscreen);
         BuildRecentMenu();
         UpdateUi();
 
@@ -74,6 +79,7 @@ public partial class MainWindow : Window
         {
             if (_renderHandler != null) CompositionTarget.Rendering -= _renderHandler;
             timeEndPeriod(1);
+            _keyHook?.Dispose();
             _emulator.Dispose();   // stop the emulation thread and persist the hard disk
             _settings.Save();
         };
@@ -152,6 +158,10 @@ public partial class MainWindow : Window
         {
             if (e.Key == Key.F11) { ToggleFullscreen(); e.Handled = true; return; }
             if (e.Key == Key.Escape && _fullscreen) { ToggleFullscreen(); e.Handled = true; return; }
+            // A real ADB keyboard reports one DOWN per press; auto-repeat is the
+            // guest OS's job (KeyThresh). Forwarding host repeats gives the Mac
+            // phantom transitions, which garbles anything that counts keystrokes.
+            if (e.IsRepeat) { e.Handled = true; return; }
             int code = AdbKeys.Map(e.SystemKey != Key.None ? e.SystemKey : e.Key);
             if (code >= 0) _emulator.KeyEvent(code, true);
         };
@@ -162,6 +172,36 @@ public partial class MainWindow : Window
         };
     }
 
+    // ---- Key Combos menu ----
+    // ADB codes for the combo tokens. A combo presses left-to-right and releases
+    // in reverse, spaced a few frames apart so the guest's ADB polling sees each
+    // transition in order -- modifiers land first and lift last, like fingers.
+    private static readonly Dictionary<string, int> ComboKeys = new()
+    {
+        ["cmd"] = 0x37, ["shift"] = 0x38, ["opt"] = 0x3A, ["ctrl"] = 0x3B,
+        ["esc"] = 0x35, ["period"] = 0x2F,
+        ["a"] = 0x00, ["c"] = 0x08, ["n"] = 0x2D, ["o"] = 0x1F, ["p"] = 0x23,
+        ["q"] = 0x0C, ["s"] = 0x01, ["v"] = 0x09, ["w"] = 0x0D, ["x"] = 0x07,
+        ["z"] = 0x06, ["1"] = 0x12, ["2"] = 0x13, ["3"] = 0x14,
+    };
+
+    private async void SendCombo_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_emulator.IsRomLoaded) return;
+        if ((sender as MenuItem)?.Tag is not string combo) return;
+        int[] codes = combo.Split('+').Select(t => ComboKeys[t]).ToArray();
+        foreach (int code in codes)
+        {
+            _emulator.KeyEvent(code, true);
+            await Task.Delay(35);
+        }
+        for (int i = codes.Length - 1; i >= 0; i--)
+        {
+            _emulator.KeyEvent(codes[i], false);
+            await Task.Delay(35);
+        }
+    }
+
     // ---- relative mouse capture ----
     private void LockMouse()
     {
@@ -170,7 +210,8 @@ public partial class MainWindow : Window
         Mouse.Capture(ScreenImage);
         ScreenImage.Cursor = Cursors.None;
         RecenterCursor();
-        Title = _baseTitle + "   —   mouse captured (middle-click to release)";
+        if (_keyHook != null) _keyHook.Enabled = true;   // Cmd(Win)+Q, Alt+Tab etc. now reach the Mac
+        Title = _baseTitle + "   —   input captured: keys go to the Mac (middle-click to release)";
     }
 
     private void UnlockMouse()
@@ -178,6 +219,7 @@ public partial class MainWindow : Window
         if (!_mouseLocked) return;
         _mouseLocked = false;
         _ignoreUpAfterLock = false;
+        if (_keyHook != null) { _keyHook.Enabled = false; _keyHook.ReleaseAll(); }
         if (ScreenImage.IsMouseCaptured) ScreenImage.ReleaseMouseCapture();
         ScreenImage.Cursor = null;
         Title = _baseTitle;

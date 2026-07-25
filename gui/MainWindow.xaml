@@ -39,6 +39,27 @@
                 <MenuItem x:Name="BootRomDiskItem" Header="Boot from ROM Disk (Cmd-Opt-X-O)"
                           Click="BootRomDisk_Click" />
             </MenuItem>
+            <MenuItem Header="_Key Combos">
+                <MenuItem Header="Quit Application" InputGestureText="⌘Q" Tag="cmd+q" Click="SendCombo_Click" />
+                <MenuItem Header="Close Window" InputGestureText="⌘W" Tag="cmd+w" Click="SendCombo_Click" />
+                <MenuItem Header="Force Quit" InputGestureText="⌘⌥Esc" Tag="cmd+opt+esc" Click="SendCombo_Click" />
+                <MenuItem Header="Cancel / Stop" InputGestureText="⌘." Tag="cmd+period" Click="SendCombo_Click" />
+                <Separator />
+                <MenuItem Header="New" InputGestureText="⌘N" Tag="cmd+n" Click="SendCombo_Click" />
+                <MenuItem Header="Open" InputGestureText="⌘O" Tag="cmd+o" Click="SendCombo_Click" />
+                <MenuItem Header="Save" InputGestureText="⌘S" Tag="cmd+s" Click="SendCombo_Click" />
+                <MenuItem Header="Print" InputGestureText="⌘P" Tag="cmd+p" Click="SendCombo_Click" />
+                <Separator />
+                <MenuItem Header="Undo" InputGestureText="⌘Z" Tag="cmd+z" Click="SendCombo_Click" />
+                <MenuItem Header="Cut" InputGestureText="⌘X" Tag="cmd+x" Click="SendCombo_Click" />
+                <MenuItem Header="Copy" InputGestureText="⌘C" Tag="cmd+c" Click="SendCombo_Click" />
+                <MenuItem Header="Paste" InputGestureText="⌘V" Tag="cmd+v" Click="SendCombo_Click" />
+                <MenuItem Header="Select All" InputGestureText="⌘A" Tag="cmd+a" Click="SendCombo_Click" />
+                <Separator />
+                <MenuItem Header="Eject Internal Floppy" InputGestureText="⌘⇧1" Tag="cmd+shift+1" Click="SendCombo_Click" />
+                <MenuItem Header="Eject External Floppy" InputGestureText="⌘⇧2" Tag="cmd+shift+2" Click="SendCombo_Click" />
+                <MenuItem Header="Screen Snapshot to Disk" InputGestureText="⌘⇧3" Tag="cmd+shift+3" Click="SendCombo_Click" />
+            </MenuItem>
             <MenuItem Header="_View">
                 <MenuItem x:Name="ScaleFitItem" Header="Fit Window" Tag="0" Click="Scale_Click" />
                 <MenuItem x:Name="Scale1Item" Header="1×  (512 × 342)" Tag="1" Click="Scale_Click" />

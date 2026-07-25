@@ -23,6 +23,20 @@ internal static class AdbKeys
         Key.LeftShift or Key.RightShift => 0x38, Key.CapsLock => 0x39,
         Key.LeftCtrl or Key.RightCtrl => 0x3B, Key.LeftAlt or Key.RightAlt => 0x3A,
         Key.LWin or Key.RWin => 0x37,
+        // Keypad (the emulated keyboard reports itself as an extended ADB
+        // keyboard, so the full keypad is fair game; 0x5A is unused on Apple)
+        Key.NumPad0 => 0x52, Key.NumPad1 => 0x53, Key.NumPad2 => 0x54,
+        Key.NumPad3 => 0x55, Key.NumPad4 => 0x56, Key.NumPad5 => 0x57,
+        Key.NumPad6 => 0x58, Key.NumPad7 => 0x59, Key.NumPad8 => 0x5B,
+        Key.NumPad9 => 0x5C, Key.Decimal => 0x41, Key.Multiply => 0x43,
+        Key.Add => 0x45, Key.Divide => 0x4B, Key.Subtract => 0x4E,
+        Key.NumLock => 0x47,   // Clear
+        // Function and navigation keys (F11 is the host's fullscreen toggle)
+        Key.F1 => 0x7A, Key.F2 => 0x78, Key.F3 => 0x63, Key.F4 => 0x76,
+        Key.F5 => 0x60, Key.F6 => 0x61, Key.F7 => 0x62, Key.F8 => 0x64,
+        Key.F9 => 0x65, Key.F10 => 0x6D, Key.F12 => 0x6F,
+        Key.Home => 0x73, Key.End => 0x77, Key.PageUp => 0x74, Key.PageDown => 0x79,
+        Key.Insert => 0x72,    // Help
         _ => -1,
     };
 }

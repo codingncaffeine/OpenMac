@@ -1100,7 +1100,7 @@ int main(int argc, char** argv) {
     u32 watchAddr = 0xFFFFFFFFu;
     bool mouseWalk = false;
     bool bootNudge = false;
-    bool keyTest = false;
+    bool keyTest = false, keyStress = false;
     std::string swapFloppyPath;
     bool bootDisk = false;
     bool forceRom = false;
@@ -1216,6 +1216,7 @@ int main(int argc, char** argv) {
         else if (arg == "--mouse-walk") mouseWalk = true;
         else if (arg == "--boot-nudge") bootNudge = true;
         else if (arg == "--key-test") keyTest = true;
+        else if (arg == "--key-stress") keyStress = true;
         else if (arg == "--swap-floppy" && i + 1 < argc) swapFloppyPath = argv[++i];
         else if (arg == "--boot-disk") bootDisk = true;
         else if (arg == "--force-rom") forceRom = true;
@@ -2186,7 +2187,14 @@ int main(int argc, char** argv) {
     if (keyTest) {
         // Boot, then inject a key AFTER the desktop is up and watch the ROM's
         // KeyMap ($174) -- i.e. does keyboard input register post-boot?
-        for (int i = 0; i < 1900 && !mac.cpu().halted; ++i) mac.runFrame();
+        // Boot length from --frames when given (the generic default of 60 is
+        // no boot at all -- use the old 1900 then): keyboard delivery differs
+        // between mid-startup and the settled desktop.
+        const int bootF = frames > 60 ? frames : 1900;
+        for (int i = 0; i < bootF && !mac.cpu().halted; ++i) {
+            if (i >= 200 && i < 340 && (i & 3) == 0) mac.mouseMove(3, 2, false);
+            mac.runFrame();
+        }
         auto keymap = [&](const char* when) {
             std::printf("KeyMap %-7s", when);
             for (u32 a = 0x174; a < 0x17C; ++a) std::printf(" %02X", mac.read8(a));
@@ -2203,6 +2211,67 @@ int main(int argc, char** argv) {
         const auto s1 = mac.adbStats();
         std::printf("key-test: kbdEnum=%u kbdPolls %u->%u modifiers %u->%u\n",
                     s1.kbdReg3, s0.kbdPolls, s1.kbdPolls, s0.kbdReg2, s1.kbdReg2);
+        return 0;
+    }
+
+    if (keyStress) {
+        // The game workload: mouse motion EVERY frame while keys arrive, so no
+        // mouse poll is ever empty. A key counts as delivered when its KeyMap
+        // ($174) bit appears during the hold window and is clear again after
+        // release. The alphabet runs twice -- mouse flooding, then quiet -- to
+        // show whether keyboard delivery survives a busy mouse. Boot length
+        // comes from --frames: keyboard behavior differs between mid-startup
+        // and the settled desktop, so the test must be able to probe both.
+        for (int i = 0; i < frames && !mac.cpu().halted; ++i) {
+            if (i >= 200 && i < 340 && (i & 3) == 0) mac.mouseMove(3, 2, false);
+            mac.runFrame();
+        }
+        {   // Sanity: the test only means something at a live Finder desktop.
+            std::string ap;
+            const u8 n = mac.read8(0x0910);
+            for (int i = 0; i < n && i < 15; ++i)
+                ap += static_cast<char>(mac.read8(0x0911 + static_cast<u32>(i)));
+            const auto s = mac.adbStats();
+            std::printf("key-stress env: CurApName='%s' kbdPolls=%u mousePolls=%u\n",
+                        ap.c_str(), s.kbdPolls, s.mousePolls);
+        }
+        static const u8 kLetters[26] = {
+            0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26,   // A-J
+            0x28, 0x25, 0x2E, 0x2D, 0x1F, 0x23, 0x0C, 0x0F, 0x01, 0x11,   // K-T
+            0x20, 0x09, 0x0D, 0x07, 0x10, 0x06 };                          // U-Z
+        auto bitSet = [&](u8 code) {
+            return (mac.read8(0x174u + (code >> 3)) >> (code & 7)) & 1;
+        };
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool flood = pass == 0;
+            int seen = 0, cleared = 0;
+            for (int k = 0; k < 26; ++k) {
+                const u8 code = kLetters[k];
+                mac.keyEvent(code, true);
+                bool down = false;
+                for (int fr = 0; fr < 12 && !mac.cpu().halted; ++fr) {
+                    if (flood) mac.mouseMove((fr & 1) ? 1 : -1, 0, false);
+                    mac.runFrame();
+                    if (bitSet(code)) down = true;
+                }
+                mac.keyEvent(code, false);
+                for (int fr = 0; fr < 12 && !mac.cpu().halted; ++fr) {
+                    if (flood) mac.mouseMove((fr & 1) ? 1 : -1, 0, false);
+                    mac.runFrame();
+                }
+                if (down) ++seen;
+                if (!bitSet(code)) ++cleared;
+                if (!down) std::printf("  MISSED %s: code %02X never showed in KeyMap\n",
+                                       flood ? "under flood" : "quiet", code);
+                else if (bitSet(code)) std::printf("  STUCK %s: code %02X still down after release\n",
+                                                   flood ? "under flood" : "quiet", code);
+            }
+            const auto s = mac.adbStats();
+            std::printf("key-stress %s: %d/26 seen down, %d/26 released clean  "
+                        "(kbdPolls=%u mousePolls=%u mouseReports=%u)\n",
+                        flood ? "MOUSE-FLOOD" : "quiet", seen, cleared,
+                        s.kbdPolls, s.mousePolls, s.mouseReports);
+        }
         return 0;
     }
 
