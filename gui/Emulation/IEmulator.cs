@@ -43,6 +43,12 @@ public interface IEmulator : IDisposable
     void EjectExternalFloppy();
 
     /// <summary>
+    /// Insert floppies with the write-protect tab set, and never copy one back
+    /// to the file it came from. Takes effect on the next insertion.
+    /// </summary>
+    bool WriteProtectFloppies { get; set; }
+
+    /// <summary>
     /// True once since the last call if a drive's contents changed without the
     /// front end asking -- the guest ejected a disk. The caller refreshes its
     /// menus; the backend has already saved whatever was written to it.

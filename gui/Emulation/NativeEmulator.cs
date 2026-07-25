@@ -257,6 +257,13 @@ public sealed class NativeEmulator : IEmulator
             Log.Line("[core] " + line);
     }
 
+    /// <summary>
+    /// Put disks in with the write-protect tab set, the way a locked disk goes
+    /// in on a real Mac. Off means the guest's writes are copied back into the
+    /// image file the disk came from.
+    /// </summary>
+    public bool WriteProtectFloppies { get; set; } = true;
+
     public void InsertFloppy(string path)
     {
         if (_h == IntPtr.Zero) return;
@@ -265,7 +272,7 @@ public sealed class NativeEmulator : IEmulator
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return;
-            Native.omac_insert_floppy(_h, img, (nuint)img.Length, 0);
+            Native.omac_insert_floppy(_h, img, (nuint)img.Length, WriteProtectFloppies ? 1 : 0);
         }
         FloppyPath = path;
     }
@@ -297,7 +304,7 @@ public sealed class NativeEmulator : IEmulator
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return;
-            Native.omac_insert_floppy2(_h, img, (nuint)img.Length, 0);
+            Native.omac_insert_floppy2(_h, img, (nuint)img.Length, WriteProtectFloppies ? 1 : 0);
         }
         ExternalDriveAttached = true;
         ExternalFloppyPath = path;
@@ -323,6 +330,11 @@ public sealed class NativeEmulator : IEmulator
     private void WriteBack(string? path, MediumReader read)
     {
         if (string.IsNullOrEmpty(path)) return;
+        // A locked disk never goes back to its file. The guest could not have
+        // changed it, and overwriting somebody's master image on the strength of
+        // a bug in our own write path is not a risk worth carrying for a disk we
+        // were told to treat as read-only.
+        if (WriteProtectFloppies) return;
         byte[]? buf = null;
         try
         {

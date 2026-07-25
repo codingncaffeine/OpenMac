@@ -10,6 +10,9 @@
                 <MenuItem Header="Open ROM…" InputGestureText="Ctrl+O" Click="OpenRom_Click" />
                 <MenuItem x:Name="RecentMenu" Header="Open Recent" />
                 <Separator />
+                <MenuItem x:Name="WriteProtectItem" Header="Write-Protect Floppies"
+                          IsCheckable="True" Click="WriteProtectFloppies_Click"
+                          ToolTip="Locks the tab on every floppy, the way a locked disk is locked. Turn this off to let the Mac save changes back into the image file it came from." />
                 <MenuItem Header="Insert Floppy in Internal Drive…" Click="InsertFloppy_Click" />
                 <MenuItem x:Name="EjectFloppyItem" Header="Eject Floppy from Internal Drive"
                           Click="EjectFloppy_Click" />

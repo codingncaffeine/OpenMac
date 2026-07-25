@@ -15,6 +15,13 @@ public sealed class Settings
     public string? LastExternalFloppy { get; set; }
     public bool ExternalDrive { get; set; }
     public string? LastHardDisk { get; set; }
+    /// <summary>
+    /// Put every floppy in with its write-protect tab set. On by default: the
+    /// images people run are masters they did not make and cannot re-make, and
+    /// a disk mounted read-write is written to whether or not anyone asked --
+    /// clearing the volume-unmounted bit in the MDB is the System's first act.
+    /// </summary>
+    public bool WriteProtectFloppies { get; set; } = true;
     public List<string> RecentRoms { get; set; } = new();
 
     /// <summary>

@@ -44,6 +44,7 @@ public partial class MainWindow : Window
 
         _settings = Settings.Load();
         _emulator = CreateBackend();
+        _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
         int w = _emulator.ScreenWidth, h = _emulator.ScreenHeight;
         _bgra = new byte[w * h * 4];
         _bitmap = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
@@ -201,10 +202,13 @@ public partial class MainWindow : Window
     // ---- machine lifecycle ----
     private void LoadRom(string path)
     {
-        Log.Line($"load ROM: {path}  (RAM={_settings.RamMB} MB, bootRomDisk={_settings.BootRomDisk})");
+        Log.Line($"load ROM: {path}  (RAM={_settings.RamMB} MB, bootRomDisk={_settings.BootRomDisk}, "
+                 + $"floppies {(_settings.WriteProtectFloppies ? "write-protected" : "writable")})");
         try
         {
             _emulator.LoadRom(path, _settings.RamMB, _settings.BootRomDisk);
+            // Before any disk goes in: the tab is read at insertion.
+            _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
             if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy))
                 _emulator.InsertFloppy(_settings.LastFloppy!);
             if (_settings.ExternalDrive) _emulator.SetExternalDrive(true);
@@ -303,6 +307,26 @@ public partial class MainWindow : Window
     // A Classic has a second drive port. Connecting a mechanism makes the ROM
     // register a second floppy drive, and a disk put in after the machine has
     // started mounts like any other. A disk already sitting in it at power-on is
+    // Disks go in locked by default. A disk image is usually a master somebody
+    // else made, it cannot be re-made once overwritten, and mounting an HFS
+    // volume read-write writes to it whether or not anyone asked -- the System
+    // clears the volume-unmounted bit in the MDB as its first act. Unlocking is
+    // a deliberate choice to let the Mac keep what it writes.
+    private void WriteProtectFloppies_Click(object sender, RoutedEventArgs e)
+    {
+        bool on = WriteProtectItem.IsChecked;
+        _settings.WriteProtectFloppies = on;
+        _settings.Save();
+        _emulator.WriteProtectFloppies = on;
+        Log.Line($"floppies are now {(on ? "write-protected" : "writable")}");
+        // The tab is read when a disk goes in, so re-seat whatever is already
+        // in a drive rather than leaving the menu disagreeing with the machine.
+        if (_emulator.FloppyPath is { } f && File.Exists(f)) _emulator.InsertFloppy(f);
+        if (_emulator.ExternalFloppyPath is { } x && File.Exists(x))
+            _emulator.InsertExternalFloppy(x);
+        UpdateUi();
+    }
+
     // thrown out by the ROM's own port probe, so put one in after booting.
     private void ExternalDrive_Click(object sender, RoutedEventArgs e)
     {
@@ -461,6 +485,7 @@ public partial class MainWindow : Window
         Mem2Item.IsChecked = _settings.RamMB == 2;
         Mem4Item.IsChecked = _settings.RamMB == 4;
         BootRomDiskItem.IsChecked = _settings.BootRomDisk;
+        WriteProtectItem.IsChecked = _settings.WriteProtectFloppies;
 
         ScaleFitItem.IsChecked = _settings.Scale == 0;
         Scale1Item.IsChecked = _settings.Scale == 1;
