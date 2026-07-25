@@ -1475,8 +1475,21 @@ void Machine::runFrame() {
     // frame ~1920). The old frame>1200 guess fired ~100M cycles before that, into
     // a still-0xFFFFFFFF queue header, and address-errored. Gate on the queue
     // being initialized instead of guessing a frame; retry every 90 frames.
+    //
+    // ...and only while the File Manager is idle. Bit 0 of $0360 is its busy
+    // flag: the queue dispatcher at $404362 does BSET #0,$000360 and, finding it
+    // already set, returns without dispatching -- the request stays queued for
+    // whoever owns the queue to pick up when it finishes. A synchronous
+    // _MountVol injected while the System is inside a File Manager call of its
+    // own therefore parks on the queue and its caller spins on ioResult at
+    // $404332. That caller is this injection, running nested inside the very
+    // code that owns the queue and cannot resume until the injection returns.
+    // Neither side moves again: the machine sits on the happy Mac forever, with
+    // the disk it was waiting for never read. Waiting for an idle moment costs
+    // at most another 90 frames.
     if (hdAutoMount_ && hdDriveNum_ != 0 && hdMountPb_ != 0 && !hdMounted_ &&
         diskEvtPosts_ < 15 && (frameCounter_ % 90) == 0 && !inSony_ &&
+        (read8(0x0360) & 1) == 0 &&
         (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) != 0xFFFFFFFFu)) {
         // Mount the hard-disk volume once the System is up (the boot path only
         // mounts the startup floppy). Preserve the interrupted System's
