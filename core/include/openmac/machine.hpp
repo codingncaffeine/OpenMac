@@ -270,6 +270,13 @@ public:
     void write8(u32 addr, u8 value) override;
     void write16(u32 addr, u16 value) override;
 
+    // Run a Mac A-line trap synchronously on the guest, nested inside whatever
+    // it was doing. Only PC/SR are preserved -- the caller saves and restores
+    // any registers it needs, checks the owning manager's busy flag first
+    // (File Manager: bit 0 of $0360), and takes the same care a driver would.
+    // Public for the test harness's guest-side exercises.
+    void execute68kTrap(u16 trap);
+
 private:
     void wireVia();
     void logAccess(const char* what, u32 addr, bool write, u32 value);
@@ -301,8 +308,6 @@ private:
     int sonyPrime(u32 pb, u32 dce);
     int sonyControl(u32 pb, u32 dce);
     int sonyStatus(u32 pb, u32 dce);
-    // Run a Mac A-line trap synchronously from within a driver handler.
-    void execute68kTrap(u16 trap);
 
     // IWM/SWIM disk controller. The chip itself lives in Iwm; the machine owns
     // the drives and feeds it the selected drive status line before each access.

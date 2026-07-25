@@ -926,6 +926,7 @@ int main(int argc, char** argv) {
     // exactly the code a patched trap or an application lands in.
     u32 liveDisasmAddr = 0; int liveDisasmCount = 0;
     bool driveInstall = false;
+    bool writeTest = false;   // --write-test: guest-side FM write exercise + host verify
     int traceIwm = 0; bool noSonyShim = false; bool sonyShimOn = false; bool swimOn = false, swimOff = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
     bool floppy800k = false, insert800k = false, insert800kRW = false;
@@ -1042,6 +1043,7 @@ int main(int argc, char** argv) {
             disasmSet = true;
         }
         else if (arg == "--drive-install") driveInstall = true;
+        else if (arg == "--write-test") writeTest = true;
         else if (arg == "--floppy2" && i + 1 < argc) dcfg.floppy2 = argv[++i];
         else if (arg == "--di-shot" && i + 1 < argc) dcfg.shotBase = argv[++i];
         else if (arg == "--di-hdout" && i + 1 < argc) dcfg.hdOut = argv[++i];
@@ -1447,6 +1449,188 @@ int main(int argc, char** argv) {
     };
 
     if (driveInstall) { dcfg.floppy1 = floppyPath; return runDriveInstall(mac, dcfg); }
+
+    if (writeTest) {
+        // Exercise the full File Manager -> Device Manager -> disk-driver ->
+        // SCSI write chain with host-verifiable data, without needing an OS
+        // install to reproduce a write loss. Boot (the caller passes
+        // --force-rom --harddisk-format N), wait for the hard disk's volume,
+        // then inject _Create/_Open/_Write/_FlushVol on the guest. Every
+        // 512-byte chunk written is self-identifying (op, chunk index), so
+        // the image scan afterwards names exactly which parts of which write
+        // arrived, regardless of where HFS placed them.
+        auto rd16v = [&](u32 a) { return mac.read16(a); };
+        auto wr32v = [&](u32 a, u32 v) {
+            mac.write16(a, u16(v >> 16));
+            mac.write16(a + 2, u16(v));
+        };
+        // Nested-trap discipline (reference: the _MountVol deadlock): wait for
+        // the File Manager to be idle, preserve every register the trap could
+        // clobber, and hand back the guest exactly as it was.
+        auto fsIdle = [&](int cap) {
+            for (int i = 0; i < cap && (mac.read8(0x0360) & 1); ++i) mac.runFrame();
+            return (mac.read8(0x0360) & 1) == 0;
+        };
+        auto doTrap = [&](u16 trap, u32 a0) -> int {
+            u32 sd[8], sa[8];
+            for (int i = 0; i < 8; ++i) { sd[i] = mac.cpu().d[i]; sa[i] = mac.cpu().a[i]; }
+            mac.cpu().a[0] = a0;
+            mac.execute68kTrap(trap);
+            const int r = static_cast<s16>(mac.cpu().d[0] & 0xFFFF);
+            for (int i = 0; i < 8; ++i) { mac.cpu().d[i] = sd[i]; mac.cpu().a[i] = sa[i]; }
+            return r;
+        };
+        auto allocSys = [&](u32 size) -> u32 {
+            u32 sd[8], sa[8];
+            for (int i = 0; i < 8; ++i) { sd[i] = mac.cpu().d[i]; sa[i] = mac.cpu().a[i]; }
+            mac.cpu().d[0] = size;
+            mac.execute68kTrap(0xA71E);            // _NewPtr ,Sys ,Clear
+            const u32 p = mac.cpu().a[0] & 0xFFFFFF;
+            for (int i = 0; i < 8; ++i) { mac.cpu().d[i] = sd[i]; mac.cpu().a[i] = sa[i]; }
+            return p;
+        };
+
+        // Boot until the hard disk's volume is mounted (the deferred _MountVol
+        // reports 0 = mounted or FFC9 = already on-line), plus settle time.
+        int bootF = 0;
+        for (; bootF < frames && !mac.cpu().halted; ++bootF) {
+            mac.runFrame();
+            if (mac.diskEvtPosts() > 0 &&
+                (mac.diskEvtResult() == 0 || mac.diskEvtResult() == 0xFFC9)) break;
+        }
+        std::printf("write-test: HD mount result=%04X at frame %d\n", mac.diskEvtResult(), bootF);
+        for (int i = 0; i < 240 && !mac.cpu().halted; ++i) mac.runFrame();
+        if (mac.cpu().halted || mac.diskEvtPosts() == 0) {
+            std::printf("write-test: FAIL -- no mounted hard disk to write to\n");
+            return 1;
+        }
+        if (!fsIdle(600)) { std::printf("write-test: FAIL -- FSBusy never cleared\n"); return 1; }
+
+        const u32 pb = allocSys(128);
+        const u32 name = allocSys(8);
+        const u32 buf = allocSys(8192);
+        std::printf("write-test: pb=%06X name=%06X buf=%06X\n", pb, name, buf);
+        if (!pb || !name || !buf) { std::printf("write-test: FAIL -- guest alloc\n"); return 1; }
+        mac.write8(name, 5);                        // "WTEST"
+        const char* nm = "WTEST";
+        for (int i = 0; i < 5; ++i) mac.write8(name + 1 + u32(i), u8(nm[i]));
+
+        wr32v(pb + 18, name);                       // ioNamePtr
+        mac.write16(pb + 22, 4);                    // ioVRefNum = drive 4 (the HD)
+        int r = doTrap(0xA008, pb);                 // _Create
+        std::printf("write-test: _Create = %d\n", r);
+        mac.write8(pb + 27, 3);                     // ioPermssn = rdWr
+        r = doTrap(0xA000, pb);                     // _Open
+        const u16 refNum = rd16v(pb + 24);
+        std::printf("write-test: _Open = %d refNum=%u\n", r, refNum);
+        if (r != 0) { std::printf("write-test: FAIL -- open\n"); return 1; }
+
+        // Each written 512-byte chunk: 'W','T',op,chunkIdx then a rolling
+        // pattern seeded by both. opIdx 0..N-1, sequential file offsets.
+        struct Op { u32 size; bool async; int result; u32 actCount; };
+        std::vector<Op> ops = {
+            {512, false, 0, 0},  {1536, false, 0, 0}, {4096, false, 0, 0},
+            {8192, false, 0, 0}, {2048, true, 0, 0},  {2048, true, 0, 0},
+            {2048, true, 0, 0},  {2048, true, 0, 0},
+        };
+        auto fillChunks = [&](u32 dst, int opIdx, u32 size, u32 fileOff) {
+            for (u32 c = 0; c < size / 512; ++c) {
+                const u32 base = dst + c * 512;
+                const u32 chunkIdx = (fileOff / 512) + c;
+                mac.write8(base + 0, 'W'); mac.write8(base + 1, 'T');
+                mac.write8(base + 2, u8(opIdx)); mac.write8(base + 3, u8(chunkIdx));
+                for (u32 j = 4; j < 512; ++j)
+                    mac.write8(base + j, u8(0x11 * (opIdx + 1) + chunkIdx * 7 + j));
+            }
+        };
+
+        u32 fileOff = 0;
+        std::vector<u32> asyncPbs;
+        for (std::size_t k = 0; k < ops.size(); ++k) {
+            const u32 sz = ops[k].size;
+            if (!fsIdle(600)) { std::printf("write-test: FSBusy stuck before op %zu\n", k); break; }
+            // Async ops get their own PB and buffer -- the data must stay put
+            // until the queued request actually runs.
+            const u32 opb = ops[k].async ? allocSys(128) : pb;
+            const u32 obuf = ops[k].async ? allocSys(sz) : buf;
+            fillChunks(obuf, int(k), sz, fileOff);
+            wr32v(opb + 12, 0);                     // ioCompletion
+            mac.write16(opb + 24, refNum);
+            wr32v(opb + 32, obuf);                  // ioBuffer
+            wr32v(opb + 36, sz);                    // ioReqCount
+            mac.write16(opb + 44, 1);               // posMode = from start
+            wr32v(opb + 46, fileOff);               // posOffset
+            const int res = doTrap(ops[k].async ? 0xA403 : 0xA003, opb);   // _Write
+            ops[k].result = res;
+            ops[k].actCount = (u32(rd16v(opb + 40)) << 16) | rd16v(opb + 42);
+            std::printf("write-test: op %zu %s size=%u off=%u -> D0=%d act=%u\n",
+                        k, ops[k].async ? "ASYNC" : "sync ", sz, fileOff,
+                        res, ops[k].actCount);
+            if (ops[k].async) asyncPbs.push_back(opb);
+            fileOff += sz;
+        }
+        // Let the queued async writes finish: ioResult flips from 1 to <= 0.
+        for (int i = 0; i < 1200 && !mac.cpu().halted; ++i) {
+            bool pending = false;
+            for (u32 apb : asyncPbs)
+                if (s16(rd16v(apb + 16)) > 0) pending = true;
+            if (!pending) break;
+            mac.runFrame();
+        }
+        for (std::size_t k = 0, a = 0; k < ops.size(); ++k)
+            if (ops[k].async)
+                std::printf("write-test: async op %zu final ioResult=%d act=%u\n", k,
+                            s16(rd16v(asyncPbs[a] + 16)),
+                            (u32(rd16v(asyncPbs[a] + 40)) << 16) | rd16v(asyncPbs[a] + 42)),
+                    ++a;
+
+        if (!fsIdle(600)) std::printf("write-test: FSBusy stuck before flush\n");
+        const u32 fpb = allocSys(128);
+        wr32v(fpb + 18, 0);
+        mac.write16(fpb + 22, 4);
+        r = doTrap(0xA013, fpb);                    // _FlushVol
+        std::printf("write-test: _FlushVol = %d\n", r);
+        for (int i = 0; i < 240 && !mac.cpu().halted; ++i) mac.runFrame();
+
+        // Ground truth: scan the image for every chunk we wrote.
+        const auto& img = mac.hardDiskImage();
+        int okOps = 0;
+        for (std::size_t k = 0, off = 0; k < ops.size(); off += ops[k].size, ++k) {
+            const u32 nChunks = ops[k].size / 512;
+            u32 found = 0, intact = 0;
+            std::string missing;
+            for (u32 c = 0; c < nChunks; ++c) {
+                const u8 chunkIdx = u8(off / 512 + c);
+                std::size_t pos = std::string::npos;
+                for (std::size_t p = 0; p + 512 <= img.size(); p += 512) {
+                    if (img[p] == 'W' && img[p+1] == 'T' && img[p+2] == u8(k) &&
+                        img[p+3] == chunkIdx) { pos = p; break; }
+                }
+                if (pos == std::string::npos) {
+                    missing += " " + std::to_string(int(chunkIdx));
+                    continue;
+                }
+                ++found;
+                bool good = true;
+                for (u32 j = 4; j < 512; ++j)
+                    if (img[pos + j] != u8(0x11 * (u32(k) + 1) + u32(chunkIdx) * 7 + j)) {
+                        good = false;
+                        break;
+                    }
+                if (good) ++intact;
+            }
+            const bool ok = found == nChunks && intact == nChunks;
+            okOps += ok ? 1 : 0;
+            std::printf("write-test: op %zu %s size=%-5u chunks=%u found=%u intact=%u%s%s\n",
+                        k, ops[k].async ? "ASYNC" : "sync ", ops[k].size, nChunks,
+                        found, intact, ok ? "  OK" : "  ** LOSS **",
+                        missing.empty() ? "" : (" missing:" + missing).c_str());
+        }
+        const auto sc = mac.scsiStats();
+        std::printf("write-test: SCSI dataOut=%u commands=%u  |  %d/%zu ops fully on disk\n",
+                    sc.dataOutBytes, sc.commands, okOps, ops.size());
+        return okOps == int(ops.size()) ? 0 : 1;
+    }
 
     if (disasmSet) {
         u32 a = disasmAddr;
