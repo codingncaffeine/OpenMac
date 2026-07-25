@@ -1,6 +1,5 @@
 using System.IO;
 using System.Windows;
-using Microsoft.Win32;
 using OpenMac.Gui.Emulation;
 
 namespace OpenMac.Gui.Dialogs;
@@ -10,8 +9,11 @@ public partial class CreateHardDiskDialog : Window
     /// <summary>Path of the image created when the dialog returns true.</summary>
     public string? CreatedPath { get; private set; }
 
-    public CreateHardDiskDialog()
+    private readonly Settings _settings;
+
+    public CreateHardDiskDialog(Settings settings)
     {
+        _settings = settings;
         InitializeComponent();
         WindowTheming.ApplyDarkTitleBar(this);
 
@@ -29,16 +31,11 @@ public partial class CreateHardDiskDialog : Window
 
     private void Browse_Click(object sender, RoutedEventArgs e)
     {
-        var dlg = new SaveFileDialog
-        {
-            Title = "Save hard-disk image",
-            Filter = "Disk image (*.img)|*.img|All files (*.*)|*.*",
-            FileName = SafeFileName(NameBox.Text) + ".img",
-            AddExtension = true,
-            DefaultExt = ".img",
-        };
-        if (dlg.ShowDialog(this) == true)
-            PathBox.Text = dlg.FileName;
+        if (FilePicker.Save(this, _settings, FilePicker.HardDisk, "Save hard-disk image",
+                            "Disk image (*.img)|*.img|All files (*.*)|*.*",
+                            SafeFileName(NameBox.Text) + ".img", ".img",
+                            _settings.LastHardDisk) is { } path)
+            PathBox.Text = path;
         Log.Line($"create hard disk: save-as -> \"{PathBox.Text}\"");
     }
 

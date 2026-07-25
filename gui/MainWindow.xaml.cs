@@ -6,7 +6,6 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using Microsoft.Win32;
 using OpenMac.Gui.Dialogs;
 using OpenMac.Gui.Emulation;
 
@@ -14,6 +13,11 @@ namespace OpenMac.Gui;
 
 public partial class MainWindow : Window
 {
+    // Both drives take the same images, so they offer the same filter and share
+    // the remembered folder.
+    private const string DiskImageFilter =
+        "Disk image (*.img;*.image;*.dsk;*.dc42)|*.img;*.image;*.dsk;*.dc42|All files (*.*)|*.*";
+
     private readonly Settings _settings;
     private IEmulator _emulator;
     private readonly WriteableBitmap _bitmap;
@@ -226,12 +230,10 @@ public partial class MainWindow : Window
 
     private void OpenRom_Click(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFileDialog
-        {
-            Title = "Open Macintosh ROM",
-            Filter = "Macintosh ROM (*.rom;*.bin)|*.rom;*.bin|All files (*.*)|*.*",
-        };
-        if (dlg.ShowDialog(this) == true) LoadRom(dlg.FileName);
+        if (FilePicker.Open(this, _settings, FilePicker.Rom, "Open Macintosh ROM",
+                            "Macintosh ROM (*.rom;*.bin)|*.rom;*.bin|All files (*.*)|*.*",
+                            _settings.LastRom) is { } path)
+            LoadRom(path);
     }
 
     private void BuildRecentMenu()
@@ -279,15 +281,11 @@ public partial class MainWindow : Window
     // ---- disks ----
     private void InsertFloppy_Click(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFileDialog
+        if (FilePicker.Open(this, _settings, FilePicker.Floppy, "Insert Floppy",
+                            DiskImageFilter, _settings.LastFloppy) is { } path)
         {
-            Title = "Insert Floppy",
-            Filter = "Disk image (*.img;*.image;*.dsk;*.dc42)|*.img;*.image;*.dsk;*.dc42|All files (*.*)|*.*",
-        };
-        if (dlg.ShowDialog(this) == true)
-        {
-            _emulator.InsertFloppy(dlg.FileName);
-            _settings.LastFloppy = dlg.FileName;
+            _emulator.InsertFloppy(path);
+            _settings.LastFloppy = path;
             _settings.Save();
             UpdateUi();
         }
@@ -318,16 +316,13 @@ public partial class MainWindow : Window
 
     private void InsertExternalFloppy_Click(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFileDialog
+        if (FilePicker.Open(this, _settings, FilePicker.Floppy,
+                            "Insert Floppy (External Drive)", DiskImageFilter,
+                            _settings.LastExternalFloppy ?? _settings.LastFloppy) is { } path)
         {
-            Title = "Insert Floppy (External Drive)",
-            Filter = "Disk image (*.img;*.image;*.dsk;*.dc42)|*.img;*.image;*.dsk;*.dc42|All files (*.*)|*.*",
-        };
-        if (dlg.ShowDialog(this) == true)
-        {
-            _emulator.InsertExternalFloppy(dlg.FileName);
+            _emulator.InsertExternalFloppy(path);
             _settings.ExternalDrive = true;
-            _settings.LastExternalFloppy = dlg.FileName;
+            _settings.LastExternalFloppy = path;
             _settings.Save();
             UpdateUi();
         }
@@ -343,18 +338,16 @@ public partial class MainWindow : Window
 
     private void AttachHardDisk_Click(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFileDialog
-        {
-            Title = "Attach Hard Disk",
-            Filter = "Disk image (*.img;*.dsk;*.hda)|*.img;*.dsk;*.hda|All files (*.*)|*.*",
-        };
-        if (dlg.ShowDialog(this) == true) AttachHardDisk(dlg.FileName);
+        if (FilePicker.Open(this, _settings, FilePicker.HardDisk, "Attach Hard Disk",
+                            "Disk image (*.img;*.dsk;*.hda)|*.img;*.dsk;*.hda|All files (*.*)|*.*",
+                            _settings.LastHardDisk) is { } path)
+            AttachHardDisk(path);
     }
 
     private void CreateHardDisk_Click(object sender, RoutedEventArgs e)
     {
         Log.Line("create hard disk: dialog opened");
-        var dlg = new CreateHardDiskDialog { Owner = this };
+        var dlg = new CreateHardDiskDialog(_settings) { Owner = this };
         bool made = dlg.ShowDialog() == true && dlg.CreatedPath is not null;
         Log.Line($"create hard disk: dialog closed, created={made}");
         if (made) AttachHardDisk(dlg.CreatedPath!);
