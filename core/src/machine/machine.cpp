@@ -814,6 +814,24 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hfsImageOffset_ = static_cast<u32>((4 + drvBlocks) * 512);
     scsi_->disk.attach(&scsiImage_, 0);
     scsi_->disk.readOnly = readOnly;
+    // Offset watch: report any committed block I/O that covers the watched
+    // HFS-volume byte, with the bytes that moved and the guest PC. This is how
+    // a single corrupted length word gets a timeline.
+    scsi_->disk.onBlockIo = [this](bool write, u32 lba, const u8* data, u32 len) {
+        if (hfsWatch_ < 0 || !onDiag) return;
+        const s64 abs = static_cast<s64>(hfsImageOffset_) + hfsWatch_;
+        const s64 lo = static_cast<s64>(lba) * 512, hi = lo + len;
+        if (abs < lo || abs >= hi) return;
+        const u8* p = data + (abs - lo);
+        u32 avail = static_cast<u32>(hi - abs);
+        if (avail > 16) avail = 16;
+        char b[200];
+        int n = std::snprintf(b, sizeof b, "hdwatch: %s lba=%u len=%u pc=%06X bytes:",
+                              write ? "WRITE" : "read ", lba, len, cpu_.pc);
+        for (u32 i = 0; i < avail && n > 0 && n < static_cast<int>(sizeof b) - 4; ++i)
+            n += std::snprintf(b + n, sizeof b - static_cast<std::size_t>(n), " %02X", p[i]);
+        onDiag(b);
+    };
 }
 
 void Machine::setSwimEnabled(bool on) { iwm_->swimEnabled = on; }
@@ -1438,8 +1456,9 @@ void Machine::watchSonyPrime() {
     // the wrong bytes without reporting an error is invisible from every other
     // vantage: the driver is happy, the System is happy, and the damage shows up
     // later as a file that will not open.
-    verifyPending_ = verifyReads_ && isRead && drive == 1 && length > 0;
+    verifyPending_ = verifyReads_ && isRead && (drive == 1 || drive == 2) && length > 0;
     if (verifyPending_) {
+        verifyDrive_ = drive;
         verifyPos_ = position;
         verifyLen_ = length;
         verifyBuf_ = read32(pb + ioBuffer);
@@ -1457,7 +1476,8 @@ void Machine::watchSonyPrime() {
 void Machine::verifyLastRead() {
     if (!verifyPending_) return;
     verifyPending_ = false;
-    const std::vector<u8>* img = drive0_->image;
+    SonyDrive& drv = verifyDrive_ == 2 ? *drive1_ : *drive0_;
+    const std::vector<u8>* img = drv.image;
     if (!img) return;
     const u32 len = verifyLen_;
     if (verifyPos_ + len > img->size()) return;      // past the end; not our business
@@ -1466,7 +1486,7 @@ void Machine::verifyLastRead() {
     // then correct while the image is stale. Fold the pending track in first,
     // exactly as the head moving off it would, so the comparison is against
     // what the disk actually holds.
-    flushFloppyTrack();
+    flushTrack(drv);
     ++readsVerified_;
     for (u32 i = 0; i < len; ++i) {
         const u8 want = (*img)[verifyPos_ + i];
@@ -1483,9 +1503,9 @@ void Machine::verifyLastRead() {
                 if ((*img)[verifyPos_ + j] != read8(verifyBuf_ + j)) ++bad;
             char b[192];
             std::snprintf(b, sizeof b,
-                          "READ WRONG: block %u len %u -- first bad byte at +%u "
+                          "READ WRONG: drive %d block %u len %u -- first bad byte at +%u "
                           "(sector %u of the request), got %02X want %02X, %u of %u bytes differ",
-                          verifyPos_ / 512u, len, i, i / 512u, got, want, bad, len);
+                          verifyDrive_, verifyPos_ / 512u, len, i, i / 512u, got, want, bad, len);
             onDiag(b);
         }
         return;

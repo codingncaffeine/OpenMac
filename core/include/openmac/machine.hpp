@@ -66,6 +66,11 @@ public:
     // vantage -- the driver is satisfied, the System is satisfied, and it
     // surfaces much later as a file that will not open.
     void setVerifyReads(bool on) { verifyReads_ = on; }
+    // Log every SCSI block read/write that touches this byte of the HFS volume
+    // (offset within the volume, not the partitioned image; -1 = off). The bytes
+    // at the watched offset and the guest PC go to onDiag -- the tool for asking
+    // "who wrote THIS word, and what did it write".
+    void setHfsWatch(s64 volumeByteOff) { hfsWatch_ = volumeByteOff; }
     u32 readsVerified() const { return readsVerified_; }
     u32 readMismatches() const { return readMismatches_; }
     bool overlayActive() const { return overlay_; }
@@ -361,6 +366,8 @@ private:
     // Read verification: what the last Prime was asked for, so what it delivers
     // can be compared against the medium once it reports success.
     bool verifyReads_ = false, verifyPending_ = false;
+    int verifyDrive_ = 1;          // which drive the pending verification read hit
+    s64 hfsWatch_ = -1;            // watched HFS-volume byte offset (-1 = off)
     u32 verifyPos_ = 0, verifyLen_ = 0, verifyBuf_ = 0;
     u32 readsVerified_ = 0, readMismatches_ = 0;
     int verifyLog_ = 20;

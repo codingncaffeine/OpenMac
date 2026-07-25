@@ -20,6 +20,7 @@
 #include "openmac/types.hpp"
 
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,9 @@ public:
     }
     int  id() const { return id_; }
     bool readOnly = false;
+    // Spy on committed block I/O: (isWrite, lba, bytes, byteLen), bytes being what
+    // was written to / read from the image. The machine points an offset watch here.
+    std::function<void(bool, u32, const u8*, u32)> onBlockIo;
 
     u32 blockCount() const {
         return image_ ? static_cast<u32>(image_->size() / 512u) : 0u;
@@ -114,6 +118,7 @@ public:
         const std::size_t off = static_cast<std::size_t>(lba) * 512u;
         for (std::size_t i = 0; i < data.size() && off + i < image_->size(); ++i)
             (*image_)[off + i] = data[i];
+        if (onBlockIo) onBlockIo(true, lba, data.data(), static_cast<u32>(data.size()));
     }
 
 private:
@@ -131,6 +136,7 @@ private:
         const std::size_t off = static_cast<std::size_t>(lba) * 512u;
         for (std::size_t i = 0; i < out.size(); ++i)
             out[i] = (off + i < image_->size()) ? (*image_)[off + i] : 0;
+        if (onBlockIo) onBlockIo(false, lba, out.data(), static_cast<u32>(out.size()));
         return 0x00;
     }
 
