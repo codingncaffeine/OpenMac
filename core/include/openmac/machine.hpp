@@ -293,6 +293,15 @@ private:
     int floppyEjectSense_ = 0;         // frames to report "no disk" so the ROM sees a swap edge
     int cstinLogBudget_ = 0;           // trace the next N disk-in-place sense reads after a swap
 
+    // The last few distinct status lines the driver read, so a drive command can
+    // be explained by the poll sequence that led to it.
+    struct SenseSample { u32 frame; u32 pc; u8 addr; u8 level; };
+    static constexpr unsigned kSenseRing = 16;
+    SenseSample senseRing_[kSenseRing] = {};
+    unsigned senseRingN_ = 0;
+    static const char* senseLineName(int addr);
+    void dumpSenseRing(const char* why);
+
     std::vector<u8> ram_;
     std::vector<u8> rom_;
     u32 ramMask_ = 0;

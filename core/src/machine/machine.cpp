@@ -878,8 +878,46 @@ bool Machine::iwmSenseLine() {
         std::snprintf(b, sizeof b, "CSTIN poll: %s", level ? "no-disk" : "disk-in");
         onDiag(b);
     }
+    // Keep the last few distinct lines the driver asked about. A drive command is
+    // the end of a conversation -- the driver polls its way to a decision and then
+    // acts -- so when it does something drastic, what it asked on the way there is
+    // the only record of why. Repeats are collapsed: the driver spins on one line
+    // for hundreds of reads, and a ring full of one answer says nothing.
+    if (senseRingN_ == 0 || senseRing_[(senseRingN_ - 1) % kSenseRing].addr != addr ||
+        senseRing_[(senseRingN_ - 1) % kSenseRing].level != (level ? 1 : 0)) {
+        SenseSample& s = senseRing_[senseRingN_ % kSenseRing];
+        s.addr = static_cast<u8>(addr);
+        s.level = level ? 1 : 0;
+        s.frame = static_cast<u32>(frameCounter_);
+        s.pc = cpu_.pc;
+        ++senseRingN_;
+    }
     if (addr == 0x6 && !level) d.clearSwitched();   // reading the line clears it
     return level;
+}
+
+// Names for the drive's multiplexed status lines, addressed CA2:CA1:CA0:SEL.
+const char* Machine::senseLineName(int addr) {
+    static const char* kNames[16] = {
+        "DIRTN",    "CSTIN",  "STEP",     "WRTPRT",
+        "MOTORON",  "TK0",    "SWITCHED", "TACH",
+        "RDDATA0",  "RDDATA1","SUPERDRV", "?B",
+        "SIDES",    "READY",  "INSTALLED","DRVIN"};
+    return kNames[addr & 15];
+}
+
+void Machine::dumpSenseRing(const char* why) {
+    if (!onDiag) return;
+    char b[128];
+    std::snprintf(b, sizeof b, "  %s -- the drive was asked, most recent last:", why);
+    onDiag(b);
+    const unsigned have = senseRingN_ < kSenseRing ? senseRingN_ : kSenseRing;
+    for (unsigned i = 0; i < have; ++i) {
+        const SenseSample& s = senseRing_[(senseRingN_ - have + i) % kSenseRing];
+        std::snprintf(b, sizeof b, "    frame %-6u %-9s = %d   (PC %06X)",
+                      s.frame, senseLineName(s.addr), s.level, s.pc);
+        onDiag(b);
+    }
 }
 
 // A drive command is latched on the rising edge of LSTRB, with the register in
@@ -898,6 +936,24 @@ void Machine::iwmStrobe() {
         if (!lstrbPrev_) {
             d.command(cmd, bit, totalCycles_);
             ++sonyCmds_[iwm_->externalDrive() ? 1 : 0][cmd & 7];
+            // An eject is never routine and never silent. It takes a volume
+            // off-line under a running System, so who armed it -- and from what
+            // code -- is worth knowing every time, not only while a log budget
+            // lasts. The eject itself matures ~750 ms later, by which time the
+            // CPU is somewhere unrelated, so this is the only useful vantage.
+            if ((cmd & 7) == 0x6 && bit && onDiag) {
+                char b[192];
+                std::snprintf(b, sizeof b,
+                              "sony: EJECT armed on drive%d at frame %u from PC %06X "
+                              "(addr=%X CA2=%d CA1=%d CA0=%d SEL=%d PA4=%d)",
+                              iwm_->externalDrive() ? 2 : 1,
+                              static_cast<unsigned>(frameCounter_), cpu_.pc,
+                              addr, (addr >> 3) & 1, (addr >> 2) & 1, (addr >> 1) & 1,
+                              addr & 1, (via_->ora() >> 4) & 1);
+                onDiag(b);
+
+                dumpSenseRing("EJECT");
+            }
             if (sonyCmdLog_ > 0 && onDiag) {
                 --sonyCmdLog_;
                 static const char* kCmd[8] = {"DIRTN", "?1", "STEP", "?3",
@@ -917,9 +973,22 @@ void Machine::iwmStrobe() {
         SonyDrive& d = selectedDrive();
         d.tickEject(totalCycles_);
         if (d.takeEjectRequest()) {
-            if (&d == drive0_.get()) flushFloppyTrack();   // before the medium goes
+            const bool internal = (&d == drive0_.get());
+            // Say which drive, when, and who asked. An eject the guest did not
+            // intend takes the volume off-line under a running System, and from
+            // the outside that is indistinguishable from a disk that failed to
+            // mount; the commanding PC is what tells the two apart.
+            if (onDiag) {
+                char b[128];
+                std::snprintf(b, sizeof b,
+                              "sony: %s drive ejected its disk (frame %u)",
+                              internal ? "internal" : "external",
+                              static_cast<unsigned>(frameCounter_));
+                onDiag(b);
+            }
+            if (internal) flushFloppyTrack();              // before the medium goes
             d.removeDisk();
-            if (&d == drive0_.get()) {
+            if (internal) {
                 // Ejecting a disk does not destroy it. Keep the medium's final
                 // contents so the host can still write them back to the file it
                 // came from -- everything the guest wrote up to this moment has
@@ -929,7 +998,6 @@ void Machine::iwmStrobe() {
                 ++floppyGen_;
                 floppyRO_ = false;
                 ++floppyEjects_;
-                if (onDiag) onDiag("sony: drive ejected the disk");
             }
         }
     }

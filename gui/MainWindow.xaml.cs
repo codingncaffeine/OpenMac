@@ -472,11 +472,19 @@ public partial class MainWindow : Window
         Scale2Item.IsChecked = _settings.Scale == 2;
         Scale3Item.IsChecked = _settings.Scale == 3;
 
+        // Name the disk each eject would actually throw out. With two drives, "Eject
+        // Floppy" alone leaves the user to remember which disk went where.
+        static string EjectLabel(string drive, string? path) =>
+            path is null ? $"Eject Floppy from {drive} Drive"
+                         : $"Eject “{Path.GetFileNameWithoutExtension(path)}” from {drive} Drive";
+
         EjectFloppyItem.IsEnabled = _emulator.FloppyPath is not null;
+        EjectFloppyItem.Header = EjectLabel("Internal", _emulator.FloppyPath);
         ExternalDriveItem.IsChecked = _emulator.ExternalDriveAttached;
         // Inserting into the external drive connects one if there isn't one, so
         // the item stays reachable rather than making the checkbox a prerequisite.
         EjectFloppy2Item.IsEnabled = _emulator.ExternalFloppyPath is not null;
+        EjectFloppy2Item.Header = EjectLabel("External", _emulator.ExternalFloppyPath);
         DetachHdItem.IsEnabled = _emulator.HardDiskAttached;
     }
 }

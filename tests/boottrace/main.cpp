@@ -867,6 +867,7 @@ int main(int argc, char** argv) {
     u16 sonyLineMask = 0, sonyLineValue = 0;
     bool floppy800k = false, insert800k = false, insert800kRW = false;
     std::string floppy800kPath, insert800kOut, externalPath;
+    std::string floppyOutPath;
     bool externalEmpty = false;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
@@ -899,6 +900,9 @@ int main(int argc, char** argv) {
         else if (arg == "--insert-800k") insert800k = true;
         else if (arg == "--insert-800k-rw") { insert800k = true; insert800kRW = true; }
         else if (arg == "--insert-800k-out" && i + 1 < argc) insert800kOut = argv[++i];
+        // Write the internal drive's medium out at the end of any run, so what the
+        // guest did to a disk can be diffed against what it started as.
+        else if (arg == "--floppy-out" && i + 1 < argc) floppyOutPath = argv[++i];
         else if (arg == "--sony-lines" && i + 2 < argc) {
             sonyLineMask  = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
             sonyLineValue = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
@@ -1749,11 +1753,57 @@ int main(int argc, char** argv) {
     std::printf("-- ADB: kbd[enum=%u modifiers=%u transitions=%u] "
                 "mouse[enum=%u polls=%u reports=%u] --\n",
                 s.kbdReg3, s.kbdReg2, s.kbdPolls, s.mouseReg3, s.mousePolls, s.mouseReports);
+    if (!floppyOutPath.empty()) {
+        const std::vector<u8>& out = mac.floppyImage();
+        std::ofstream of(floppyOutPath, std::ios::binary);
+        of.write(reinterpret_cast<const char*>(out.data()),
+                 static_cast<std::streamsize>(out.size()));
+        std::printf("-- wrote the internal drive's medium (%zu bytes) to %s --\n",
+                    out.size(), floppyOutPath.c_str());
+    }
     if (mac.hardDiskPresent())
         std::printf("-- HARD DISK: %zu bytes, drive#=%d, block accesses=%u, "
                     "mount attempts=%u last result=%04X --\n",
                     mac.hardDiskImage().size(), mac.hardDiskDriveNum(),
                     mac.hdAccessCount(), mac.diskEvtPosts(), mac.diskEvtResult());
+    // What the file system believes it has. A drive that registered but whose
+    // volume never mounted, and a volume that mounted against the wrong drive,
+    // look identical from outside; these two queues tell them apart. The drive
+    // queue ($0308) is what _AddDrive built; the volume queue ($0356) is what
+    // _MountVol built, and a disk is only usable when it appears in both.
+    {
+        auto qWord = [&](u32 a) { return mac.read16(a); };
+        auto qLong = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
+        auto rd8 = [&](u32 a) {
+            const u16 w = mac.read16(a & ~1u);
+            return static_cast<u8>((a & 1) ? (w & 0xFF) : (w >> 8));
+        };
+        std::printf("-- DRIVE QUEUE ($0308): --\n");
+        int n = 0;
+        for (u32 e = qLong(0x030A); e && n < 8; e = qLong(e), ++n) {
+            const u32 blocks = (static_cast<u32>(qWord(e + 14)) << 16) | qWord(e + 12);
+            std::printf("   drive %2d  refNum %6d  FSID %04X  %u blocks (%u KB)\n",
+                        static_cast<std::int16_t>(qWord(e + 6)), static_cast<std::int16_t>(qWord(e + 8)),
+                        qWord(e + 10), blocks, blocks / 2);
+        }
+        if (n == 0) std::printf("   (empty -- no drive ever registered)\n");
+
+        std::printf("-- VOLUME QUEUE ($0356): --\n");
+        n = 0;
+        for (u32 v = qLong(0x0358); v && n < 8; v = qLong(v), ++n) {
+            char nm[28] = {0};
+            const u8 len = rd8(v + 0x2C);          // vcbVN, a Pascal string
+            for (u8 i = 0; i < len && i < 27; ++i) nm[i] = static_cast<char>(rd8(v + 0x2D + i));
+            const u32 alBlks = qWord(v + 26), alSize = qLong(v + 28), free = qWord(v + 42);
+            std::printf("   \"%s\"  drive %d  refNum %d  vRefNum %d  sig %04X  "
+                        "%u KB free of %u KB\n",
+                        nm, static_cast<std::int16_t>(qWord(v + 72)), static_cast<std::int16_t>(qWord(v + 74)),
+                        static_cast<std::int16_t>(qWord(v + 78)), qWord(v + 8),
+                        static_cast<u32>((static_cast<u64>(free) * alSize) >> 10),
+                        static_cast<u32>((static_cast<u64>(alBlks) * alSize) >> 10));
+        }
+        if (n == 0) std::printf("   (empty -- nothing is mounted)\n");
+    }
     {
         const auto sc = mac.scsiStats();
         std::printf("-- SCSI: reads=%u writes=%u selects=%u commands=%u dataIn=%u dataOut=%u lastCDB=",

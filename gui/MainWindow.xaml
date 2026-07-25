@@ -10,13 +10,14 @@
                 <MenuItem Header="Open ROM…" InputGestureText="Ctrl+O" Click="OpenRom_Click" />
                 <MenuItem x:Name="RecentMenu" Header="Open Recent" />
                 <Separator />
-                <MenuItem Header="Insert Floppy…" Click="InsertFloppy_Click" />
-                <MenuItem x:Name="EjectFloppyItem" Header="Eject Floppy" Click="EjectFloppy_Click" />
+                <MenuItem Header="Insert Floppy in Internal Drive…" Click="InsertFloppy_Click" />
+                <MenuItem x:Name="EjectFloppyItem" Header="Eject Floppy from Internal Drive"
+                          Click="EjectFloppy_Click" />
                 <Separator />
                 <MenuItem x:Name="ExternalDriveItem" Header="External Drive Connected"
                           IsCheckable="True" Click="ExternalDrive_Click" />
-                <MenuItem Header="Insert Floppy (External)…" Click="InsertExternalFloppy_Click" />
-                <MenuItem x:Name="EjectFloppy2Item" Header="Eject Floppy (External)"
+                <MenuItem Header="Insert Floppy in External Drive…" Click="InsertExternalFloppy_Click" />
+                <MenuItem x:Name="EjectFloppy2Item" Header="Eject Floppy from External Drive"
                           Click="EjectExternalFloppy_Click" />
                 <Separator />
                 <MenuItem Header="Attach Hard Disk…" Click="AttachHardDisk_Click" />
