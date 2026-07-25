@@ -5,17 +5,58 @@
 
 namespace openmac::dbg {
 
+// A-line trap names. An OS trap word is 1010 0 fff tttttttt: the number is the
+// low byte and bits 8-10 are per-trap flags (for the Device Manager, $0400 is
+// async and $0200 immediate; for the Memory Manager, sys heap and clear). A
+// Toolbox trap word is 1010 1 ff nnnnnnnnnn, so its number is the low ten bits.
+// Names are what make a trap trace readable, and an unnamed trap in the middle
+// of one is the trace's blind spot -- so the OS table is complete rather than
+// only the traps some past session happened to need.
 const char* trapName(u16 op) {
     if ((op & 0xF000) != 0xA000) return nullptr;
     if (op & 0x0800) {                       // Toolbox trap: number in bits 0-9
-        switch (op & 0x0FFF) {
-            case 0x0BC8: return "_SysBeep";
-            case 0x0A9F: return "_InitCursor";
-            case 0x0B44: return "_DrawMenuBar";
-            case 0x0B93: return "_InitWindows";
-            case 0x0A86: return "_DrawString";
-            case 0x0A88: return "_StillDown";
-            default:     return "_Toolbox";
+        switch (op & 0x03FF) {
+            case 0x050: return "_InitCursor";
+            case 0x051: return "_SetCursor";
+            case 0x052: return "_HideCursor";
+            case 0x053: return "_ShowCursor";
+            case 0x060: return "_WaitNextEvent";
+            case 0x084: return "_DrawString";
+            case 0x112: return "_InitWindows";
+            case 0x122: return "_BeginUpdate";
+            case 0x123: return "_EndUpdate";
+            case 0x128: return "_InvalRect";
+            case 0x137: return "_DrawMenuBar";
+            case 0x13D: return "_MenuSelect";
+            case 0x170: return "_GetNextEvent";
+            case 0x171: return "_EventAvail";
+            case 0x172: return "_GetMouse";
+            case 0x173: return "_StillDown";
+            case 0x174: return "_Button";
+            case 0x175: return "_TickCount";
+            case 0x17C: return "_GetNewDialog";
+            case 0x185: return "_Alert";
+            case 0x186: return "_StopAlert";
+            case 0x187: return "_NoteAlert";
+            case 0x188: return "_CautionAlert";
+            case 0x18B: return "_ParamText";
+            case 0x191: return "_ModalDialog";
+            case 0x197: return "_OpenResFile";
+            case 0x19A: return "_CloseResFile";
+            case 0x1A0: return "_GetResource";
+            case 0x1A3: return "_ReleaseResource";
+            case 0x1B2: return "_SystemEvent";
+            case 0x1B4: return "_SystemTask";
+            case 0x1C8: return "_SysBeep";
+            case 0x1C9: return "_SysError";
+            case 0x1E5: return "_InitPack";
+            case 0x1E6: return "_InitAllPacks";
+            case 0x1E9: return "_Pack2/DiskInit";
+            case 0x1EA: return "_Pack3/StdFile";
+            case 0x1F0: return "_LoadSeg";
+            case 0x1F1: return "_UnLoadSeg";
+            case 0x1F4: return "_ExitToShell";
+            default:    return "_Toolbox";
         }
     }
     switch (op & 0x00FF) {                    // OS trap: number in bits 0-7
@@ -28,11 +69,30 @@ const char* trapName(u16 op) {
         case 0x06: return "_KillIO";
         case 0x07: return "_GetVolInfo";
         case 0x08: return "_Create";
+        case 0x09: return "_Delete";
+        case 0x0A: return "_OpenRF";
+        case 0x0B: return "_Rename";
+        case 0x0C: return "_GetFileInfo";
+        case 0x0D: return "_SetFileInfo";
+        case 0x0E: return "_UnmountVol";
         case 0x0F: return "_MountVol";
+        case 0x10: return "_Allocate";
+        case 0x11: return "_GetEOF";
+        case 0x12: return "_SetEOF";
         case 0x13: return "_FlushVol";
+        case 0x14: return "_GetVol";
+        case 0x15: return "_SetVol";
+        case 0x16: return "_FInitQueue";
+        case 0x17: return "_Eject";
+        case 0x18: return "_GetFPos";
+        case 0x19: return "_InitZone";
+        case 0x1B: return "_SetZone";
+        case 0x1C: return "_FreeMem";
         case 0x1D: return "_MaxMem";
         case 0x1E: return "_NewPtr";
         case 0x1F: return "_DisposPtr";
+        case 0x20: return "_SetPtrSize";
+        case 0x21: return "_GetPtrSize";
         case 0x22: return "_NewHandle";
         case 0x23: return "_DisposHandle";
         case 0x24: return "_SetHandleSize";
@@ -42,13 +102,92 @@ const char* trapName(u16 op) {
         case 0x28: return "_RecoverHandle";
         case 0x29: return "_HLock";
         case 0x2A: return "_HUnlock";
+        case 0x2B: return "_EmptyHandle";
+        case 0x2C: return "_InitApplZone";
+        case 0x2D: return "_SetApplLimit";
         case 0x2E: return "_BlockMove";
+        case 0x2F: return "_PostEvent";
+        case 0x30: return "_OSEventAvail";
+        case 0x31: return "_GetOSEvent";
+        case 0x32: return "_FlushEvents";
+        case 0x33: return "_VInstall";
+        case 0x34: return "_VRemove";
+        case 0x35: return "_OffLine";
+        case 0x36: return "_MoreMasters";
+        case 0x38: return "_WriteParam";
+        case 0x39: return "_ReadDateTime";
+        case 0x3A: return "_SetDateTime";
+        case 0x3B: return "_Delay";
         case 0x3C: return "_CmpString";
+        case 0x3D: return "_DrvrInstall";
+        case 0x3E: return "_DrvrRemove";
+        case 0x3F: return "_InitUtil";
         case 0x40: return "_ResrvMem";
+        case 0x41: return "_SetFilLock";
+        case 0x42: return "_RstFilLock";
+        case 0x43: return "_SetFilType";
+        case 0x44: return "_SetFPos";
+        case 0x45: return "_FlushFile";
+        case 0x46: return "_GetTrapAddress";
+        case 0x47: return "_SetTrapAddress";
+        case 0x48: return "_PtrZone";
         case 0x49: return "_HPurge";
         case 0x4A: return "_HNoPurge";
+        case 0x4B: return "_SetGrowZone";
+        case 0x4C: return "_CompactMem";
+        case 0x4D: return "_PurgeMem";
         case 0x4E: return "_AddDrive";
+        case 0x4F: return "_RDrvrInstall";
+        case 0x50: return "_RelString";
+        case 0x51: return "_ReadXPRam";
+        case 0x52: return "_WriteXPRam";
+        case 0x54: return "_UprString";
         case 0x55: return "_StripAddress";
+        case 0x56: return "_LowerText";
+        case 0x57: return "_SetAppBase";
+        case 0x58: return "_InsTime";
+        case 0x59: return "_RmvTime";
+        case 0x5A: return "_PrimeTime";
+        case 0x5B: return "_PowerOff";
+        case 0x5C: return "_MemoryDispatch";
+        case 0x5D: return "_SwapMMUMode";
+        case 0x5E: return "_NMInstall";
+        case 0x5F: return "_NMRemove";
+        case 0x60: return "_HFSDispatch";
+        case 0x61: return "_MaxBlock";
+        case 0x62: return "_PurgeSpace";
+        case 0x63: return "_MaxApplZone";
+        case 0x64: return "_MoveHHi";
+        case 0x65: return "_StackSpace";
+        case 0x66: return "_NewEmptyHandle";
+        case 0x67: return "_HSetRBit";
+        case 0x68: return "_HClrRBit";
+        case 0x69: return "_HGetState";
+        case 0x6A: return "_HSetState";
+        case 0x6C: return "_InitFS";
+        case 0x6D: return "_InitEvents";
+        case 0x6E: return "_SlotManager";
+        case 0x71: return "_AttachVBL";
+        case 0x72: return "_DoVBLTask";
+        case 0x77: return "_CountADBs";
+        case 0x78: return "_GetIndADB";
+        case 0x79: return "_GetADBInfo";
+        case 0x7A: return "_SetADBInfo";
+        case 0x7B: return "_ADBReInit";
+        case 0x7C: return "_ADBOp";
+        case 0x7D: return "_GetDefaultStartup";
+        case 0x7E: return "_SetDefaultStartup";
+        case 0x7F: return "_InternalWait";
+        case 0x80: return "_GetVideoDefault";
+        case 0x81: return "_SetVideoDefault";
+        case 0x82: return "_DTInstall";
+        case 0x83: return "_SetOSDefault";
+        case 0x84: return "_GetOSDefault";
+        case 0x85: return "_PMgrOp";
+        case 0x89: return "_SCSIAtomic";
+        case 0x8A: return "_Sleep";
+        case 0x8D: return "_DebugUtil";
+        case 0x90: return "_SysEnvirons";
         default:   return "_OSTrap";
     }
 }
@@ -65,11 +204,16 @@ bool trapReturnsPtrInA0(u16 op) {
 
 namespace {
 const LowMem kGlobals[] = {
-    {0x0108, "MemTop",     4}, {0x011C, "UTableBase", 4}, {0x0126, "MinStack", 4},
-    {0x0130, "ApplLimit",  4}, {0x0134, "SonyVars",   4}, {0x016A, "Ticks",    4},
-    {0x0210, "BootDrive",  2}, {0x0220, "FSQHdr",     4}, {0x02AE, "ROMBase",  4},
-    {0x02B2, "RAMBase",    4}, {0x0308, "DrvQHdr",   10}, {0x0824, "ScrnBase", 4},
-    {0x08FC, "JIODone",    4}, {0x0904, "CurrentA5",  4}, {0x0910, "CurApName",4},
+    {0x0108, "MemTop",     4}, {0x010C, "BufPtr",     4}, {0x0114, "HeapEnd",   4},
+    {0x0118, "TheZone",    4}, {0x011C, "UTableBase", 4}, {0x0126, "MinStack",  4},
+    {0x0130, "ApplLimit",  4}, {0x0134, "SonyVars",   4}, {0x0144, "SysEvtMask",2},
+    {0x014A, "EventQueue",10}, {0x0154, "EvtBufCnt",  2}, {0x015C, "SysVersion",2},
+    {0x016A, "Ticks",      4}, {0x0174, "KeyMap",     4}, {0x0210, "BootDrive", 2},
+    {0x02AA, "ApplZone",   4}, {0x02AE, "ROMBase",    4}, {0x02B2, "RAMBase",   4},
+    {0x02E0, "ToExtFS",    4}, {0x0308, "DrvQHdr",   10}, {0x0312, "EjectNotify",4},
+    {0x0316, "IAZNotify",  4}, {0x034E, "FCBSPtr",    4}, {0x0352, "DefVCBPtr", 4},
+    {0x0356, "VCBQHdr",   10}, {0x0360, "FSQHdr",    10}, {0x0824, "ScrnBase",  4},
+    {0x08FC, "JIODone",    4}, {0x0904, "CurrentA5",  4}, {0x0910, "CurApName", 4},
 };
 } // namespace
 
@@ -149,8 +293,23 @@ struct Cursor {
 };
 
 const char* kSizes[] = {".b", ".w", ".l"};
+const char* kCond[] = {"T","F","HI","LS","CC","CS","NE","EQ",
+                       "VC","VS","PL","MI","GE","LT","GT","LE"};
+
+// A signed 16-bit displacement, written the way it reads in a listing.
+std::string disp16(u16 v) {
+    char b[16];
+    const int d = static_cast<int16_t>(v);
+    std::snprintf(b, sizeof b, "%s$%04X", d < 0 ? "-" : "", d < 0 ? -d : d);
+    return b;
+}
 
 // Decode an effective address, appending text and consuming extension words.
+// `size` is 0/1/2 for byte/word/long and only matters for an immediate.
+//
+// PC-relative operands are resolved to the address they name rather than left
+// as the raw displacement: a ROM listing is nearly all `JSR $xxxx(PC)`, and a
+// displacement you have to add by hand is what makes reading one slow.
 std::string ea(Cursor& c, int mode, int reg, int size) {
     char b[48];
     switch (mode) {
@@ -159,20 +318,33 @@ std::string ea(Cursor& c, int mode, int reg, int size) {
         case 2: std::snprintf(b, sizeof b, "(A%d)", reg); break;
         case 3: std::snprintf(b, sizeof b, "(A%d)+", reg); break;
         case 4: std::snprintf(b, sizeof b, "-(A%d)", reg); break;
-        case 5: std::snprintf(b, sizeof b, "$%04X(A%d)", c.word(), reg); break;
+        case 5: { const std::string d = disp16(c.word());
+                  std::snprintf(b, sizeof b, "%s(A%d)", d.c_str(), reg); break; }
         case 6: { const u16 ext = c.word();
-                  std::snprintf(b, sizeof b, "$%02X(A%d,%c%d)", ext & 0xFF, reg,
-                                ext & 0x8000 ? 'A' : 'D', (ext >> 12) & 7); break; }
+                  std::snprintf(b, sizeof b, "$%02X(A%d,%c%d%s)",
+                                static_cast<unsigned>(ext & 0xFF), reg,
+                                (ext & 0x8000) ? 'A' : 'D', (ext >> 12) & 7,
+                                (ext & 0x0800) ? ".l" : ".w"); break; }
         case 7:
             switch (reg) {
-                case 0: std::snprintf(b, sizeof b, "$%04X", c.word()); break;
-                case 1: std::snprintf(b, sizeof b, "$%08X", c.lng()); break;
-                case 2: std::snprintf(b, sizeof b, "$%04X(PC)", c.word()); break;
-                case 3: { const u16 ext = c.word();
-                          std::snprintf(b, sizeof b, "$%02X(PC,%c%d)", ext & 0xFF,
-                                        ext & 0x8000 ? 'A' : 'D', (ext >> 12) & 7); break; }
+                case 0: std::snprintf(b, sizeof b, "$%06X",
+                                      static_cast<u32>(static_cast<int16_t>(c.word())) & 0xFFFFFFu);
+                        break;
+                case 1: std::snprintf(b, sizeof b, "$%06X", c.lng() & 0xFFFFFFu); break;
+                case 2: { const u32 base = c.p;
+                          const u32 t = (base + static_cast<u32>(static_cast<int16_t>(c.word())))
+                                        & 0xFFFFFFu;
+                          std::snprintf(b, sizeof b, "$%06X(PC)", t); break; }
+                case 3: { const u32 base = c.p;
+                          const u16 ext = c.word();
+                          const u32 t = (base + static_cast<u32>(static_cast<int8_t>(ext & 0xFF)))
+                                        & 0xFFFFFFu;
+                          std::snprintf(b, sizeof b, "$%06X(PC,%c%d%s)", t,
+                                        (ext & 0x8000) ? 'A' : 'D', (ext >> 12) & 7,
+                                        (ext & 0x0800) ? ".l" : ".w"); break; }
                 case 4:
                     if (size == 2) std::snprintf(b, sizeof b, "#$%08X", c.lng());
+                    else if (size == 0) std::snprintf(b, sizeof b, "#$%02X", c.word() & 0xFF);
                     else std::snprintf(b, sizeof b, "#$%04X", c.word());
                     break;
                 default: std::snprintf(b, sizeof b, "?"); break;
@@ -183,66 +355,297 @@ std::string ea(Cursor& c, int mode, int reg, int size) {
     return b;
 }
 
+// The MOVEM register list, which is a bitmap whose bit order depends on the
+// direction: -(An) numbers it A7..A0,D7..D0, everything else D0..D7,A0..A7.
+std::string regList(u16 mask, bool predec) {
+    std::string out;
+    for (int i = 0; i < 16; ++i) {
+        const int bit = predec ? 15 - i : i;
+        if (!(mask & (1u << bit))) continue;
+        int run = i;
+        while (run + 1 < 16) {
+            const int nb = predec ? 15 - (run + 1) : (run + 1);
+            if (!(mask & (1u << nb)) || ((run + 1) == 8)) break;   // don't span D7->A0
+            ++run;
+        }
+        char b[16];
+        const char* kind0 = i < 8 ? "D" : "A";
+        if (run == i) std::snprintf(b, sizeof b, "%s%d", kind0, i & 7);
+        else std::snprintf(b, sizeof b, "%s%d-%s%d", kind0, i & 7, kind0, run & 7);
+        if (!out.empty()) out += "/";
+        out += b;
+        i = run;
+    }
+    return out.empty() ? std::string("-") : out;
+}
+
 } // namespace
 
+// A 68000 disassembler covering the whole instruction set. It exists to read
+// this ROM: an unrecognised word printed as DC.W is not a gap in cosmetics, it
+// is a line of the routine under investigation that has to be decoded by hand,
+// and every one of those is a chance to misread a branch.
 int disasm(Machine& mac, u32 pc, std::string& out) {
     Cursor c{mac, pc};
     const u16 op = c.word();
-    char buf[96];
+    char buf[128];
+    const int mode = (op >> 3) & 7, reg = op & 7;
+    const int dreg = (op >> 9) & 7;
 
     auto emit = [&](const char* s) { out += s; };
+    auto emit1 = [&](const char* mnem, const std::string& a) {
+        std::snprintf(buf, sizeof buf, "%-8s %s", mnem, a.c_str());
+        out += buf;
+    };
+    auto emit2 = [&](const char* mnem, const std::string& a, const std::string& b) {
+        std::snprintf(buf, sizeof buf, "%-8s %s,%s", mnem, a.c_str(), b.c_str());
+        out += buf;
+    };
+    auto sized = [&](const char* stem, int sz) {
+        static char nb[16];
+        std::snprintf(nb, sizeof nb, "%s%s", stem, kSizes[sz & 3]);
+        return nb;
+    };
 
-    if ((op & 0xF000) == 0xA000) {
+    switch (op >> 12) {
+    case 0x0: {                                     // immediate / bit / MOVEP
+        if ((op & 0xF138) == 0x0108) {              // MOVEP
+            const std::string d = disp16(c.word());
+            const bool toMem = (op & 0x0080) != 0;
+            char mem[24];
+            std::snprintf(mem, sizeof mem, "%s(A%d)", d.c_str(), reg);
+            char dn[8];
+            std::snprintf(dn, sizeof dn, "D%d", dreg);
+            std::snprintf(buf, sizeof buf, "MOVEP%-3s %s,%s", (op & 0x40) ? ".l" : ".w",
+                          toMem ? dn : mem, toMem ? mem : dn);
+            emit(buf);
+            break;
+        }
+        if ((op & 0xFF00) == 0x0800 || (op & 0xF100) == 0x0100) {   // BTST/BCHG/BCLR/BSET
+            static const char* bops[] = {"BTST","BCHG","BCLR","BSET"};
+            const bool stat = (op & 0xFF00) == 0x0800;
+            std::string src;
+            if (stat) { char t[12]; std::snprintf(t, sizeof t, "#%d", c.word() & 0x1F); src = t; }
+            else      { char t[12]; std::snprintf(t, sizeof t, "D%d", dreg); src = t; }
+            emit2(bops[(op >> 6) & 3], src, ea(c, mode, reg, 0));
+            break;
+        }
+        static const char* iops[] = {"ORI","ANDI","SUBI","ADDI",nullptr,"EORI","CMPI",nullptr};
+        const char* im = iops[(op >> 9) & 7];
+        const int sz = (op >> 6) & 3;
+        if (!im || sz == 3) { std::snprintf(buf, sizeof buf, "DC.W     $%04X", op); emit(buf); break; }
+        if (mode == 7 && reg == 4) {                // ORI/ANDI/EORI to CCR or SR
+            const bool toSr = (sz == 1);
+            std::snprintf(buf, sizeof buf, "%-8s #$%04X,%s", im,
+                          static_cast<unsigned>(c.word()), toSr ? "SR" : "CCR");
+            emit(buf);
+            break;
+        }
+        const std::string s = ea(c, 7, 4, sz);      // the immediate first
+        emit2(sized(im, sz), s, ea(c, mode, reg, sz));
+        break;
+    }
+    case 0x1: case 0x2: case 0x3: {                 // MOVE / MOVEA
+        const int sz = (op >> 12) == 1 ? 0 : (op >> 12) == 3 ? 1 : 2;
+        const std::string s = ea(c, mode, reg, sz);
+        const int dm = (op >> 6) & 7;
+        const std::string d = ea(c, dm, dreg, sz);
+        emit2(sized(dm == 1 ? "MOVEA" : "MOVE", sz), s, d);
+        break;
+    }
+    case 0x4: {                                     // miscellaneous
+        if ((op & 0xFFC0) == 0x40C0) { emit2("MOVE", "SR", ea(c, mode, reg, 1)); break; }
+        if ((op & 0xFFC0) == 0x44C0) { emit2("MOVE", ea(c, mode, reg, 1), "CCR"); break; }
+        if ((op & 0xFFC0) == 0x46C0) { emit2("MOVE", ea(c, mode, reg, 1), "SR"); break; }
+        if (op == 0x4E70) { emit("RESET"); break; }
+        if (op == 0x4E71) { emit("NOP"); break; }
+        if (op == 0x4E72) { std::snprintf(buf, sizeof buf, "STOP     #$%04X",
+                                          static_cast<unsigned>(c.word())); emit(buf); break; }
+        if (op == 0x4E73) { emit("RTE"); break; }
+        if (op == 0x4E75) { emit("RTS"); break; }
+        if (op == 0x4E76) { emit("TRAPV"); break; }
+        if (op == 0x4E77) { emit("RTR"); break; }
+        if ((op & 0xFFF0) == 0x4E40) { std::snprintf(buf, sizeof buf, "TRAP     #%d", op & 15);
+                                       emit(buf); break; }
+        if ((op & 0xFFF8) == 0x4E50) { std::snprintf(buf, sizeof buf, "LINK     A%d,#%s", reg,
+                                                     disp16(c.word()).c_str()); emit(buf); break; }
+        if ((op & 0xFFF8) == 0x4E58) { std::snprintf(buf, sizeof buf, "UNLK     A%d", reg);
+                                       emit(buf); break; }
+        if ((op & 0xFFF8) == 0x4E60) { std::snprintf(buf, sizeof buf, "MOVE     A%d,USP", reg);
+                                       emit(buf); break; }
+        if ((op & 0xFFF8) == 0x4E68) { std::snprintf(buf, sizeof buf, "MOVE     USP,A%d", reg);
+                                       emit(buf); break; }
+        if ((op & 0xFFC0) == 0x4E80) { emit1("JSR", ea(c, mode, reg, 2)); break; }
+        if ((op & 0xFFC0) == 0x4EC0) { emit1("JMP", ea(c, mode, reg, 2)); break; }
+        if ((op & 0xF1C0) == 0x41C0) { const std::string s = ea(c, mode, reg, 2);
+                                       char t[8]; std::snprintf(t, sizeof t, "A%d", dreg);
+                                       emit2("LEA", s, t); break; }
+        if ((op & 0xF1C0) == 0x4180) { const std::string s = ea(c, mode, reg, 1);
+                                       char t[8]; std::snprintf(t, sizeof t, "D%d", dreg);
+                                       emit2("CHK", s, t); break; }
+        if ((op & 0xFFF8) == 0x4840) { std::snprintf(buf, sizeof buf, "SWAP     D%d", reg);
+                                       emit(buf); break; }
+        if ((op & 0xFFB8) == 0x4880) { std::snprintf(buf, sizeof buf, "EXT%s     D%d",
+                                                     (op & 0x40) ? ".l" : ".w", reg);
+                                       emit(buf); break; }
+        if ((op & 0xFB80) == 0x4880) {              // MOVEM
+            const u16 mask = c.word();
+            const bool toReg = (op & 0x0400) != 0;
+            const char* nm = (op & 0x40) ? "MOVEM.l" : "MOVEM.w";
+            const std::string m = ea(c, mode, reg, 2);
+            if (toReg) emit2(nm, m, regList(mask, false));
+            else       emit2(nm, regList(mask, mode == 4), m);
+            break;
+        }
+        if ((op & 0xFFC0) == 0x4800) { emit1("NBCD", ea(c, mode, reg, 0)); break; }
+        if ((op & 0xFFC0) == 0x4840) { emit1("PEA", ea(c, mode, reg, 2)); break; }
+        if (op == 0x4AFC) { emit("ILLEGAL"); break; }
+        if ((op & 0xFFC0) == 0x4AC0) { emit1("TAS", ea(c, mode, reg, 0)); break; }
+        if ((op & 0xFF00) == 0x4A00) { const int sz = (op >> 6) & 3;
+                                       if (sz == 3) { std::snprintf(buf, sizeof buf, "DC.W     $%04X", op); emit(buf); break; }
+                                       emit1(sized("TST", sz), ea(c, mode, reg, sz)); break; }
+        {   // NEGX / CLR / NEG / NOT
+            static const char* uops[] = {"NEGX","CLR","NEG","NOT"};
+            const int which = (op >> 9) & 7;
+            const int sz = (op >> 6) & 3;
+            if (which < 4 && sz != 3) { emit1(sized(uops[which], sz), ea(c, mode, reg, sz)); break; }
+        }
+        std::snprintf(buf, sizeof buf, "DC.W     $%04X", op);
+        emit(buf);
+        break;
+    }
+    case 0x5: {                                     // ADDQ / SUBQ / Scc / DBcc
+        if ((op & 0x00C0) == 0x00C0) {
+            const int cond = (op >> 8) & 15;
+            if (mode == 1) {                        // DBcc
+                const u32 base = c.p;
+                const u32 t = (base + static_cast<u32>(static_cast<int16_t>(c.word()))) & 0xFFFFFFu;
+                std::snprintf(buf, sizeof buf, "DB%-6s D%d,$%06X", kCond[cond], reg, t);
+                emit(buf);
+            } else {
+                char nm[12];
+                std::snprintf(nm, sizeof nm, "S%s", kCond[cond]);
+                emit1(nm, ea(c, mode, reg, 0));
+            }
+            break;
+        }
+        const int sz = (op >> 6) & 3;
+        const int q = dreg == 0 ? 8 : dreg;
+        char imm[8];
+        std::snprintf(imm, sizeof imm, "#%d", q);
+        emit2(sized((op & 0x0100) ? "SUBQ" : "ADDQ", sz), imm, ea(c, mode, reg, sz));
+        break;
+    }
+    case 0x6: {                                     // Bcc / BRA / BSR
+        static const char* bcc[] = {"BRA","BSR","BHI","BLS","BCC","BCS","BNE","BEQ",
+                                    "BVC","BVS","BPL","BMI","BGE","BLT","BGT","BLE"};
+        int d = static_cast<int8_t>(op & 0xFF);
+        const u32 base = c.p;
+        if ((op & 0xFF) == 0x00) d = static_cast<int16_t>(c.word());
+        std::snprintf(buf, sizeof buf, "%-8s $%06X", bcc[(op >> 8) & 0xF],
+                      (base + static_cast<u32>(d)) & 0xFFFFFFu);
+        emit(buf);
+        break;
+    }
+    case 0x7:
+        std::snprintf(buf, sizeof buf, "MOVEQ    #$%02X,D%d",
+                      static_cast<unsigned>(op & 0xFF), dreg);
+        emit(buf);
+        break;
+    case 0x8: case 0x9: case 0xB: case 0xC: case 0xD: {
+        const int grp = op >> 12;
+        const char* base = grp == 0x8 ? "OR" : grp == 0x9 ? "SUB"
+                         : grp == 0xB ? "CMP" : grp == 0xC ? "AND" : "ADD";
+        const int opmode = (op >> 6) & 7;
+        char dn[8]; std::snprintf(dn, sizeof dn, "D%d", dreg);
+        char an[8]; std::snprintf(an, sizeof an, "A%d", dreg);
+        if (opmode == 3 || opmode == 7) {           // xxxA.w / xxxA.l
+            if (grp == 0x8 || grp == 0xC) {         // DIVU/DIVS or MULU/MULS
+                const char* nm = grp == 0x8 ? (opmode == 3 ? "DIVU" : "DIVS")
+                                            : (opmode == 3 ? "MULU" : "MULS");
+                emit2(nm, ea(c, mode, reg, 1), dn);
+                break;
+            }
+            char nm[12];
+            std::snprintf(nm, sizeof nm, "%sA%s", base, opmode == 3 ? ".w" : ".l");
+            emit2(nm, ea(c, mode, reg, opmode == 3 ? 1 : 2), an);
+            break;
+        }
+        const int sz = opmode & 3;
+        if (opmode >= 4) {
+            if (grp == 0xB && mode == 1) {          // CMPM
+                char sa[12], da[12];
+                std::snprintf(sa, sizeof sa, "(A%d)+", reg);
+                std::snprintf(da, sizeof da, "(A%d)+", dreg);
+                emit2(sized("CMPM", sz), sa, da);
+                break;
+            }
+            if ((grp == 0x9 || grp == 0xD) && (mode == 0 || mode == 1)) {   // SUBX/ADDX
+                char sa[12], da[12];
+                if (mode == 0) { std::snprintf(sa, sizeof sa, "D%d", reg);
+                                 std::snprintf(da, sizeof da, "D%d", dreg); }
+                else           { std::snprintf(sa, sizeof sa, "-(A%d)", reg);
+                                 std::snprintf(da, sizeof da, "-(A%d)", dreg); }
+                emit2(sized(grp == 0x9 ? "SUBX" : "ADDX", sz), sa, da);
+                break;
+            }
+            if ((grp == 0x8 || grp == 0xC) && opmode == 4 && (mode == 0 || mode == 1)) {
+                char sa[12], da[12];                // SBCD / ABCD
+                if (mode == 0) { std::snprintf(sa, sizeof sa, "D%d", reg);
+                                 std::snprintf(da, sizeof da, "D%d", dreg); }
+                else           { std::snprintf(sa, sizeof sa, "-(A%d)", reg);
+                                 std::snprintf(da, sizeof da, "-(A%d)", dreg); }
+                emit2(grp == 0x8 ? "SBCD" : "ABCD", sa, da);
+                break;
+            }
+            if (grp == 0xC && (op & 0x0130) == 0x0100) {                    // EXG
+                const int m = (op >> 3) & 0x1F;
+                char sa[8], da[8];
+                if (m == 0x08)      { std::snprintf(sa, sizeof sa, "D%d", dreg);
+                                      std::snprintf(da, sizeof da, "D%d", reg); }
+                else if (m == 0x09) { std::snprintf(sa, sizeof sa, "A%d", dreg);
+                                      std::snprintf(da, sizeof da, "A%d", reg); }
+                else                { std::snprintf(sa, sizeof sa, "D%d", dreg);
+                                      std::snprintf(da, sizeof da, "A%d", reg); }
+                emit2("EXG", sa, da);
+                break;
+            }
+            const char* nm = grp == 0xB ? "EOR" : base;
+            emit2(sized(nm, sz), dn, ea(c, mode, reg, sz));
+            break;
+        }
+        emit2(sized(base, sz), ea(c, mode, reg, sz), dn);
+        break;
+    }
+    case 0xE: {                                     // shifts and rotates
+        static const char* sops[] = {"AS","LS","ROX","RO"};
+        if ((op & 0x00C0) == 0x00C0) {              // memory, by one
+            char nm[12];
+            std::snprintf(nm, sizeof nm, "%s%c.w", sops[(op >> 9) & 3], (op & 0x0100) ? 'L' : 'R');
+            emit1(nm, ea(c, mode, reg, 1));
+            break;
+        }
+        const int sz = (op >> 6) & 3;
+        char nm[12];
+        std::snprintf(nm, sizeof nm, "%s%c%s", sops[(op >> 3) & 3], (op & 0x0100) ? 'L' : 'R',
+                      kSizes[sz & 3]);
+        char cnt[8];
+        if (op & 0x0020) std::snprintf(cnt, sizeof cnt, "D%d", dreg);
+        else             std::snprintf(cnt, sizeof cnt, "#%d", dreg == 0 ? 8 : dreg);
+        char dst[8]; std::snprintf(dst, sizeof dst, "D%d", reg);
+        emit2(nm, cnt, dst);
+        break;
+    }
+    case 0xA: {
         const char* n = trapName(op);
         std::snprintf(buf, sizeof buf, "%-8s ; $%04X", n ? n : "_Axxx", op);
         emit(buf);
-    } else if ((op & 0xF000) == 0x6000) {          // Bcc / BRA / BSR
-        static const char* cc[] = {"BRA","BSR","BHI","BLS","BCC","BCS","BNE","BEQ",
-                                   "BVC","BVS","BPL","BMI","BGE","BLT","BGT","BLE"};
-        int disp = int8_t(op & 0xFF);
-        u32 base = c.p;
-        if ((op & 0xFF) == 0) { disp = int16_t(c.word()); }
-        std::snprintf(buf, sizeof buf, "%-8s $%06X", cc[(op >> 8) & 0xF], base + disp);
-        emit(buf);
-    } else if ((op & 0xF0F8) == 0x50C8) {          // DBcc
-        const int disp = int16_t(c.word());
-        std::snprintf(buf, sizeof buf, "DB%-6s D%d,$%06X", "cc", op & 7, c.p - 2 + disp);
-        emit(buf);
-    } else if (op == 0x4E75) { emit("RTS");
-    } else if (op == 0x4E73) { emit("RTE");
-    } else if (op == 0x4E71) { emit("NOP");
-    } else if ((op & 0xFFC0) == 0x4E80 || (op & 0xFFC0) == 0x4EC0) {  // JSR / JMP
-        const std::string t = ea(c, (op >> 3) & 7, op & 7, 2);
-        std::snprintf(buf, sizeof buf, "%-8s %s", (op & 0x40) ? "JMP" : "JSR", t.c_str());
-        emit(buf);
-    } else if ((op & 0xF1C0) == 0x41C0) {          // LEA
-        const std::string s = ea(c, (op >> 3) & 7, op & 7, 2);
-        std::snprintf(buf, sizeof buf, "LEA      %s,A%d", s.c_str(), (op >> 9) & 7);
-        emit(buf);
-    } else if ((op & 0xF000) == 0x7000) {          // MOVEQ
-        std::snprintf(buf, sizeof buf, "MOVEQ    #$%02X,D%d", op & 0xFF, (op >> 9) & 7);
-        emit(buf);
-    } else if ((op & 0xC000) == 0 && (op & 0x3000) != 0) {   // MOVE.b/w/l
-        const int sz = (op >> 12) == 1 ? 0 : (op >> 12) == 3 ? 1 : 2;
-        const std::string s = ea(c, (op >> 3) & 7, op & 7, sz + 1);
-        const std::string d = ea(c, (op >> 6) & 7, (op >> 9) & 7, sz + 1);
-        std::snprintf(buf, sizeof buf, "MOVE%-4s %s,%s", kSizes[sz], s.c_str(), d.c_str());
-        emit(buf);
-    } else if ((op & 0xFF00) == 0x4A00) {          // TST
-        const int sz = (op >> 6) & 3;
-        const std::string s = ea(c, (op >> 3) & 7, op & 7, (sz == 2 ? 2 : sz) + 1);
-        std::snprintf(buf, sizeof buf, "TST%-5s %s", kSizes[sz < 3 ? sz : 1], s.c_str());
-        emit(buf);
-    } else if ((op & 0xFF00) == 0x0800) {          // static BTST/BCHG/BCLR/BSET
-        static const char* bops[] = {"BTST","BCHG","BCLR","BSET"};
-        const u16 bit = c.word();
-        const std::string s = ea(c, (op >> 3) & 7, op & 7, 1);
-        std::snprintf(buf, sizeof buf, "%-8s #%d,%s", bops[(op >> 6) & 3], bit & 0x1F,
-                      s.c_str());
-        emit(buf);
-    } else {
+        break;
+    }
+    default:
         std::snprintf(buf, sizeof buf, "DC.W     $%04X", op);
         emit(buf);
+        break;
     }
     return static_cast<int>(c.p - pc);
 }
@@ -415,10 +818,37 @@ bool describeIOTrap(Machine& mac, u16 trap, u32 pc, u32 a0, std::string& out) {
     return true;
 }
 
+namespace {
+
+// Where the call that would return to `v` starts, or 0 if nothing ends there.
+// Filtering a stack scan on "looks like a ROM address" only ever finds ROM
+// callers, which is no use when the question is which patch in the system heap
+// or which application asked for something. Looking for the call instruction
+// itself works anywhere in memory, and rejects the data that merely looks like
+// a code address -- which is what made a raw scan unreadable.
+u32 callSiteOf(Machine& mac, u32 v) {
+    if ((v & 1) || v < 0x000400) return 0;
+    const u16 w2 = mac.read16((v - 2) & 0xFFFFFF);
+    const u16 w4 = mac.read16((v - 4) & 0xFFFFFF);
+    const u16 w6 = mac.read16((v - 6) & 0xFFFFFF);
+    const u8 lo2 = static_cast<u8>(w2 & 0xFF);
+    if ((w2 & 0xFF00) == 0x6100 && lo2 != 0x00 && lo2 != 0xFF) return v - 2;  // BSR.S
+    if ((w2 & 0xFFF8) == 0x4E90) return v - 2;                                // JSR (An)
+    if (w4 == 0x6100) return v - 4;                                           // BSR.W
+    if ((w4 & 0xFFF8) == 0x4EA8) return v - 4;                                // JSR (d16,An)
+    if ((w4 & 0xFFF8) == 0x4EB0) return v - 4;                                // JSR (d8,An,Xn)
+    if (w4 == 0x4EB8 || w4 == 0x4EBA || w4 == 0x4EBB) return v - 4;           // JSR abs.w/PC
+    if (w6 == 0x4EB9) return v - 6;                                           // JSR abs.l
+    return 0;
+}
+
+} // namespace
+
 void dumpBacktrace(const M68000& cpu, Machine& mac, std::FILE* out) {
     auto r32 = [&](u32 a) { return (u32(mac.read16(a)) << 16) | mac.read16(a + 2); };
     std::fprintf(out, "-- backtrace (A6 chain) --\n");
-    std::fprintf(out, "  pc   %06X\n", cpu.pc & 0xFFFFFF);
+    std::fprintf(out, "  pc   %06X  %s\n", cpu.pc & 0xFFFFFF,
+                 symbolFor(mac, cpu.pc).c_str());
     u32 fp = cpu.a[6];
     for (int i = 0; i < 24 && fp && (fp & 1) == 0 && fp < 0x400000; ++i) {
         const u32 ret = r32(fp + 4) & 0xFFFFFF;
@@ -429,15 +859,19 @@ void dumpBacktrace(const M68000& cpu, Machine& mac, std::FILE* out) {
         fp = next;
     }
     // Frame pointers aren't always set up (or A6 may be clobbered), so also
-    // scan the raw stack for values that look like ROM return addresses.
-    std::fprintf(out, "  -- stack scan (A7=%06X) --\n", cpu.a[7] & 0xFFFFFF);
+    // walk the raw stack, keeping every long a call instruction ends at.
+    std::fprintf(out, "  -- stack scan (A7=%06X, callers innermost first) --\n",
+                 cpu.a[7] & 0xFFFFFF);
     u32 sp = cpu.a[7];
-    for (int i = 0, found = 0; i < 160 && sp < 0x400000 && found < 24; ++i, sp += 2) {
+    for (int i = 0, found = 0; i < 512 && sp < 0x400000 && found < 32; ++i, sp += 2) {
         const u32 v = r32(sp) & 0xFFFFFF;
-        if (v >= 0x400100 && v < 0x440000 && (v & 1) == 0) {
-            std::fprintf(out, "    %06X: %06X  %s\n", sp, v, symbolFor(mac, v).c_str());
-            ++found;
-        }
+        const u32 site = callSiteOf(mac, v);
+        if (!site) continue;
+        std::string call;
+        disasm(mac, site, call);
+        std::fprintf(out, "    %06X: %06X %-18s  %s\n", sp, site,
+                     symbolFor(mac, site).c_str(), call.c_str());
+        ++found;
     }
 }
 

@@ -839,6 +839,9 @@ int main(int argc, char** argv) {
     int profileAt = -1;
     u32 traceToPc = 0;
     int watchControl = -1;
+    int trapRingSize = 0;
+    u16 trapRingMask = 0;      // 0 = every trap; otherwise keep only $A0xx or $A8xx
+    int diskLogAt = -1, diskLogBudget = 400;
     u32 watchAddr = 0xFFFFFFFFu;
     bool mouseWalk = false;
     bool bootNudge = false;
@@ -863,6 +866,10 @@ int main(int argc, char** argv) {
     u32 dumpStructAddr = 0;
     bool traceBranches = false, dumpStructSet = false;
     u32 disasmAddr = 0; int disasmCount = 0; bool disasmSet = false;
+    // Same, but after the machine has run: code loaded from disk into the system
+    // or application heap does not exist until a System is up, and that is
+    // exactly the code a patched trap or an application lands in.
+    u32 liveDisasmAddr = 0; int liveDisasmCount = 0;
     bool driveInstall = false;
     int traceIwm = 0; bool noSonyShim = false; bool sonyShimOn = false; bool swimOn = false, swimOff = false;
     u16 sonyLineMask = 0, sonyLineValue = 0;
@@ -911,6 +918,13 @@ int main(int argc, char** argv) {
         else if (arg == "--insert-external" && i + 1 < argc) insertExternalPath = argv[++i];
         else if (arg == "--insert-external-at" && i + 1 < argc) insertExternalAt = std::atoi(argv[++i]);
         else if (arg == "--watch-control" && i + 1 < argc) watchControl = std::atoi(argv[++i]);
+        else if (arg == "--trap-ring" && i + 1 < argc) trapRingSize = std::atoi(argv[++i]);
+        else if (arg == "--disk-log" && i + 2 < argc) {
+            diskLogAt = std::atoi(argv[++i]);
+            diskLogBudget = std::atoi(argv[++i]);
+        }
+        else if (arg == "--trap-ring-mask" && i + 1 < argc)
+            trapRingMask = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
         else if (arg == "--sony-lines" && i + 2 < argc) {
             sonyLineMask  = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
             sonyLineValue = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
@@ -962,6 +976,10 @@ int main(int argc, char** argv) {
             dumpStructName = argv[++i];
             dumpStructSet = true;
         }
+        else if (arg == "--disasm-live" && i + 2 < argc) {
+            liveDisasmAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            liveDisasmCount = std::atoi(argv[++i]);
+        }
         else if (arg == "--disasm" && i + 2 < argc) {
             disasmAddr = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             disasmCount = std::atoi(argv[++i]);
@@ -996,7 +1014,34 @@ int main(int argc, char** argv) {
                 rom.size(), rom[0], rom[1], rom[2], rom[3], rom[8], rom[9]);
 
     Machine mac(std::move(rom), {ramMB * 1024u * 1024u});
-    mac.onDiag = [](const char* s) { std::printf("[diag] %s\n", s); };
+
+    // A ring of the most recent traps, dumped when something the machine does
+    // on its own account needs explaining. A running System issues thousands of
+    // traps a second, so tracing them from a chosen frame either drowns the
+    // interesting ones or misses them; keeping the last few thousand and
+    // printing them at the moment of the event costs nothing until it fires.
+    struct TrapRec { u32 frame, pc, a0, d0; u16 trap; };
+    std::vector<TrapRec> trapRing(trapRingSize ? static_cast<std::size_t>(trapRingSize) : 1);
+    std::size_t trapRingN = 0;
+    auto dumpTrapRing = [&](const char* why) {
+        if (!trapRingSize) return;
+        const std::size_t have = trapRingN < trapRing.size() ? trapRingN : trapRing.size();
+        std::printf("-- last %zu traps before %s (oldest first) --\n", have, why);
+        for (std::size_t i = 0; i < have; ++i) {
+            const TrapRec& t = trapRing[(trapRingN - have + i) % trapRing.size()];
+            const char* nm = openmac::dbg::trapName(t.trap);
+            std::printf("   f%-5u %04X %-18s pc=%06X %-20s A0=%08X D0=%08X\n", t.frame,
+                        t.trap, nm ? nm : "?", t.pc,
+                        openmac::dbg::symbolFor(mac, t.pc).c_str(), t.a0, t.d0);
+        }
+    };
+
+    mac.onDiag = [&](const char* s) {
+        std::printf("[diag] %s\n", s);
+        // An eject is the machine deciding to take a volume off-line. What the
+        // guest was doing in the seconds before it is the whole question.
+        if (trapRingSize && std::strstr(s, "EJECT armed")) dumpTrapRing("the eject");
+    };
     if (forceRom) mac.setForceRomDisk(true);
     // The Classic has a SWIM, so the chip answers the ROM's probe by default.
     // --no-swim makes it answer as a plain IWM instead, which is worth being
@@ -1127,8 +1172,15 @@ int main(int argc, char** argv) {
         mac.insertHardDisk(std::move(hd), false);
     }
 
-    if (traceTraps || breakTrap || watchControl >= -2) {
+    if (traceTraps || breakTrap || watchControl >= -2 || trapRingSize) {
         mac.cpu().onTrap = [&](u16 trap, u32 pc) {
+            if (trapRingSize &&
+                (!trapRingMask || (trap & 0xF800u) == trapRingMask)) {
+                trapRing[trapRingN % trapRing.size()] =
+                    {static_cast<u32>(mac.frameCount()), pc, mac.cpu().a[0],
+                     mac.cpu().d[0], trap};
+                ++trapRingN;
+            }
             if (traceTraps) {
                 std::string s;
                 if (openmac::dbg::describeIOTrap(mac, trap, pc, mac.cpu().a[0], s))
@@ -1166,8 +1218,15 @@ int main(int argc, char** argv) {
                 }
             }
             if (breakTrap && (trap & 0x0FFFu) == (breakTrap & 0x0FFFu)) {
-                std::printf("\n=== BREAK trap %04X at pc=%06X ===\n", trap, pc);
+                std::printf("\n=== BREAK trap %04X %s at pc=%06X frame %u ===\n", trap,
+                            openmac::dbg::trapName(trap), pc,
+                            static_cast<unsigned>(mac.frameCount()));
                 openmac::dbg::dumpRegs(mac.cpu(), stdout);
+                // Who asked. A trap taken from a patch in the system heap or
+                // from an application is exactly the case the queue dumps below
+                // cannot answer, and the stack is where the answer is.
+                openmac::dbg::dumpBacktrace(mac.cpu(), mac, stdout);
+                dumpTrapRing("this trap");
                 openmac::dbg::dumpDriveQueue(mac, stdout);
                 openmac::dbg::dumpUnitTable(mac, stdout);
             }
@@ -1717,6 +1776,15 @@ int main(int argc, char** argv) {
         if (!insertExternalPath.empty() && i > insertExternalAt)
             mac.mouseMove((i & 1) ? 1 : -1, 0, false);
         if (i == profileAt) profileFrame(mac);
+        // Re-open the driver's own diagnostics for the interesting stretch. The
+        // first forty requests of a boot are the media probe; the ones that
+        // matter are whichever the System makes just before it does something
+        // unexpected, and by then the budget is long gone.
+        if (diskLogAt >= 0 && i == diskLogAt) {
+            mac.openDiskLog(diskLogBudget);
+            std::printf("-- frame %d: disk diagnostics re-opened for %d lines --\n",
+                        i, diskLogBudget);
+        }
         mac.runFrame();
         mac.drainAudio(tmpAudio);
         allAudio.insert(allAudio.end(), tmpAudio.begin(), tmpAudio.end());
@@ -1763,6 +1831,18 @@ int main(int argc, char** argv) {
     if (dumpMemLen) {
         std::printf("-- memory $%06X (%u bytes) --\n", dumpMemAddr, dumpMemLen);
         openmac::dbg::dumpMem(mac, dumpMemAddr, dumpMemLen, stdout);
+    }
+
+    if (liveDisasmCount > 0) {
+        std::printf("-- disassembly of $%06X after %d frames --\n", liveDisasmAddr, frames);
+        u32 a = liveDisasmAddr;
+        for (int k = 0; k < liveDisasmCount; ++k) {
+            std::string dis;
+            const int len = openmac::dbg::disasm(mac, a, dis);
+            std::printf("  %06X  %-30s %s\n", a, dis.c_str(),
+                        openmac::dbg::symbolFor(mac, a).c_str());
+            a += len > 0 ? static_cast<u32>(len) : 2;
+        }
     }
     if (dumpStructSet)
         openmac::dbg::dumpStruct(mac, dumpStructAddr, dumpStructName.c_str(), stdout);

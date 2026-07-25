@@ -48,6 +48,18 @@ public:
     Via6522& via() { return *via_; }
     Rtc& rtc() { return *rtc_; }
     u64 totalCycles() const { return totalCycles_; }
+    // Frames since power-on. Everything the machine says about itself is
+    // stamped with this, so anything keeping its own record needs to read it
+    // to line the two up.
+    u64 frameCount() const { return frameCounter_; }
+
+    // Re-open the disk diagnostics for another `budget` lines each. They are
+    // budgeted because a running System reads constantly and would bury the
+    // log; but the interesting request is usually the last one, not the first,
+    // so it has to be possible to open them again at a chosen moment.
+    void openDiskLog(int budget) {
+        gcrErrLog_ = sonyPrimeLog_ = sonyResultLog_ = sonyCmdLog_ = budget;
+    }
     bool overlayActive() const { return overlay_; }
 
     u32 screenBase() const;
