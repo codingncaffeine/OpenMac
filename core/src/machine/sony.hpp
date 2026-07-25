@@ -148,7 +148,19 @@ public:
             case 0x3: return !(readOnly);          // WRTPRT: 0 = write protected
             case 0x4: return !motorRunning(now);   // MOTORON: 0 = motor running
             case 0x5: return track != 0;           // TK0: 0 = head at track 0
-            case 0x6: return !diskSwitched_;       // SWITCHED: 0 = disk changed
+            // SWITCHED, and unlike its neighbours it is active HIGH: the drive
+            // latches it when a disk is put in and holds it until the driver
+            // resets it. The ROM's per-VBL drive poll ($4357D0) reads it for
+            // any drive it already believes holds a disk, and $435C98 turns the
+            // line into a flag with SNE -- so a HIGH reading is what makes it
+            // announce a disk insertion. Answering it the other way up leaves
+            // the machine reporting "a disk was just swapped in" for as long as
+            // the disk sits there: the ROM posts a disk-inserted event for a
+            // volume that is already mounted, the mount comes back volOnLinErr,
+            // and the Finder responds the way it does to any disk it cannot
+            // mount -- it flushes it and ejects it, and asks for it back by
+            // name. It also means a genuine insertion is never announced.
+            case 0x6: return diskSwitched_;        // SWITCHED: 1 = disk changed
             case 0x7: return tach(now);            // TACH: 60 pulses per rev
             case 0x8: return true;                 // RDDATA lower head (P3)
             case 0x9: return true;                 // RDDATA upper head (P3)
@@ -188,17 +200,16 @@ public:
                 stepIn = !data;
                 break;
             case 0x1:
-                // UNSETTLED. Inside Macintosh III-35 lists only the four SEL=0
-                // registers below; this is a SEL=1 extended register that the
-                // 1985 table predates. The Classic ROM's .Sony driver writes it
-                // (and nothing else) to the internal drive before every attempt
-                // to read, ~36 times per boot, and never writes MOTORON at all.
-                // Treating it as a motor enable is what makes the surface start
-                // delivering disk bytes, so it is at least motor-related -- but
-                // it has not been confirmed, and the driver still does not
-                // complete a sector read, so do not treat this as settled.
-                if (!motorWanted_) motorUpAt_ = now + kSpinUpCycles;
-                motorWanted_ = true;
+                // Reset the disk-switched latch. Inside Macintosh III-35 lists
+                // only the four SEL=0 registers below; this is the SEL=1
+                // register the 1985 table predates, and the ROM names it by
+                // use: $435866-$435868 strobes it with data 1 immediately after
+                // reading status line $6 high, and only there -- the
+                // acknowledgement that closes "a disk was put in". Handling it
+                // as a motor enable (an earlier guess, from watching it written
+                // before every read while the drive-poll task was resetting a
+                // latch that never cleared) leaves the latch set forever.
+                if (data) diskSwitched_ = false;
                 break;
             case 0x2:   // STEP: writing 0 steps one track; done after ~12 ms
                 if (!data) {
@@ -238,8 +249,10 @@ public:
         if (hasDisk()) ejectRequested_ = true;
     }
 
-    // Reading the disk-switched line is what clears it.
-    void clearSwitched() { diskSwitched_ = false; }
+    // The disk-switched latch is cleared by the driver acknowledging it through
+    // control register 001, not by reading the line -- so there is deliberately
+    // no way to clear it from outside the mechanism.
+    bool diskSwitched() const { return diskSwitched_; }
 
     // ---- the rotating surface -------------------------------------------
     //

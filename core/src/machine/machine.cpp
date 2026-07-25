@@ -1001,7 +1001,6 @@ bool Machine::iwmSenseLine() {
         s.pc = cpu_.pc;
         ++senseRingN_;
     }
-    if (addr == 0x6 && !level) d.clearSwitched();   // reading the line clears it
     return level;
 }
 

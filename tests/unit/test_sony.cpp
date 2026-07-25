@@ -189,3 +189,57 @@ TEST_CASE("sony: stepping walks the head and tracks the direction bit") {
     for (int i = 0; i < 100; ++i) s.drive.command(0x2, false, s.now);
     CHECK(s.drive.track == 0);
 }
+
+TEST_CASE("sony: the disk-switched line is high until the driver acknowledges it") {
+    SpunUp s;
+    std::vector<u8> other(1024, 0);
+
+    // Seating a disk latches the line. It is active HIGH, unlike every other
+    // status line on the drive: the ROM's per-VBL drive poll turns it into a
+    // flag with SNE ($435C98) and announces a disk insertion when it reads high.
+    s.drive.insert(&s.media, false, false);
+    CHECK(s.drive.sense(0x6, s.now) == true);
+
+    // Reading it does not clear it. If it did, the line would answer "a disk was
+    // just swapped in" for as long as the disk sat in the drive, and the ROM
+    // would post a disk-inserted event for a volume that is already mounted --
+    // which the Finder answers by flushing that volume and ejecting it.
+    CHECK(s.drive.sense(0x6, s.now) == true);
+    CHECK(s.drive.sense(0x6, s.now) == true);
+
+    // Control register 001 with data 1 is the acknowledgement ($435866-$435868,
+    // issued only after the line has read high), and it is what clears it.
+    s.drive.command(0x1, true, s.now);
+    CHECK(s.drive.sense(0x6, s.now) == false);
+
+    // ...and it stays clear, so an idle drive never announces anything.
+    s.now += SonyDrive::kCyclesPerByte * 100000;
+    CHECK(s.drive.sense(0x6, s.now) == false);
+
+    // A real disk change latches it again, which is how an insertion into a
+    // drive that already held one gets noticed at all.
+    s.drive.insert(&other, false, false);
+    CHECK(s.drive.sense(0x6, s.now) == true);
+    s.drive.command(0x1, true, s.now);
+    CHECK(s.drive.sense(0x6, s.now) == false);
+
+    // So does taking one out.
+    s.drive.removeDisk();
+    CHECK(s.drive.sense(0x6, s.now) == true);
+}
+
+TEST_CASE("sony: acknowledging a disk switch does not touch the motor") {
+    SpunUp s;
+    REQUIRE(s.drive.motorRunning(s.now));
+    s.drive.command(0x4, true, s.now);           // MOTORON, data 1 = motor off
+    CHECK(s.drive.motorRunning(s.now) == false);
+
+    // Register 001 was read as a motor enable for a while, because the drive
+    // poll strobes it constantly -- which it only did because the latch it
+    // acknowledges never cleared. Spinning the disk up here would start the
+    // motor every time the poll ran.
+    s.drive.command(0x1, true, s.now);
+    CHECK(s.drive.motorRunning(s.now) == false);
+    s.now += SonyDrive::kCyclesPerByte * 100000;
+    CHECK(s.drive.motorRunning(s.now) == false);
+}
