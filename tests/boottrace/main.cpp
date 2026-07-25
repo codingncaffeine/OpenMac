@@ -1468,8 +1468,14 @@ int main(int argc, char** argv) {
         // the File Manager to be idle, preserve every register the trap could
         // clobber, and hand back the guest exactly as it was.
         auto fsIdle = [&](int cap) {
-            for (int i = 0; i < cap && (mac.read8(0x0360) & 1); ++i) mac.runFrame();
-            return (mac.read8(0x0360) & 1) == 0;
+            // Busy flag clear AND the request queue drained -- injecting while
+            // a queued request waits invites the nested-_MountVol deadlock.
+            auto busy = [&] {
+                return (mac.read8(0x0360) & 1) != 0 ||
+                       ((u32(mac.read16(0x0362)) << 16) | mac.read16(0x0364)) != 0;
+            };
+            for (int i = 0; i < cap && busy(); ++i) mac.runFrame();
+            return !busy();
         };
         auto doTrap = [&](u16 trap, u32 a0) -> int {
             u32 sd[8], sa[8];
@@ -1629,7 +1635,123 @@ int main(int argc, char** argv) {
         const auto sc = mac.scsiStats();
         std::printf("write-test: SCSI dataOut=%u commands=%u  |  %d/%zu ops fully on disk\n",
                     sc.dataOutBytes, sc.commands, okOps, ops.size());
-        return okOps == int(ops.size()) ? 0 : 1;
+
+        // Part two -- the install's real workload shape: floppy READS while the
+        // hard disk takes writes. Open the boot floppy's System file, take
+        // quiet baseline checksums of three regions, then re-read each region
+        // repeatedly with async HD writes in flight. A transient zero/garbage
+        // read -- the installed volume's zero-length resources -- shows up as
+        // a checksum that differs from the baseline. Skipped when there is no
+        // floppy to read (ROM boot with --harddisk-format only).
+        int contFail = 0;
+        {
+            // A floppy boot is still loading the Finder at this point and the
+            // File Manager stays legitimately busy for long stretches; let the
+            // boot finish before measuring.
+            for (int i = 0; i < 2400 && !mac.cpu().halted; ++i) mac.runFrame();
+            const u32 rpb = allocSys(128);
+            const u32 rname = allocSys(8);
+            const u32 rbuf = allocSys(8192);
+            mac.write8(rname, 6);
+            const char* sysNm = "System";
+            for (int i = 0; i < 6; ++i) mac.write8(rname + 1 + u32(i), u8(sysNm[i]));
+            wr32v(rpb + 18, rname);
+            mac.write16(rpb + 22, 0);              // default volume = the boot floppy
+            mac.write8(rpb + 27, 1);               // fsRdPerm
+            int rr = doTrap(0xA00A, rpb);          // _OpenRF -- the resource fork
+            if (rr > 0) {                          // still queued: wait for ioResult
+                for (int i = 0; i < 300 && s16(rd16v(rpb + 16)) > 0; ++i) mac.runFrame();
+                rr = s16(rd16v(rpb + 16));
+            }
+            const u16 rRef = rd16v(rpb + 24);
+            std::printf("write-test: floppy System _OpenRF = %d refNum=%u\n", rr, rRef);
+            if (rr == 0) {
+                const u32 regions[3] = {0, 65536, 262144};
+                u32 baseline[3] = {0, 0, 0};
+                auto readSum = [&](u32 off, u32* sumOut) -> int {
+                    // Async, then let the machine run: a floppy read takes
+                    // emulated seconds and a synchronous injection would blow
+                    // execute68kTrap's step guard and leave the request parked.
+                    wr32v(rpb + 12, 0);
+                    wr32v(rpb + 32, rbuf);
+                    wr32v(rpb + 36, 8192);
+                    mac.write16(rpb + 44, 1);
+                    wr32v(rpb + 46, off);
+                    doTrap(0xA402, rpb);                   // _Read ,Async
+                    int res = 1;
+                    for (int w = 0; w < 2400 && !mac.cpu().halted; ++w) {
+                        res = s16(rd16v(rpb + 16));        // ioResult
+                        if (res <= 0) break;
+                        mac.runFrame();
+                    }
+                    u32 h = 2166136261u;
+                    for (u32 j = 0; j < 8192; ++j) h = (h ^ mac.read8(rbuf + j)) * 16777619u;
+                    *sumOut = h;
+                    return res;
+                };
+                bool baseOk = true;
+                for (int i = 0; i < 3; ++i) {
+                    if (!fsIdle(3000)) {
+                        const u32 qHead = (u32(mac.read16(0x0362)) << 16) | mac.read16(0x0364);
+                        std::printf("write-test: baseline region %u: FSBusy stuck "
+                                    "(flag=%u qHead=%06X pc=%06X)\n",
+                                    regions[i], mac.read8(0x0360) & 1, qHead, mac.cpu().pc);
+                        if (qHead) {
+                            std::printf("  parked PB: ioTrap=%04X ioResult=%d refNum=%d "
+                                        "vRef=%d posOff=%u\n",
+                                        mac.read16(qHead + 6), s16(mac.read16(qHead + 16)),
+                                        s16(mac.read16(qHead + 24)), s16(mac.read16(qHead + 22)),
+                                        (u32(mac.read16(qHead + 46)) << 16) | mac.read16(qHead + 48));
+                        }
+                        openmac::dbg::dumpBacktrace(mac.cpu(), mac, stdout);
+                        baseOk = false;
+                        break;
+                    }
+                    const int res = readSum(regions[i], &baseline[i]);
+                    if (res != 0) {
+                        std::printf("write-test: baseline region %u: _Read = %d\n", regions[i], res);
+                        baseOk = false;
+                        break;
+                    }
+                }
+                if (!baseOk) {
+                    std::printf("write-test: contention SKIP -- baseline reads failed\n");
+                } else {
+                    for (int round = 0; round < 8; ++round) {
+                        // Queue two async HD writes, then immediately read the
+                        // floppy regions while they complete.
+                        for (int w = 0; w < 2; ++w) {
+                            if (!fsIdle(600)) break;
+                            const u32 apb = allocSys(128);
+                            const u32 abuf = allocSys(2048);
+                            fillChunks(abuf, 8 + round, 2048, fileOff);
+                            wr32v(apb + 12, 0);
+                            mac.write16(apb + 24, refNum);
+                            wr32v(apb + 32, abuf);
+                            wr32v(apb + 36, 2048);
+                            mac.write16(apb + 44, 1);
+                            wr32v(apb + 46, fileOff);
+                            doTrap(0xA403, apb);
+                            fileOff += 2048;
+                        }
+                        for (int i = 0; i < 3; ++i) {
+                            u32 h = 0;
+                            if (!fsIdle(600)) break;
+                            const int res = readSum(regions[i], &h);
+                            if (res != 0 || h != baseline[i]) {
+                                ++contFail;
+                                std::printf("write-test: CONTENTION LOSS round %d region %u: "
+                                            "res=%d sum=%08X want=%08X\n",
+                                            round, regions[i], res, h, baseline[i]);
+                            }
+                        }
+                        for (int i = 0; i < 90 && !mac.cpu().halted; ++i) mac.runFrame();
+                    }
+                    std::printf("write-test: contention rounds done, failures=%d\n", contFail);
+                }
+            }
+        }
+        return (okOps == int(ops.size()) && contFail == 0) ? 0 : 1;
     }
 
     if (disasmSet) {

@@ -1580,7 +1580,11 @@ void Machine::execute68kTrap(u16 trap) {
     const u32 savedPc = cpu_.pc;
     const u16 savedSr = cpu_.getSR();
     cpu_.pc = scratch;
-    for (int guard = 0; guard < 4000000 && cpu_.pc != scratch + 2 && !cpu_.halted; ++guard) {
+    // The guard only exists to keep a wedged trap from hanging the host. It
+    // must clear a real floppy operation run synchronously inside the ROM's
+    // driver -- seek plus streaming, several emulated seconds -- so it is
+    // sized in the tens of millions of steps, not the millions.
+    for (int guard = 0; guard < 64000000 && cpu_.pc != scratch + 2 && !cpu_.halted; ++guard) {
         // Consult the .Sony driver intercept here too. A trap we execute (e.g.
         // _MountVol for the hard disk) reads volumes through the .Sony driver's
         // Prime entry, which must reach our C handler rather than the ROM's real
