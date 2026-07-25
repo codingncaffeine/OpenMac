@@ -1213,11 +1213,12 @@ void Machine::noteGcrError(u32 pc) {
             char b[160];
             std::snprintf(b, sizeof b,
                           "gcr: read failed, ROM says %02X %s (at %06X, frame %u, drive%d, "
-                          "track %d side %d, %s)",
+                          "track %d side %d, %s, path=%s)",
                           s.code, gcrErrorName(s.code), pc,
                           static_cast<unsigned>(frameCounter_),
                           iwm_->externalDrive() ? 2 : 1, d.track, d.headUpper ? 1 : 0,
-                          d.hdMedia ? "MFM" : "GCR");
+                          d.hdMedia ? "MFM" : "GCR",
+                          iwm_->ismSelected() ? "ISM" : "IWM");
             onDiag(b);
         }
         return;

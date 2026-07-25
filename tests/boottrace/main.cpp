@@ -869,6 +869,7 @@ int main(int argc, char** argv) {
     bool floppy800k = false, insert800k = false, insert800kRW = false;
     std::string floppy800kPath, insert800kOut, externalPath;
     std::string floppyOutPath;
+    bool floppyReadOnly = false;
     std::string insertExternalPath;
     int insertExternalAt = 2600;
     bool externalEmpty = false;
@@ -877,6 +878,7 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--rom" && i + 1 < argc) romPath = argv[++i];
         else if (arg == "--floppy" && i + 1 < argc) floppyPath = argv[++i];
+        else if (arg == "--floppy-ro") floppyReadOnly = true;
         else if (arg == "--harddisk-blank" && i + 1 < argc)
             hdBlankMB = static_cast<u32>(std::atoi(argv[++i]));
         else if (arg == "--harddisk-format" && i + 1 < argc)
@@ -1082,8 +1084,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cannot read floppy: %s\n", floppyPath.c_str());
             return 2;
         }
-        std::printf("FLOPPY %zu bytes inserted\n", img.size());
-        mac.insertFloppy(std::move(img), false);
+        std::printf("FLOPPY %zu bytes inserted%s\n", img.size(),
+                    floppyReadOnly ? " (write-protected)" : "");
+        mac.insertFloppy(std::move(img), floppyReadOnly);
     }
     if (floppy800k && !insert800k) {
         // An 800K GCR volume: 1600 sectors, the geometry the IWM read path
@@ -1124,7 +1127,7 @@ int main(int argc, char** argv) {
         mac.insertHardDisk(std::move(hd), false);
     }
 
-    if (traceTraps || breakTrap || watchControl >= 0) {
+    if (traceTraps || breakTrap || watchControl >= -2) {
         mac.cpu().onTrap = [&](u16 trap, u32 pc) {
             if (traceTraps) {
                 std::string s;
@@ -1137,24 +1140,30 @@ int main(int argc, char** argv) {
             // requester -- this is where the ask itself is visible. csCode 7 is
             // eject. The trail is the route in, which for a call made from an
             // application is far more use than the frames still on the stack.
-            if (watchControl >= 0 && (trap & 0xF0FFu) == 0xA004u &&
-                static_cast<int>(mac.read16((mac.cpu().a[0] + 26) & 0xFFFFFF)) == watchControl) {
+            // -2 logs every Control call with its code, which is how the driver's
+            // conversation reads as a sequence; a specific code also prints the
+            // route in.
+            const int csNow = (watchControl >= -2 && (trap & 0xF0FFu) == 0xA004u)
+                ? static_cast<int>(mac.read16((mac.cpu().a[0] + 26) & 0xFFFFFF)) : -999;
+            if (csNow != -999 && (watchControl == -2 || csNow == watchControl)) {
                 const u32 pb = mac.cpu().a[0];
-                std::printf("\n=== _Control csCode=%d at pc=%06X pb=%06X "
+                std::printf("=== _Control csCode=%d at pc=%06X pb=%06X "
                             "ioRefNum=%d ioVRefNum=%d cyc=%llu ===\n",
-                            watchControl, pc, pb,
+                            csNow, pc, pb,
                             static_cast<std::int16_t>(mac.read16(pb + 24)),
                             static_cast<std::int16_t>(mac.read16(pb + 22)),
                             static_cast<unsigned long long>(mac.totalCycles()));
-                u32 prev = 0;
-                int col = 0;
-                for (int k = 127; k >= 0; --k) {
-                    const u32 p = mac.cpu().recentPc(k);
-                    if (!p || p == prev) continue;
-                    prev = p;
-                    std::printf("%06X%s", p, (++col % 10 == 0) ? "\n" : " ");
+                if (watchControl >= 0) {
+                    u32 prev = 0;
+                    int col = 0;
+                    for (int k = 127; k >= 0; --k) {
+                        const u32 p = mac.cpu().recentPc(k);
+                        if (!p || p == prev) continue;
+                        prev = p;
+                        std::printf("%06X%s", p, (++col % 10 == 0) ? "\n" : " ");
+                    }
+                    std::printf("\n");
                 }
-                std::printf("\n");
             }
             if (breakTrap && (trap & 0x0FFFu) == (breakTrap & 0x0FFFu)) {
                 std::printf("\n=== BREAK trap %04X at pc=%06X ===\n", trap, pc);
