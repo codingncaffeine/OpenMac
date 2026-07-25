@@ -319,6 +319,12 @@ public:
     // sequence on p.32), so by then the chip must already have clocked both CRC
     // bytes through. Crediting them on the way out instead leaves the check one
     // byte early, and every sector fails its CRC.
+    // A mark opens a field, and the generator restarts there -- the same rule the
+    // write side follows, and the reason a field and its own CRC bytes come out
+    // to zero. Without it the check depends on where the FIFO was last cleared,
+    // and any sync bytes read ahead of the address mark are folded in.
+    void ismCrcReset() { ismCrc_ = 0xFFFF; }
+
     void ismCrcAdd(u8 b) {
         ismCrc_ ^= static_cast<u16>(static_cast<u16>(b) << 8);
         for (int i = 0; i < 8; ++i)

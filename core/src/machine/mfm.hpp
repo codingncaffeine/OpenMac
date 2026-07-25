@@ -121,7 +121,9 @@ inline void buildTrack(const std::vector<u8>& image, int track, int side,
 // Pull every sector whose marks, id and CRCs check out back into `image`, the
 // way a drive would if it re-read what was just written. Returns the count.
 inline int decodeTrack(const std::vector<u8>& trk, const std::vector<u8>& marks,
-                       std::vector<u8>& image, int track, int side) {
+                       std::vector<u8>& image, int track, int side,
+                       u32* okMask = nullptr) {
+    if (okMask) *okMask = 0;
     if (trk.size() != marks.size() || trk.size() < 64) return 0;
     const std::size_t n = trk.size();
     auto at = [&](std::size_t i) { return trk[i % n]; };
@@ -162,6 +164,7 @@ inline int decodeTrack(const std::vector<u8>& trk, const std::vector<u8>& marks,
         const std::size_t off = blockOf(track, side, sector) * kSectorBytes;
         if (off + kSectorBytes <= image.size())
             for (std::size_t k = 0; k < kSectorBytes; ++k) image[off + k] = at(data + k);
+        if (okMask) *okMask |= 1u << sector;
         ++found;
     }
     return found;

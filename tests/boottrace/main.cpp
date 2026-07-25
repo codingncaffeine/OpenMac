@@ -838,6 +838,7 @@ int main(int argc, char** argv) {
     u32 ramMB = 4;
     int profileAt = -1;
     u32 traceToPc = 0;
+    int watchControl = -1;
     u32 watchAddr = 0xFFFFFFFFu;
     bool mouseWalk = false;
     bool bootNudge = false;
@@ -907,6 +908,7 @@ int main(int argc, char** argv) {
         else if (arg == "--floppy-out" && i + 1 < argc) floppyOutPath = argv[++i];
         else if (arg == "--insert-external" && i + 1 < argc) insertExternalPath = argv[++i];
         else if (arg == "--insert-external-at" && i + 1 < argc) insertExternalAt = std::atoi(argv[++i]);
+        else if (arg == "--watch-control" && i + 1 < argc) watchControl = std::atoi(argv[++i]);
         else if (arg == "--sony-lines" && i + 2 < argc) {
             sonyLineMask  = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
             sonyLineValue = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
@@ -1122,12 +1124,37 @@ int main(int argc, char** argv) {
         mac.insertHardDisk(std::move(hd), false);
     }
 
-    if (traceTraps || breakTrap) {
+    if (traceTraps || breakTrap || watchControl >= 0) {
         mac.cpu().onTrap = [&](u16 trap, u32 pc) {
             if (traceTraps) {
                 std::string s;
                 if (openmac::dbg::describeIOTrap(mac, trap, pc, mac.cpu().a[0], s))
                     std::printf("TRAP %s\n", s.c_str());
+            }
+            // Catch a Device Manager Control call by its csCode. The .Sony driver
+            // carries a request out at interrupt time, long after whoever asked
+            // for it has returned, so the execution site says nothing about the
+            // requester -- this is where the ask itself is visible. csCode 7 is
+            // eject. The trail is the route in, which for a call made from an
+            // application is far more use than the frames still on the stack.
+            if (watchControl >= 0 && (trap & 0xF0FFu) == 0xA004u &&
+                static_cast<int>(mac.read16((mac.cpu().a[0] + 26) & 0xFFFFFF)) == watchControl) {
+                const u32 pb = mac.cpu().a[0];
+                std::printf("\n=== _Control csCode=%d at pc=%06X pb=%06X "
+                            "ioRefNum=%d ioVRefNum=%d cyc=%llu ===\n",
+                            watchControl, pc, pb,
+                            static_cast<std::int16_t>(mac.read16(pb + 24)),
+                            static_cast<std::int16_t>(mac.read16(pb + 22)),
+                            static_cast<unsigned long long>(mac.totalCycles()));
+                u32 prev = 0;
+                int col = 0;
+                for (int k = 127; k >= 0; --k) {
+                    const u32 p = mac.cpu().recentPc(k);
+                    if (!p || p == prev) continue;
+                    prev = p;
+                    std::printf("%06X%s", p, (++col % 10 == 0) ? "\n" : " ");
+                }
+                std::printf("\n");
             }
             if (breakTrap && (trap & 0x0FFFu) == (breakTrap & 0x0FFFu)) {
                 std::printf("\n=== BREAK trap %04X at pc=%06X ===\n", trap, pc);
@@ -1794,6 +1821,8 @@ int main(int argc, char** argv) {
                 mac.surfaceReads(0), mac.surfaceReads(1), mac.surfaceReads(2));
     std::printf("-- ADDRESSED: internal=%u external=%u --\n",
                 mac.surfaceReads(3), mac.surfaceReads(4));
+    std::printf("-- WRITES DROPPED: internal=%u external=%u --\n",
+                mac.surfaceReads(5), mac.surfaceReads(6));
     if (!floppyOutPath.empty()) {
         const std::vector<u8>& out = mac.floppyImage();
         std::ofstream of(floppyOutPath, std::ios::binary);

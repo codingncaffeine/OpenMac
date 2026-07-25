@@ -350,6 +350,7 @@ private:
     bool ismActionPrev_ = false;   // edge detect on the ISM ACTION bit
     u16  ismCrcOut_ = 0xFFFF;      // CRC accumulated over bytes written in MFM mode
     bool ismWriteMarkPrev_ = false;  // last written byte was a mark (a field opener)
+    bool ismReadMarkPrev_ = false;   // last byte read off the surface was a mark
     int  writeLogBudget_ = 12;     // diag budget for tracks written back to the image
     u32  floppyWrites_ = 0;        // tracks the driver has written through the surface
     u32  floppyEjects_ = 0;        // times the drive threw a disk out on its own

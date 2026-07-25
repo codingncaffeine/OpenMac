@@ -103,3 +103,29 @@ TEST_CASE("mfm: a mark byte is not just its value") {
         for (std::size_t k = 0; k < mfm::kSectorBytes; ++k) CHECK(dst[off + k] == 0xA1);
     }
 }
+
+TEST_CASE("mfm: a field is one byte short if both CRC bytes do not go down") {
+    // The two CRC bytes closing a field occupy consecutive cells. Losing the
+    // second leaves the field's last byte as whatever was there before, and the
+    // sector then fails its own checksum on every read -- while every byte the
+    // guest handed over was faithfully written. Reproduce that here so a write
+    // path that drops it cannot pass.
+    std::vector<u8> image(mfm::kImageBytes, 0x5A);
+    std::vector<u8> trk, marks;
+    mfm::buildTrack(image, 0, 0, trk, marks);
+
+    std::vector<u8> dst(mfm::kImageBytes, 0);
+    u32 ok = 0;
+    CHECK(mfm::decodeTrack(trk, marks, dst, 0, 0, &ok) == mfm::kSectorsPerTrack);
+    CHECK(ok == ((1u << (mfm::kSectorsPerTrack + 1)) - 2));   // sectors 1..18
+
+    // Sector 3's data CRC ends at gap 3; replace its low byte with gap filler,
+    // exactly as a dropped second CRC byte would leave it.
+    const std::size_t base = 146 + 2 * 658;
+    const std::size_t crcLo = base + 56 + 4 + mfm::kSectorBytes + 1;
+    CHECK(trk[crcLo] != 0x4E);
+    trk[crcLo] = 0x4E;
+
+    CHECK(mfm::decodeTrack(trk, marks, dst, 0, 0, &ok) == mfm::kSectorsPerTrack - 1);
+    CHECK((ok & (1u << 3)) == 0);        // and it is sector 3 that is lost
+}

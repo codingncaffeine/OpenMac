@@ -666,6 +666,8 @@ u32 Machine::sonyCommandCount(int drive, int reg) const {
 // $0CB3 says so), so a drive that needed PA4 driven high would be unreachable
 // under a ROM-disk boot.
 u32 Machine::surfaceReads(int which) const {
+    if (which == 6) return drive1_->writesDropped;
+    if (which == 5) return drive0_->writesDropped;
     if (which == 4) return drive1_->selections;
     if (which == 3) return drive0_->selections;
     if (which == 1) return drive1_->surfaceReads;
@@ -757,18 +759,89 @@ void Machine::iwmUpdateTrack() {
 void Machine::flushTrack(SonyDrive& d) {
     if (!d.trackDirty() || !d.hasDisk() || d.readOnly) { d.clearTrackDirty(); return; }
     std::vector<u8>& img = *d.image;
+    u32 ok = 0;
     const int wrote = d.hdMedia
-        ? mfm::decodeTrack(d.trackData(), d.trackMarks(), img, d.cacheTrack, d.cacheSide)
+        ? mfm::decodeTrack(d.trackData(), d.trackMarks(), img, d.cacheTrack, d.cacheSide, &ok)
         : gcr::decodeTrack(d.trackData(), img, d.cacheTrack,
                            img.size() > 440u * 1024u ? 2 : 1);
     d.clearTrackDirty();
     ++floppyWrites_;
     if (writeLogBudget_ > 0 && onDiag) {
         --writeLogBudget_;
-        char b[96];
-        std::snprintf(b, sizeof b, "sony: track %d side %d written back (%d sectors)",
-                      d.cacheTrack, d.cacheSide, wrote);
+        char b[160];
+        int len = std::snprintf(b, sizeof b, "sony: track %d side %d written back (%d sectors)",
+                                d.cacheTrack, d.cacheSide, wrote);
+        // Name the sectors that did not survive. A track that comes back one
+        // sector short is a sector the driver can no longer read either, and
+        // which one it is says where the damage was done.
+        if (d.hdMedia && wrote < mfm::kSectorsPerTrack && len > 0) {
+            len += std::snprintf(b + len, sizeof b - static_cast<std::size_t>(len), " -- lost");
+            for (int s = 1; s <= mfm::kSectorsPerTrack && len > 0; ++s)
+                if (!(ok & (1u << s)))
+                    len += std::snprintf(b + len, sizeof b - static_cast<std::size_t>(len),
+                                         " %d", s);
+        }
         onDiag(b);
+        // For the first lost sector, show the surface where its two address marks
+        // ought to be. A field that reads back as something other than what was
+        // laid down says the write landed in the wrong place, and by how far.
+        if (d.hdMedia && wrote < mfm::kSectorsPerTrack) {
+            const std::vector<u8>& trk = d.trackData();
+            const std::vector<u8>& mk = d.trackMarks();
+            for (int s = 1; s <= mfm::kSectorsPerTrack; ++s) {
+                if (ok & (1u << s)) continue;
+                const std::size_t base = 146 + static_cast<std::size_t>(s - 1) * 658;
+                for (int which = 0; which < 2; ++which) {
+                    const std::size_t at = base + (which ? 22 : 12);
+                    char h[320];
+                    int p = std::snprintf(h, sizeof h, "  sector %d %s @%zu:", s,
+                                          which ? "gap2+sync" : "ID mark  ", at);
+                    for (int k = 0; k < (which ? 44 : 12) && p > 0; ++k) {
+                        const std::size_t q = (at + static_cast<std::size_t>(k)) % trk.size();
+                        p += std::snprintf(h + p, sizeof h - static_cast<std::size_t>(p),
+                                           " %02X%c", trk[q],
+                                           (mk.size() == trk.size() && mk[q]) ? '*' : ' ');
+                    }
+                    onDiag(h);
+                }
+                {
+                    // Find the data mark the way the decoder does, then show its
+                    // CRC against the one computed over the field, which is the
+                    // only check left once the marks are known to be in place.
+                    const std::size_t i0 = base + 12;
+                    std::size_t j = i0 + 10;
+                    const std::size_t lim = j + 64;
+                    auto mk3 = [&](std::size_t q) {
+                        return mk.size() == trk.size() && mk[q % trk.size()] &&
+                               mk[(q + 1) % trk.size()] && mk[(q + 2) % trk.size()];
+                    };
+                    for (; j < lim; ++j)
+                        if (mk3(j) && trk[j % trk.size()] == 0xA1 &&
+                            trk[(j + 3) % trk.size()] == 0xFB) break;
+                    if (j < lim) {
+                        u8 hd4[4] = {0xA1, 0xA1, 0xA1, 0xFB};
+                        u16 c = mfm::crc16(hd4, 4);
+                        const std::size_t dat = j + 4;
+                        for (std::size_t k = 0; k < mfm::kSectorBytes; ++k)
+                            c = mfm::crc16Update(c, trk[(dat + k) % trk.size()]);
+                        const u16 want = static_cast<u16>(
+                            (trk[(dat + mfm::kSectorBytes) % trk.size()] << 8) |
+                            trk[(dat + mfm::kSectorBytes + 1) % trk.size()]);
+                        char h2[160];
+                        std::snprintf(h2, sizeof h2,
+                                      "  data mark at %zu, CRC computed %04X, on disk %04X, "
+                                      "tail %02X %02X %02X %02X",
+                                      j, c, want,
+                                      trk[(dat + mfm::kSectorBytes) % trk.size()],
+                                      trk[(dat + mfm::kSectorBytes + 1) % trk.size()],
+                                      trk[(dat + mfm::kSectorBytes + 2) % trk.size()],
+                                      trk[(dat + mfm::kSectorBytes + 3) % trk.size()]);
+                        onDiag(h2);
+                    }
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -789,6 +862,7 @@ void Machine::ismService(SonyDrive& d) {
         if (!iwm_->ismWriting()) d.syncToMark(totalCycles_);
         ismCrcOut_ = 0xFFFF;
         ismWriteMarkPrev_ = false;
+        ismReadMarkPrev_ = false;
     }
     ismActionPrev_ = action;
     if (!action) return;
@@ -801,6 +875,12 @@ void Machine::ismService(SonyDrive& d) {
                 iwm_->ismData = b;
                 iwm_->ismMarkNext = mark;
                 iwm_->ismDataReady = true;
+                // The first mark of a run opens a field and restarts the CRC, so
+                // the check stops depending on where the driver last cleared the
+                // FIFO. Reading from anywhere ahead of an address mark folded the
+                // sync bytes in, and the field could then never verify.
+                if (mark && !ismReadMarkPrev_) iwm_->ismCrcReset();
+                ismReadMarkPrev_ = mark;
                 iwm_->ismCrcAdd(b);
                 ++iwmDataBytes_;
             }
@@ -833,8 +913,8 @@ void Machine::ismService(SonyDrive& d) {
     }
     if (iwm_->ismWroteCrc) {
         iwm_->ismWroteCrc = false;
-        d.writeByte(totalCycles_, static_cast<u8>(ismCrcOut_ >> 8), false);
-        d.writeByte(totalCycles_, static_cast<u8>(ismCrcOut_), false);
+        d.writeCrc(totalCycles_, static_cast<u8>(ismCrcOut_ >> 8),
+                   static_cast<u8>(ismCrcOut_));
         iwmDataWrites_ += 2;
     }
 }

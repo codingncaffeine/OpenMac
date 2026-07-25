@@ -37,6 +37,7 @@ public:
     bool superDrive  = true;    // FDHD: can do 1.4 MB MFM media
     u32 surfaceReads = 0;       // bytes this mechanism has handed the controller
     u32 selections = 0;         // controller accesses made while this drive was addressed
+    u32 writesDropped = 0;      // bytes the controller handed over before the head was ready
 
     // ---- media ---------------------------------------------------------
     // Not owned. Null (or empty) means no disk in the drive.
@@ -323,12 +324,33 @@ public:
     }
 
     // Lay a byte down at the head, marked or not, for an MFM write.
+    // The two CRC bytes closing a field are shifted out back-to-back and occupy
+    // consecutive cells. Handing them over with one timestamp meant the second
+    // was still inside the first one's byte time, failed the readiness gate and
+    // was dropped -- so every field the guest wrote ended one byte short, its
+    // last byte left over from whatever had been there. The sector then failed
+    // its own checksum on every read for as long as the disk stayed in.
+    void writeCrc(u64 now, u8 hi, u8 lo) {
+        writeByte(now, hi, false);
+        writeByte(lastByteAt_ + cyclesPerByte(), lo, false);
+    }
+
     void writeByte(u64 now, u8 b, bool mark) {
-        if (!writeReady(now)) return;
+        if (!writeReady(now)) { ++writesDropped; return; }
         const std::size_t n = trackData_.size();
         const u64 per = cyclesPerByte();
         const u64 steps = (now - lastByteAt_) / per;
-        bytePos_ = (bytePos_ + static_cast<std::size_t>((steps - 1) % n)) % n;
+        // Keep the byte clock aligned, but lay this byte in the very next cell.
+        //
+        // A write is a continuous burst: the controller clocks bytes onto the
+        // surface back-to-back at the bit-cell rate, and the driver keeps up
+        // because the handshake makes it. Advancing the head by the host's
+        // elapsed time -- which is right for reading, where the surface turns
+        // under a head that is only listening -- steps over cells the driver
+        // believes it filled, leaving what was there before standing in the
+        // middle of a field. Every byte written is then faithful and the sector
+        // still never reads back, because its address mark is buried under the
+        // old contents. That is what cost the volume its MDB on first mount.
         lastByteAt_ += steps * per;
         trackData_[bytePos_] = b;
         if (trackMark_.size() == n) trackMark_[bytePos_] = mark ? 1 : 0;
