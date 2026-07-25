@@ -35,6 +35,8 @@ public:
     bool installed   = false;   // drive physically connected to this port
     bool doubleSided = true;    // 800K/1.4MB mechanism (SIDES)
     bool superDrive  = true;    // FDHD: can do 1.4 MB MFM media
+    u32 surfaceReads = 0;       // bytes this mechanism has handed the controller
+    u32 selections = 0;         // controller accesses made while this drive was addressed
 
     // ---- media ---------------------------------------------------------
     // Not owned. Null (or empty) means no disk in the drive.
@@ -59,6 +61,7 @@ public:
         headUpper = false;
         stepIn = true;
         motorWanted_ = false;
+        enabled_ = false;
         stepDoneAt_ = motorUpAt_ = 0;
         diskSwitched_ = false;
         ejectPending_ = false;
@@ -104,6 +107,22 @@ public:
         return motorWanted_ && hasDisk() && now >= motorUpAt_;
     }
     bool motorCommanded() const { return motorWanted_; }
+
+    // The controller's ENABLE output, routed to whichever mechanism the drive-select
+    // latch addresses (/ENBL1 to the internal port, /ENBL2 to the external one). It
+    // is what powers the addressed drive: without it the drive does not listen, and
+    // the spindle does not turn however the control registers are set.
+    //
+    // Asserting it spins the addressed drive up. Dropping it does NOT stop the
+    // spindle here -- the driver takes ENABLE away between accesses as a matter of
+    // course, and it stops the motor deliberately through MOTORON when its own idle
+    // timeout expires. Spinning down on every deassertion would mean paying the
+    // spin-up delay for each sector.
+    void setEnabled(bool on, u64 now) {
+        if (!installed || on == enabled_) return;
+        enabled_ = on;
+        if (on && !motorWanted_) { motorUpAt_ = now + kSpinUpCycles; motorWanted_ = true; }
+    }
     bool stepping(u64 now) const { return now < stepDoneAt_; }
 
     // ---- status lines --------------------------------------------------
@@ -274,6 +293,7 @@ public:
     // cannot serve there, because $00 is an ordinary sync byte in MFM.
     bool nextByte(u64 now, u8* byte, bool* isMark) {
         if (!motorRunning(now) || trackData_.empty()) { lastByteAt_ = now; return false; }
+        ++surfaceReads;
         const u64 per = cyclesPerByte();
         if (now < lastByteAt_ + per) return false;
         const std::size_t n = trackData_.size();
@@ -392,6 +412,7 @@ public:
 private:
     bool motorWanted_   = false;
     bool diskSwitched_  = false;
+    bool enabled_       = false;
     bool ejectPending_  = false;
     bool ejectRequested_ = false;
     u64  stepDoneAt_ = 0;

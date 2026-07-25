@@ -97,6 +97,9 @@ public:
         return hd_;
     }
     u32 hdAccessCount() const { return hdReads_ + hdWrites_; }
+    // Bytes each mechanism has actually handed the controller. A drive the ROM
+    // addresses but never reads from is the signature of a phantom bay.
+    u32 surfaceReads(int which) const;
     int hardDiskDriveNum() const { return hdDriveNum_; }   // 0 until Open adds it
     u32 diskEvtPosts() const { return diskEvtPosts_; }
     u32 diskEvtResult() const { return diskEvtResult_; }

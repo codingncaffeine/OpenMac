@@ -868,6 +868,8 @@ int main(int argc, char** argv) {
     bool floppy800k = false, insert800k = false, insert800kRW = false;
     std::string floppy800kPath, insert800kOut, externalPath;
     std::string floppyOutPath;
+    std::string insertExternalPath;
+    int insertExternalAt = 2600;
     bool externalEmpty = false;
     DriveCfg dcfg;
     for (int i = 1; i < argc; ++i) {
@@ -903,6 +905,8 @@ int main(int argc, char** argv) {
         // Write the internal drive's medium out at the end of any run, so what the
         // guest did to a disk can be diffed against what it started as.
         else if (arg == "--floppy-out" && i + 1 < argc) floppyOutPath = argv[++i];
+        else if (arg == "--insert-external" && i + 1 < argc) insertExternalPath = argv[++i];
+        else if (arg == "--insert-external-at" && i + 1 < argc) insertExternalAt = std::atoi(argv[++i]);
         else if (arg == "--sony-lines" && i + 2 < argc) {
             sonyLineMask  = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
             sonyLineValue = static_cast<u16>(std::strtoul(argv[++i], nullptr, 16));
@@ -1646,6 +1650,23 @@ int main(int argc, char** argv) {
     std::vector<u8> allAudio;
     std::vector<u8> tmpAudio;
     for (int i = 0; i < frames; ++i) {
+        // Put a disk into the external drive mid-run, the way a user does when an
+        // installer asks for the next one. A disk already in the drive at power-on
+        // is a different case: the ROM reads the disk-switched line during its own
+        // boot-time probe, which clears it, and the System that would have acted on
+        // it does not exist yet -- so it sits there unmounted.
+        if (!insertExternalPath.empty() && i == insertExternalAt) {
+            std::ifstream ef(insertExternalPath, std::ios::binary);
+            std::vector<u8> eimg{std::istreambuf_iterator<char>(ef),
+                                 std::istreambuf_iterator<char>()};
+            std::printf("-- frame %d: inserting %zu bytes into the external drive --\n",
+                        i, eimg.size());
+            mac.insertExternalFloppy(std::move(eimg), false);
+        }
+        // The Finder only notices a disk while it is running its event loop, and an
+        // idle machine gets no events at all, so keep the mouse alive afterwards.
+        if (!insertExternalPath.empty() && i > insertExternalAt)
+            mac.mouseMove((i & 1) ? 1 : -1, 0, false);
         if (i == profileAt) profileFrame(mac);
         mac.runFrame();
         mac.drainAudio(tmpAudio);
@@ -1753,6 +1774,10 @@ int main(int argc, char** argv) {
     std::printf("-- ADB: kbd[enum=%u modifiers=%u transitions=%u] "
                 "mouse[enum=%u polls=%u reports=%u] --\n",
                 s.kbdReg3, s.kbdReg2, s.kbdPolls, s.mouseReg3, s.mousePolls, s.mouseReports);
+    std::printf("-- SURFACE READS: internal=%u external=%u phantom-bay=%u --\n",
+                mac.surfaceReads(0), mac.surfaceReads(1), mac.surfaceReads(2));
+    std::printf("-- ADDRESSED: internal=%u external=%u --\n",
+                mac.surfaceReads(3), mac.surfaceReads(4));
     if (!floppyOutPath.empty()) {
         const std::vector<u8>& out = mac.floppyImage();
         std::ofstream of(floppyOutPath, std::ios::binary);

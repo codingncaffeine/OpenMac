@@ -665,6 +665,14 @@ u32 Machine::sonyCommandCount(int drive, int reg) const {
 // leaves it alone while the ROM disk is in use ($43F806 returns early when
 // $0CB3 says so), so a drive that needed PA4 driven high would be unreachable
 // under a ROM-disk boot.
+u32 Machine::surfaceReads(int which) const {
+    if (which == 4) return drive1_->selections;
+    if (which == 3) return drive0_->selections;
+    if (which == 1) return drive1_->surfaceReads;
+    if (which == 2) return driveBay2_->surfaceReads;
+    return drive0_->surfaceReads;
+}
+
 SonyDrive& Machine::selectedDrive() {
     if (iwm_->externalDrive()) return *drive1_;
     return ((via_->ora() >> 4) & 1) ? *driveBay2_ : *drive0_;
@@ -826,6 +834,13 @@ u8 Machine::iwmAccess(int reg, bool write, u8 data) {
     // us; keep the mechanism's view of it current.
     drive0_->readOnly = floppyRO_;
     drive0_->hdMedia  = floppy_.size() >= 1440u * 1024u;
+    // ENABLE powers the mechanism the drive-select latch addresses. Until this was
+    // wired the only thing that ever started a spindle was the driver's write to
+    // the undocumented register 1, which it sends to the drive it booted from --
+    // so a second drive never turned, delivered no bytes, and answered every read
+    // with the ROM's "no disk bytes under the head".
+    ++selectedDrive().selections;
+    selectedDrive().setEnabled(iwm_->motorOn(), totalCycles_);
     iwm_->senseHigh = iwmSenseLine();
     iwmUpdateTrack();
     SonyDrive& d = selectedDrive();
