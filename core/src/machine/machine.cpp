@@ -217,9 +217,18 @@ void Machine::postMouseButton(bool down) {
     // _PostEvent: A0 = event code (mouseDown=1 / mouseUp=2), D0 = message (0 for
     // mouse). PostEvent fills evtQWhere from the low-mem mouse location and
     // evtQWhen from the tick count, so position the cursor first (mouseMove).
+    //
+    // Preserve the interrupted code's registers -- execute68kTrap only saves
+    // PC/SR. Leaving the event code in A0 handed a live `JMP (A0)` in the
+    // System's event path an address of 1: the guest bombed with an address
+    // error at whatever moment a scripted click happened to interrupt, which
+    // from the outside looked like the Installer crashing of its own accord.
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
     cpu_.a[0] = down ? 1u : 2u;
     cpu_.d[0] = 0;
     execute68kTrap(0xA02F);
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
 }
 
 bool Machine::keyHeld(u8 adbCode) const {
