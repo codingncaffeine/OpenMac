@@ -76,10 +76,23 @@ public:
     // Expand the 1-bit framebuffer to ARGB8888 (kScreenW * kScreenH).
     void renderScreen(u32* argbOut) const;
 
-    // Floppy: mount a raw sector image (400K/800K/1.44MB). We service it
-    // through a replacement .Sony disk driver rather than emulating the IWM,
-    // so any image the ROM's HFS can read will boot. Empty image = no disk.
-    void insertFloppy(std::vector<u8> image, bool readOnly = false);
+    // What became of a disk handed to a drive. kAccepted means the mechanism has
+    // it and the ROM's driver will find sectors on it; kRefused means the file is
+    // not something a floppy drive can hold -- the drive is left exactly as it
+    // was, and mediumText() says what the file actually is, in words meant for
+    // the person who chose it.
+    enum class InsertVerdict { kAccepted, kRefused };
+    // The last per-drive medium description (0 = internal, 1 = external):
+    // geometry and container for an accepted disk, the reason for a refusal.
+    const char* mediumText(int drive) const { return mediumText_[drive & 1]; }
+
+    // Floppy: put a disk image in the internal drive. Raw 400K/800K/1.4MB
+    // sector dumps mount as-is; DiskCopy 4.2 and MacBinary wrappers (and the
+    // two nested) are recognised and stripped, and are faithfully reassembled
+    // around the guest's writes when the image is read back out. Anything that
+    // is not floppy media -- an NDIF image, an application, an archive -- is
+    // refused with its nature named rather than framed as noise.
+    InsertVerdict insertFloppy(std::vector<u8> image, bool readOnly = false);
     void ejectFloppy();
     bool floppyInserted() const { return !floppy_.empty(); }
     // Persist writes by reading this back out. When the ROM's own driver is
@@ -96,7 +109,7 @@ public:
     // because it is the same mechanism model over the same chip.
     void setExternalDriveAttached(bool on);
     bool externalDriveAttached() const;
-    void insertExternalFloppy(std::vector<u8> image, bool readOnly = false);
+    InsertVerdict insertExternalFloppy(std::vector<u8> image, bool readOnly = false);
     void ejectExternalFloppy();
     bool externalFloppyInserted() const { return !floppy2_.empty(); }
     const std::vector<u8>& externalFloppyImage();
@@ -274,7 +287,7 @@ private:
     void noteGcrError(u32 pc);     // one of them was reached
     void watchSonyPrime();         // log a read/write the ROM's own driver is about to do
     void watchSonyResult();        // log the result the ROM's own driver hands back
-    void describeMedium(const char* which, const std::vector<u8>& img, bool diskCopy);
+    void describeMedium(int drive, const char* which, const char* refusal);
     void flushTrack(SonyDrive& d);  // decode a written track back into that drive's image
     void flushFloppyTrack();       // ...the internal drive's, which the host persists
     void ismService(SonyDrive& d); // move bytes between the ISM FIFO and the surface
@@ -293,9 +306,23 @@ private:
 
     std::vector<u8> floppy_;
     std::vector<u8> floppy2_;      // the external drive's medium
-    // DiskCopy 4.2 wrapper stripped on insertion, put back when the image is
-    // handed out so the file stays the format it arrived in.
-    std::vector<u8> floppyHeader_, floppy2Header_, mediumOut_;
+    // Containers stripped on insertion -- MacBinary around DiskCopy 4.2 around
+    // the sectors, either or both -- kept so the image is handed back out in
+    // the file format it arrived in, reassembled around the guest's writes.
+    struct MediumWrapper {
+        std::vector<u8> mbHeader, mbResource;   // MacBinary, when the file wore it
+        std::vector<u8> dcHeader, dcTags;       // DiskCopy 4.2, likewise
+        void clear() { *this = MediumWrapper{}; }
+        // Put the wrappers back around the sector data, innermost first.
+        std::vector<u8> reassemble(const std::vector<u8>& data) const;
+    };
+    MediumWrapper floppyWrap_, floppy2Wrap_;
+    std::vector<u8> mediumOut_;
+    char mediumText_[2][224] = {{0}, {0}};
+    // Peel MacBinary and DiskCopy wrappers off `image` into `wrap` and judge
+    // what is left. Returns nullptr for mountable floppy media, else the
+    // refusal text (which is also stored for mediumText()).
+    const char* classifyMedium(int drive, std::vector<u8>& image, MediumWrapper& wrap);
     bool floppyRO_ = false;
     u32 sonyOpenPc_ = 0, sonyPrimePc_ = 0, sonyControlPc_ = 0, sonyStatusPc_ = 0;
     // Error exits of the ROM's GCR reader, kept as a span plus a short list so

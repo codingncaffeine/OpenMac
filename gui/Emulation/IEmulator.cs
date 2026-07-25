@@ -31,15 +31,26 @@ public interface IEmulator : IDisposable
     /// </summary>
     bool TryGetFrame(byte[] bgra);
 
-    void InsertFloppy(string path);
+    /// <summary>
+    /// Put a disk image in the drive. Returns false if the core refused the file
+    /// because it is not floppy media (an NDIF image, an application, an
+    /// archive...); the drive is then left untouched and <see cref="MediumNote"/>
+    /// says why, in words meant for the person who chose the file.
+    /// </summary>
+    bool InsertFloppy(string path);
     void EjectFloppy();
+
+    /// <summary>The core's description of the last medium offered to a drive
+    /// (0 = internal, 1 = external): geometry for an accepted disk, the reason
+    /// for a refusal.</summary>
+    string MediumNote(int drive);
 
     /// <summary>Path of the disk in the external drive, or null.</summary>
     string? ExternalFloppyPath { get; }
     /// <summary>Whether a drive is connected to the machine's external port.</summary>
     bool ExternalDriveAttached { get; }
     void SetExternalDrive(bool attached);
-    void InsertExternalFloppy(string path);
+    bool InsertExternalFloppy(string path);
     void EjectExternalFloppy();
 
     /// <summary>

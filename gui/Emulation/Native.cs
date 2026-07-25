@@ -34,11 +34,20 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern nuint omac_drain_audio(IntPtr h, byte[] outBuf, nuint cap);
 
+    // Returns 1 if the drive took the disk, 0 if the file is not floppy media
+    // (an NDIF image, an application, an archive...); the drive is then left
+    // untouched and omac_floppy_medium says why.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    public static extern void omac_insert_floppy(IntPtr h, byte[] img, nuint len, int readOnly);
+    public static extern int omac_insert_floppy(IntPtr h, byte[] img, nuint len, int readOnly);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_eject_floppy(IntPtr h);
+
+    // The last medium description for a drive (0 = internal, 1 = external):
+    // geometry and container for an accepted disk, the reason for a refusal.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_floppy_medium(IntPtr h, int drive,
+                                                  [Out] byte[]? outBuf, nuint cap);
 
     // The external drive port. Attaching a mechanism makes the ROM register a
     // second floppy drive; a disk put in after the machine has started mounts
@@ -47,7 +56,7 @@ internal static class Native
     public static extern void omac_set_external_drive(IntPtr h, int attached);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    public static extern void omac_insert_floppy2(IntPtr h, byte[] img, nuint len, int readOnly);
+    public static extern int omac_insert_floppy2(IntPtr h, byte[] img, nuint len, int readOnly);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_eject_floppy2(IntPtr h);

@@ -78,20 +78,41 @@ OMAC_API size_t omac_drain_audio(OMac* m, uint8_t* out, size_t cap)
     return n;
 }
 
-OMAC_API void omac_insert_floppy(OMac* m, const uint8_t* img, size_t len, int ro)
+OMAC_API int omac_insert_floppy(OMac* m, const uint8_t* img, size_t len, int ro)
 {
-    if (m && img) m->mac.insertFloppy(std::vector<u8>(img, img + len), ro != 0);
+    if (!m || !img) return 0;
+    return m->mac.insertFloppy(std::vector<u8>(img, img + len), ro != 0) ==
+                   openmac::Machine::InsertVerdict::kAccepted
+               ? 1
+               : 0;
 }
 OMAC_API void omac_eject_floppy(OMac* m) { if (m) m->mac.ejectFloppy(); }
+
+OMAC_API size_t omac_floppy_medium(OMac* m, int drive, char* out, size_t cap)
+{
+    if (!m) return 0;
+    const char* s = m->mac.mediumText(drive);
+    const size_t n = std::strlen(s);
+    if (out && cap) {
+        const size_t c = n < cap - 1 ? n : cap - 1;
+        std::memcpy(out, s, c);
+        out[c] = 0;
+    }
+    return n;
+}
 
 OMAC_API void omac_set_external_drive(OMac* m, int attached)
 {
     if (m) m->mac.setExternalDriveAttached(attached != 0);
 }
 
-OMAC_API void omac_insert_floppy2(OMac* m, const uint8_t* img, size_t len, int ro)
+OMAC_API int omac_insert_floppy2(OMac* m, const uint8_t* img, size_t len, int ro)
 {
-    if (m && img) m->mac.insertExternalFloppy(std::vector<u8>(img, img + len), ro != 0);
+    if (!m || !img) return 0;
+    return m->mac.insertExternalFloppy(std::vector<u8>(img, img + len), ro != 0) ==
+                   openmac::Machine::InsertVerdict::kAccepted
+               ? 1
+               : 0;
 }
 
 OMAC_API void omac_eject_floppy2(OMac* m) { if (m) m->mac.ejectExternalFloppy(); }

@@ -264,17 +264,35 @@ public sealed class NativeEmulator : IEmulator
     /// </summary>
     public bool WriteProtectFloppies { get; set; }
 
-    public void InsertFloppy(string path)
+    public bool InsertFloppy(string path)
     {
-        if (_h == IntPtr.Zero) return;
+        if (_h == IntPtr.Zero) return false;
         WriteBackFloppy();   // save the outgoing disk before it is replaced
         byte[] img = File.ReadAllBytes(path);
+        int ok;
         lock (_sync)
         {
-            if (_h == IntPtr.Zero) return;
-            Native.omac_insert_floppy(_h, img, (nuint)img.Length, WriteProtectFloppies ? 1 : 0);
+            if (_h == IntPtr.Zero) return false;
+            ok = Native.omac_insert_floppy(_h, img, (nuint)img.Length,
+                                           WriteProtectFloppies ? 1 : 0);
         }
-        FloppyPath = path;
+        // A refused file is not "the disk in the drive": the core left the drive
+        // exactly as it was, so the previous path (and its write-back) stands.
+        if (ok != 0) FloppyPath = path;
+        return ok != 0;
+    }
+
+    public string MediumNote(int drive)
+    {
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return "";
+            nuint n = Native.omac_floppy_medium(_h, drive, null, 0);
+            if (n == 0) return "";
+            byte[] buf = new byte[n + 1];
+            Native.omac_floppy_medium(_h, drive, buf, (nuint)buf.Length);
+            return System.Text.Encoding.ASCII.GetString(buf, 0, (int)n);
+        }
     }
 
     public void EjectFloppy()
@@ -296,18 +314,24 @@ public sealed class NativeEmulator : IEmulator
         ExternalDriveAttached = attached;
     }
 
-    public void InsertExternalFloppy(string path)
+    public bool InsertExternalFloppy(string path)
     {
-        if (_h == IntPtr.Zero) return;
+        if (_h == IntPtr.Zero) return false;
         WriteBackExternalFloppy();
         byte[] img = File.ReadAllBytes(path);
+        int ok;
         lock (_sync)
         {
-            if (_h == IntPtr.Zero) return;
-            Native.omac_insert_floppy2(_h, img, (nuint)img.Length, WriteProtectFloppies ? 1 : 0);
+            if (_h == IntPtr.Zero) return false;
+            ok = Native.omac_insert_floppy2(_h, img, (nuint)img.Length,
+                                            WriteProtectFloppies ? 1 : 0);
         }
-        ExternalDriveAttached = true;
-        ExternalFloppyPath = path;
+        if (ok != 0)
+        {
+            ExternalDriveAttached = true;
+            ExternalFloppyPath = path;
+        }
+        return ok != 0;
     }
 
     public void EjectExternalFloppy()

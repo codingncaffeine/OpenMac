@@ -22,9 +22,12 @@
 //   82     u16  $0100 -- the private word that identifies the format
 //   84     the disk data, then the tag bytes
 //
-// Tags are the twelve bytes per sector that the file system used for recovery;
-// they are dropped here, as they are on the GCR surface, which synthesises them
-// as zeroes. No disk needs them to mount.
+// Tags are the twelve bytes per sector that the file system used for recovery.
+// The GCR surface synthesises them as zeroes -- no disk needs them to mount --
+// but the file's own tag block is kept and put back on the way out, along with
+// its checksum field untouched, so an image that came in with tags leaves with
+// them and an unchanged disk round-trips byte for byte. (The guest cannot
+// change a tag through this drive: the surface never carries real ones.)
 
 #include "openmac/types.hpp"
 
@@ -55,20 +58,32 @@ inline bool isDiskCopy(const std::vector<u8>& img) {
 
 inline u32 dataSize(const std::vector<u8>& img) { return be32(img, 64); }
 
-// Split a loaded file into the header we must keep and the sectors the drive
-// sees. `img` is left holding just the disk data; the returned vector holds the
-// header, which has to be put back in front when the image is written out or the
-// file stops being a DiskCopy image. A raw image is left alone and the returned
-// header is empty.
-inline std::vector<u8> takeHeader(std::vector<u8>& img) {
+// The pieces of a DiskCopy file that are not sector data, kept so the file can
+// be put back together on the way out.
+struct Parts {
+    std::vector<u8> header;   // the 84 bytes
+    std::vector<u8> tags;     // the tag block that followed the data, if any
+    bool wrapped() const { return header.size() == kHeaderSize; }
+};
+
+// Split a loaded file into the sectors the drive sees and the pieces we must
+// keep. `img` is left holding just the disk data. A raw image is left alone
+// and the returned parts are empty.
+inline Parts split(std::vector<u8>& img) {
     if (!isDiskCopy(img)) return {};
+    Parts p;
     const std::size_t data = dataSize(img);
-    std::vector<u8> header(img.begin(), img.begin() + kHeaderSize);
+    p.header.assign(img.begin(), img.begin() + kHeaderSize);
+    p.tags.assign(img.begin() + static_cast<std::ptrdiff_t>(kHeaderSize + data), img.end());
     std::vector<u8> sectors(img.begin() + kHeaderSize,
-                            img.begin() + kHeaderSize + static_cast<std::ptrdiff_t>(data));
+                            img.begin() + static_cast<std::ptrdiff_t>(kHeaderSize + data));
     img = std::move(sectors);
-    return header;
+    return p;
 }
+
+// Compatibility shim for callers that only want the header and are content to
+// lose the tags.
+inline std::vector<u8> takeHeader(std::vector<u8>& img) { return split(img).header; }
 
 // Apple's checksum: for every 16-bit word, add it to the running total and then
 // rotate the total right one bit. Used for both the data and tag fields.
@@ -81,21 +96,33 @@ inline u32 checksum(const u8* p, std::size_t n) {
     return sum;
 }
 
-// Put a header back in front of the data, refreshing the size and checksum so
-// the result is a valid DiskCopy image of whatever the guest has written.
-inline std::vector<u8> rewrap(const std::vector<u8>& header, const std::vector<u8>& data) {
-    if (header.size() != kHeaderSize) return data;
-    std::vector<u8> out(header);
+// Put the file back together around a (possibly rewritten) data block: sizes
+// and the data checksum refreshed, the original tag block and its checksum
+// field carried through unchanged. The guest cannot alter tags through the
+// drive, so what came in is still true on the way out -- and an untouched disk
+// reassembles to the identical file, tag-checksum quirks and all.
+inline std::vector<u8> rewrap(const Parts& p, const std::vector<u8>& data) {
+    if (!p.wrapped()) return data;
+    std::vector<u8> out(p.header);
     const u32 size = static_cast<u32>(data.size());
     out[64] = static_cast<u8>(size >> 24); out[65] = static_cast<u8>(size >> 16);
     out[66] = static_cast<u8>(size >> 8);  out[67] = static_cast<u8>(size);
-    out[68] = out[69] = out[70] = out[71] = 0;      // tags dropped
+    const u32 tagSize = static_cast<u32>(p.tags.size());
+    out[68] = static_cast<u8>(tagSize >> 24); out[69] = static_cast<u8>(tagSize >> 16);
+    out[70] = static_cast<u8>(tagSize >> 8);  out[71] = static_cast<u8>(tagSize);
     const u32 ck = checksum(data.data(), data.size());
     out[72] = static_cast<u8>(ck >> 24); out[73] = static_cast<u8>(ck >> 16);
     out[74] = static_cast<u8>(ck >> 8);  out[75] = static_cast<u8>(ck);
-    out[76] = out[77] = out[78] = out[79] = 0;      // tag checksum
     out.insert(out.end(), data.begin(), data.end());
+    out.insert(out.end(), p.tags.begin(), p.tags.end());
     return out;
+}
+
+// The old shape, for callers that dropped the tags.
+inline std::vector<u8> rewrap(const std::vector<u8>& header, const std::vector<u8>& data) {
+    Parts p;
+    p.header = header;
+    return rewrap(p, data);
 }
 
 } // namespace openmac::dc42

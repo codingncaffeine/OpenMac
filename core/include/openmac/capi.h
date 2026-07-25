@@ -47,15 +47,26 @@ OMAC_API void omac_render(OMac*, uint32_t* argb);
 OMAC_API size_t omac_drain_audio(OMac*, uint8_t* out, size_t cap);
 
 /* ---- disks ---- */
-OMAC_API void omac_insert_floppy(OMac*, const uint8_t* img, size_t len, int read_only);
+/* Put a disk image in a drive. Raw 400K/800K/1.4MB dumps mount as-is; DiskCopy
+   4.2 and MacBinary wrappers (or the two nested) are stripped on the way in and
+   faithfully reassembled around the guest's writes on the way out. Returns 1 if
+   the drive took the disk, 0 if the file is not floppy media (an NDIF image, an
+   application, an archive...) -- the drive is then left untouched, and
+   omac_floppy_medium says why, in words meant for the person who chose it. */
+OMAC_API int omac_insert_floppy(OMac*, const uint8_t* img, size_t len, int read_only);
 OMAC_API void omac_eject_floppy(OMac*);
+
+/* The last medium description for a drive (0 = internal, 1 = external):
+   geometry and container for an accepted disk, the reason for a refusal.
+   Copies at most cap-1 bytes plus a terminator; returns the full length. */
+OMAC_API size_t omac_floppy_medium(OMac*, int drive, char* out, size_t cap);
 
 /* The external drive port. Attaching a mechanism makes the ROM register a
    second floppy drive; a disk put in after the machine has started mounts like
    any other. omac_floppy_data copies the medium out so writes can be persisted
    -- pass a null buffer to ask how large it is. */
 OMAC_API void omac_set_external_drive(OMac*, int attached);
-OMAC_API void omac_insert_floppy2(OMac*, const uint8_t* img, size_t len, int read_only);
+OMAC_API int omac_insert_floppy2(OMac*, const uint8_t* img, size_t len, int read_only);
 OMAC_API void omac_eject_floppy2(OMac*);
 
 /* Is there a disk in that drive right now? 0 = internal, 1 = external. The guest

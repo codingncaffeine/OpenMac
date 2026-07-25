@@ -4,6 +4,7 @@
 #include "iwm.hpp"
 #include "rtc.hpp"
 #include "dc42.hpp"
+#include "macbinary.hpp"
 #include "gcr.hpp"
 #include "mfm.hpp"
 #include "scsi.hpp"
@@ -499,44 +500,147 @@ int Machine::stepInstruction() {
 // service a raw disk image directly, which sidesteps the IWM and the GCR/MFM
 // encoding entirely (the same approach mature Mac emulators take).
 
+std::vector<u8> Machine::MediumWrapper::reassemble(const std::vector<u8>& data) const {
+    std::vector<u8> out = data;
+    if (dcHeader.size() == dc42::kHeaderSize) {
+        dc42::Parts p;
+        p.header = dcHeader;
+        p.tags = dcTags;
+        out = dc42::rewrap(p, out);
+    }
+    if (mbHeader.size() == macbinary::kHeaderSize) {
+        macbinary::Parts p;
+        p.header = mbHeader;
+        p.resource = mbResource;
+        out = macbinary::rewrap(p, out);
+    }
+    return out;
+}
+
+// Peel the containers off a file and judge what is left. The refusal texts are
+// written for the person who picked the file: they name what it actually is and
+// what to do with it instead, because from the desktop every one of these looks
+// identical -- an unreadable disk the System offers to initialise, which for a
+// mis-framed master image is an offer to destroy it.
+const char* Machine::classifyMedium(int drive, std::vector<u8>& image, MediumWrapper& wrap) {
+    wrap.clear();
+    char* text = mediumText_[drive & 1];
+    const std::size_t textCap = sizeof mediumText_[0];
+    if (image.empty()) {
+        std::snprintf(text, textCap, "drive is empty");
+        return nullptr;
+    }
+    const std::size_t fileSize = image.size();
+    std::string mbType, mbCreator, mbName;
+    if (macbinary::isMacBinary(image)) {
+        macbinary::Parts p = macbinary::split(image);
+        mbType = p.type();
+        mbCreator = p.creator();
+        mbName = p.name();
+        wrap.mbHeader = std::move(p.header);
+        wrap.mbResource = std::move(p.resource);
+    }
+    bool diskCopy = false;
+    if (dc42::isDiskCopy(image)) {
+        dc42::Parts p = dc42::split(image);
+        wrap.dcHeader = std::move(p.header);
+        wrap.dcTags = std::move(p.tags);
+        diskCopy = true;
+    }
+
+    const char* geometry =
+        image.size() == 1474560u ? "1.4MB MFM, 80 x 2 x 18" :
+        image.size() ==  819200u ? "800K GCR, 80 x 2 zoned" :
+        image.size() ==  409600u ? "400K GCR, 80 x 1 zoned" : nullptr;
+    const char* container =
+        !wrap.mbHeader.empty() && diskCopy ? "MacBinary around DiskCopy 4.2, both stripped" :
+        !wrap.mbHeader.empty()             ? "MacBinary (128-byte header stripped)" :
+        diskCopy                           ? "DiskCopy 4.2 (84-byte header stripped)" :
+                                             "raw image";
+    if (geometry) {
+        std::snprintf(text, textCap, "%zu bytes, %s -- %s", fileSize, container, geometry);
+        return nullptr;
+    }
+
+    // Nothing a floppy drive can hold. Name what it is instead, most specific
+    // wrapper first: the MacBinary header carries the file's own type and
+    // creator, which is the file saying what it is in its own words.
+    if (!mbType.empty()) {
+        if (mbType == "APPL")
+            std::snprintf(text, textCap,
+                          "'%s' is a Macintosh application ('APPL'), not a disk image. If it is "
+                          "a self-mounting archive (.smi), copy it onto a mounted disk and run "
+                          "it inside the Mac.",
+                          mbName.c_str());
+        else if (mbType == "SIT!" || mbType == "SITD" || mbType == "SIT5" || mbCreator == "SIT!")
+            std::snprintf(text, textCap,
+                          "'%s' is a StuffIt archive, not a disk image. Copy it onto a mounted "
+                          "disk and unpack it inside the Mac.",
+                          mbName.c_str());
+        else if (mbCreator == "ddsk" || mbType == "rohd" || mbType == "rdwr")
+            std::snprintf(text, textCap,
+                          "'%s' is a Disk Copy 6 (NDIF) image ('%s' by '%s'): its sectors live "
+                          "in a compressed block map, not a raw dump, and it is usually a "
+                          "hard-disk image besides. Convert it to raw or DiskCopy 4.2 first.",
+                          mbName.c_str(), mbType.c_str(), mbCreator.c_str());
+        else
+            std::snprintf(text, textCap,
+                          "'%s' (MacBinary, type '%s' by '%s') holds %zu bytes, which is not a "
+                          "floppy: no geometry fits it, so the drive cannot frame its sectors.",
+                          mbName.c_str(), mbType.c_str(), mbCreator.c_str(), image.size());
+        return text;
+    }
+    if (image.size() == 737280u) {
+        std::snprintf(text, textCap,
+                      "%zu bytes is a 720K MFM (DOS-format) disk. A Macintosh needs Apple File "
+                      "Exchange to read one, and this drive does not frame that geometry yet.",
+                      fileSize);
+        return text;
+    }
+    std::snprintf(text, textCap,
+                  "%zu bytes, %s -- UNRECOGNISED SIZE, no geometry fits it: the drive cannot "
+                  "frame its sectors, so nothing would mount.",
+                  fileSize, container);
+    return text;
+}
+
 // Put a disk in the drive. That is the whole operation: the mechanism latches
 // its disk-switched line and the ROM's own driver notices on its next pass --
 // its per-VBL task polls CSTIN, posts the disk-inserted event and lets the
 // System mount the volume, exactly as on the desk. Nothing here stages a mount,
 // unmounts the outgoing volume or drives a trap; all of that belonged to the
 // high-level driver replacement that the real hardware has now displaced.
-void Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
+//
+// A file that is not floppy media is refused outright, leaving the drive
+// untouched: framing arbitrary bytes onto the surface only manufactures an
+// unreadable disk, and the System's answer to one of those is an offer to
+// initialise it -- which, with the guest's writes copied back to the file, is
+// an offer to destroy the original.
+Machine::InsertVerdict Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
+    MediumWrapper wrap;
+    const char* refusal = classifyMedium(0, image, wrap);
+    describeMedium(0, "floppy", refusal);
+    if (refusal) return InsertVerdict::kRefused;
     flushFloppyTrack();   // whatever the driver wrote to the outgoing disk
     floppy_ = std::move(image);
-    floppyHeader_ = dc42::takeHeader(floppy_);   // DiskCopy wrapper, if that is what it is
+    floppyWrap_ = std::move(wrap);
     floppyEjected_.clear();
     ++floppyGen_;
     floppyRO_ = readOnly;
     drive0_->insert(&floppy_, readOnly, floppy_.size() >= 1440u * 1024u);
-    describeMedium("floppy", floppy_, !floppyHeader_.empty());
+    return InsertVerdict::kAccepted;
 }
 
-// Say what was actually recognised. Getting this wrong looks exactly like a
-// broken drive: a disk whose sectors are not where the geometry says they are
-// never mounts, and the machine shows the flashing question mark of a disk with
-// no System on it -- with nothing anywhere to say why.
-void Machine::describeMedium(const char* which, const std::vector<u8>& img, bool diskCopy) {
+// Report the classification: what was recognised, or why the file was turned
+// away. Getting this wrong looks exactly like a broken drive -- a disk whose
+// sectors are not where the geometry says they are never mounts, and the
+// machine shows the flashing question mark of a disk with no System on it,
+// with nothing anywhere to say why.
+void Machine::describeMedium(int drive, const char* which, const char* refusal) {
     if (!onDiag) return;
-    char b[224];
-    if (img.empty()) {
-        std::snprintf(b, sizeof b, "%s: drive is empty", which);
-        onDiag(b);
-        return;
-    }
-    const char* geometry =
-        img.size() == 1474560u ? "1.4MB MFM, 80 x 2 x 18" :
-        img.size() ==  819200u ? "800K GCR, 80 x 2 zoned" :
-        img.size() ==  409600u ? "400K GCR, 80 x 1 zoned" : nullptr;
-    std::snprintf(b, sizeof b, "%s: %zu bytes, %s -- %s", which, img.size(),
-                  diskCopy ? "DiskCopy 4.2 (84-byte header stripped)" : "raw image",
-                  geometry ? geometry
-                           : "UNRECOGNISED SIZE, no geometry fits it: the drive cannot frame "
-                             "its sectors, so nothing will mount");
+    char b[288];
+    std::snprintf(b, sizeof b, "%s: %s%s", which, refusal ? "REFUSED -- " : "",
+                  mediumText_[drive & 1]);
     onDiag(b);
 }
 
@@ -568,13 +672,17 @@ void Machine::setExternalDriveAttached(bool on) {
 
 bool Machine::externalDriveAttached() const { return drive1_->installed; }
 
-void Machine::insertExternalFloppy(std::vector<u8> image, bool readOnly) {
+Machine::InsertVerdict Machine::insertExternalFloppy(std::vector<u8> image, bool readOnly) {
+    MediumWrapper wrap;
+    const char* refusal = classifyMedium(1, image, wrap);
+    describeMedium(1, "external floppy", refusal);
+    if (refusal) return InsertVerdict::kRefused;
     flushTrack(*drive1_);
     floppy2_ = std::move(image);
-    floppy2Header_ = dc42::takeHeader(floppy2_);
+    floppy2Wrap_ = std::move(wrap);
     setExternalDriveAttached(true);
     drive1_->insert(&floppy2_, readOnly, floppy2_.size() >= 1440u * 1024u);
-    describeMedium("external floppy", floppy2_, !floppy2Header_.empty());
+    return InsertVerdict::kAccepted;
 }
 
 void Machine::ejectExternalFloppy() {
@@ -588,21 +696,24 @@ void Machine::ejectExternalFloppy() {
 
 // Hand the medium out for the host to save. If the drive has thrown the disk
 // out, the medium still exists -- give back what was on it. A disk that arrived
-// wrapped in a DiskCopy header is rewrapped, so the file it is written back to
-// stays the format it came in as rather than silently becoming a raw image.
+// in a wrapper -- DiskCopy, MacBinary, or one inside the other -- is put back
+// together the same way, so the file it is written back to stays the format it
+// came in as rather than silently becoming a raw image.
 const std::vector<u8>& Machine::floppyImage() {
     flushFloppyTrack();
     const std::vector<u8>& data =
         floppy_.empty() && !floppyEjected_.empty() ? floppyEjected_ : floppy_;
-    if (floppyHeader_.empty() || data.empty()) return data;
-    mediumOut_ = dc42::rewrap(floppyHeader_, data);
+    if (data.empty()) return data;
+    if (floppyWrap_.mbHeader.empty() && floppyWrap_.dcHeader.empty()) return data;
+    mediumOut_ = floppyWrap_.reassemble(data);
     return mediumOut_;
 }
 
 const std::vector<u8>& Machine::externalFloppyImage() {
     flushTrack(*drive1_);
-    if (floppy2Header_.empty() || floppy2_.empty()) return floppy2_;
-    mediumOut_ = dc42::rewrap(floppy2Header_, floppy2_);
+    if (floppy2_.empty()) return floppy2_;
+    if (floppy2Wrap_.mbHeader.empty() && floppy2Wrap_.dcHeader.empty()) return floppy2_;
+    mediumOut_ = floppy2Wrap_.reassemble(floppy2_);
     return mediumOut_;
 }
 // Take the disk out from the host side, as if the button on the front were a

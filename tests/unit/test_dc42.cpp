@@ -78,6 +78,25 @@ TEST_CASE("dc42: the magic alone is not enough") {
     CHECK(dc42::isDiskCopy(bad) == false);
 }
 
+TEST_CASE("dc42: tags are kept and an unchanged disk round-trips byte for byte") {
+    // 800K images were archived with their twelve tag bytes a sector; the drive
+    // synthesises zeros on the surface, but the file's tag block is not ours to
+    // discard. split/rewrap must reassemble the identical file.
+    const std::vector<u8> data = disk(819200);
+    std::vector<u8> file = wrap(data, 1600 * 12);
+    // Give the header a data checksum so the round-trip has to reproduce it.
+    const u32 ck = dc42::checksum(data.data(), data.size());
+    file[72] = static_cast<u8>(ck >> 24); file[73] = static_cast<u8>(ck >> 16);
+    file[74] = static_cast<u8>(ck >> 8);  file[75] = static_cast<u8>(ck);
+    const std::vector<u8> original = file;
+
+    dc42::Parts p = dc42::split(file);
+    CHECK(p.wrapped());
+    CHECK(file == data);
+    CHECK(p.tags.size() == 1600u * 12u);
+    CHECK(dc42::rewrap(p, file) == original);
+}
+
 TEST_CASE("dc42: rewrapping produces a file that unwraps to the same disk") {
     // What a host writes back after a session must still be a DiskCopy image, so
     // the file keeps the format it arrived in.

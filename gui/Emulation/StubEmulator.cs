@@ -57,8 +57,9 @@ public sealed class StubEmulator : IEmulator
         }
     }
 
-    public void InsertFloppy(string path) => FloppyPath = path;
+    public bool InsertFloppy(string path) { FloppyPath = path; return true; }
     public void EjectFloppy() => FloppyPath = null;
+    public string MediumNote(int drive) => "";
 
     public string? ExternalFloppyPath { get; private set; }
     public bool ExternalDriveAttached { get; private set; }
@@ -67,10 +68,11 @@ public sealed class StubEmulator : IEmulator
         ExternalDriveAttached = attached;
         if (!attached) ExternalFloppyPath = null;
     }
-    public void InsertExternalFloppy(string path)
+    public bool InsertExternalFloppy(string path)
     {
         ExternalDriveAttached = true;
         ExternalFloppyPath = path;
+        return true;
     }
     public void EjectExternalFloppy() => ExternalFloppyPath = null;
     public bool WriteProtectFloppies { get; set; }

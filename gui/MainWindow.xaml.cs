@@ -15,8 +15,11 @@ public partial class MainWindow : Window
 {
     // Both drives take the same images, so they offer the same filter and share
     // the remembered folder.
+    // .bin is here because much archived software travels as MacBinary
+    // (".img.bin"); the core strips that wrapper on insertion.
     private const string DiskImageFilter =
-        "Disk image (*.img;*.image;*.dsk;*.dc42)|*.img;*.image;*.dsk;*.dc42|All files (*.*)|*.*";
+        "Disk image (*.img;*.image;*.dsk;*.dc42;*.bin)|*.img;*.image;*.dsk;*.dc42;*.bin|"
+        + "All files (*.*)|*.*";
 
     private readonly Settings _settings;
     private IEmulator _emulator;
@@ -209,12 +212,22 @@ public partial class MainWindow : Window
             _emulator.LoadRom(path, _settings.RamMB, _settings.BootRomDisk);
             // Before any disk goes in: the tab is read at insertion.
             _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
-            if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy))
-                _emulator.InsertFloppy(_settings.LastFloppy!);
+            // A remembered path the core now refuses is forgotten rather than
+            // retried on every boot; the refusal is in the log.
+            if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy) &&
+                !_emulator.InsertFloppy(_settings.LastFloppy!))
+            {
+                Log.Line($"floppy refused: {_settings.LastFloppy} -- {_emulator.MediumNote(0)}");
+                _settings.LastFloppy = null;
+            }
             if (_settings.ExternalDrive) _emulator.SetExternalDrive(true);
             if (!string.IsNullOrEmpty(_settings.LastExternalFloppy) &&
-                File.Exists(_settings.LastExternalFloppy))
-                _emulator.InsertExternalFloppy(_settings.LastExternalFloppy!);
+                File.Exists(_settings.LastExternalFloppy) &&
+                !_emulator.InsertExternalFloppy(_settings.LastExternalFloppy!))
+            {
+                Log.Line($"floppy refused: {_settings.LastExternalFloppy} -- {_emulator.MediumNote(1)}");
+                _settings.LastExternalFloppy = null;
+            }
             if (!string.IsNullOrEmpty(_settings.LastHardDisk) && File.Exists(_settings.LastHardDisk))
                 _emulator.AttachHardDisk(_settings.LastHardDisk!);
         }
@@ -283,14 +296,31 @@ public partial class MainWindow : Window
     }
 
     // ---- disks ----
+    // The core judges every file offered to a drive: containers (MacBinary,
+    // DiskCopy 4.2) are stripped and mount; anything that is not floppy media is
+    // refused with its nature named. A refusal leaves the drive untouched, so
+    // don't remember the path as "the disk in the drive" -- surface the verdict.
+    private bool TryInsert(string path, Func<string, bool> insert, int drive)
+    {
+        if (insert(path)) return true;
+        string why = _emulator.MediumNote(drive);
+        Log.Line($"floppy refused: {path} -- {why}");
+        MessageBox.Show(this,
+            Path.GetFileName(path) + " did not go in the drive.\n\n" + why,
+            "Not a floppy", MessageBoxButton.OK, MessageBoxImage.Warning);
+        return false;
+    }
+
     private void InsertFloppy_Click(object sender, RoutedEventArgs e)
     {
         if (FilePicker.Open(this, _settings, FilePicker.Floppy, "Insert Floppy",
                             DiskImageFilter, _settings.LastFloppy) is { } path)
         {
-            _emulator.InsertFloppy(path);
-            _settings.LastFloppy = path;
-            _settings.Save();
+            if (TryInsert(path, _emulator.InsertFloppy, 0))
+            {
+                _settings.LastFloppy = path;
+                _settings.Save();
+            }
             UpdateUi();
         }
     }
@@ -344,10 +374,12 @@ public partial class MainWindow : Window
                             "Insert Floppy (External Drive)", DiskImageFilter,
                             _settings.LastExternalFloppy ?? _settings.LastFloppy) is { } path)
         {
-            _emulator.InsertExternalFloppy(path);
-            _settings.ExternalDrive = true;
-            _settings.LastExternalFloppy = path;
-            _settings.Save();
+            if (TryInsert(path, _emulator.InsertExternalFloppy, 1))
+            {
+                _settings.ExternalDrive = true;
+                _settings.LastExternalFloppy = path;
+                _settings.Save();
+            }
             UpdateUi();
         }
     }
