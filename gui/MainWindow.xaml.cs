@@ -365,6 +365,11 @@ public partial class MainWindow : Window
         if (!on) _settings.LastExternalFloppy = null;
         _settings.ExternalDrive = on;
         _settings.Save();
+        // The ROM scans the drive ports once, at boot -- a drive connected to a
+        // running machine is never noticed (nor would it be on a real Classic,
+        // where plugging one in hot was against the manual). Reboot so the
+        // toggle means what it says, the way the RAM menu does.
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
         UpdateUi();
     }
 
