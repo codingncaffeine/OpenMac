@@ -509,6 +509,6 @@ OMAC_API void omac_poll_log(OMac* m, char* out, size_t cap)
     m->logBuf.clear();
 }
 
-OMAC_API const char* omac_version(void) { return "OpenMac core 0.1"; }
+OMAC_API const char* omac_version(void) { return "OpenMac core 0.5.0"; }
 
 } // extern "C"
