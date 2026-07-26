@@ -530,6 +530,13 @@ public sealed class NativeEmulator : IEmulator
         if (_h == IntPtr.Zero) { error = "no machine"; return false; }
         byte[]? img = FolderDisk.BuildTransferVolume(filePath, 0, out error);
         if (img is null) return false;
+        // Mark the volume software-locked (drAtrb bit 15 in both MDB copies)
+        // so the System MOUNTS it read-only and never writes. Without the bit
+        // the Finder writes its Desktop file into a disk that silently drops
+        // writes, and the guest's cached view quietly diverges from the disk.
+        img[1024 + 10] |= 0x80;
+        int altMdb = img.Length - 2 * 512;
+        if (altMdb > 0) img[altMdb + 10] |= 0x80;
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return false;
