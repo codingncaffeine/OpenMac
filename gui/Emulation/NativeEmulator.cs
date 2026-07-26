@@ -89,6 +89,8 @@ public sealed class NativeEmulator : IEmulator
         ExternalDriveAttached = false;
         HardDiskAttached = false;
         HardDiskPath = null;
+        CdRomAttached = false;
+        CdPath = null;
         Log.Line($"[core] created — {ramMB} MB, ROM {Path.GetFileName(path)}");
     }
 
@@ -185,12 +187,13 @@ public sealed class NativeEmulator : IEmulator
     // guest wrote to that disk is never saved back to the file it came from.
     private void NoticeGuestEjects()
     {
-        bool internalGone, externalGone;
+        bool internalGone, externalGone, cdGone;
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return;
             internalGone = FloppyPath is not null && Native.omac_floppy_present(_h, 0) == 0;
             externalGone = ExternalFloppyPath is not null && Native.omac_floppy_present(_h, 1) == 0;
+            cdGone = CdPath is not null && Native.omac_cd_present(_h) == 0;
         }
         if (internalGone)
         {
@@ -205,7 +208,13 @@ public sealed class NativeEmulator : IEmulator
                      $"{Path.GetFileName(ExternalFloppyPath)} (external drive)");
             ExternalFloppyPath = null;
         }
-        if (internalGone || externalGone) _diskStateDirty = true;
+        if (cdGone)
+        {
+            // Nothing to write back: CDs are read-only.
+            Log.Line($"[disk] the machine ejected the CD {Path.GetFileName(CdPath)}");
+            CdPath = null;
+        }
+        if (internalGone || externalGone || cdGone) _diskStateDirty = true;
     }
 
     private void PublishFrame()
@@ -415,6 +424,76 @@ public sealed class NativeEmulator : IEmulator
             File.WriteAllBytes(HardDiskPath!, buf!);   // file I/O outside the lock (don't stall the worker)
         }
         catch { /* best-effort persistence */ }
+    }
+
+    // ---- CD-ROM ----
+    public bool CdRomAttached { get; private set; }
+    public string? CdPath { get; private set; }
+
+    public void SetCdRomAttached(bool attached)
+    {
+        lock (_sync)
+        {
+            if (_h != IntPtr.Zero) Native.omac_cd_attach(_h, attached ? 1 : 0, 3);
+        }
+        CdRomAttached = attached;
+        if (!attached) CdPath = null;
+    }
+
+    public bool InsertCd(string path)
+    {
+        if (_h == IntPtr.Zero) return false;
+        // A .cue is a text sheet naming the real data file; load that one.
+        string mediaPath = path;
+        if (Path.GetExtension(path).Equals(".cue", StringComparison.OrdinalIgnoreCase))
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(
+                File.ReadAllText(path), "FILE\\s+\"([^\"]+)\"",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (m.Success)
+                mediaPath = Path.Combine(Path.GetDirectoryName(path) ?? "", m.Groups[1].Value);
+        }
+        byte[] img = File.ReadAllBytes(mediaPath);
+        int ok;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            if (Native.omac_cd_attached(_h) == 0) Native.omac_cd_attach(_h, 1, 3);
+            ok = Native.omac_cd_insert(_h, img, (nuint)img.Length);
+        }
+        if (ok != 0)
+        {
+            CdRomAttached = true;
+            CdPath = path;
+        }
+        return ok != 0;
+    }
+
+    public void EjectCd()
+    {
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_cd_eject(_h); }
+        CdPath = null;
+    }
+
+    public bool CdPresent
+    {
+        get
+        {
+            lock (_sync) { return _h != IntPtr.Zero && Native.omac_cd_present(_h) != 0; }
+        }
+    }
+
+    public string CdMediumNote()
+    {
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return "";
+            nuint n = Native.omac_cd_medium(_h, null, 0);
+            if (n == 0) return "";
+            byte[] buf = new byte[n + 1];
+            Native.omac_cd_medium(_h, buf, (nuint)buf.Length);
+            return System.Text.Encoding.ASCII.GetString(buf, 0, (int)n);
+        }
     }
 
     public void MouseMove(int dx, int dy, bool button)

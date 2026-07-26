@@ -90,6 +90,23 @@ public sealed class StubEmulator : IEmulator
         HardDiskAttached = false;
     }
 
+    public bool CdRomAttached { get; private set; }
+    public string? CdPath { get; private set; }
+    public void SetCdRomAttached(bool attached)
+    {
+        CdRomAttached = attached;
+        if (!attached) CdPath = null;
+    }
+    public bool InsertCd(string path)
+    {
+        CdRomAttached = true;
+        CdPath = path;
+        return true;
+    }
+    public void EjectCd() => CdPath = null;
+    public bool CdPresent => CdPath is not null;
+    public string CdMediumNote() => "";
+
     public void MouseMove(int dx, int dy, bool button) { }
     public void MouseButton(bool down) { }
     public void KeyEvent(int adbCode, bool down) { }

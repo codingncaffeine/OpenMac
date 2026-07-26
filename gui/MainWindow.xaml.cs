@@ -272,6 +272,13 @@ public partial class MainWindow : Window
             }
             if (!string.IsNullOrEmpty(_settings.LastHardDisk) && File.Exists(_settings.LastHardDisk))
                 _emulator.AttachHardDisk(_settings.LastHardDisk!);
+            if (_settings.CdRomAttached) _emulator.SetCdRomAttached(true);
+            if (!string.IsNullOrEmpty(_settings.LastCd) && File.Exists(_settings.LastCd) &&
+                !_emulator.InsertCd(_settings.LastCd!))
+            {
+                Log.Line($"cd refused: {_settings.LastCd} -- {_emulator.CdMediumNote()}");
+                _settings.LastCd = null;
+            }
         }
         catch (Exception ex)
         {
@@ -484,6 +491,72 @@ public partial class MainWindow : Window
         UpdateUi();
     }
 
+    // ---- CD-ROM ----
+    // The drive is a SCSI device found during startup's bus scan, so attaching
+    // one wants a restart; a disc put in later is noticed by the Apple CD
+    // software's own polling, so inserting never does.
+    private void CdDrive_Click(object sender, RoutedEventArgs e)
+    {
+        bool on = CdDriveItem.IsChecked;
+        _emulator.SetCdRomAttached(on);
+        if (!on) _settings.LastCd = null;
+        _settings.CdRomAttached = on;
+        _settings.Save();
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom)
+        {
+            var r = MessageBox.Show(this,
+                "The Mac scans the SCSI bus only at startup, so this change to the " +
+                "CD-ROM drive isn't seen until it restarts.\n\nRestart now?",
+                "CD-ROM Drive", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (r == MessageBoxResult.Yes) LoadRom(rom);
+        }
+        UpdateUi();
+    }
+
+    private void InsertCd_Click(object sender, RoutedEventArgs e)
+    {
+        if (FilePicker.Open(this, _settings, FilePicker.Cd, "Insert CD Image",
+                "CD image (*.iso;*.toast;*.bin;*.cue;*.img;*.dsk)|*.iso;*.toast;*.bin;*.cue;*.img;*.dsk|"
+                + "All files (*.*)|*.*",
+                _settings.LastCd) is { } path)
+        {
+            bool driveWasAttached = _emulator.CdRomAttached;
+            if (_emulator.InsertCd(path))
+            {
+                _settings.CdRomAttached = true;
+                _settings.LastCd = path;
+                _settings.Save();
+                Log.Line($"cd inserted: {path} -- {_emulator.CdMediumNote()}");
+                // Inserting also connected the drive; that half needs the scan.
+                if (!driveWasAttached && _emulator.IsRomLoaded && _emulator.RomPath is { } rom)
+                {
+                    var r = MessageBox.Show(this,
+                        "The disc is in, but the drive itself was just connected, and the " +
+                        "Mac scans the SCSI bus only at startup.\n\nRestart now so it appears?",
+                        "CD-ROM Drive", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                    if (r == MessageBoxResult.Yes) LoadRom(rom);
+                }
+            }
+            else
+            {
+                string why = _emulator.CdMediumNote();
+                Log.Line($"cd refused: {path} -- {why}");
+                MessageBox.Show(this,
+                    Path.GetFileName(path) + " did not go in the drive.\n\n" + why,
+                    "Not a CD image", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            UpdateUi();
+        }
+    }
+
+    private void EjectCd_Click(object sender, RoutedEventArgs e)
+    {
+        _emulator.EjectCd();
+        _settings.LastCd = null;
+        _settings.Save();
+        UpdateUi();
+    }
+
     // ---- view ----
     private void Scale_Click(object sender, RoutedEventArgs e)
     {
@@ -555,6 +628,7 @@ public partial class MainWindow : Window
                   ? $"  •  External: {Path.GetFileName(f2)}" : "")
               + (_emulator.HardDiskAttached && _emulator.HardDiskPath is { } hd
                   ? $"  •  HD: {Path.GetFileName(hd)}" : "")
+              + (_emulator.CdPath is { } cd ? $"  •  CD: {Path.GetFileName(cd)}" : "")
             : "No ROM loaded";
         StatusMachine.Text = machine;
         Title = _emulator.IsRomLoaded && _emulator.RomPath is { } r
@@ -585,5 +659,9 @@ public partial class MainWindow : Window
         EjectFloppy2Item.IsEnabled = _emulator.ExternalFloppyPath is not null;
         EjectFloppy2Item.Header = EjectLabel("External", _emulator.ExternalFloppyPath);
         DetachHdItem.IsEnabled = _emulator.HardDiskAttached;
+        CdDriveItem.IsChecked = _emulator.CdRomAttached;
+        EjectCdItem.IsEnabled = _emulator.CdPath is not null;
+        EjectCdItem.Header = _emulator.CdPath is { } cdPath
+            ? $"Eject “{Path.GetFileNameWithoutExtension(cdPath)}”" : "Eject CD";
     }
 }

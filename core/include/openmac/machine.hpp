@@ -18,6 +18,7 @@ class Via6522;
 class Rtc;
 class AdbTransceiver;
 class Ncr5380;
+class ScsiCdRom;
 class Iwm;
 class SonyDrive;
 
@@ -135,6 +136,19 @@ public:
         return hd_;
     }
     u32 hdAccessCount() const { return hdReads_ + hdWrites_; }
+
+    // CD-ROM: an AppleCD SC-class SCSI drive. The drive is attached to the bus
+    // (a device, persisting across discs); a disc image is inserted into it
+    // (media, always read-only -- nothing is ever copied back out). The guest
+    // ejects discs on its own -- the Finder's drag to the Trash -- so a front
+    // end polls cdPresent() rather than trusting its last action, exactly like
+    // the floppies.
+    void attachCdRom(bool attached, int busId = 3);
+    bool cdRomAttached() const;
+    InsertVerdict insertCd(std::vector<u8> image);
+    void ejectCd();
+    bool cdPresent() const;
+    const char* cdMediumText() const { return cdMediumText_; }
     // Bytes each mechanism has actually handed the controller. A drive the ROM
     // addresses but never reads from is the signature of a phantom bay.
     u32 surfaceReads(int which) const;
@@ -416,6 +430,8 @@ private:
     std::unique_ptr<Rtc> rtc_;
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<Ncr5380> scsi_;
+    std::unique_ptr<ScsiCdRom> cdrom_;
+    char cdMediumText_[224] = {0};
     std::unique_ptr<Iwm> iwm_;
     // Internal (drive 1) and external (drive 2) Sony mechanisms. The Classic ships
     // one internal SuperDrive; the external port is empty unless a drive is added.

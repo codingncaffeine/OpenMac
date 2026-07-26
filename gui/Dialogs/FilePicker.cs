@@ -24,12 +24,14 @@ internal static class FilePicker
     public const string Rom = "rom";
     public const string Floppy = "floppy";
     public const string HardDisk = "harddisk";
+    public const string Cd = "cd";
 
     private static Guid GuidFor(string purpose) => purpose switch
     {
         Rom      => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d01"),
         Floppy   => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d02"),
         HardDisk => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d03"),
+        Cd       => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d04"),
         _        => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d00"),
     };
 

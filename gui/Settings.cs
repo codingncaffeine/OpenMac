@@ -15,6 +15,9 @@ public sealed class Settings
     public string? LastExternalFloppy { get; set; }
     public bool ExternalDrive { get; set; }
     public string? LastHardDisk { get; set; }
+    /// <summary>The CD-ROM drive on the SCSI bus, and the disc left in it.</summary>
+    public bool CdRomAttached { get; set; }
+    public string? LastCd { get; set; }
     /// <summary>
     /// The write-protect tab, as a physical one: off unless asked for. A Mac
     /// writes to its floppies constantly and they stay perfectly usable, so

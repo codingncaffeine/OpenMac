@@ -83,6 +83,21 @@ OMAC_API void omac_insert_harddisk(OMac*, const uint8_t* img, size_t len, int re
    the disk back to its file on eject/exit. */
 OMAC_API size_t omac_harddisk_data(OMac*, uint8_t* out, size_t cap);
 
+/* ---- CD-ROM (an AppleCD SC-class SCSI drive) ---- */
+/* The drive itself is a bus device: attach it once (scsi_id 3 is Apple's
+   factory default) and it persists across discs. A disc image goes in with
+   omac_cd_insert -- .iso, raw 2352-byte MODE1 (.bin), Apple-partitioned or
+   bare-HFS masters -- always read-only; nothing is ever copied back out.
+   Returns 1 if the drive took it, 0 if refused; omac_cd_medium describes the
+   disc (or the refusal) either way. The guest ejects discs on its own (drag to
+   the Trash), so poll omac_cd_present rather than trusting the last insert. */
+OMAC_API void omac_cd_attach(OMac*, int attached, int scsi_id);
+OMAC_API int  omac_cd_attached(OMac*);
+OMAC_API int  omac_cd_insert(OMac*, const uint8_t* img, size_t len);
+OMAC_API void omac_cd_eject(OMac*);
+OMAC_API int  omac_cd_present(OMac*);
+OMAC_API size_t omac_cd_medium(OMac*, char* out, size_t cap);
+
 /* Format a blank HFS volume of size_bytes into out (which must hold size_bytes).
    Returns 0 on success. Front-ends use this for "Create Hard Disk". */
 OMAC_API int omac_format_hfs(uint32_t size_bytes, const char* volume_name, uint8_t* out);

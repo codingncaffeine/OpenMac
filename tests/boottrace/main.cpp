@@ -1107,6 +1107,8 @@ int main(int argc, char** argv) {
     std::string dumpPath;
     std::string floppyPath;
     std::string hdImagePath;   // --harddisk <path>: attach an existing HD image (HFS volume)
+    std::string cdImagePath;   // --cd <path>: attach the CD-ROM drive with this disc in it
+    bool cdAttach = false;     // --cd-attach: attach the drive with an empty tray
     u32 hdBlankMB = 0;   // --harddisk-blank N: attach a blank N-MB hard disk
     u32 hdFormatMB = 0;  // --harddisk-format N: attach a formatted N-MB HFS disk
     bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
@@ -1149,6 +1151,8 @@ int main(int argc, char** argv) {
         else if (arg == "--harddisk-format" && i + 1 < argc)
             hdFormatMB = static_cast<u32>(std::atoi(argv[++i]));
         else if (arg == "--harddisk" && i + 1 < argc) hdImagePath = argv[++i];
+        else if (arg == "--cd" && i + 1 < argc) cdImagePath = argv[++i];
+        else if (arg == "--cd-attach") cdAttach = true;
         else if (arg == "--trace-traps") traceTraps = true;
         else if (arg == "--trace-irq") traceIrq = true;
         else if (arg == "--trace-adb") traceAdb = true;
@@ -1441,6 +1445,19 @@ int main(int argc, char** argv) {
         std::vector<u8> hd{std::istreambuf_iterator<char>(hf), std::istreambuf_iterator<char>()};
         std::printf("HARD DISK %zu bytes loaded from %s\n", hd.size(), hdImagePath.c_str());
         mac.insertHardDisk(std::move(hd), false);
+    }
+    if (cdAttach || !cdImagePath.empty()) {
+        mac.attachCdRom(true);
+        if (!cdImagePath.empty()) {
+            std::ifstream cf(cdImagePath, std::ios::binary);
+            if (!cf) { std::printf("CD: cannot open %s\n", cdImagePath.c_str()); return 1; }
+            std::vector<u8> disc{std::istreambuf_iterator<char>(cf),
+                                 std::istreambuf_iterator<char>()};
+            const bool took =
+                mac.insertCd(std::move(disc)) == Machine::InsertVerdict::kAccepted;
+            std::printf("CD %s: %s\n", took ? "inserted" : "REFUSED", mac.cdMediumText());
+            if (!took) return 1;
+        }
     }
 
     if (traceTraps || breakTrap || watchControl >= -2 || trapRingSize) {

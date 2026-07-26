@@ -7,7 +7,9 @@
 #include "macbinary.hpp"
 #include "gcr.hpp"
 #include "mfm.hpp"
+#include "cdmedia.hpp"
 #include "scsi.hpp"
+#include "scsicd.hpp"
 #include "sony.hpp"
 #include "scsiimage.hpp"
 #include "via.hpp"
@@ -60,6 +62,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
       rtc_(std::make_unique<Rtc>()),
       adb_(std::make_unique<AdbTransceiver>()),
       scsi_(std::make_unique<Ncr5380>()),
+      cdrom_(std::make_unique<ScsiCdRom>()),
       iwm_(std::make_unique<Iwm>()),
       drive0_(std::make_unique<SonyDrive>()),
       drive1_(std::make_unique<SonyDrive>()),
@@ -68,6 +71,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     // The Classic has one internal 1.4 MB SuperDrive; the external port is empty.
     // The internal mechanism always reads its medium out of floppy_, so an empty
     // floppy_ simply means no disk is in the drive.
+    scsi_->addTarget(cdrom_.get());   // detached until the front end attaches it
     drive0_->installed = true;
     drive0_->image = &floppy_;
     drive1_->installed = false;
@@ -873,6 +877,39 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
         onDiag(b);
     };
 }
+
+void Machine::attachCdRom(bool attached, int busId) {
+    cdrom_->setAttached(attached, busId);
+    if (onDiag) {
+        char b[64];
+        std::snprintf(b, sizeof b, "cd: drive %s (SCSI ID %d)",
+                      attached ? "attached" : "detached", busId & 7);
+        onDiag(b);
+    }
+}
+
+bool Machine::cdRomAttached() const { return cdrom_->attachedState(); }
+
+Machine::InsertVerdict Machine::insertCd(std::vector<u8> image) {
+    cd::Medium m = cd::normalize(std::move(image));
+    std::snprintf(cdMediumText_, sizeof cdMediumText_, "%s", m.desc);
+    if (onDiag) {
+        char b[240];
+        std::snprintf(b, sizeof b, "cd: %s%s", m.ok ? "inserted — " : "refused: ",
+                      m.desc);
+        onDiag(b);
+    }
+    if (!m.ok) return InsertVerdict::kRefused;
+    cdrom_->insert(std::move(m.data));
+    return InsertVerdict::kAccepted;
+}
+
+void Machine::ejectCd() {
+    cdrom_->eject();
+    if (onDiag) onDiag("cd: disc taken out by the host");
+}
+
+bool Machine::cdPresent() const { return cdrom_->discPresent(); }
 
 void Machine::setSwimEnabled(bool on) { iwm_->swimEnabled = on; }
 bool Machine::iwmInIsmMode() const { return iwm_->ismSelected(); }
@@ -1795,6 +1832,11 @@ void Machine::runFrame() {
             onDiag(b);
         }
     }
+
+    // The Finder ejects CDs by itself (drag to the Trash -> START STOP UNIT
+    // with LoEj). Surface it so the front end can update its menus.
+    if (cdrom_->takeEjectRequest() && onDiag)
+        onDiag("cd: the machine ejected the disc");
 
     // Mount the hard-disk volume once the System's file system is actually ready.
     // _MountVol enqueues the new VCB into a low-memory volume queue at $360 that

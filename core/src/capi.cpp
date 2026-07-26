@@ -153,6 +153,38 @@ OMAC_API size_t omac_harddisk_data(OMac* m, uint8_t* out, size_t cap)
     return n;
 }
 
+OMAC_API void omac_cd_attach(OMac* m, int attached, int scsi_id)
+{
+    if (m) m->mac.attachCdRom(attached != 0, scsi_id);
+}
+
+OMAC_API int omac_cd_attached(OMac* m) { return m && m->mac.cdRomAttached() ? 1 : 0; }
+
+OMAC_API int omac_cd_insert(OMac* m, const uint8_t* img, size_t len)
+{
+    if (!m || !img) return 0;
+    return m->mac.insertCd(std::vector<u8>(img, img + len)) ==
+                   openmac::Machine::InsertVerdict::kAccepted
+               ? 1
+               : 0;
+}
+
+OMAC_API void omac_cd_eject(OMac* m) { if (m) m->mac.ejectCd(); }
+OMAC_API int omac_cd_present(OMac* m) { return m && m->mac.cdPresent() ? 1 : 0; }
+
+OMAC_API size_t omac_cd_medium(OMac* m, char* out, size_t cap)
+{
+    if (!m) return 0;
+    const char* s = m->mac.cdMediumText();
+    const size_t n = std::strlen(s);
+    if (out && cap) {
+        const size_t c = n < cap - 1 ? n : cap - 1;
+        std::memcpy(out, s, c);
+        out[c] = 0;
+    }
+    return n;
+}
+
 OMAC_API int omac_format_hfs(uint32_t size_bytes, const char* name, uint8_t* out)
 {
     if (!out) return -1;

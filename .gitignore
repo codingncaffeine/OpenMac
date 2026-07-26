@@ -22,6 +22,9 @@ roms/
 *.dsk
 *.hfs
 *.dc42
+*.iso
+*.toast
+*.cue
 
 # Locally fetched test data (SingleStepTests etc.)
 tests/data/

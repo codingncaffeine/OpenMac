@@ -27,6 +27,12 @@
                 <MenuItem Header="Create Hard Disk…" Click="CreateHardDisk_Click" />
                 <MenuItem x:Name="DetachHdItem" Header="Detach Hard Disk" Click="DetachHardDisk_Click" />
                 <Separator />
+                <MenuItem x:Name="CdDriveItem" Header="CD-ROM Drive Connected"
+                          IsCheckable="True" Click="CdDrive_Click"
+                          ToolTip="Puts an AppleCD SC-class drive on the SCSI bus. The Mac finds it during its startup bus scan, so connecting one wants a restart; discs can then go in and out any time." />
+                <MenuItem Header="Insert CD Image…" Click="InsertCd_Click" />
+                <MenuItem x:Name="EjectCdItem" Header="Eject CD" Click="EjectCd_Click" />
+                <Separator />
                 <MenuItem Header="Exit" InputGestureText="Alt+F4" Click="Exit_Click" />
             </MenuItem>
             <MenuItem Header="_Machine">

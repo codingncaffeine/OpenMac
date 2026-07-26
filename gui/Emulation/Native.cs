@@ -77,6 +77,27 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_insert_harddisk(IntPtr h, byte[] img, nuint len, int readOnly);
 
+    // CD-ROM: the drive is a bus device (attach), a disc is media (insert).
+    // Discs are read-only; the guest can eject them itself, so presence is
+    // polled like the floppies.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_cd_attach(IntPtr h, int attached, int scsiId);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_cd_attached(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_cd_insert(IntPtr h, byte[] img, nuint len);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_cd_eject(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_cd_present(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_cd_medium(IntPtr h, [Out] byte[]? outBuf, nuint cap);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern nuint omac_harddisk_data(IntPtr h, byte[]? outBuf, nuint cap);
 

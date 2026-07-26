@@ -69,6 +69,20 @@ public interface IEmulator : IDisposable
     void AttachHardDisk(string path);
     void DetachHardDisk();
 
+    // ---- CD-ROM ----
+    // The drive is a SCSI device (attached to the bus; the ROM and the Apple CD
+    // software find it during the boot-time bus scan). A disc is media: put in
+    // any time, noticed by the driver's polling, always read-only — nothing is
+    // ever copied back out. The guest ejects discs itself (drag to the Trash),
+    // so the front end polls CdPresent like it does the floppies.
+    bool CdRomAttached { get; }
+    string? CdPath { get; }
+    void SetCdRomAttached(bool attached);
+    bool InsertCd(string path);
+    void EjectCd();
+    bool CdPresent { get; }
+    string CdMediumNote();
+
     void MouseMove(int dx, int dy, bool button);
     void MouseButton(bool down);
     void KeyEvent(int adbCode, bool down);
