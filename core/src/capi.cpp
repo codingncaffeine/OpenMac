@@ -160,6 +160,11 @@ OMAC_API void omac_insert_harddisk2(OMac* m, const uint8_t* img, size_t len, int
 
 OMAC_API void omac_detach_harddisk2(OMac* m) { if (m) m->mac.detachHardDisk2(); }
 
+OMAC_API int omac_harddisk2_booted(OMac* m)
+{
+    return m && m->mac.hardDisk2DriverResident() ? 1 : 0;
+}
+
 OMAC_API size_t omac_harddisk2_data(OMac* m, uint8_t* out, size_t cap)
 {
     if (!m || !m->mac.hardDisk2Present()) return 0;

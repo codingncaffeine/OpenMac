@@ -1876,6 +1876,10 @@ void Machine::runFrame() {
     const u32 vcbHead = read32(0x0358);
     const bool systemUp = vcbHead != 0 && vcbHead != 0xFFFFFFFFu;
 
+    // Latch just before the ROM's SCSI scan (the RAM test alone runs past
+    // frame 900): a disk 2 present now gets its driver loaded by the scan.
+    if (frameCounter_ == 900) bootHadHd2_ = !hd2_.empty();
+
     // Arrange the hard disk's mount once the System is far enough along to
     // allocate from the system heap. This used to force the .Sony driver open
     // first, because the drive registration hung off that driver's Open; the

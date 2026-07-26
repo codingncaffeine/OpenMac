@@ -93,6 +93,7 @@ public sealed class NativeEmulator : IEmulator
         CdRomAttached = false;
         CdPath = null;
         FolderDiskPath = null;
+        TransferDiskLabel = null;
         Log.Line($"[core] created — {ramMB} MB, ROM {Path.GetFileName(path)}");
         // The adapter is per-machine state; re-attach it on the fresh machine.
         if (NetworkingEnabled)
@@ -510,6 +511,34 @@ public sealed class NativeEmulator : IEmulator
         SyncFolderDisk();
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_detach_harddisk2(_h); }
         FolderDiskPath = null;
+    }
+
+    // ---- transfer disk (shares the second-disk seat with the folder disk) ----
+    public string? TransferDiskLabel { get; private set; }
+
+    public bool TransferDiskResident
+    {
+        get
+        {
+            lock (_sync) { return _h != IntPtr.Zero && Native.omac_harddisk2_booted(_h) != 0; }
+        }
+    }
+
+    public bool AttachTransferDisk(string filePath, out string error)
+    {
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        byte[]? img = FolderDisk.BuildTransferVolume(filePath, 0, out error);
+        if (img is null) return false;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            Native.omac_insert_harddisk2(_h, img, (nuint)img.Length, 1);   // read-only
+        }
+        TransferDiskLabel = Path.GetFileName(filePath);
+        Log.Line($"[disk] transfer disk built for {TransferDiskLabel} "
+                 + $"({img.Length / (1024 * 1024)} MB volume, read-only)");
+        return true;
     }
 
     /// <summary>Write the guest's folder-disk changes back to the host folder.</summary>

@@ -147,6 +147,11 @@ public:
     void detachHardDisk2();
     bool hardDisk2Present() const { return !hd2_.empty(); }
     const std::vector<u8>& hardDisk2Image() const;
+    // Was a second disk on the bus when the ROM's boot scan ran? Only then is
+    // its on-disk driver resident, and only a resident driver lets a disk
+    // attached MID-SESSION mount without a restart. The front end asks this to
+    // decide between "it appears in a few seconds" and offering a restart.
+    bool hardDisk2DriverResident() const { return bootHadHd2_; }
 
     // CD-ROM: an AppleCD SC-class SCSI drive. The drive is attached to the bus
     // (a device, persisting across discs); a disc image is inserted into it
@@ -424,6 +429,7 @@ private:
     u32 hd2MountPb_ = 0;
     bool hd2Mounted_ = false;
     u32 hd2MountTries_ = 0;
+    bool bootHadHd2_ = false;      // disk 2 present when the boot scan ran
     bool scsiHandlesHd_ = true;    // true: SCSI driver owns the HD (skip .Sony HD reg); false: .Sony still mounts
     bool hdRO_ = false;
     bool hdInstalled_ = false;     // the hard disk's deferred mount is set up

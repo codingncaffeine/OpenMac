@@ -605,6 +605,14 @@ public partial class MainWindow : Window
                             MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
+        if (_emulator.TransferDiskLabel is { } tdl)
+        {
+            MessageBox.Show(this,
+                $"The transfer disk “{tdl}” is using the second SCSI seat. Restart the " +
+                "machine to release it, then open the folder disk.",
+                "Folder Disk", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
         var dlg = new Microsoft.Win32.OpenFolderDialog { Title = "Open Host Folder as Disk" };
         if (!string.IsNullOrEmpty(_settings.LastFolderDisk) &&
             Directory.Exists(_settings.LastFolderDisk))
@@ -764,17 +772,19 @@ public partial class MainWindow : Window
     {
         long size;
         try { size = new FileInfo(path).Length; } catch { return false; }
-        if (size > 2_000_000)
+        if (size > 1_300_000)
         {
-            if (!requireMacBinary)
+            // Too big for a floppy: ride the second SCSI disk instead, sized
+            // to fit and read-only.
+            if (requireMacBinary)
             {
-                Log.Line($"transfer refused: {path} -- too big for a floppy");
-                MessageBox.Show(this,
-                    Path.GetFileName(path) + " is too big for the 1.44 MB transfer floppy." +
-                    "\n\nPut it in a folder and use File ▸ Open Host Folder as Disk instead.",
-                    "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+                try
+                {
+                    if (!MacBinary.TryDecode(File.ReadAllBytes(path), out _)) return false;
+                }
+                catch { return false; }
             }
-            return false;
+            return TransferBigDrop(path);
         }
         if (requireMacBinary)
         {
@@ -827,6 +837,55 @@ public partial class MainWindow : Window
             Log.Line($"drop: {Path.GetFileName(path)} -> transfer floppy in the "
                      + $"{(toExternal ? "external" : "internal")} drive");
         return ok;
+    }
+
+    /// <summary>An archive too big for a floppy becomes a read-only transfer
+    /// disk on the second SCSI seat. One at a time, and the seat is shared
+    /// with the folder disk — the occupant is named rather than clobbered
+    /// (swapping the image under a volume the Mac still has mounted crosses
+    /// its cached catalog with the new disk's blocks).</summary>
+    private bool TransferBigDrop(string path)
+    {
+        if (_emulator.FolderDiskPath is { } fd)
+        {
+            MessageBox.Show(this,
+                Path.GetFileName(path) + " needs the second SCSI disk, but the folder disk " +
+                $"“{Path.GetFileName(fd.TrimEnd('\\', '/'))}” is using it.\n\n" +
+                "Close the folder disk first — or just copy the file into that folder " +
+                "and restart; it rides in with the folder.",
+                "Transfer Disk", MessageBoxButton.OK, MessageBoxImage.Information);
+            return true;   // handled: told the user what to do
+        }
+        if (_emulator.TransferDiskLabel is { } prev)
+        {
+            MessageBox.Show(this,
+                $"The transfer disk “{prev}” is still attached. Drag its volume to the " +
+                "Trash in the Mac, then restart before dropping another big file.",
+                "Transfer Disk", MessageBoxButton.OK, MessageBoxImage.Information);
+            return true;
+        }
+        if (!_emulator.AttachTransferDisk(path, out string error))
+        {
+            Log.Line($"transfer refused: {path} -- {error}");
+            MessageBox.Show(this,
+                Path.GetFileName(path) + " did not become a transfer disk.\n\n" + error,
+                "Transfer Disk", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return true;
+        }
+        UpdateUi();
+        if (_emulator.TransferDiskResident)
+        {
+            Log.Line($"drop: {Path.GetFileName(path)} -> transfer disk (mounts in a few seconds)");
+        }
+        else if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom)
+        {
+            var r = MessageBox.Show(this,
+                "The disk is on the bus, but its driver loads during the startup scan." +
+                "\n\nRestart now so it appears?",
+                "Transfer Disk", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (r == MessageBoxResult.Yes) LoadRom(rom);
+        }
+        return true;
     }
 
     /// <summary>ISO/High Sierra volume descriptor or raw 2352-byte sync — the
@@ -951,6 +1010,7 @@ public partial class MainWindow : Window
               + (_emulator.CdPath is { } cd ? $"  •  CD: {Path.GetFileName(cd)}" : "")
               + (_emulator.FolderDiskPath is { } fd
                   ? $"  •  Folder: {Path.GetFileName(fd.TrimEnd('\\', '/'))}" : "")
+              + (_emulator.TransferDiskLabel is { } td ? $"  •  Drop: {td}" : "")
             : "No ROM loaded";
         StatusMachine.Text = machine;
         Title = _emulator.IsRomLoaded && _emulator.RomPath is { } r

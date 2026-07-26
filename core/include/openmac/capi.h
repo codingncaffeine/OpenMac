@@ -87,6 +87,9 @@ OMAC_API size_t omac_harddisk_data(OMac*, uint8_t* out, size_t cap);
 OMAC_API void omac_insert_harddisk2(OMac*, const uint8_t* img, size_t len, int read_only);
 OMAC_API void omac_detach_harddisk2(OMac*);
 OMAC_API size_t omac_harddisk2_data(OMac*, uint8_t* out, size_t cap);
+/* 1 when a second disk was on the bus during the boot scan (its driver is
+   resident, so a mid-session attach mounts live; otherwise offer a restart). */
+OMAC_API int omac_harddisk2_booted(OMac*);
 
 /* ---- HFS folder-volume builder / reader (host-side, no machine needed) ----
    Builder: begin -> add_dir/add_file (parent 2 = the root) -> build (NULL out

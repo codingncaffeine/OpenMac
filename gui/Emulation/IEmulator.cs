@@ -86,6 +86,15 @@ public interface IEmulator : IDisposable
     bool AttachFolderDisk(string folder, out string error);
     void DetachFolderDisk();
 
+    // ---- transfer disk ----
+    // An oversized dropped archive rides the same second-disk seat as the
+    // folder disk, read-only, sized to fit. One at a time; it clears when the
+    // machine reloads. TransferDiskResident says whether the seat's driver
+    // was loaded by the boot scan (mounts live) or a restart is needed.
+    string? TransferDiskLabel { get; }
+    bool TransferDiskResident { get; }
+    bool AttachTransferDisk(string filePath, out string error);
+
     // ---- CD-ROM ----
     // The drive is a SCSI device (attached to the bus; the ROM and the Apple CD
     // software find it during the boot-time bus scan). A disc is media: put in

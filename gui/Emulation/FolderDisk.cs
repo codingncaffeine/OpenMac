@@ -182,7 +182,13 @@ internal static class FolderDisk
     /// wear it silently — so forked files arrive whole. The caller inserts the
     /// image write-protected; the guest only copies off it.
     /// </summary>
-    public static byte[]? BuildTransferFloppy(string filePath, out string error)
+    public static byte[]? BuildTransferFloppy(string filePath, out string error) =>
+        BuildTransferVolume(filePath, TransferFloppyBytes, out error);
+
+    /// <summary>Same wrapping at whatever size fits: sizeBytes 0 auto-sizes,
+    /// which is how multi-megabyte archives ride the second SCSI disk.</summary>
+    public static byte[]? BuildTransferVolume(string filePath, uint sizeBytes,
+                                              out string error)
     {
         error = "";
         byte[] bytes;
@@ -205,7 +211,8 @@ internal static class FolderDisk
                 omac_hfsb_add_file(b, 2, Path.GetFileName(filePath), type, creator, 0,
                     bytes, (nuint)bytes.Length, null, 0, cr, md);
             }
-            nuint size = omac_hfsb_build_sized(b, TransferFloppyBytes, null, 0);
+            nuint size = sizeBytes != 0 ? omac_hfsb_build_sized(b, sizeBytes, null, 0)
+                                        : omac_hfsb_build(b, null, 0);
             if (size == 0)
             {
                 byte[] msg = new byte[512];
@@ -213,11 +220,13 @@ internal static class FolderDisk
                 int n = Array.IndexOf(msg, (byte)0);
                 error = System.Text.Encoding.ASCII.GetString(msg, 0, n < 0 ? msg.Length : n);
                 if (error.Length == 0)
-                    error = "it does not fit a 1.44 MB transfer floppy";
+                    error = sizeBytes != 0 ? "it does not fit a 1.44 MB transfer floppy"
+                                           : "the volume build failed";
                 return null;
             }
             byte[] img = new byte[size];
-            omac_hfsb_build_sized(b, TransferFloppyBytes, img, (nuint)img.Length);
+            if (sizeBytes != 0) omac_hfsb_build_sized(b, sizeBytes, img, (nuint)img.Length);
+            else omac_hfsb_build(b, img, (nuint)img.Length);
             return img;
         }
         catch (Exception ex)

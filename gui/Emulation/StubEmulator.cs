@@ -102,6 +102,15 @@ public sealed class StubEmulator : IEmulator
     }
     public void DetachFolderDisk() => FolderDiskPath = null;
 
+    public string? TransferDiskLabel { get; private set; }
+    public bool TransferDiskResident => true;
+    public bool AttachTransferDisk(string filePath, out string error)
+    {
+        error = "";
+        TransferDiskLabel = System.IO.Path.GetFileName(filePath);
+        return true;
+    }
+
     public bool CdRomAttached { get; private set; }
     public string? CdPath { get; private set; }
     public void SetCdRomAttached(bool attached)
