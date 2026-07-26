@@ -25,6 +25,13 @@ roms/
 *.iso
 *.toast
 *.cue
+*.bin
+*.sit
+*.sea
+*.hqx
+*.cpt
+*.lha
+*.lzh
 
 # Locally fetched test data (SingleStepTests etc.)
 tests/data/
