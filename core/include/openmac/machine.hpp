@@ -20,6 +20,7 @@ class AdbTransceiver;
 class Ncr5380;
 class ScsiDisk;
 class ScsiCdRom;
+class ScsiEthernet;
 class Iwm;
 class SonyDrive;
 
@@ -159,6 +160,15 @@ public:
     void ejectCd();
     bool cdPresent() const;
     const char* cdMediumText() const { return cdMediumText_; }
+
+    // Networking: a DaynaPORT SCSI/Link Ethernet adapter (SCSI ID 4). The
+    // device moves raw Ethernet frames; the front end owns the backend (its
+    // user-mode NAT). Inject queues a host frame for the guest; drain hands
+    // out one guest frame, empty result = nothing waiting.
+    void attachNet(bool attached, int busId = 4);
+    bool netAttached() const;
+    bool netInject(const u8* frame, u32 len);
+    bool netDrain(std::vector<u8>& out);
     // Bytes each mechanism has actually handed the controller. A drive the ROM
     // addresses but never reads from is the signature of a phantom bay.
     u32 surfaceReads(int which) const;
@@ -454,6 +464,7 @@ private:
     std::unique_ptr<Ncr5380> scsi_;
     std::unique_ptr<ScsiDisk> disk2_;   // second disk target (SCSI ID 1)
     std::unique_ptr<ScsiCdRom> cdrom_;
+    std::unique_ptr<ScsiEthernet> netdev_;
     char cdMediumText_[224] = {0};
     std::unique_ptr<Iwm> iwm_;
     // Internal (drive 1) and external (drive 2) Sony mechanisms. The Classic ships

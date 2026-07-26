@@ -20,6 +20,8 @@ public sealed class Settings
     public string? LastCd { get; set; }
     /// <summary>Host folder served to the Mac as a disk (rebuilt each start).</summary>
     public string? LastFolderDisk { get; set; }
+    /// <summary>DaynaPORT adapter + user-mode NAT.</summary>
+    public bool Networking { get; set; }
     /// <summary>
     /// The write-protect tab, as a physical one: off unless asked for. A Mac
     /// writes to its floppies constantly and they stay perfectly usable, so

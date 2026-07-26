@@ -313,6 +313,29 @@ OMAC_API int omac_cd_insert(OMac* m, const uint8_t* img, size_t len)
                : 0;
 }
 
+OMAC_API void omac_net_attach(OMac* m, int attached, int scsi_id)
+{
+    if (m) m->mac.attachNet(attached != 0, scsi_id);
+}
+
+OMAC_API int omac_net_attached(OMac* m) { return m && m->mac.netAttached() ? 1 : 0; }
+
+OMAC_API int omac_net_inject(OMac* m, const uint8_t* frame, size_t len)
+{
+    if (!m || !frame) return 0;
+    return m->mac.netInject(frame, static_cast<u32>(len)) ? 1 : 0;
+}
+
+OMAC_API size_t omac_net_drain(OMac* m, uint8_t* out, size_t cap)
+{
+    if (!m || !out) return 0;
+    std::vector<u8> f;
+    if (!m->mac.netDrain(f)) return 0;
+    const size_t n = f.size() < cap ? f.size() : cap;
+    if (n) std::memcpy(out, f.data(), n);
+    return n;
+}
+
 OMAC_API void omac_cd_eject(OMac* m) { if (m) m->mac.ejectCd(); }
 OMAC_API int omac_cd_present(OMac* m) { return m && m->mac.cdPresent() ? 1 : 0; }
 

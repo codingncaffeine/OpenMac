@@ -90,6 +90,9 @@ public sealed class StubEmulator : IEmulator
         HardDiskAttached = false;
     }
 
+    public bool NetworkingEnabled { get; private set; }
+    public void SetNetworking(bool enabled) => NetworkingEnabled = enabled;
+
     public string? FolderDiskPath { get; private set; }
     public bool AttachFolderDisk(string folder, out string error)
     {

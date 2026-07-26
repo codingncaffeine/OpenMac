@@ -178,6 +178,17 @@ OMAC_API void omac_debug_dump(OMac*, const char* name, char* out, size_t cap);
    off the CPU exception path, so it can't destabilize emulation. */
 OMAC_API void omac_poll_log(OMac*, char* out, size_t cap);
 
+/* ---- networking (a DaynaPORT SCSI/Link Ethernet adapter, SCSI ID 4) ----
+   The device moves raw Ethernet frames; the front end owns the backend (its
+   user-mode NAT). Inject queues a host frame toward the guest (returns 1, or
+   0 when the ring is full / the device is detached). Drain copies one guest
+   frame out and returns its length (0 = nothing waiting); poll it per frame
+   like the audio. */
+OMAC_API void omac_net_attach(OMac*, int attached, int scsi_id);
+OMAC_API int  omac_net_attached(OMac*);
+OMAC_API int  omac_net_inject(OMac*, const uint8_t* frame, size_t len);
+OMAC_API size_t omac_net_drain(OMac*, uint8_t* out, size_t cap);
+
 /* Version string for the About box / logs. */
 OMAC_API const char* omac_version(void);
 

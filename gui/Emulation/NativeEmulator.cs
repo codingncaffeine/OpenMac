@@ -94,6 +94,9 @@ public sealed class NativeEmulator : IEmulator
         CdPath = null;
         FolderDiskPath = null;
         Log.Line($"[core] created — {ramMB} MB, ROM {Path.GetFileName(path)}");
+        // The adapter is per-machine state; re-attach it on the fresh machine.
+        if (NetworkingEnabled)
+            lock (_sync) { if (_h != IntPtr.Zero) Native.omac_net_attach(_h, 1, 4); }
     }
 
     public void Reset()
@@ -169,6 +172,7 @@ public sealed class NativeEmulator : IEmulator
             DrainLog();
             DrainAudio();
         }
+        PumpNetwork();
         NoticeGuestEjects();
     }
 
@@ -428,6 +432,59 @@ public sealed class NativeEmulator : IEmulator
         catch { /* best-effort persistence */ }
     }
 
+    // ---- networking ----
+    public bool NetworkingEnabled { get; private set; }
+    private SlirpNat? _nat;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _netToGuest = new();
+    private readonly byte[] _netFrame = new byte[1600];
+
+    public void SetNetworking(bool enabled)
+    {
+        lock (_sync)
+        {
+            if (_h != IntPtr.Zero) Native.omac_net_attach(_h, enabled ? 1 : 0, 4);
+        }
+        if (enabled && _nat is null)
+        {
+            _nat = new SlirpNat(f => _netToGuest.Enqueue(f), Log.Line);
+            Log.Line("net: NAT up — guest network 10.0.2.0/24 (BOOTP serves 10.0.2.15)");
+        }
+        else if (!enabled && _nat is not null)
+        {
+            _nat.Dispose();
+            _nat = null;
+            while (_netToGuest.TryDequeue(out _)) { }
+            Log.Line("net: NAT down");
+        }
+        NetworkingEnabled = enabled;
+    }
+
+    // Called on the emulation thread each frame: move guest frames to the NAT
+    // and NAT frames to the guest. Guest frames are processed outside _sync so
+    // socket work never stalls the frame loop.
+    private void PumpNetwork()
+    {
+        if (_nat is null) return;
+        List<byte[]>? outbound = null;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return;
+            for (int i = 0; i < 32; ++i)
+            {
+                nuint n = Native.omac_net_drain(_h, _netFrame, (nuint)_netFrame.Length);
+                if (n == 0) break;
+                byte[] f = new byte[n];
+                Buffer.BlockCopy(_netFrame, 0, f, 0, (int)n);
+                (outbound ??= new List<byte[]>()).Add(f);
+            }
+            while (_netToGuest.TryDequeue(out byte[]? inFrame))
+                Native.omac_net_inject(_h, inFrame, (nuint)inFrame.Length);
+        }
+        if (outbound is not null)
+            foreach (byte[] f in outbound)
+                _nat.OnGuestFrame(f);
+    }
+
     // ---- folder disk ----
     public string? FolderDiskPath { get; private set; }
 
@@ -579,6 +636,7 @@ public sealed class NativeEmulator : IEmulator
         WriteBackHardDisk();
         SyncFolderDisk();
         Destroy();
+        _nat?.Dispose();
         _audio.Dispose();
     }
 }

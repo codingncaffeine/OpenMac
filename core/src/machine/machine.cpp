@@ -10,6 +10,7 @@
 #include "cdmedia.hpp"
 #include "scsi.hpp"
 #include "scsicd.hpp"
+#include "scsinet.hpp"
 #include "sony.hpp"
 #include "scsiimage.hpp"
 #include "via.hpp"
@@ -64,6 +65,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
       scsi_(std::make_unique<Ncr5380>()),
       disk2_(std::make_unique<ScsiDisk>()),
       cdrom_(std::make_unique<ScsiCdRom>()),
+      netdev_(std::make_unique<ScsiEthernet>()),
       iwm_(std::make_unique<Iwm>()),
       drive0_(std::make_unique<SonyDrive>()),
       drive1_(std::make_unique<SonyDrive>()),
@@ -74,6 +76,8 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     // floppy_ simply means no disk is in the drive.
     scsi_->addTarget(disk2_.get());   // off the bus until an image attaches
     scsi_->addTarget(cdrom_.get());   // detached until the front end attaches it
+    scsi_->addTarget(netdev_.get());  // likewise
+    netdev_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     drive0_->installed = true;
     drive0_->image = &floppy_;
     drive1_->installed = false;
@@ -944,6 +948,20 @@ void Machine::ejectCd() {
 }
 
 bool Machine::cdPresent() const { return cdrom_->discPresent(); }
+
+void Machine::attachNet(bool attached, int busId) {
+    netdev_->setAttached(attached, busId);
+    if (onDiag) {
+        char b[64];
+        std::snprintf(b, sizeof b, "net: adapter %s (SCSI ID %d)",
+                      attached ? "attached" : "detached", busId & 7);
+        onDiag(b);
+    }
+}
+
+bool Machine::netAttached() const { return netdev_->attachedState(); }
+bool Machine::netInject(const u8* frame, u32 len) { return netdev_->injectFrame(frame, len); }
+bool Machine::netDrain(std::vector<u8>& out) { return netdev_->drainFrame(out); }
 
 void Machine::setSwimEnabled(bool on) { iwm_->swimEnabled = on; }
 bool Machine::iwmInIsmMode() const { return iwm_->ismSelected(); }

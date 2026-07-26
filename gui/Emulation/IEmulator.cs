@@ -69,6 +69,14 @@ public interface IEmulator : IDisposable
     void AttachHardDisk(string path);
     void DetachHardDisk();
 
+    // ---- networking ----
+    // A DaynaPORT SCSI/Link adapter on the bus, backed by user-mode NAT (no
+    // drivers, no admin). The guest runs the Dayna driver + MacTCP; BOOTP
+    // hands it 10.0.2.15. Takes effect fully after a restart (the driver
+    // loads with the System).
+    bool NetworkingEnabled { get; }
+    void SetNetworking(bool enabled);
+
     // ---- folder disk ----
     // A host folder served to the Mac as a real HFS disk (second SCSI disk).
     // Built from the folder when attached; the guest's changes sync back to

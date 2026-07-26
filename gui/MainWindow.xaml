@@ -50,6 +50,10 @@
                 <Separator />
                 <MenuItem x:Name="BootRomDiskItem" Header="Boot from ROM Disk (Cmd-Opt-X-O)"
                           Click="BootRomDisk_Click" />
+                <Separator />
+                <MenuItem x:Name="NetworkingItem" Header="Networking (DaynaPORT at SCSI 4)"
+                          IsCheckable="True" Click="Networking_Click"
+                          ToolTip="Puts a DaynaPORT SCSI/Link Ethernet adapter on the bus, backed by user-mode NAT — no drivers or admin rights on this PC. Inside the Mac, install the Dayna SCSI/Link driver and MacTCP, set MacTCP to BOOTP (or manually to 10.0.2.15, router 10.0.2.2, DNS 10.0.2.3), and restart." />
             </MenuItem>
             <MenuItem Header="_Key Combos">
                 <MenuItem Header="Quit Application" InputGestureText="⌘Q" Tag="cmd+q" Click="SendCombo_Click" />

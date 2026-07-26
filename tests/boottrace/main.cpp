@@ -1110,6 +1110,7 @@ int main(int argc, char** argv) {
     std::string cdImagePath;   // --cd <path>: attach the CD-ROM drive with this disc in it
     bool cdAttach = false;     // --cd-attach: attach the drive with an empty tray
     std::string hd2ImagePath;  // --harddisk2 <path>: attach a second SCSI disk (ID 1)
+    bool netAttach = false;    // --net: attach the DaynaPORT Ethernet adapter (ID 4)
     u32 hdBlankMB = 0;   // --harddisk-blank N: attach a blank N-MB hard disk
     u32 hdFormatMB = 0;  // --harddisk-format N: attach a formatted N-MB HFS disk
     bool traceTraps = false, lowmemDump = false, traceOsTraps = false, checkHeapFlag = false;
@@ -1155,6 +1156,7 @@ int main(int argc, char** argv) {
         else if (arg == "--cd" && i + 1 < argc) cdImagePath = argv[++i];
         else if (arg == "--cd-attach") cdAttach = true;
         else if (arg == "--harddisk2" && i + 1 < argc) hd2ImagePath = argv[++i];
+        else if (arg == "--net") netAttach = true;
         else if (arg == "--trace-traps") traceTraps = true;
         else if (arg == "--trace-irq") traceIrq = true;
         else if (arg == "--trace-adb") traceAdb = true;
@@ -1455,6 +1457,7 @@ int main(int argc, char** argv) {
         std::printf("HARD DISK 2 %zu bytes loaded from %s\n", hd.size(), hd2ImagePath.c_str());
         mac.insertHardDisk2(std::move(hd), false);
     }
+    if (netAttach) mac.attachNet(true);
     if (cdAttach || !cdImagePath.empty()) {
         mac.attachCdRom(true);
         if (!cdImagePath.empty()) {

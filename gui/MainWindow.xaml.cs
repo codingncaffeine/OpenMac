@@ -292,6 +292,7 @@ public partial class MainWindow : Window
                 Log.Line($"folder disk refused: {_settings.LastFolderDisk} -- {fdErr}");
                 _settings.LastFolderDisk = null;
             }
+            if (_settings.Networking) _emulator.SetNetworking(true);
         }
         catch (Exception ex)
         {
@@ -574,6 +575,24 @@ public partial class MainWindow : Window
         _emulator.EjectCd();
         _settings.LastCd = null;
         _settings.Save();
+        UpdateUi();
+    }
+
+    // ---- networking ----
+    private void Networking_Click(object sender, RoutedEventArgs e)
+    {
+        bool on = NetworkingItem.IsChecked;
+        _emulator.SetNetworking(on);
+        _settings.Networking = on;
+        _settings.Save();
+        if (on && _emulator.IsRomLoaded && _emulator.RomPath is { } rom)
+        {
+            var r = MessageBox.Show(this,
+                "The adapter is on the bus. The Dayna driver loads with the System, " +
+                "so networking works fully after a restart.\n\nRestart now?",
+                "Networking", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (r == MessageBoxResult.Yes) LoadRom(rom);
+        }
         UpdateUi();
     }
 
@@ -878,5 +897,6 @@ public partial class MainWindow : Window
         EjectCdItem.Header = _emulator.CdPath is { } cdPath
             ? $"Eject “{Path.GetFileNameWithoutExtension(cdPath)}”" : "Eject CD";
         CloseFolderDiskItem.IsEnabled = _emulator.FolderDiskPath is not null;
+        NetworkingItem.IsChecked = _emulator.NetworkingEnabled;
     }
 }

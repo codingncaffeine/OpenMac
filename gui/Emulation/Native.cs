@@ -130,6 +130,16 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_poll_log(IntPtr h, byte[] outBuf, nuint cap);
 
+    // Networking: raw Ethernet frames to/from the DaynaPORT target.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_net_attach(IntPtr h, int attached, int scsiId);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_net_inject(IntPtr h, byte[] frame, nuint len);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_net_drain(IntPtr h, byte[] outBuf, nuint cap);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr omac_version();
 }
