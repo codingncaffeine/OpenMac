@@ -1866,12 +1866,22 @@ void Machine::runFrame() {
         if (onDiag) onDiag("floppy: staged disk now in the drive");
     }
 
+    // A mounted boot volume (live VCB queue head) is the one trustworthy sign
+    // the Start Manager is done choosing and the File Manager is genuinely
+    // running. No trap injection below fires before it: injecting into the
+    // ROM's boot scan mounts disks out from under it and parks the machine in
+    // the nested call forever — measured on drive 5, then again on drive 4
+    // when a non-bootable power-on floppy slowed the scan past the old frame
+    // gate.
+    const u32 vcbHead = read32(0x0358);
+    const bool systemUp = vcbHead != 0 && vcbHead != 0xFFFFFFFFu;
+
     // Arrange the hard disk's mount once the System is far enough along to
     // allocate from the system heap. This used to force the .Sony driver open
     // first, because the drive registration hung off that driver's Open; the
     // disk's own driver registers the drive now, so there is nothing to open and
     // nothing to alias.
-    if (!hd_.empty() && !hdInstalled_ && frameCounter_ > 1600 &&
+    if (!hd_.empty() && !hdInstalled_ && systemUp && frameCounter_ > 1600 &&
         (frameCounter_ % 60) == 0 &&
         read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
         u32 sd[8], sa[8];
@@ -1890,15 +1900,8 @@ void Machine::runFrame() {
     if (cdrom_->takeEjectRequest() && onDiag)
         onDiag("cd: the machine ejected the disc");
 
-    // Second disk: mount drive 5 once the SYSTEM is up. The gate that matters
-    // is a live volume queue (VCBQHdr head at $0358) -- the boot volume is
-    // mounted, so the Start Manager is done choosing and the File Manager is
-    // genuinely running. Injecting any earlier lands _MountVol in the middle
-    // of the ROM's own boot scan, which mounts the wrong disk out from under
-    // it and parks the machine inside the nested trap forever (measured, not
-    // theorized).
-    const u32 vcbHead = read32(0x0358);
-    const bool systemUp = vcbHead != 0 && vcbHead != 0xFFFFFFFFu;
+    // Second disk: mount drive 5 once the system is up, under the same
+    // systemUp gate as everything above.
     if (!hd2_.empty() && !hd2Installed_ && systemUp && frameCounter_ > 2400 &&
         (frameCounter_ % 60) == 30 &&
         read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
@@ -1950,7 +1953,7 @@ void Machine::runFrame() {
     // the disk it was waiting for never read. Waiting for an idle moment costs
     // at most another 90 frames.
     if (hdAutoMount_ && hdDriveNum_ != 0 && hdMountPb_ != 0 && !hdMounted_ &&
-        diskEvtPosts_ < 15 && (frameCounter_ % 90) == 0 && !inSony_ &&
+        systemUp && diskEvtPosts_ < 15 && (frameCounter_ % 90) == 0 && !inSony_ &&
         (read8(0x0360) & 1) == 0 &&
         (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) != 0xFFFFFFFFu)) {
         // Mount the hard-disk volume once the System is up (the boot path only

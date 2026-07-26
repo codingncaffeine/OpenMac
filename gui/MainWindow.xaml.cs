@@ -663,6 +663,14 @@ public partial class MainWindow : Window
     // which was meant.
     private static readonly string[] CdOnlyExtensions = { ".iso", ".toast", ".cue" };
 
+    // Loose Mac files — the archives and encodings the StuffIt-era tools open:
+    // native .sit/.sea, BinHex, Compact Pro, and the DOS-side .zip/.lha the
+    // Deluxe translators handle. (.bin MacBinary is sniffed separately, since
+    // a .bin may also be a floppy or a raw CD.) They ride into the guest on a
+    // write-protected 1.44 MB transfer floppy.
+    private static readonly string[] TransferExtensions =
+        { ".sit", ".sea", ".cpt", ".hqx", ".zip", ".lha", ".lzh" };
+
     private void Window_DragOver(object sender, DragEventArgs e)
     {
         e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop)
@@ -694,6 +702,10 @@ public partial class MainWindow : Window
         long size;
         try { size = new FileInfo(path).Length; } catch { return; }
 
+        // Archives and encodings go INTO the guest on a transfer floppy, not
+        // into a drive as media.
+        if (TransferExtensions.Contains(ext)) { TransferDrop(path, requireMacBinary: false); return; }
+
         // Floppy-sized files: let the core's judge look first. The internal
         // drive takes it unless it's occupied and the external one is free —
         // the two-disk install flow dropped as a pair lands one in each.
@@ -718,6 +730,10 @@ public partial class MainWindow : Window
             // Not floppy media — let the other drives look at it.
         }
 
+        // A .bin that isn't floppy media may be a MacBinary-wrapped loose file
+        // (Game.sit.bin and friends): decode it onto a transfer floppy.
+        if (ext == ".bin" && TransferDrop(path, requireMacBinary: true)) return;
+
         if (CdOnlyExtensions.Contains(ext) || LooksLikeCdImage(path))
         {
             if (InsertCdFrom(path))
@@ -738,6 +754,79 @@ public partial class MainWindow : Window
         MessageBox.Show(this,
             Path.GetFileName(path) + " did not go in any drive.\n\n" + why,
             "OpenMac", MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
+
+    /// <summary>Put one loose Mac file into the guest on a write-protected
+    /// 1.44 MB transfer floppy. With <paramref name="requireMacBinary"/> the
+    /// file must decode as MacBinary (the quiet .bin fall-through); without it,
+    /// failures are reported to the person who dropped the file.</summary>
+    private bool TransferDrop(string path, bool requireMacBinary)
+    {
+        long size;
+        try { size = new FileInfo(path).Length; } catch { return false; }
+        if (size > 2_000_000)
+        {
+            if (!requireMacBinary)
+            {
+                Log.Line($"transfer refused: {path} -- too big for a floppy");
+                MessageBox.Show(this,
+                    Path.GetFileName(path) + " is too big for the 1.44 MB transfer floppy." +
+                    "\n\nPut it in a folder and use File ▸ Open Host Folder as Disk instead.",
+                    "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            return false;
+        }
+        if (requireMacBinary)
+        {
+            try
+            {
+                if (!MacBinary.TryDecode(File.ReadAllBytes(path), out _)) return false;
+            }
+            catch { return false; }
+        }
+
+        byte[]? img = FolderDisk.BuildTransferFloppy(path, out string error);
+        if (img is null)
+        {
+            if (!requireMacBinary)
+            {
+                Log.Line($"transfer refused: {path} -- {error}");
+                MessageBox.Show(this,
+                    Path.GetFileName(path) + " did not fit a transfer floppy.\n\n" + error +
+                    "\n\nPut it in a folder and use File ▸ Open Host Folder as Disk instead.",
+                    "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            return false;
+        }
+
+        string temp = Path.Combine(Path.GetTempPath(), "OpenMac",
+                                   Path.GetFileNameWithoutExtension(path) + ".transfer.img");
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(temp)!);
+            File.WriteAllBytes(temp, img);
+        }
+        catch (Exception ex)
+        {
+            Log.Line($"transfer failed: {ex.Message}");
+            return false;
+        }
+
+        bool toExternal = _emulator.FloppyPath is not null &&
+                          _emulator.ExternalDriveAttached &&
+                          _emulator.ExternalFloppyPath is null;
+        // The disk goes in locked: the guest only copies off it, and the tab
+        // means its own writes never chase a temp file. The user's global
+        // write-protect choice comes right back.
+        bool saved = _emulator.WriteProtectFloppies;
+        _emulator.WriteProtectFloppies = true;
+        bool ok = toExternal ? _emulator.InsertExternalFloppy(temp)
+                             : _emulator.InsertFloppy(temp);
+        _emulator.WriteProtectFloppies = saved;
+        if (ok)
+            Log.Line($"drop: {Path.GetFileName(path)} -> transfer floppy in the "
+                     + $"{(toExternal ? "external" : "internal")} drive");
+        return ok;
     }
 
     /// <summary>ISO/High Sierra volume descriptor or raw 2352-byte sync — the

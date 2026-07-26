@@ -117,6 +117,30 @@ TEST_CASE("hostile names canonicalize and collide into distinct entries") {
     CHECK(files == 3);
 }
 
+TEST_CASE("an explicit floppy-sized build packs tight and round-trips") {
+    hfs::VolumeBuilder b("Transfer");
+    std::vector<u8> big(1200 * 1024);
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = u8(i * 3);
+    b.addFile(2, "Game.sit", 0x53495444, 0x53495421, 0, big, {});
+    auto img = b.build(1474560);   // exactly a 1.44 MB floppy
+    REQUIRE_MESSAGE(!img.empty(), b.why());
+    CHECK(img.size() == 1474560);
+
+    std::vector<hfs::Item> items;
+    REQUIRE(hfs::listVolume(img, items));
+    REQUIRE(items.size() == 2);
+    std::vector<u8> fork;
+    REQUIRE(hfs::readFork(img, items[1].isDir ? items[0].id : items[1].id, false, fork));
+    REQUIRE(fork.size() == big.size());
+    CHECK(fork[777] == big[777]);
+
+    // And a file that cannot fit fails with the reason set, not a bad volume.
+    hfs::VolumeBuilder b2("Transfer");
+    b2.addFile(2, "huge", 0, 0, 0, std::vector<u8>(2 * 1024 * 1024), {});
+    CHECK(b2.build(1474560).empty());
+    CHECK_FALSE(b2.why().empty());
+}
+
 TEST_CASE("the formatter's empty volume still lists as just a root") {
     auto img = hfs::formatVolume(4u * 1024 * 1024, "Blank");
     std::vector<hfs::Item> items;

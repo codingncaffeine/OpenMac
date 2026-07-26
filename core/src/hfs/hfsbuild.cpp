@@ -451,8 +451,11 @@ std::vector<u8> VolumeBuilder::build(u32 sizeBytes) {
         counts[0] = extABs;
         counts[1] = catABs;
         counts[2] = forkABs;
-        // Leave a fifth of the volume (at least) free for the guest to write.
-        return extABs + catABs + forkABs + nmAlBlks / 5 + 4 <= nmAlBlks;
+        // Auto-sized volumes keep a fifth free for the guest to write into. An
+        // explicitly-sized volume is packed tight (a write-protected transfer
+        // floppy has no use for headroom) with just a safety floor.
+        const u32 headroom = sizeBytes ? 16u : nmAlBlks / 5 + 4;
+        return extABs + catABs + forkABs + headroom <= nmAlBlks;
     };
     if (sizeBytes) {
         if (sizeBytes % kBlockSize || !tryGeometry(sizeBytes)) {

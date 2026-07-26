@@ -103,6 +103,9 @@ OMAC_API void omac_hfsb_add_file(void* b, uint32_t parent, const char* name,
                                  const uint8_t* rsrc, size_t rsrc_len,
                                  uint32_t cr_date, uint32_t md_date);
 OMAC_API size_t omac_hfsb_build(void* b, uint8_t* out, size_t cap);
+/* Build at an exact size (e.g. 1474560 = a 1.44 MB floppy), packed tight.
+   The volume must fit or the build fails with omac_hfsb_error set. */
+OMAC_API size_t omac_hfsb_build_sized(void* b, uint32_t size_bytes, uint8_t* out, size_t cap);
 OMAC_API size_t omac_hfsb_error(void* b, char* out, size_t cap);
 OMAC_API void omac_hfsb_free(void* b);
 

@@ -178,9 +178,9 @@ struct HfsBuilderHandle {
     bool done = false;
     explicit HfsBuilderHandle(const char* name)
         : builder(name ? name : "Untitled") {}
-    const std::vector<u8>& image()
+    const std::vector<u8>& image(uint32_t sizeBytes)
     {
-        if (!done) { built = builder.build(); done = true; }
+        if (!done) { built = builder.build(sizeBytes); done = true; }
         return built;
     }
 };
@@ -220,7 +220,17 @@ OMAC_API void omac_hfsb_add_file(void* b, uint32_t parent, const char* name,
 OMAC_API size_t omac_hfsb_build(void* b, uint8_t* out, size_t cap)
 {
     if (!b) return 0;
-    const auto& img = static_cast<HfsBuilderHandle*>(b)->image();
+    const auto& img = static_cast<HfsBuilderHandle*>(b)->image(0);
+    if (!out) return img.size();
+    const size_t n = img.size() < cap ? img.size() : cap;
+    if (n) std::memcpy(out, img.data(), n);
+    return n;
+}
+
+OMAC_API size_t omac_hfsb_build_sized(void* b, uint32_t size_bytes, uint8_t* out, size_t cap)
+{
+    if (!b) return 0;
+    const auto& img = static_cast<HfsBuilderHandle*>(b)->image(size_bytes);
     if (!out) return img.size();
     const size_t n = img.size() < cap ? img.size() : cap;
     if (n) std::memcpy(out, img.data(), n);

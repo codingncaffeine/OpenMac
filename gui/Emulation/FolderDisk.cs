@@ -55,6 +55,9 @@ internal static class FolderDisk
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern nuint omac_hfsb_build(IntPtr b, byte[]? outBuf, nuint cap);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    private static extern nuint omac_hfsb_build_sized(IntPtr b, uint sizeBytes,
+                                                      byte[]? outBuf, nuint cap);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern nuint omac_hfsb_error(IntPtr b, byte[] outBuf, nuint cap);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern void omac_hfsb_free(IntPtr b);
@@ -159,8 +162,74 @@ internal static class FolderDisk
     {
         ".txt" or ".text" or ".md" => (0x54455854u, 0x74747874u),   // TEXT/ttxt
         ".sit" => (0x53495444u, 0x53495421u),                        // SITD/SIT!
+        ".sea" => (0x4150504Cu, 0x61757374u),                        // APPL/aust
+        ".cpt" => (0x50414354u, 0x43504354u),                        // PACT/CPCT
+        ".hqx" => (0x54455854u, 0x426E4871u),                        // TEXT/BnHq
+        ".zip" => (0x5A495020u, 0x5A495020u),                        // ZIP /ZIP
+        ".lha" or ".lzh" => (0x4C484120u, 0x4C415243u),              // LHA /LARC
         _ => (0x3F3F3F3Fu, 0x3F3F3F3Fu),                             // ????/????
     };
+
+    // ---- transfer floppy -------------------------------------------------
+
+    /// <summary>Exactly a 1.44 MB floppy: the size the internal drive takes.</summary>
+    public const int TransferFloppyBytes = 1474560;
+
+    /// <summary>
+    /// Wrap one loose host file (a .sit, a .sea, anything StuffIt-era) in a
+    /// tight-packed 1.44 MB HFS floppy image, named after the file. MacBinary
+    /// wrapping is sniffed regardless of extension — period downloads often
+    /// wear it silently — so forked files arrive whole. The caller inserts the
+    /// image write-protected; the guest only copies off it.
+    /// </summary>
+    public static byte[]? BuildTransferFloppy(string filePath, out string error)
+    {
+        error = "";
+        byte[] bytes;
+        try { bytes = File.ReadAllBytes(filePath); }
+        catch (Exception ex) { error = ex.Message; return null; }
+        string stem = Path.GetFileNameWithoutExtension(filePath);
+        IntPtr b = omac_hfsb_begin(stem.Length == 0 ? "Transfer" : stem);
+        if (b == IntPtr.Zero) { error = "builder failed to start"; return null; }
+        try
+        {
+            uint cr = ToHfsDate(File.GetCreationTime(filePath));
+            uint md = ToHfsDate(File.GetLastWriteTime(filePath));
+            if (MacBinary.TryDecode(bytes, out var mb))
+                omac_hfsb_add_file(b, 2, stem, mb.Type, mb.Creator, mb.Flags,
+                    mb.Data, (nuint)mb.Data.Length, mb.Rsrc, (nuint)mb.Rsrc.Length,
+                    cr, md);
+            else
+            {
+                (uint type, uint creator) = InferTypeCreator(Path.GetExtension(filePath));
+                omac_hfsb_add_file(b, 2, Path.GetFileName(filePath), type, creator, 0,
+                    bytes, (nuint)bytes.Length, null, 0, cr, md);
+            }
+            nuint size = omac_hfsb_build_sized(b, TransferFloppyBytes, null, 0);
+            if (size == 0)
+            {
+                byte[] msg = new byte[512];
+                omac_hfsb_error(b, msg, (nuint)msg.Length);
+                int n = Array.IndexOf(msg, (byte)0);
+                error = System.Text.Encoding.ASCII.GetString(msg, 0, n < 0 ? msg.Length : n);
+                if (error.Length == 0)
+                    error = "it does not fit a 1.44 MB transfer floppy";
+                return null;
+            }
+            byte[] img = new byte[size];
+            omac_hfsb_build_sized(b, TransferFloppyBytes, img, (nuint)img.Length);
+            return img;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return null;
+        }
+        finally
+        {
+            omac_hfsb_free(b);
+        }
+    }
 
     // ---- sync back ------------------------------------------------------
 
