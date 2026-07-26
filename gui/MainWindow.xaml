@@ -3,7 +3,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="OpenMac" Height="560" Width="760" MinWidth="360" MinHeight="300"
         Background="{StaticResource WindowBg}" Foreground="{StaticResource TextPrimary}"
-        FontFamily="Segoe UI" FontSize="13">
+        FontFamily="Segoe UI" FontSize="13"
+        AllowDrop="True" Drop="Window_Drop" DragOver="Window_DragOver">
     <DockPanel>
         <Menu DockPanel.Dock="Top">
             <MenuItem Header="_File">

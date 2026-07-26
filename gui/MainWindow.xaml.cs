@@ -74,6 +74,12 @@ public partial class MainWindow : Window
             ApplyScale();
             if (!string.IsNullOrEmpty(_settings.LastRom) && File.Exists(_settings.LastRom))
                 LoadRom(_settings.LastRom!);
+            // Files handed on the command line ride the same router as a drop,
+            // so "openmac.exe game.img" and double-click associations both work.
+            string[] args = Environment.GetCommandLineArgs();
+            for (int i = 1; i < args.Length; i++)
+                if (File.Exists(args[i])) RouteMedia(args[i]);
+            if (args.Length > 1) UpdateUi();
         };
         Closing += (_, _) =>
         {
@@ -520,33 +526,40 @@ public partial class MainWindow : Window
                 + "All files (*.*)|*.*",
                 _settings.LastCd) is { } path)
         {
-            bool driveWasAttached = _emulator.CdRomAttached;
-            if (_emulator.InsertCd(path))
-            {
-                _settings.CdRomAttached = true;
-                _settings.LastCd = path;
-                _settings.Save();
-                Log.Line($"cd inserted: {path} -- {_emulator.CdMediumNote()}");
-                // Inserting also connected the drive; that half needs the scan.
-                if (!driveWasAttached && _emulator.IsRomLoaded && _emulator.RomPath is { } rom)
-                {
-                    var r = MessageBox.Show(this,
-                        "The disc is in, but the drive itself was just connected, and the " +
-                        "Mac scans the SCSI bus only at startup.\n\nRestart now so it appears?",
-                        "CD-ROM Drive", MessageBoxButton.YesNo, MessageBoxImage.Question);
-                    if (r == MessageBoxResult.Yes) LoadRom(rom);
-                }
-            }
-            else
-            {
-                string why = _emulator.CdMediumNote();
-                Log.Line($"cd refused: {path} -- {why}");
-                MessageBox.Show(this,
-                    Path.GetFileName(path) + " did not go in the drive.\n\n" + why,
-                    "Not a CD image", MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
+            InsertCdFrom(path);
             UpdateUi();
         }
+    }
+
+    /// <summary>Insert a CD image (from the menu or a drop), with the restart
+    /// offer when the insertion also had to connect the drive. Returns whether
+    /// the drive took the disc.</summary>
+    private bool InsertCdFrom(string path)
+    {
+        bool driveWasAttached = _emulator.CdRomAttached;
+        if (_emulator.InsertCd(path))
+        {
+            _settings.CdRomAttached = true;
+            _settings.LastCd = path;
+            _settings.Save();
+            Log.Line($"cd inserted: {path} -- {_emulator.CdMediumNote()}");
+            // Inserting also connected the drive; that half needs the boot scan.
+            if (!driveWasAttached && _emulator.IsRomLoaded && _emulator.RomPath is { } rom)
+            {
+                var r = MessageBox.Show(this,
+                    "The disc is in, but the drive itself was just connected, and the " +
+                    "Mac scans the SCSI bus only at startup.\n\nRestart now so it appears?",
+                    "CD-ROM Drive", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (r == MessageBoxResult.Yes) LoadRom(rom);
+            }
+            return true;
+        }
+        string why = _emulator.CdMediumNote();
+        Log.Line($"cd refused: {path} -- {why}");
+        MessageBox.Show(this,
+            Path.GetFileName(path) + " did not go in the drive.\n\n" + why,
+            "Not a CD image", MessageBoxButton.OK, MessageBoxImage.Warning);
+        return false;
     }
 
     private void EjectCd_Click(object sender, RoutedEventArgs e)
@@ -555,6 +568,141 @@ public partial class MainWindow : Window
         _settings.LastCd = null;
         _settings.Save();
         UpdateUi();
+    }
+
+    // ---- drag & drop / media routing ----
+    // Anything dropped on the window lands in the right place: ROMs load,
+    // floppy-sized files go to the floppy drives on the core's own judgment
+    // (containers stripped, non-media refused with its nature named), CD images
+    // go to the CD drive, and partitioned or bare-HFS images attach as the hard
+    // disk. Extensions only break the tie between shapes that are byte-identical
+    // on purpose: an HFS master could be a CD or an HD, and .iso/.toast/.cue say
+    // which was meant.
+    private static readonly string[] CdOnlyExtensions = { ".iso", ".toast", ".cue" };
+
+    private void Window_DragOver(object sender, DragEventArgs e)
+    {
+        e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop)
+            ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private void Window_Drop(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetData(DataFormats.FileDrop) is not string[] files) return;
+        foreach (string f in files)
+            if (File.Exists(f)) RouteMedia(f);
+        UpdateUi();
+    }
+
+    private void RouteMedia(string path)
+    {
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext == ".rom") { LoadRom(path); return; }
+        if (!_emulator.IsRomLoaded)
+        {
+            Log.Line($"drop ignored (no ROM loaded): {path}");
+            MessageBox.Show(this,
+                "Load a ROM first (File ▸ Open ROM…), then drop disks in.",
+                "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        long size;
+        try { size = new FileInfo(path).Length; } catch { return; }
+
+        // Floppy-sized files: let the core's judge look first. The internal
+        // drive takes it unless it's occupied and the external one is free —
+        // the two-disk install flow dropped as a pair lands one in each.
+        bool triedFloppy = false;
+        if (size <= 3_500_000 && !CdOnlyExtensions.Contains(ext))
+        {
+            triedFloppy = true;
+            bool toExternal = _emulator.FloppyPath is not null &&
+                              _emulator.ExternalDriveAttached &&
+                              _emulator.ExternalFloppyPath is null;
+            bool ok = toExternal ? _emulator.InsertExternalFloppy(path)
+                                 : _emulator.InsertFloppy(path);
+            if (ok)
+            {
+                if (toExternal) _settings.LastExternalFloppy = path;
+                else _settings.LastFloppy = path;
+                _settings.Save();
+                Log.Line($"drop: {Path.GetFileName(path)} -> "
+                         + $"{(toExternal ? "external" : "internal")} floppy drive");
+                return;
+            }
+            // Not floppy media — let the other drives look at it.
+        }
+
+        if (CdOnlyExtensions.Contains(ext) || LooksLikeCdImage(path))
+        {
+            if (InsertCdFrom(path))
+                Log.Line($"drop: {Path.GetFileName(path)} -> CD-ROM drive");
+            return;
+        }
+
+        if (LooksLikeHardDisk(path))
+        {
+            Log.Line($"drop: {Path.GetFileName(path)} -> hard disk");
+            AttachHardDisk(path);
+            return;
+        }
+
+        string why = triedFloppy ? _emulator.MediumNote(0)
+                                 : "not floppy media, a CD image, or a hard-disk image";
+        Log.Line($"drop refused: {path} -- {why}");
+        MessageBox.Show(this,
+            Path.GetFileName(path) + " did not go in any drive.\n\n" + why,
+            "OpenMac", MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
+
+    /// <summary>ISO/High Sierra volume descriptor or raw 2352-byte sync — the
+    /// shapes that mean "CD" regardless of what the file is called.</summary>
+    private static bool LooksLikeCdImage(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            byte[] head = new byte[16];
+            if (fs.Read(head, 0, 16) == 16 &&
+                head[0] == 0x00 && head[1] == 0xFF && head[11] == 0x00 &&
+                head[2] == 0xFF && head[10] == 0xFF)
+                return true;   // raw 2352 sync pattern
+            if (fs.Length >= 17L * 2048)
+            {
+                byte[] pvd = new byte[16];
+                fs.Seek(16L * 2048, SeekOrigin.Begin);
+                if (fs.Read(pvd, 0, 16) == 16)
+                {
+                    if (pvd[1] == 'C' && pvd[2] == 'D' && pvd[3] == '0' &&
+                        pvd[4] == '0' && pvd[5] == '1') return true;   // ISO 9660
+                    if (pvd[9] == 'C' && pvd[10] == 'D' && pvd[11] == 'R' &&
+                        pvd[12] == 'O' && pvd[13] == 'M') return true; // High Sierra
+                }
+            }
+        }
+        catch { /* unreadable = not a CD */ }
+        return false;
+    }
+
+    /// <summary>An Apple partition map ('ER') or a bare HFS volume ('BD' at
+    /// 1024) that isn't floppy-sized — the shapes the SCSI disk mounts.</summary>
+    private static bool LooksLikeHardDisk(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            byte[] b = new byte[2];
+            if (fs.Read(b, 0, 2) == 2 && b[0] == 0x45 && b[1] == 0x52) return true;
+            if (fs.Length >= 1536)
+            {
+                fs.Seek(1024, SeekOrigin.Begin);
+                if (fs.Read(b, 0, 2) == 2 && b[0] == 0x42 && b[1] == 0x44) return true;
+            }
+        }
+        catch { /* unreadable = not a disk */ }
+        return false;
     }
 
     // ---- view ----
