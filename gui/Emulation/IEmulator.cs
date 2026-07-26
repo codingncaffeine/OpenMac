@@ -69,6 +69,15 @@ public interface IEmulator : IDisposable
     void AttachHardDisk(string path);
     void DetachHardDisk();
 
+    // ---- folder disk ----
+    // A host folder served to the Mac as a real HFS disk (second SCSI disk).
+    // Built from the folder when attached; the guest's changes sync back to
+    // the folder on detach, reload, and exit. The guest's deletions move to
+    // _openmac-removed rather than erasing host files.
+    string? FolderDiskPath { get; }
+    bool AttachFolderDisk(string folder, out string error);
+    void DetachFolderDisk();
+
     // ---- CD-ROM ----
     // The drive is a SCSI device (attached to the bus; the ROM and the Apple CD
     // software find it during the boot-time bus scan). A disc is media: put in

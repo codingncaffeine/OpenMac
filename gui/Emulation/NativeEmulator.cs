@@ -67,6 +67,7 @@ public sealed class NativeEmulator : IEmulator
         WriteBackFloppy();
         WriteBackExternalFloppy();
         WriteBackHardDisk();   // persist guest writes on every medium before teardown
+        SyncFolderDisk();
         byte[] rom = File.ReadAllBytes(path);
         lock (_sync)
         {
@@ -91,6 +92,7 @@ public sealed class NativeEmulator : IEmulator
         HardDiskPath = null;
         CdRomAttached = false;
         CdPath = null;
+        FolderDiskPath = null;
         Log.Line($"[core] created — {ramMB} MB, ROM {Path.GetFileName(path)}");
     }
 
@@ -426,6 +428,52 @@ public sealed class NativeEmulator : IEmulator
         catch { /* best-effort persistence */ }
     }
 
+    // ---- folder disk ----
+    public string? FolderDiskPath { get; private set; }
+
+    public bool AttachFolderDisk(string folder, out string error)
+    {
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        SyncFolderDisk();   // a previously attached folder gets its changes first
+        byte[]? img = FolderDisk.Build(folder, out error);
+        if (img is null) return false;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            Native.omac_insert_harddisk2(_h, img, (nuint)img.Length, 0);
+        }
+        FolderDiskPath = folder;
+        Log.Line($"[disk] folder disk built from {folder} ({img.Length / (1024 * 1024)} MB volume)");
+        return true;
+    }
+
+    public void DetachFolderDisk()
+    {
+        SyncFolderDisk();
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_detach_harddisk2(_h); }
+        FolderDiskPath = null;
+    }
+
+    /// <summary>Write the guest's folder-disk changes back to the host folder.</summary>
+    private void SyncFolderDisk()
+    {
+        if (string.IsNullOrEmpty(FolderDiskPath)) return;
+        byte[]? img = null;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return;
+            nuint size = Native.omac_harddisk2_data(_h, null, 0);
+            if (size == 0) return;
+            img = new byte[size];
+            if (Native.omac_harddisk2_data(_h, img, size) == 0) return;
+        }
+        var r = FolderDisk.SyncBack(img!, FolderDiskPath!);   // file I/O off the lock
+        Log.Line(r.Error is null
+            ? $"[disk] folder disk synced: {r.Updated} updated, {r.Added} added, {r.Removed} moved to _openmac-removed"
+            : $"[disk] folder disk sync FAILED: {r.Error}");
+    }
+
     // ---- CD-ROM ----
     public bool CdRomAttached { get; private set; }
     public string? CdPath { get; private set; }
@@ -529,6 +577,7 @@ public sealed class NativeEmulator : IEmulator
         WriteBackFloppy();
         WriteBackExternalFloppy();
         WriteBackHardDisk();
+        SyncFolderDisk();
         Destroy();
         _audio.Dispose();
     }

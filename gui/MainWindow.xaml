@@ -34,6 +34,11 @@
                 <MenuItem Header="Insert CD Image…" Click="InsertCd_Click" />
                 <MenuItem x:Name="EjectCdItem" Header="Eject CD" Click="EjectCd_Click" />
                 <Separator />
+                <MenuItem Header="Open Host Folder as Disk…" Click="OpenFolderDisk_Click"
+                          ToolTip="Builds a real HFS disk from a folder on this PC and puts it on the SCSI bus. Changes the Mac makes come back to the folder when the disk is closed, the machine restarts, or OpenMac quits." />
+                <MenuItem x:Name="CloseFolderDiskItem" Header="Close Folder Disk"
+                          Click="CloseFolderDisk_Click" />
+                <Separator />
                 <MenuItem Header="Exit" InputGestureText="Alt+F4" Click="Exit_Click" />
             </MenuItem>
             <MenuItem Header="_Machine">

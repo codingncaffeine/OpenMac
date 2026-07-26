@@ -90,6 +90,15 @@ public sealed class StubEmulator : IEmulator
         HardDiskAttached = false;
     }
 
+    public string? FolderDiskPath { get; private set; }
+    public bool AttachFolderDisk(string folder, out string error)
+    {
+        error = "";
+        FolderDiskPath = folder;
+        return true;
+    }
+    public void DetachFolderDisk() => FolderDiskPath = null;
+
     public bool CdRomAttached { get; private set; }
     public string? CdPath { get; private set; }
     public void SetCdRomAttached(bool attached)

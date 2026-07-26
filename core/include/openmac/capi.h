@@ -83,6 +83,45 @@ OMAC_API void omac_insert_harddisk(OMac*, const uint8_t* img, size_t len, int re
    the disk back to its file on eject/exit. */
 OMAC_API size_t omac_harddisk_data(OMac*, uint8_t* out, size_t cap);
 
+/* ---- second SCSI disk (the folder disk's seat; SCSI ID 1, drive 5) ---- */
+OMAC_API void omac_insert_harddisk2(OMac*, const uint8_t* img, size_t len, int read_only);
+OMAC_API void omac_detach_harddisk2(OMac*);
+OMAC_API size_t omac_harddisk2_data(OMac*, uint8_t* out, size_t cap);
+
+/* ---- HFS folder-volume builder / reader (host-side, no machine needed) ----
+   Builder: begin -> add_dir/add_file (parent 2 = the root) -> build (NULL out
+   queries the size; the volume is built once and cached) -> free. Names are
+   canonicalized to a collation-safe ASCII subset; dates are HFS-epoch seconds
+   (0 = a fixed valid date). Reader: open an image (returns NULL if it is not
+   a mountable HFS volume), enumerate items, read forks, free. */
+OMAC_API void* omac_hfsb_begin(const char* volume_name);
+OMAC_API uint32_t omac_hfsb_add_dir(void* b, uint32_t parent, const char* name,
+                                    uint32_t cr_date, uint32_t md_date);
+OMAC_API void omac_hfsb_add_file(void* b, uint32_t parent, const char* name,
+                                 uint32_t type, uint32_t creator, uint16_t fd_flags,
+                                 const uint8_t* data, size_t data_len,
+                                 const uint8_t* rsrc, size_t rsrc_len,
+                                 uint32_t cr_date, uint32_t md_date);
+OMAC_API size_t omac_hfsb_build(void* b, uint8_t* out, size_t cap);
+OMAC_API size_t omac_hfsb_error(void* b, char* out, size_t cap);
+OMAC_API void omac_hfsb_free(void* b);
+
+typedef struct {
+    uint32_t id, parent;
+    int32_t is_dir;
+    uint32_t type, creator;
+    uint32_t fd_flags;
+    uint32_t cr_date, md_date;
+    uint32_t data_len, rsrc_len;
+    char name[64];
+} OMacHfsItem;
+OMAC_API void* omac_hfsr_open(const uint8_t* img, size_t len);
+OMAC_API int32_t omac_hfsr_count(void* r);
+OMAC_API int32_t omac_hfsr_item(void* r, int32_t index, OMacHfsItem* out);
+OMAC_API size_t omac_hfsr_fork(void* r, uint32_t file_id, int32_t rsrc,
+                               uint8_t* out, size_t cap);
+OMAC_API void omac_hfsr_free(void* r);
+
 /* ---- CD-ROM (an AppleCD SC-class SCSI drive) ---- */
 /* The drive itself is a bus device: attach it once (scsi_id 3 is Apple's
    factory default) and it persists across discs. A disc image goes in with

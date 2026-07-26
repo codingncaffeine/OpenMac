@@ -62,6 +62,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
       rtc_(std::make_unique<Rtc>()),
       adb_(std::make_unique<AdbTransceiver>()),
       scsi_(std::make_unique<Ncr5380>()),
+      disk2_(std::make_unique<ScsiDisk>()),
       cdrom_(std::make_unique<ScsiCdRom>()),
       iwm_(std::make_unique<Iwm>()),
       drive0_(std::make_unique<SonyDrive>()),
@@ -71,6 +72,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     // The Classic has one internal 1.4 MB SuperDrive; the external port is empty.
     // The internal mechanism always reads its medium out of floppy_, so an empty
     // floppy_ simply means no disk is in the drive.
+    scsi_->addTarget(disk2_.get());   // off the bus until an image attaches
     scsi_->addTarget(cdrom_.get());   // detached until the front end attaches it
     drive0_->installed = true;
     drive0_->image = &floppy_;
@@ -876,6 +878,38 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
             n += std::snprintf(b + n, sizeof b - static_cast<std::size_t>(n), " %02X", p[i]);
         onDiag(b);
     };
+}
+
+void Machine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
+    hd2_ = std::move(image);
+    hd2Installed_ = false;
+    hd2Mounted_ = false;
+    hd2MountTries_ = 0;
+    // Same wrapping as the first disk, but this copy of the driver answers for
+    // SCSI ID 1, adds drive 5, and installs at unit 33 (the real-world SCSI
+    // slot for ID 1), so the two instances never collide.
+    auto driver = scsi::buildScsiDriver(1, 5, 33);
+    scsiImage2_ = scsi::buildAppleScsiDisk(hd2_, driver);
+    const std::size_t drvBlocks = driver.empty() ? 1u : (driver.size() + 511) / 512;
+    hfsImageOffset2_ = static_cast<u32>((4 + drvBlocks) * 512);
+    disk2_->attach(&scsiImage2_, 1);
+    disk2_->readOnly = readOnly;
+    if (onDiag) onDiag("hd2: disk attached (SCSI ID 1, drive 5)");
+}
+
+void Machine::detachHardDisk2() {
+    disk2_->detach();
+    hd2_.clear();
+    scsiImage2_.clear();
+    if (onDiag) onDiag("hd2: disk detached");
+}
+
+const std::vector<u8>& Machine::hardDisk2Image() const {
+    if (!scsiImage2_.empty() &&
+        static_cast<std::size_t>(hfsImageOffset2_) + hd2_.size() <= scsiImage2_.size())
+        hd2_.assign(scsiImage2_.begin() + hfsImageOffset2_,
+                    scsiImage2_.begin() + hfsImageOffset2_ + hd2_.size());
+    return hd2_;
 }
 
 void Machine::attachCdRom(bool attached, int busId) {
@@ -1837,6 +1871,47 @@ void Machine::runFrame() {
     // with LoEj). Surface it so the front end can update its menus.
     if (cdrom_->takeEjectRequest() && onDiag)
         onDiag("cd: the machine ejected the disc");
+
+    // Second disk: mount drive 5 once the SYSTEM is up. The gate that matters
+    // is a live volume queue (VCBQHdr head at $0358) -- the boot volume is
+    // mounted, so the Start Manager is done choosing and the File Manager is
+    // genuinely running. Injecting any earlier lands _MountVol in the middle
+    // of the ROM's own boot scan, which mounts the wrong disk out from under
+    // it and parks the machine inside the nested trap forever (measured, not
+    // theorized).
+    const u32 vcbHead = read32(0x0358);
+    const bool systemUp = vcbHead != 0 && vcbHead != 0xFFFFFFFFu;
+    if (!hd2_.empty() && !hd2Installed_ && systemUp && frameCounter_ > 2400 &&
+        (frameCounter_ % 60) == 30 &&
+        read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        hd2Installed_ = true;
+        cpu_.d[0] = 80;
+        execute68kTrap(kTrapNewPtrSysClear);
+        hd2MountPb_ = cpu_.a[0];
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    }
+    if (hd2Installed_ && hd2MountPb_ != 0 && !hd2Mounted_ && !hd2_.empty() &&
+        systemUp && hd2MountTries_ < 15 && (frameCounter_ % 90) == 45 && !inSony_ &&
+        (read8(0x0360) & 1) == 0 &&
+        (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) != 0xFFFFFFFFu)) {
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        write16(hd2MountPb_ + ioVRefNum, 5);          // drive 5
+        cpu_.a[0] = hd2MountPb_;
+        execute68kTrap(kTrapMountVol);
+        const u16 r = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+        ++hd2MountTries_;
+        if (r == 0 || r == 0xFFC9) hd2Mounted_ = true;   // mounted / already on-line
+        if (onDiag && (hd2Mounted_ || hd2MountTries_ == 15)) {
+            char b[80];
+            std::snprintf(b, sizeof b, "hd2: mount result %04X after %u tries", r,
+                          hd2MountTries_);
+            onDiag(b);
+        }
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    }
 
     // Mount the hard-disk volume once the System's file system is actually ready.
     // _MountVol enqueues the new VCB into a low-memory volume queue at $360 that

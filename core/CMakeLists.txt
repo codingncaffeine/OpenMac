@@ -10,6 +10,8 @@ add_library(openmac_core STATIC
     src/machine/via.cpp
     src/machine/rtc.cpp
     src/hfs/hfsformat.cpp
+    src/hfs/hfsbuild.cpp
+    src/hfs/hfsread.cpp
     src/debugger.cpp
 )
 

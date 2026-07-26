@@ -153,6 +153,150 @@ OMAC_API size_t omac_harddisk_data(OMac* m, uint8_t* out, size_t cap)
     return n;
 }
 
+OMAC_API void omac_insert_harddisk2(OMac* m, const uint8_t* img, size_t len, int ro)
+{
+    if (m && img) m->mac.insertHardDisk2(std::vector<u8>(img, img + len), ro != 0);
+}
+
+OMAC_API void omac_detach_harddisk2(OMac* m) { if (m) m->mac.detachHardDisk2(); }
+
+OMAC_API size_t omac_harddisk2_data(OMac* m, uint8_t* out, size_t cap)
+{
+    if (!m || !m->mac.hardDisk2Present()) return 0;
+    const auto& img = m->mac.hardDisk2Image();
+    if (!out) return img.size();
+    const size_t n = img.size() < cap ? img.size() : cap;
+    if (n) std::memcpy(out, img.data(), n);
+    return n;
+}
+
+namespace {
+
+struct HfsBuilderHandle {
+    openmac::hfs::VolumeBuilder builder;
+    std::vector<u8> built;
+    bool done = false;
+    explicit HfsBuilderHandle(const char* name)
+        : builder(name ? name : "Untitled") {}
+    const std::vector<u8>& image()
+    {
+        if (!done) { built = builder.build(); done = true; }
+        return built;
+    }
+};
+
+struct HfsReaderHandle {
+    std::vector<u8> img;
+    std::vector<openmac::hfs::Item> items;
+};
+
+} // namespace
+
+OMAC_API void* omac_hfsb_begin(const char* volume_name)
+{
+    try { return new HfsBuilderHandle(volume_name); } catch (...) { return nullptr; }
+}
+
+OMAC_API uint32_t omac_hfsb_add_dir(void* b, uint32_t parent, const char* name,
+                                    uint32_t cr, uint32_t md)
+{
+    if (!b || !name) return 0;
+    return static_cast<HfsBuilderHandle*>(b)->builder.addDir(parent, name, cr, md);
+}
+
+OMAC_API void omac_hfsb_add_file(void* b, uint32_t parent, const char* name,
+                                 uint32_t type, uint32_t creator, uint16_t fdflags,
+                                 const uint8_t* data, size_t data_len,
+                                 const uint8_t* rsrc, size_t rsrc_len,
+                                 uint32_t cr, uint32_t md)
+{
+    if (!b || !name) return;
+    static_cast<HfsBuilderHandle*>(b)->builder.addFile(
+        parent, name, type, creator, fdflags,
+        data ? std::vector<u8>(data, data + data_len) : std::vector<u8>{},
+        rsrc ? std::vector<u8>(rsrc, rsrc + rsrc_len) : std::vector<u8>{}, cr, md);
+}
+
+OMAC_API size_t omac_hfsb_build(void* b, uint8_t* out, size_t cap)
+{
+    if (!b) return 0;
+    const auto& img = static_cast<HfsBuilderHandle*>(b)->image();
+    if (!out) return img.size();
+    const size_t n = img.size() < cap ? img.size() : cap;
+    if (n) std::memcpy(out, img.data(), n);
+    return n;
+}
+
+OMAC_API size_t omac_hfsb_error(void* b, char* out, size_t cap)
+{
+    if (!b) return 0;
+    const std::string& s = static_cast<HfsBuilderHandle*>(b)->builder.why();
+    if (out && cap) {
+        const size_t c = s.size() < cap - 1 ? s.size() : cap - 1;
+        std::memcpy(out, s.data(), c);
+        out[c] = 0;
+    }
+    return s.size();
+}
+
+OMAC_API void omac_hfsb_free(void* b) { delete static_cast<HfsBuilderHandle*>(b); }
+
+OMAC_API void* omac_hfsr_open(const uint8_t* img, size_t len)
+{
+    if (!img || !len) return nullptr;
+    try {
+        auto* h = new HfsReaderHandle;
+        h->img.assign(img, img + len);
+        if (!openmac::hfs::listVolume(h->img, h->items)) { delete h; return nullptr; }
+        return h;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+OMAC_API int32_t omac_hfsr_count(void* r)
+{
+    return r ? static_cast<int32_t>(static_cast<HfsReaderHandle*>(r)->items.size()) : 0;
+}
+
+OMAC_API int32_t omac_hfsr_item(void* r, int32_t index, OMacHfsItem* out)
+{
+    if (!r || !out) return 0;
+    const auto& items = static_cast<HfsReaderHandle*>(r)->items;
+    if (index < 0 || static_cast<size_t>(index) >= items.size()) return 0;
+    const auto& it = items[static_cast<size_t>(index)];
+    out->id = it.id;
+    out->parent = it.parent;
+    out->is_dir = it.isDir ? 1 : 0;
+    out->type = it.type;
+    out->creator = it.creator;
+    out->fd_flags = it.fdFlags;
+    out->cr_date = it.crDate;
+    out->md_date = it.mdDate;
+    out->data_len = it.dataLen;
+    out->rsrc_len = it.rsrcLen;
+    const size_t n = it.name.size() < sizeof out->name - 1 ? it.name.size()
+                                                           : sizeof out->name - 1;
+    std::memcpy(out->name, it.name.data(), n);
+    out->name[n] = 0;
+    return 1;
+}
+
+OMAC_API size_t omac_hfsr_fork(void* r, uint32_t file_id, int32_t rsrc,
+                               uint8_t* out, size_t cap)
+{
+    if (!r) return 0;
+    auto* h = static_cast<HfsReaderHandle*>(r);
+    std::vector<u8> fork;
+    if (!openmac::hfs::readFork(h->img, file_id, rsrc != 0, fork)) return 0;
+    if (!out) return fork.size();
+    const size_t n = fork.size() < cap ? fork.size() : cap;
+    if (n) std::memcpy(out, fork.data(), n);
+    return n;
+}
+
+OMAC_API void omac_hfsr_free(void* r) { delete static_cast<HfsReaderHandle*>(r); }
+
 OMAC_API void omac_cd_attach(OMac* m, int attached, int scsi_id)
 {
     if (m) m->mac.attachCdRom(attached != 0, scsi_id);

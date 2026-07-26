@@ -77,6 +77,16 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_insert_harddisk(IntPtr h, byte[] img, nuint len, int readOnly);
 
+    // Second SCSI disk (the folder disk's seat).
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_insert_harddisk2(IntPtr h, byte[] img, nuint len, int readOnly);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_detach_harddisk2(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_harddisk2_data(IntPtr h, byte[]? outBuf, nuint cap);
+
     // CD-ROM: the drive is a bus device (attach), a disc is media (insert).
     // Discs are read-only; the guest can eject them itself, so presence is
     // polled like the floppies.

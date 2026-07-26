@@ -18,6 +18,7 @@ class Via6522;
 class Rtc;
 class AdbTransceiver;
 class Ncr5380;
+class ScsiDisk;
 class ScsiCdRom;
 class Iwm;
 class SonyDrive;
@@ -136,6 +137,15 @@ public:
         return hd_;
     }
     u32 hdAccessCount() const { return hdReads_ + hdWrites_; }
+
+    // A second, independent SCSI disk (ID 1, drive 5, unit 33) — the folder
+    // disk rides here so the user's main hard disk keeps its slot. Attach it
+    // before boot (the ROM's bus scan runs its driver and mounts it); read the
+    // image back out to persist the guest's writes.
+    void insertHardDisk2(std::vector<u8> image, bool readOnly = false);
+    void detachHardDisk2();
+    bool hardDisk2Present() const { return !hd2_.empty(); }
+    const std::vector<u8>& hardDisk2Image() const;
 
     // CD-ROM: an AppleCD SC-class SCSI drive. The drive is attached to the bus
     // (a device, persisting across discs); a disc image is inserted into it
@@ -392,6 +402,18 @@ private:
     mutable std::vector<u8> hd_;   // hard-disk image (empty = none); synced from scsiImage_ on read-out
     std::vector<u8> scsiImage_;    // hd_ wrapped in an Apple partition structure for the SCSI bus
     u32 hfsImageOffset_ = 0;       // byte offset of the HFS volume within scsiImage_
+    mutable std::vector<u8> hd2_;  // second SCSI disk (the folder disk), same lifecycle
+    std::vector<u8> scsiImage2_;
+    u32 hfsImageOffset2_ = 0;
+    // The ROM only mounts the BOOT volume; every other disk on a real Mac
+    // appears because something posts its mount. Drive 5 gets the same
+    // machine-side _MountVol injection that drive 4 grew for mid-session
+    // attaches, staggered against it and under the same File-Manager-idle
+    // gates.
+    bool hd2Installed_ = false;    // mount param block allocated
+    u32 hd2MountPb_ = 0;
+    bool hd2Mounted_ = false;
+    u32 hd2MountTries_ = 0;
     bool scsiHandlesHd_ = true;    // true: SCSI driver owns the HD (skip .Sony HD reg); false: .Sony still mounts
     bool hdRO_ = false;
     bool hdInstalled_ = false;     // the hard disk's deferred mount is set up
@@ -430,6 +452,7 @@ private:
     std::unique_ptr<Rtc> rtc_;
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<Ncr5380> scsi_;
+    std::unique_ptr<ScsiDisk> disk2_;   // second disk target (SCSI ID 1)
     std::unique_ptr<ScsiCdRom> cdrom_;
     char cdMediumText_[224] = {0};
     std::unique_ptr<Iwm> iwm_;

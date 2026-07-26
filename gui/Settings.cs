@@ -18,6 +18,8 @@ public sealed class Settings
     /// <summary>The CD-ROM drive on the SCSI bus, and the disc left in it.</summary>
     public bool CdRomAttached { get; set; }
     public string? LastCd { get; set; }
+    /// <summary>Host folder served to the Mac as a disk (rebuilt each start).</summary>
+    public string? LastFolderDisk { get; set; }
     /// <summary>
     /// The write-protect tab, as a physical one: off unless asked for. A Mac
     /// writes to its floppies constantly and they stay perfectly usable, so

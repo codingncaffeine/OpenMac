@@ -285,6 +285,13 @@ public partial class MainWindow : Window
                 Log.Line($"cd refused: {_settings.LastCd} -- {_emulator.CdMediumNote()}");
                 _settings.LastCd = null;
             }
+            if (!string.IsNullOrEmpty(_settings.LastFolderDisk) &&
+                Directory.Exists(_settings.LastFolderDisk) &&
+                !_emulator.AttachFolderDisk(_settings.LastFolderDisk!, out string fdErr))
+            {
+                Log.Line($"folder disk refused: {_settings.LastFolderDisk} -- {fdErr}");
+                _settings.LastFolderDisk = null;
+            }
         }
         catch (Exception ex)
         {
@@ -570,6 +577,63 @@ public partial class MainWindow : Window
         UpdateUi();
     }
 
+    // ---- folder disk ----
+    private void OpenFolderDisk_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_emulator.IsRomLoaded)
+        {
+            MessageBox.Show(this, "Load a ROM first (File ▸ Open ROM…).", "OpenMac",
+                            MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        var dlg = new Microsoft.Win32.OpenFolderDialog { Title = "Open Host Folder as Disk" };
+        if (!string.IsNullOrEmpty(_settings.LastFolderDisk) &&
+            Directory.Exists(_settings.LastFolderDisk))
+            dlg.InitialDirectory = _settings.LastFolderDisk;
+        if (dlg.ShowDialog(this) != true) return;
+
+        if (_emulator.AttachFolderDisk(dlg.FolderName, out string error))
+        {
+            _settings.LastFolderDisk = dlg.FolderName;
+            _settings.Save();
+            UpdateUi();
+            // The volume mounts on its own a few seconds after the System is
+            // up (the machine posts its mount); mid-session it appears without
+            // a restart, but only if the boot-time bus scan installed the
+            // second disk's driver — which happens whenever a folder disk was
+            // attached at startup. First-time mid-session attach wants a
+            // restart so the driver loads.
+            if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom)
+            {
+                var r = MessageBox.Show(this,
+                    "The folder is on the bus. If no folder disk was attached when this " +
+                    "Mac started, its driver hasn't been loaded by the startup scan yet." +
+                    "\n\nRestart now so the disk appears?",
+                    "Folder Disk", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (r == MessageBoxResult.Yes) LoadRom(rom);
+            }
+        }
+        else
+        {
+            Log.Line($"folder disk refused: {dlg.FolderName} -- {error}");
+            MessageBox.Show(this, "The folder did not become a disk.\n\n" + error,
+                            "Folder Disk", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void CloseFolderDisk_Click(object sender, RoutedEventArgs e)
+    {
+        _emulator.DetachFolderDisk();   // syncs changes back to the folder first
+        _settings.LastFolderDisk = null;
+        _settings.Save();
+        UpdateUi();
+        MessageBox.Show(this,
+            "Changes were written back to the folder (the log has the counts). " +
+            "The Mac may still show the volume until it restarts — like a SCSI " +
+            "drive unplugged while running.",
+            "Folder Disk", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
     // ---- drag & drop / media routing ----
     // Anything dropped on the window lands in the right place: ROMs load,
     // floppy-sized files go to the floppy drives on the core's own judgment
@@ -777,6 +841,8 @@ public partial class MainWindow : Window
               + (_emulator.HardDiskAttached && _emulator.HardDiskPath is { } hd
                   ? $"  •  HD: {Path.GetFileName(hd)}" : "")
               + (_emulator.CdPath is { } cd ? $"  •  CD: {Path.GetFileName(cd)}" : "")
+              + (_emulator.FolderDiskPath is { } fd
+                  ? $"  •  Folder: {Path.GetFileName(fd.TrimEnd('\\', '/'))}" : "")
             : "No ROM loaded";
         StatusMachine.Text = machine;
         Title = _emulator.IsRomLoaded && _emulator.RomPath is { } r
@@ -811,5 +877,6 @@ public partial class MainWindow : Window
         EjectCdItem.IsEnabled = _emulator.CdPath is not null;
         EjectCdItem.Header = _emulator.CdPath is { } cdPath
             ? $"Eject “{Path.GetFileNameWithoutExtension(cdPath)}”" : "Eject CD";
+        CloseFolderDiskItem.IsEnabled = _emulator.FolderDiskPath is not null;
     }
 }

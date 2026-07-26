@@ -57,7 +57,15 @@ inline u16 driverChecksum(const std::vector<u8>& driver) {
 // the driver. Confirmed live: a probe that dropped a marker at $0CFC and RTS'd ran at
 // RAM $1FBC and the boot reached the desktop cleanly. This stub just returns; the real
 // installer (build the DQE, _AddDrive, wire Prime to SCSI Manager I/O) replaces it.
-inline std::vector<u8> buildScsiDriver() {
+//
+// Parameterized so a SECOND disk can carry its own copy: scsiId feeds D5 for
+// both the ROM read helper and our WRITE(6) path, driveNum is the _AddDrive
+// number, and unit picks the unit-table slot (refNum = -(unit+1)); the first
+// disk keeps its historical (0, 4, 1), a second uses the real-world SCSI
+// convention of unit 32 + ID.
+inline std::vector<u8> buildScsiDriver(u8 scsiId = 0, u16 driveNum = 4, u8 unit = 1) {
+    const u16 refNum = static_cast<u16>(~unit);         // -(unit+1)
+    const u8 refHi = static_cast<u8>(refNum >> 8), refLo = static_cast<u8>(refNum);
     // Full clean-room disk driver loaded from the disk's Apple_Driver43 partition. The
     // ROM JSRs the installer at offset 0 (A0 = HFS partition entry). It installs the
     // embedded DRVR at refNum -2 by hand-building the Device Control Entry + unit-table
@@ -85,16 +93,18 @@ inline std::vector<u8> buildScsiDriver() {
         0x00, 0x80, 0x80, 0x00, 0x00, 0x00, // ORI.L #$80000000,D0    set locked-master-ptr flag
         0x28, 0x80,                         // MOVE.L D0,(A4)         *handle = flagged DCE ptr
         0x22, 0x78, 0x01, 0x1C,             // MOVEA.L ($011C).W,A1   A1 = UTableBase
-        0x23, 0x4C, 0x00, 0x04,             // MOVE.L A4,4(A1)        UTableBase[1] = handle (refNum -2)
+        0x23, 0x4C,                         // MOVE.L A4,d16(A1)      UTableBase[unit] = handle
+        static_cast<u8>((unit * 4u) >> 8), static_cast<u8>(unit * 4u),
         0x26, 0x8A,                         // MOVE.L A2,(A3)         DCE.dCtlDriver = &DRVR
         0x37, 0x7C, 0x4F, 0x20, 0x00, 0x04, // MOVE.W #$4F20,4(A3)    dCtlFlags: NeedLock|R|W|Ctl|Stat|dOpened
-        0x37, 0x7C, 0xFF, 0xFE, 0x00, 0x18, // MOVE.W #-2,$18(A3)     DCE.dCtlRefNum = -2
+        0x37, 0x7C, refHi, refLo, 0x00, 0x18, // MOVE.W #refNum,$18(A3)  DCE.dCtlRefNum
         0x70, 0x1E,                         // MOVEQ #30,D0
         0xA7, 0x1E,                         // _NewPtr,Sys,Clear      A0 = DrvSts
         0x11, 0x7C, 0x00, 0x01, 0x00, 0x04, // MOVE.B #1,4(A0)        dsInstalled
         0x11, 0x7C, 0x00, 0x08, 0x00, 0x03, // MOVE.B #8,3(A0)        dsDiskInPlace
         0x22, 0x48,                         // MOVEA.L A0,A1
-        0x20, 0x3C, 0x00, 0x04, 0xFF, 0xFE, // MOVE.L #$0004FFFE,D0   drive 4 | refNum -2
+        0x20, 0x3C,                         // MOVE.L #(drive<<16)|refNum,D0
+        static_cast<u8>(driveNum >> 8), static_cast<u8>(driveNum), refHi, refLo,
         0x41, 0xE9, 0x00, 0x06,             // LEA 6(A1),A0          &dsQLink
         0xA0, 0x4E,                         // _AddDrive
         0x4E, 0x75,                         // RTS
@@ -146,7 +156,7 @@ inline std::vector<u8> buildScsiDriver() {
         0x24, 0x68, 0x00, 0x20,             // MOVEA.L $20(A0),A2     ioBuffer
         0xD5, 0xE8, 0x00, 0x28,             // ADDA.L $28(A0),A2      + progress
         0x28, 0x3C, 0x00, 0x00, 0x02, 0x00, // MOVE.L #512,D4         block size
-        0x7A, 0x00,                         // MOVEQ #0,D5            SCSI target id 0
+        0x7A, scsiId,                       // MOVEQ #scsiId,D5       SCSI target
         0x2F, 0x08,                         // MOVE.L A0,-(A7)        PB/DCE/chunk survive the call
         0x2F, 0x09,                         // MOVE.L A1,-(A7)
         0x2F, 0x02,                         // MOVE.L D2,-(A7)
