@@ -5,8 +5,19 @@
 // Test convention: initial.pc is the instruction address; prefetch[0..1] are
 // the words at pc/pc+2 (not present in the ram list) and get injected into
 // memory; final.pc is the next instruction's address.
+//
+// --cpu 040 runs the same corpus DIFFERENTIALLY against the M68040 core: each
+// test is first executed on the 68000 in-process, and any test that enters an
+// exception there is skipped (exception frames differ by architecture). What
+// remains is the architecturally shared integer subset, where final state
+// must match exactly. A short opcode skip list removes the encodings whose
+// straight-line semantics genuinely diverge ('040 32-bit Bcc displacements,
+// privileged MOVE from SR, the SR write mask, the MOVEM predecrement
+// base-register rule, RTE frame formats). Cycles are never gated for the
+// '040 -- it is a different chip.
 
 #include <openmac/cpu.hpp>
+#include <openmac/cpu040.hpp>
 
 #include <miniz.h>
 #include <nlohmann/json.hpp>
@@ -57,6 +68,34 @@ private:
     std::vector<u32> dirty_;
 };
 
+// The '040 view of the same memory: 32-bit cycles, addresses wrapped to the
+// 16MB the corpus lives in (matching the 68000's bus view so final RAM
+// contents are directly comparable).
+class TestBus040 final : public IBus040 {
+public:
+    explicit TestBus040(TestBus& b) : b_(b) {}
+
+    u8  read8(u32 addr) override { return b_.peek(addr); }
+    u16 read16(u32 addr) override {
+        return static_cast<u16>((b_.peek(addr) << 8) | b_.peek(addr + 1));
+    }
+    u32 read32(u32 addr) override {
+        return (static_cast<u32>(read16(addr)) << 16) | read16(addr + 2);
+    }
+    void write8(u32 addr, u8 v) override { b_.poke(addr, v); }
+    void write16(u32 addr, u16 v) override {
+        b_.poke(addr, static_cast<u8>(v >> 8));
+        b_.poke(addr + 1, static_cast<u8>(v & 0xFF));
+    }
+    void write32(u32 addr, u32 v) override {
+        write16(addr, static_cast<u16>(v >> 16));
+        write16(addr + 2, static_cast<u16>(v & 0xFFFF));
+    }
+
+private:
+    TestBus& b_;
+};
+
 std::string gunzipFile(const fs::path& path) {
     std::ifstream f(path, std::ios::binary);
     std::vector<char> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -94,9 +133,81 @@ struct Totals {
 
 struct Options {
     bool cycles = false;
+    bool cpu040 = false;
     int maxShow = 6;
     std::string filter;
 };
+
+// Straight-line encodings whose semantics differ between 68000 and 68040;
+// everything exception-taking is filtered dynamically instead.
+bool skipFor040(u16 op, u16 ext) {
+    if ((op & 0xFFC0) == 0x40C0) return true;              // MOVE from SR: privileged
+    if ((op & 0xFFC0) == 0x46C0) return true;              // MOVE to SR: '040 SR mask
+    if (op == 0x007C || op == 0x027C || op == 0x0A7C) return true;   // xxxI to SR
+    if (op == 0x4E72 || op == 0x4E73) return true;         // STOP / RTE
+    if ((op & 0xF0FF) == 0x60FF) return true;              // Bcc.L on the '040
+    if ((op & 0xFFB8) == 0x48A0) {                         // MOVEM regs,-(An)
+        const int reg = op & 7;
+        if ((ext >> (7 - reg)) & 1) return true;           // base register in mask
+    }
+    return false;
+}
+
+void applyState040(M68040& cpu, TestBus& bus, const json& st) {
+    for (int i = 0; i < 8; ++i) cpu.d[i] = st["d" + std::to_string(i)].get<u32>();
+    for (int i = 0; i < 7; ++i) cpu.a[i] = st["a" + std::to_string(i)].get<u32>();
+    // Force M and T0 off: the corpus was generated for a 68000, where those
+    // SR bits do not exist.
+    const u16 sr = static_cast<u16>(st["sr"].get<u32>() & ~0x5000u);
+    cpu.setSR(sr);
+    cpu.usp = st["usp"].get<u32>();
+    cpu.isp = st["ssp"].get<u32>();
+    cpu.a[7] = (sr & 0x2000) ? cpu.isp : cpu.usp;
+    cpu.pc = st["pc"].get<u32>();
+    cpu.stopped = false;
+    cpu.halted = false;
+
+    for (const auto& pair : st["ram"]) {
+        bus.poke(pair[0].get<u32>(), static_cast<u8>(pair[1].get<u32>()));
+    }
+    const auto& pf = st["prefetch"];
+    const u32 pc = cpu.pc;
+    const u16 w0 = static_cast<u16>(pf[0].get<u32>());
+    const u16 w1 = static_cast<u16>(pf[1].get<u32>());
+    bus.poke(pc, static_cast<u8>(w0 >> 8));
+    bus.poke(pc + 1, static_cast<u8>(w0 & 0xFF));
+    bus.poke(pc + 2, static_cast<u8>(w1 >> 8));
+    bus.poke(pc + 3, static_cast<u8>(w1 & 0xFF));
+}
+
+bool compareState040(const M68040& cpu, const TestBus& bus, const json& fin,
+                     std::vector<std::string>& diffs) {
+    char buf[160];
+    auto expect = [&](const char* what, u32 got, u32 want) {
+        if (got != want) {
+            std::snprintf(buf, sizeof(buf), "  %-4s got %08X want %08X", what, got, want);
+            diffs.emplace_back(buf);
+        }
+    };
+    for (int i = 0; i < 8; ++i)
+        expect(("d" + std::to_string(i)).c_str(), cpu.d[i], fin["d" + std::to_string(i)].get<u32>());
+    for (int i = 0; i < 7; ++i)
+        expect(("a" + std::to_string(i)).c_str(), cpu.a[i], fin["a" + std::to_string(i)].get<u32>());
+    expect("usp", cpu.uspValue(), fin["usp"].get<u32>());
+    expect("isp", cpu.ispValue(), fin["ssp"].get<u32>());
+    expect("sr", cpu.getSR() & 0xA71F, fin["sr"].get<u32>() & 0xA71F);
+    expect("pc", cpu.pc, fin["pc"].get<u32>());
+    for (const auto& pair : fin["ram"]) {
+        const u32 addr = pair[0].get<u32>();
+        const u8 want = static_cast<u8>(pair[1].get<u32>());
+        const u8 got = bus.peek(addr);
+        if (got != want) {
+            std::snprintf(buf, sizeof(buf), "  ram[%06X] got %02X want %02X", addr, got, want);
+            diffs.emplace_back(buf);
+        }
+    }
+    return diffs.empty();
+}
 
 void applyState(M68000& cpu, TestBus& bus, const json& st) {
     for (int i = 0; i < 8; ++i) cpu.d[i] = st["d" + std::to_string(i)].get<u32>();
@@ -152,7 +263,8 @@ bool compareState(const M68000& cpu, const TestBus& bus, const json& fin,
     return diffs.empty();
 }
 
-Totals runFile(const fs::path& path, M68000& cpu, TestBus& bus, const Options& opt) {
+Totals runFile(const fs::path& path, M68000& cpu, TestBus& bus, M68040* cpu40,
+               const Options& opt) {
     Totals t;
     const std::string text = gunzipFile(path);
     if (text.empty()) return t;
@@ -179,6 +291,44 @@ Totals runFile(const fs::path& path, M68000& cpu, TestBus& bus, const Options& o
             if (name == bad) { skip = true; break; }
         }
         if (skip) continue;
+
+        if (opt.cpu040) {
+            const auto& pf = test["initial"]["prefetch"];
+            const u16 op = static_cast<u16>(pf[0].get<u32>());
+            const u16 ext = static_cast<u16>(pf[1].get<u32>());
+            if (skipFor040(op, ext)) continue;
+
+            // Dynamic filter: anything that excepts on the 68000 has
+            // architecture-specific framing; only clean runs must agree.
+            bus.clear();
+            applyState(cpu, bus, test["initial"]);
+            bool excepted = false;
+            cpu.onException = [&](int, u32) { excepted = true; };
+            (void)cpu.step();
+            cpu.onException = nullptr;
+            if (excepted || cpu.halted) continue;
+
+            bus.clear();
+            applyState040(*cpu40, bus, test["initial"]);
+            const u32 extBefore = cpu40->ext020Count;
+            (void)cpu40->step();
+            if (cpu40->ext020Count != extBefore) continue;   // '020+ ext-word
+                // features engaged: the corpus's don't-care bits mean
+                // something here, so the 68000 expectation doesn't apply.
+
+            ++t.tests;
+            std::vector<std::string> diffs;
+            const bool stateOk = compareState040(*cpu40, bus, test["final"], diffs);
+            if (stateOk) ++t.statePass;
+            ++t.cyclePass;   // cycles are never gated for the '040
+            if (!stateOk && shown < opt.maxShow) {
+                ++shown;
+                std::printf("FAIL(040) %s\n", test["name"].get<std::string>().c_str());
+                for (const auto& d : diffs) std::printf("%s\n", d.c_str());
+            }
+            continue;
+        }
+
         ++t.tests;
         bus.clear();
         applyState(cpu, bus, test["initial"]);
@@ -213,13 +363,14 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--cycles") opt.cycles = true;
+        else if (arg == "--cpu" && i + 1 < argc) opt.cpu040 = std::string(argv[++i]) == "040";
         else if (arg == "--max-show" && i + 1 < argc) opt.maxShow = std::atoi(argv[++i]);
         else if (arg == "--filter" && i + 1 < argc) opt.filter = argv[++i];
         else target = arg;
     }
     if (target.empty()) {
         std::fprintf(stderr, "usage: openmac_sst <file.json.gz | directory> [--cycles] "
-                             "[--max-show N] [--filter substr]\n");
+                             "[--cpu 040] [--max-show N] [--filter substr]\n");
         return 2;
     }
 
@@ -235,11 +386,13 @@ int main(int argc, char** argv) {
 
     TestBus bus;
     M68000 cpu(bus);
+    TestBus040 bus40(bus);
+    M68040 cpu40(bus40);
     Totals grand;
     long filesFullPass = 0;
 
     for (const auto& f : files) {
-        const Totals t = runFile(f, cpu, bus, opt);
+        const Totals t = runFile(f, cpu, bus, &cpu40, opt);
         grand.tests += t.tests;
         grand.statePass += t.statePass;
         grand.cyclePass += t.cyclePass;

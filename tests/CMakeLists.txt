@@ -24,6 +24,7 @@ FetchContent_MakeAvailable(miniz nlohmann_json)
 add_executable(openmac_unit
     unit/main.cpp
     unit/test_cpu_reset.cpp
+    unit/test_cpu040.cpp
     unit/test_machine.cpp
     unit/test_hfs.cpp
     unit/test_hfsbuild.cpp

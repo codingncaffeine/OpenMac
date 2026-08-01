@@ -6,6 +6,16 @@ add_library(openmac_core STATIC
     src/cpu_ops_shift_bits.cpp
     src/cpu_ops_muldiv_bcd.cpp
     src/cpu_ops_flow.cpp
+    src/cpu040.cpp
+    src/cpu040_decode.cpp
+    src/cpu040_ea.cpp
+    src/cpu040_ops_move.cpp
+    src/cpu040_ops_alu.cpp
+    src/cpu040_ops_bits.cpp
+    src/cpu040_ops_muldiv.cpp
+    src/cpu040_ops_flow.cpp
+    src/cpu040_ops_system.cpp
+    src/cpu040_fpu.cpp
     src/machine/machine.cpp
     src/machine/via.cpp
     src/machine/rtc.cpp
