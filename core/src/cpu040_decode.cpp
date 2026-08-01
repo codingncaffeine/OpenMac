@@ -30,13 +30,11 @@ void CpuOps040::buildTableInto(std::array<Handler, 65536>& t) {
                 if (eaValid(mode, reg, kEaControl)) h = &opChk2Cmp2;
                 break;
             }
-            if ((op & 0xF9C0) == 0x08C0) {
-                // CAS: 0000 1ss0 11 <ea>, ss = 01 b, 10 w, 11 l
-                const int ss = (op >> 9) & 3;
-                if (ss != 0) {
-                    if (op == 0x0CFC || op == 0x0EFC) h = &opCas2;
-                    else if (eaValid(mode, reg, kEaMemAlter)) h = &opCas;
-                }
+            if ((op & 0xF9C0) == 0x08C0 && ((op >> 9) & 3) != 0) {
+                // CAS: 0000 1ss0 11 <ea>, ss = 01 b, 10 w, 11 l. The ss = 00
+                // row ($08C0) is static BSET and falls through to it.
+                if (op == 0x0CFC || op == 0x0EFC) h = &opCas2;
+                else if (eaValid(mode, reg, kEaMemAlter)) h = &opCas;
                 break;
             }
             if (bit8) {
