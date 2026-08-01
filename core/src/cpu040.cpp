@@ -370,6 +370,7 @@ int M68040::doInterrupt(int level) {
 // simply re-executes the instruction. The Mac ROM's probe handlers adjust the
 // stacked PC themselves when they want to skip the faulting access.
 int CpuOps040::enterAccessError(M68040& c, const M68040::AccessFault& f) {
+    c.lastFaultAddr = f.addr;
     if (c.onException) c.onException(kVec040AccessError, c.instrStart_);
     try {
         const u16 oldSR = c.sr_;

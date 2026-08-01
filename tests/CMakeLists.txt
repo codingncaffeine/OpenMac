@@ -45,6 +45,11 @@ add_executable(openmac_trace
 )
 target_link_libraries(openmac_trace PRIVATE openmac_core openmac_warnings)
 
+add_executable(openmac_trace040
+    boottrace040/main.cpp
+)
+target_link_libraries(openmac_trace040 PRIVATE openmac_core openmac_warnings)
+
 # SingleStepTests runner: point it at a local clone of SingleStepTests/680x0.
 add_executable(openmac_sst
     cpu_sst/main.cpp

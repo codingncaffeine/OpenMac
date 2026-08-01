@@ -16,6 +16,7 @@ add_library(openmac_core STATIC
     src/cpu040_ops_flow.cpp
     src/cpu040_ops_system.cpp
     src/cpu040_fpu.cpp
+    src/machine/quadra/quadra.cpp
     src/machine/machine.cpp
     src/machine/via.cpp
     src/machine/rtc.cpp

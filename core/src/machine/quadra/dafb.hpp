@@ -1,0 +1,258 @@
+#pragma once
+
+// DAFB video as integrated into djMEMC on the Quadra 610/650/800 ("MEMC"
+// variant, version 3, Antelope CLUT/DAC, 1MB VRAM). Register window is 1KB at
+// $F9800000 in four 256-byte blocks: DAFB control, swatch timing generator,
+// RAMDAC, clock generator. VRAM is a 2MB window at $F9000000 with 1MB
+// populated (mirrored). No hardware cursor, no convolution (NTSC/PAL modes
+// are documented non-functional on this variant).
+//
+//   +$00  framebuffer base bits 20-9      +$100 swatch mode
+//   +$04  framebuffer base bits 8-5       +$104 IRQ enables (bit0 = VBL)
+//   +$08  stride in 32-bit words          +$108 IRQ status (read)
+//   +$0C  timing control                  +$114 clear VBL interrupt
+//   +$10  configuration                   +$148 HPIX   +$14C VHLINE
+//   +$1C  monitor sense (read = inverse)  +$158 VBP    +$15C VAL
+//   +$2C  test/version (bits 15-9 = 3)
+//   +$200 CLUT address  +$210 CLUT data (R,G,B bytes)  +$220 depth control
+//   +$300 DP8534 clock generator (serial-shift protocol; stored, not decoded)
+//
+// Reference: Quadra 650 hardware dossier (DAFB/MEMC sections), Apple
+// Developer Notes for the Centris 650/Quadra 800 family. Clean-room.
+
+#include "openmac/types.hpp"
+
+#include <functional>
+#include <vector>
+
+namespace openmac {
+
+class Dafb {
+public:
+    Dafb() : vram_(kVramSize, 0) {
+        reset();
+        // A neutral ramp so anything drawn before the ROM loads the CLUT is
+        // visible rather than black-on-black.
+        for (int i = 0; i < 256; ++i) {
+            const u8 v = static_cast<u8>(255 - i);
+            clut_[i] = 0xFF000000u | (static_cast<u32>(v) << 16) |
+                       (static_cast<u32>(v) << 8) | v;
+        }
+    }
+
+    void reset() {
+        for (auto& r : regs_) r = 0;
+        for (auto& r : swatch_) r = 0;
+        clutAddr_ = 0;
+        clutPhase_ = 0;
+        depthCtl_ = 0;
+        vblEnabled_ = false;
+        vblPending_ = false;
+        clockShift_ = 0;
+    }
+
+    // ---- VRAM (the machine routes $F9000000+ here; 1MB mirrored) ----
+    static constexpr u32 kVramSize = 0x100000;
+    u8   vramRead8(u32 off) const { return vram_[off & (kVramSize - 1)]; }
+    void vramWrite8(u32 off, u8 v) { vram_[off & (kVramSize - 1)] = v; }
+    u32 vramRead32(u32 off) const {
+        off &= kVramSize - 1;
+        return (static_cast<u32>(vram_[off]) << 24) |
+               (static_cast<u32>(vram_[(off + 1) & (kVramSize - 1)]) << 16) |
+               (static_cast<u32>(vram_[(off + 2) & (kVramSize - 1)]) << 8) |
+               vram_[(off + 3) & (kVramSize - 1)];
+    }
+    void vramWrite32(u32 off, u32 v) {
+        off &= kVramSize - 1;
+        vram_[off] = static_cast<u8>(v >> 24);
+        vram_[(off + 1) & (kVramSize - 1)] = static_cast<u8>(v >> 16);
+        vram_[(off + 2) & (kVramSize - 1)] = static_cast<u8>(v >> 8);
+        vram_[(off + 3) & (kVramSize - 1)] = static_cast<u8>(v);
+    }
+
+    // ---- register window ($F9800000 + offset, offset < 0x400) ----
+    u32 read(u32 offset) {
+        offset &= 0x3FF;
+        const u32 block = offset >> 8;
+        const u32 reg = offset & 0xFF;
+        switch (block) {
+        case 0:
+            if (reg == 0x1C) {
+                // Monitor sense: a plain 13" 640x480 monitor has no
+                // cross-wired sense lines, so probing drives change nothing
+                // and every read returns the inverse of the passive code.
+                return (~kSenseCode) & 7u;
+            }
+            if (reg == 0x2C) return (3u << 9) | (regs_[0x2C >> 2] & 0x1FFu);
+            return regs_[reg >> 2];
+        case 1:
+            if (reg == 0x08) {   // IRQ status: bit0 = VBL, bit2 = cursor line
+                return (vblPending_ ? 1u : 0u) | (cursorPending_ ? 4u : 0u);
+            }
+            return swatch_[reg >> 2] & 0xFFFu;
+        case 2:
+            if (reg == 0x00) return clutAddr_;
+            if (reg == 0x10) {   // CLUT data readback, same 3-byte cycle
+                const u32 rgb = clut_[clutAddr_ & 0xFF];
+                const u32 v = (rgb >> (16 - clutPhase_ * 8)) & 0xFF;
+                if (++clutPhase_ == 3) {
+                    clutPhase_ = 0;
+                    clutAddr_ = (clutAddr_ + 1) & 0xFF;
+                }
+                return v;
+            }
+            if (reg == 0x20) return depthCtl_;
+            return 0;
+        default:
+            return 0;   // clock generator: nothing readable
+        }
+    }
+
+    void write(u32 offset, u32 v) {
+        offset &= 0x3FF;
+        const u32 block = offset >> 8;
+        const u32 reg = offset & 0xFF;
+        switch (block) {
+        case 0:
+            regs_[reg >> 2] = v;
+            break;
+        case 1:
+            swatch_[reg >> 2] = v & 0xFFFu;
+            if (reg == 0x04) vblEnabled_ = (v & 1) != 0;
+            if (reg == 0x0C) cursorPending_ = false;             // clear cursor int
+            if (reg == 0x14) { vblPending_ = false; updateIrq(); }
+            break;
+        case 2:
+            if (reg == 0x00) {
+                clutAddr_ = v & 0xFF;
+                clutPhase_ = 0;
+            } else if (reg == 0x10) {
+                // Three successive byte writes: R, G, B; autoincrement after
+                // the blue byte lands.
+                const int shift = 16 - clutPhase_ * 8;
+                u32& e = clut_[clutAddr_ & 0xFF];
+                e = (e & ~(0xFFu << shift)) | ((v & 0xFF) << shift);
+                e |= 0xFF000000u;
+                if (++clutPhase_ == 3) {
+                    clutPhase_ = 0;
+                    clutAddr_ = (clutAddr_ + 1) & 0xFF;
+                }
+            } else if (reg == 0x20) {
+                depthCtl_ = v & 0xFF;
+            }
+            break;
+        default:
+            // DP8534 serial shift: store the stream for the record; the
+            // pixel clock itself is derived from the swatch timing.
+            clockShift_ = (clockShift_ << 1) | (v & 1);
+            break;
+        }
+    }
+
+    // ---- scanout ----
+    // Depth from the Antelope control register bits [4:2].
+    int bpp() const {
+        switch (depthCtl_ & 0x1C) {
+        case 0x00: return 1;
+        case 0x08: return 2;
+        case 0x10: return 4;
+        case 0x18: return 8;
+        default:   return 24;
+        }
+    }
+    u32 fbBase() const {
+        return ((regs_[0] & 0xFFFu) << 9) | ((regs_[1] & 0xFu) << 5);
+    }
+    u32 strideBytes() const { return (regs_[2] & 0xFFFu) * 4; }
+
+    // Visible geometry from the swatch, as the ROM programs it (verified
+    // against the 13" 640x480 values it writes: HAL $98, HFP $318, active
+    // start $52 half-lines, active end $412 of $41A total -- Apple's 525-line
+    // timing). Falls back to 640x480 until the swatch is programmed.
+    int width() const {
+        const int px = static_cast<int>(swatch_[0x44 >> 2]) -
+                       static_cast<int>(swatch_[0x40 >> 2]);
+        return px > 0 && px <= 2048 ? px : 640;
+    }
+    int height() const {
+        const int hl = static_cast<int>(swatch_[0x60 >> 2]) -
+                       static_cast<int>(swatch_[0x5C >> 2]);
+        const int lines = hl / 2;
+        return lines > 0 && lines <= 1024 ? lines : 480;
+    }
+
+    // Expand the framebuffer to ARGB8888. `out` holds width()*height().
+    void render(u32* out) const {
+        const int w = width(), h = height();
+        const u32 base = fbBase();
+        const u32 stride = strideBytes() ? strideBytes()
+                                         : static_cast<u32>(w) * static_cast<u32>(bpp()) / 8;
+        const int depth = bpp();
+        for (int y = 0; y < h; ++y) {
+            const u32 row = base + static_cast<u32>(y) * stride;
+            u32* dst = out + static_cast<size_t>(y) * static_cast<size_t>(w);
+            switch (depth) {
+            case 1:
+                for (int x = 0; x < w; ++x) {
+                    const u8 b = vramRead8(row + static_cast<u32>(x >> 3));
+                    dst[x] = clut_[(b >> (7 - (x & 7))) & 1];
+                }
+                break;
+            case 2:
+                for (int x = 0; x < w; ++x) {
+                    const u8 b = vramRead8(row + static_cast<u32>(x >> 2));
+                    dst[x] = clut_[(b >> (6 - 2 * (x & 3))) & 3];
+                }
+                break;
+            case 4:
+                for (int x = 0; x < w; ++x) {
+                    const u8 b = vramRead8(row + static_cast<u32>(x >> 1));
+                    dst[x] = clut_[(x & 1) ? (b & 0xF) : (b >> 4)];
+                }
+                break;
+            case 8:
+                for (int x = 0; x < w; ++x)
+                    dst[x] = clut_[vramRead8(row + static_cast<u32>(x))];
+                break;
+            default:   // 24bpp: one pixel per 32-bit word, xRGB
+                for (int x = 0; x < w; ++x)
+                    dst[x] = 0xFF000000u | (vramRead32(row + static_cast<u32>(x) * 4) & 0xFFFFFF);
+                break;
+            }
+        }
+    }
+
+    // Vertical blank, raised by the machine once per display frame. The
+    // status bits latch whether or not their interrupts are enabled (the
+    // ROM's beam-sync loops poll them directly); the enables only gate the
+    // interrupt line. The beam crosses the cursor scanline every frame.
+    void vblank() {
+        vblPending_ = true;
+        cursorPending_ = true;
+        updateIrq();
+    }
+    bool irqAsserted() const { return vblPending_ && vblEnabled_; }
+    std::function<void(bool level)> onIrq;
+
+    // Hi-res color 13"/14" (640x480): base sense code 6.
+    static constexpr u32 kSenseCode = 6;
+
+private:
+    void updateIrq() {
+        if (onIrq) onIrq(irqAsserted());
+    }
+
+    std::vector<u8> vram_;
+    u32 regs_[64]{};
+    u32 swatch_[64]{};
+    u32 clut_[256]{};
+    u32 clutAddr_ = 0;
+    int clutPhase_ = 0;
+    u32 depthCtl_ = 0;
+    bool vblEnabled_ = false;
+    bool vblPending_ = false;
+    bool cursorPending_ = false;
+    u64 clockShift_ = 0;
+};
+
+} // namespace openmac

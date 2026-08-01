@@ -252,6 +252,187 @@ inline std::vector<u8> buildScsiDriver(u8 scsiId = 0, u16 driveNum = 4, u8 unit 
     };
 }
 
+// The same driver with BOTH transfer directions going through _SCSIDispatch
+// (SCSIGet/Select/Cmd/Read-or-Write/Complete) instead of the Classic ROM's
+// internal read helper. The SCSI Manager API is hardware-independent, so this
+// driver works on any machine whose ROM provides it -- it is what the Quadra
+// build uses, where there is no 5380 and no $4041D4. Same installer, same
+// DRVR shape; Prime dispatches on the ioTrap's low bit into a shared
+// six-byte-CDB transfer subroutine parameterized by opcode (D1) and
+// _SCSIDispatch selector (D0).
+inline std::vector<u8> buildScsiDriverPortable(u8 scsiId = 0, u16 driveNum = 4,
+                                               u8 unit = 1) {
+    const u16 refNum = static_cast<u16>(~unit);
+    const u8 refHi = static_cast<u8>(refNum >> 8), refLo = static_cast<u8>(refNum);
+    return {
+        // ---- installer (offset 0): identical to buildScsiDriver ----
+        0x45, 0xFA, 0x00, 0x5A,             // LEA drvr(PC),A2
+        0x26, 0x28, 0x00, 0x08,             // MOVE.L 8(A0),D3
+        0x20, 0x3C, 0x00, 0x00, 0x00, 0x30, // MOVE.L #$30,D0
+        0xA7, 0x1E,                         // _NewPtr,Sys,Clear
+        0x26, 0x48,                         // MOVEA.L A0,A3
+        0x27, 0x43, 0x00, 0x14,             // MOVE.L D3,$14(A3)
+        0x70, 0x04,                         // MOVEQ #4,D0
+        0xA7, 0x1E,                         // _NewPtr,Sys,Clear
+        0x28, 0x48,                         // MOVEA.L A0,A4
+        0x20, 0x0B,                         // MOVE.L A3,D0
+        0x00, 0x80, 0x80, 0x00, 0x00, 0x00, // ORI.L #$80000000,D0
+        0x28, 0x80,                         // MOVE.L D0,(A4)
+        0x22, 0x78, 0x01, 0x1C,             // MOVEA.L ($011C).W,A1
+        0x23, 0x4C,                         // MOVE.L A4,d16(A1)
+        static_cast<u8>((unit * 4u) >> 8), static_cast<u8>(unit * 4u),
+        0x26, 0x8A,                         // MOVE.L A2,(A3)
+        0x37, 0x7C, 0x4F, 0x20, 0x00, 0x04, // MOVE.W #$4F20,4(A3)
+        0x37, 0x7C, refHi, refLo, 0x00, 0x18, // MOVE.W #refNum,$18(A3)
+        0x70, 0x1E,                         // MOVEQ #30,D0
+        0xA7, 0x1E,                         // _NewPtr,Sys,Clear
+        0x11, 0x7C, 0x00, 0x01, 0x00, 0x04, // MOVE.B #1,4(A0)
+        0x11, 0x7C, 0x00, 0x08, 0x00, 0x03, // MOVE.B #8,3(A0)
+        0x22, 0x48,                         // MOVEA.L A0,A1
+        0x20, 0x3C,                         // MOVE.L #(drive<<16)|refNum,D0
+        static_cast<u8>(driveNum >> 8), static_cast<u8>(driveNum), refHi, refLo,
+        0x41, 0xE9, 0x00, 0x06,             // LEA 6(A1),A0
+        0xA0, 0x4E,                         // _AddDrive
+        0x4E, 0x75,                         // RTS
+        // ---- DRVR (offset 0x5C) ----
+        0x4F, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x1A,                         // drvrOpen   = 0x1A
+        0x00, 0x1E,                         // drvrPrime  = 0x1E
+        0x00, 0xB2,                         // drvrCtl    = 0xB2
+        0x00, 0xBA,                         // drvrStatus = 0xBA
+        0x00, 0xC2,                         // drvrClose  = 0xC2
+        0x07, '.', 'S', 'c', 's', 'i', 'H', 'D',
+        // Open (0x1A)
+        0x70, 0x00, 0x4E, 0x75,
+        // Prime (0x1E): chunked loop as in buildScsiDriver; direction picks
+        // CDB opcode + dispatch selector for the shared xfer6.
+        0x2F, 0x09,                         // p+0   MOVE.L A1,-(A7)
+        0x2F, 0x03,                         // p+2
+        0x2F, 0x04,                         // p+4
+        0x2F, 0x05,                         // p+6
+        0x2F, 0x06,                         // p+8
+        0x2F, 0x07,                         // p+10
+        0x2F, 0x0A,                         // p+12
+        0x42, 0xA8, 0x00, 0x28,             // p+14  CLR.L $28(A0)
+        // .loop (p+18)
+        0x2E, 0x28, 0x00, 0x24,             // p+18
+        0x9E, 0xA8, 0x00, 0x28,             // p+22
+        0xE0, 0x8F,                         // p+26
+        0xE2, 0x8F,                         // p+28
+        0x67, 0x00, 0x00, 0x5E,             // p+30  BEQ.W .done (p+126)
+        0x74, 0x40,                         // p+34
+        0xBE, 0x82,                         // p+36
+        0x6C, 0x02,                         // p+38
+        0x24, 0x07,                         // p+40
+        // .have (p+42)
+        0x26, 0x28, 0x00, 0x2E,             // p+42
+        0xD6, 0xA8, 0x00, 0x28,             // p+46
+        0xE0, 0x8B,                         // p+50
+        0xE2, 0x8B,                         // p+52
+        0xD6, 0xA9, 0x00, 0x14,             // p+54
+        0x24, 0x68, 0x00, 0x20,             // p+58
+        0xD5, 0xE8, 0x00, 0x28,             // p+62
+        0x28, 0x3C, 0x00, 0x00, 0x02, 0x00, // p+66  MOVE.L #512,D4
+        0x7A, scsiId,                       // p+72  MOVEQ #scsiId,D5
+        0x2F, 0x08,                         // p+74
+        0x2F, 0x09,                         // p+76
+        0x2F, 0x02,                         // p+78
+        0x30, 0x28, 0x00, 0x06,             // p+80  MOVE.W $06(A0),D0
+        0x08, 0x00, 0x00, 0x00,             // p+84  BTST #0,D0
+        0x67, 0x06,                         // p+88  BEQ.S .read (p+96)
+        0x72, 0x0A,                         // p+90  MOVEQ #$0A,D1  (WRITE(6))
+        0x70, 0x06,                         // p+92  MOVEQ #6,D0    (SCSIWrite)
+        0x60, 0x04,                         // p+94  BRA.S .go (p+100)
+        0x72, 0x08,                         // p+96  .read: MOVEQ #$08,D1
+        0x70, 0x05,                         // p+98  MOVEQ #5,D0    (SCSIRead)
+        0x61, 0x00, 0x00, 0x42,             // p+100 .go: BSR.W xfer6 (0xC6)
+        // .chk (p+104)
+        0x24, 0x1F,                         // p+104
+        0x22, 0x5F,                         // p+106
+        0x20, 0x5F,                         // p+108
+        0x4A, 0x40,                         // p+110
+        0x66, 0x0E,                         // p+112 BNE.S .out (p+128)
+        0xE1, 0x8A,                         // p+114
+        0xE3, 0x8A,                         // p+116
+        0xD5, 0xA8, 0x00, 0x28,             // p+118
+        0x60, 0x00, 0xFF, 0x96,             // p+122 BRA.W .loop
+        // .done (p+126)
+        0x70, 0x00,
+        // .out (p+128)
+        0x24, 0x5F,                         // p+128
+        0x2E, 0x1F,                         // p+130
+        0x2C, 0x1F,                         // p+132
+        0x2A, 0x1F,                         // p+134
+        0x28, 0x1F,                         // p+136
+        0x26, 0x1F,                         // p+138
+        0x22, 0x5F,                         // p+140
+        0x20, 0x78, 0x08, 0xFC,             // p+142
+        0x4E, 0xD0,                         // p+146
+        // Control (0xB2)
+        0x70, 0x00, 0x20, 0x78, 0x08, 0xFC, 0x4E, 0xD0,
+        // Status (0xBA)
+        0x70, 0x00, 0x20, 0x78, 0x08, 0xFC, 0x4E, 0xD0,
+        // Close (0xC2)
+        0x70, 0x00, 0x4E, 0x75,
+        // xfer6 (0xC6): six-byte-CDB transfer via _SCSIDispatch. In: D1.B =
+        // CDB opcode, D0.W = data-phase selector (5 = SCSIRead, 6 =
+        // SCSIWrite), D3 = LBA, D2 = block count, D4 = block size, D5 =
+        // target, A2 = buffer. Out: D0 = status (0 = GOOD).
+        0x2F, 0x07,                         // q+0   MOVE.L D7,-(A7)
+        0x7E, 0x00,                         // q+2   MOVEQ #0,D7
+        0x41, 0xF8, 0x09, 0xFA,             // q+4   LEA $09FA,A0
+        0x10, 0xC1,                         // q+8   MOVE.B D1,(A0)+  opcode
+        0x48, 0x43,                         // q+10  SWAP D3
+        0x02, 0x03, 0x00, 0x1F,             // q+12  ANDI.B #$1F,D3
+        0x10, 0xC3,                         // q+16
+        0x48, 0x43,                         // q+18
+        0x30, 0xC3,                         // q+20
+        0x10, 0xC2,                         // q+22
+        0x42, 0x18,                         // q+24
+        0xC8, 0xC2,                         // q+26  MULU D2,D4
+        0x9E, 0xFC, 0x00, 0x14,             // q+28  SUBA.W #$14,A7
+        0x2C, 0x0F,                         // q+32  MOVE.L A7,D6
+        0x55, 0x8F,                         // q+34  SUBQ.L #2,A7
+        0x3F, 0x3C, 0x00, 0x01,             // q+36  SCSIGet
+        0xA8, 0x15,                         // q+40
+        0x3E, 0x17,                         // q+42
+        0x66, 0x4C,                         // q+44  BNE.S .err (q+122)
+        0x3F, 0x05,                         // q+46
+        0x3F, 0x3C, 0x00, 0x02,             // q+48  SCSISelect
+        0xA8, 0x15,                         // q+52
+        0x3E, 0x17,                         // q+54
+        0x66, 0x40,                         // q+56  BNE.S .err
+        0x48, 0x78, 0x09, 0xFA,             // q+58  PEA $09FA
+        0x3F, 0x3C, 0x00, 0x06,             // q+62  CDB length 6
+        0x3F, 0x3C, 0x00, 0x03,             // q+66  SCSICmd
+        0xA8, 0x15,                         // q+70
+        0x3E, 0x17,                         // q+72
+        0x66, 0x16,                         // q+74  BNE.S .compl (q+98)
+        0x20, 0x46,                         // q+76  MOVE.L D6,A0
+        0x30, 0xFC, 0x00, 0x01,             // q+78  MOVE.W #1,(A0)+  scInc
+        0x20, 0xCA,                         // q+82
+        0x20, 0xC4,                         // q+84
+        0x30, 0xBC, 0x00, 0x07,             // q+86  MOVE.W #7,(A0)   scStop
+        0x2F, 0x06,                         // q+90  MOVE.L D6,-(A7)  TIB
+        0x3F, 0x00,                         // q+92  MOVE.W D0,-(A7)  selector
+        0xA8, 0x15,                         // q+94
+        0x3E, 0x17,                         // q+96
+        // .compl (q+98)
+        0x48, 0x78, 0x09, 0xFA,             // q+98
+        0x48, 0x78, 0x09, 0xFC,             // q+102
+        0x2F, 0x3C, 0x00, 0x00, 0x00, 0x00, // q+106
+        0x3F, 0x3C, 0x00, 0x04,             // q+112 SCSIComplete
+        0xA8, 0x15,                         // q+116
+        0x3E, 0x38, 0x09, 0xFA,             // q+118
+        // .err (q+122)
+        0xDE, 0xFC, 0x00, 0x16,             // q+122 ADDA.W #$16,A7
+        0x30, 0x07,                         // q+126 MOVE.W D7,D0
+        0x2E, 0x1F,                         // q+128
+        0x4E, 0x75,                         // q+130 RTS
+    };
+}
+
 // Wrap `hfs` (a raw HFS volume) and `driver` (68k driver bytes) into a full
 // Apple-partitioned disk image. `driverLoadAddr`/`driverEntryOff` describe where
 // the ROM should load and enter the driver.

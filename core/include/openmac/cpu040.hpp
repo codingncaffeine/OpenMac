@@ -103,6 +103,9 @@ public:
     // separate architectural divergence from disagreement.
     u32 ext020Count = 0;
 
+    // Diagnostics: the logical address of the most recent access error.
+    u32 lastFaultAddr = 0;
+
 private:
     friend struct CpuOps040;
 
