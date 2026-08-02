@@ -182,4 +182,25 @@ internal static class Native
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern nuint omac_q_harddisk_data(IntPtr h, byte[]? outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_insert_floppy(IntPtr h, byte[] img, nuint len, int readOnly);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_q_eject_floppy(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_floppy_present(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_q_floppy_data(IntPtr h, byte[]? outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_insert_cd(IntPtr h, byte[] img, nuint len);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_q_eject_cd(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_cd_present(IntPtr h);
 }

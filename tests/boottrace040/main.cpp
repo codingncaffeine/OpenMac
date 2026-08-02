@@ -137,6 +137,7 @@ int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb) {
 int main(int argc, char** argv) {
     const char* romPath = nullptr;
     const char* fdPath = nullptr;
+    int fdAfter = -1;               // --floppy-after: insert mid-run at this frame
     const char* hdPath = nullptr;
     const char* cdPath = nullptr;
     const char* shotPath = nullptr;
@@ -166,6 +167,7 @@ int main(int argc, char** argv) {
         }
         if (a == "--rom" && i + 1 < argc) romPath = argv[++i];
         else if (a == "--floppy" && i + 1 < argc) fdPath = argv[++i];
+        else if (a == "--floppy-after" && i + 2 < argc) { fdPath = argv[++i]; fdAfter = std::atoi(argv[++i]); }
         else if (a == "--harddisk" && i + 1 < argc) hdPath = argv[++i];
         else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
         else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
@@ -258,13 +260,18 @@ int main(int argc, char** argv) {
         mac.insertHardDisk(std::move(hd));
         std::printf("hd: attached\n");
     }
+    std::vector<u8> fdDeferred;
     if (fdPath) {
         auto fd = loadFile(fdPath);
         if (fd.empty()) {
             std::fprintf(stderr, "cannot read floppy: %s\n", fdPath);
             return 2;
         }
-        std::printf("floppy: %s\n", mac.insertFloppy(std::move(fd)) ? "inserted" : "REFUSED");
+        if (fdAfter >= 0) {
+            fdDeferred = std::move(fd);   // insert mid-run at frame fdAfter
+        } else {
+            std::printf("floppy: %s\n", mac.insertFloppy(std::move(fd)) ? "inserted" : "REFUSED");
+        }
     }
     if (cdPath) {
         auto cd = loadFile(cdPath);
@@ -374,6 +381,10 @@ int main(int argc, char** argv) {
                 if (++shown >= 24) break;
             }
             continue;
+        }
+        if (fdAfter >= 0 && i == fdAfter && !fdDeferred.empty()) {
+            std::printf("floppy (mid-run, frame %d): %s\n", i,
+                        mac.insertFloppy(std::move(fdDeferred)) ? "inserted" : "REFUSED");
         }
         mac.runFrame();
         std::vector<u8> chunk;

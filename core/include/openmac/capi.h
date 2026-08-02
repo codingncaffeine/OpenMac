@@ -214,6 +214,19 @@ OMAC_API void   omac_q_mouse(OMacQ*, int dx, int dy, int button);
 OMAC_API void   omac_q_key(OMacQ*, int adb_code, int down);
 OMAC_API void   omac_q_insert_harddisk(OMacQ*, const uint8_t* img, size_t len, int read_only);
 OMAC_API size_t omac_q_harddisk_data(OMacQ*, uint8_t* out, size_t cap);
+/* Floppy in the internal SuperDrive. Raw 400K/800K/1.44MB dumps and DiskCopy
+   4.2 / MacBinary wrappers all mount; returns 1 if the drive took the disk,
+   0 if the file is not floppy media. omac_q_floppy_data copies the medium out
+   so guest writes can be persisted. */
+OMAC_API int    omac_q_insert_floppy(OMacQ*, const uint8_t* img, size_t len, int read_only);
+OMAC_API void   omac_q_eject_floppy(OMacQ*);
+OMAC_API int    omac_q_floppy_present(OMacQ*);
+OMAC_API size_t omac_q_floppy_data(OMacQ*, uint8_t* out, size_t cap);
+/* CD-ROM on the SCSI bus (AppleCD-class target). Takes a raw ISO/Apple-
+   partitioned disc image; returns 1 if accepted. */
+OMAC_API int    omac_q_insert_cd(OMacQ*, const uint8_t* img, size_t len);
+OMAC_API void   omac_q_eject_cd(OMacQ*);
+OMAC_API int    omac_q_cd_present(OMacQ*);
 
 /* Version string for the About box / logs. */
 OMAC_API const char* omac_version(void);

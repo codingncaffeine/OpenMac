@@ -333,6 +333,24 @@ public partial class MainWindow : Window
             }
             if (!string.IsNullOrEmpty(_settings.ModelLastHardDisk) && File.Exists(_settings.ModelLastHardDisk))
                 _emulator.AttachHardDisk(_settings.ModelLastHardDisk!);
+            if (_settings.IsQuadra)
+            {
+                // The Quadra reads floppies (DiskCopy 4.2 / MacBinary / raw) through
+                // the .Sony Prime hook and mounts a SCSI CD; restore both so a
+                // remembered boot disk is already in the drive for the boot scan.
+                if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy) &&
+                    !_emulator.InsertFloppy(_settings.LastFloppy!))
+                {
+                    Log.Line($"floppy refused: {_settings.LastFloppy} -- {_emulator.MediumNote(0)}");
+                    _settings.LastFloppy = null;
+                }
+                if (!string.IsNullOrEmpty(_settings.LastCd) && File.Exists(_settings.LastCd) &&
+                    !_emulator.InsertCd(_settings.LastCd!))
+                {
+                    Log.Line($"cd refused: {_settings.LastCd} -- {_emulator.CdMediumNote()}");
+                    _settings.LastCd = null;
+                }
+            }
             if (!_settings.IsQuadra)
             {
                 if (_settings.CdRomAttached) _emulator.SetCdRomAttached(true);

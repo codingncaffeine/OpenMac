@@ -20,7 +20,7 @@ public sealed class QuadraEmulator : IEmulator
 
     public bool IsRomLoaded => _h != IntPtr.Zero;
     public string? RomPath { get; private set; }
-    public string? FloppyPath => null;
+    public string? FloppyPath { get; private set; }
     public string? ExternalFloppyPath => null;
     public bool ExternalDriveAttached => false;
     public bool HardDiskAttached { get; private set; }
@@ -157,10 +157,37 @@ public sealed class QuadraEmulator : IEmulator
         }
     }
 
-    // ---- media the Quadra build doesn't carry yet ----
-    public bool InsertFloppy(string path) => false;
-    public void EjectFloppy() { }
-    public string MediumNote(int drive) => "The Quadra 650 build has no floppy drive yet — boot from a SCSI hard disk.";
+    // ---- floppy (internal SuperDrive, served through the .Sony Prime hook) ----
+    public bool InsertFloppy(string path)
+    {
+        if (_h == IntPtr.Zero) return false;
+        byte[] img;
+        try { img = File.ReadAllBytes(path); }
+        catch { return false; }
+        int ok;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            ok = Native.omac_q_insert_floppy(_h, img, (nuint)img.Length, WriteProtectFloppies ? 1 : 0);
+        }
+        if (ok == 0) return false;
+        FloppyPath = path;
+        Log.Line($"[core] Quadra floppy: {Path.GetFileName(path)}");
+        return true;
+    }
+
+    public void EjectFloppy()
+    {
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_eject_floppy(_h); }
+        FloppyPath = null;
+    }
+
+    public string MediumNote(int drive) =>
+        drive == 0
+            ? "The internal SuperDrive takes a 400K/800K/1.44 MB dump or a DiskCopy 4.2 / MacBinary image. "
+              + "System 7.5 boots the Quadra 650 (7.1 needs a System Enabler this build doesn't carry)."
+            : "The Quadra 650 has one internal floppy drive; there is no external drive port on this machine.";
+
     public void SetExternalDrive(bool attached) { }
     public bool InsertExternalFloppy(string path) => false;
     public void EjectExternalFloppy() { }
@@ -182,13 +209,49 @@ public sealed class QuadraEmulator : IEmulator
         error = "Transfer disks are not on the Quadra 650 yet.";
         return false;
     }
-    public bool CdRomAttached => false;
-    public string? CdPath => null;
-    public void SetCdRomAttached(bool attached) { }
-    public bool InsertCd(string path) => false;
-    public void EjectCd() { }
-    public bool CdPresent => false;
-    public string CdMediumNote() => "The CD-ROM drive is not on the Quadra 650 yet.";
+
+    // ---- CD-ROM (AppleCD-class target on the SCSI bus) ----
+    public bool CdRomAttached { get; private set; }
+    public string? CdPath { get; private set; }
+    public void SetCdRomAttached(bool attached)
+    {
+        CdRomAttached = attached;
+        if (!attached) EjectCd();
+    }
+
+    public bool InsertCd(string path)
+    {
+        if (_h == IntPtr.Zero) return false;
+        byte[] img;
+        try { img = File.ReadAllBytes(path); }
+        catch { return false; }
+        int ok;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            ok = Native.omac_q_insert_cd(_h, img, (nuint)img.Length);
+        }
+        if (ok == 0) return false;
+        CdRomAttached = true;
+        CdPath = path;
+        Log.Line($"[core] Quadra CD: {Path.GetFileName(path)}");
+        return true;
+    }
+
+    public void EjectCd()
+    {
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_eject_cd(_h); }
+        CdPath = null;
+    }
+
+    public bool CdPresent
+    {
+        get { lock (_sync) return _h != IntPtr.Zero && Native.omac_q_cd_present(_h) != 0; }
+    }
+
+    public string CdMediumNote() =>
+        "The SCSI CD-ROM takes a raw ISO or Apple-partitioned disc image. The 7.1 install CD is "
+        + "readable, but the ROM does not auto-boot a CD — boot a floppy, then mount the disc.";
 
     // ---- hard disk ----
     public void AttachHardDisk(string path)

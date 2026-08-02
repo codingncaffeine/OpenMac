@@ -578,4 +578,34 @@ OMAC_API size_t omac_q_harddisk_data(OMacQ* m, uint8_t* out, size_t cap)
     return img.size();
 }
 
+OMAC_API int omac_q_insert_floppy(OMacQ* m, const uint8_t* img, size_t len, int ro)
+{
+    if (!m || !img) return 0;
+    return m->mac.insertFloppy(std::vector<u8>(img, img + len), ro != 0);
+}
+
+OMAC_API void omac_q_eject_floppy(OMacQ* m) { if (m) m->mac.ejectFloppy(); }
+
+OMAC_API int omac_q_floppy_present(OMacQ* m) { return m && m->mac.floppyPresent() ? 1 : 0; }
+
+OMAC_API size_t omac_q_floppy_data(OMacQ* m, uint8_t* out, size_t cap)
+{
+    if (!m || !m->mac.floppyPresent()) return 0;
+    const auto& img = m->mac.floppyImage();
+    if (!out) return img.size();
+    if (cap < img.size()) return 0;
+    std::copy(img.begin(), img.end(), out);
+    return img.size();
+}
+
+OMAC_API int omac_q_insert_cd(OMacQ* m, const uint8_t* img, size_t len)
+{
+    if (!m || !img) return 0;
+    return m->mac.insertCd(std::vector<u8>(img, img + len));
+}
+
+OMAC_API void omac_q_eject_cd(OMacQ* m) { if (m) m->mac.ejectCd(); }
+
+OMAC_API int omac_q_cd_present(OMacQ* m) { return m && m->mac.cdPresent() ? 1 : 0; }
+
 } // extern "C"
