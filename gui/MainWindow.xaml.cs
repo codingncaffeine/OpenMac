@@ -287,6 +287,22 @@ public partial class MainWindow : Window
     // ---- machine lifecycle ----
     private void LoadRom(string path)
     {
+        // The two machines take different ROMs (Classic: 512 KB, Quadra
+        // family: 1 MB). Feeding the wrong one wedges the CPU into a white
+        // screen with no diagnostics -- refuse it with directions instead.
+        long romLen = new FileInfo(path).Length;
+        bool looksQuadra = romLen >= 1024 * 1024;
+        if (looksQuadra != _settings.IsQuadra)
+        {
+            string msg = looksQuadra
+                ? "This is a 1 MB Quadra-family ROM, but the current model is the Macintosh " +
+                  "Classic.\n\nSwitch Machine > Model > Macintosh Quadra 650, then open this ROM there."
+                : "This is a Classic-sized ROM, but the current model is the Quadra 650.\n\n" +
+                  "Switch Machine > Model > Macintosh Classic, then open this ROM there.";
+            Log.Line($"ROM refused (wrong model): {path} ({romLen} bytes, model={_settings.Model})");
+            MessageBox.Show(this, msg, "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
         Log.Line($"load ROM: {path}  (RAM={_settings.ModelRamMB} MB, bootRomDisk={_settings.BootRomDisk}, "
                  + $"floppies {(_settings.WriteProtectFloppies ? "write-protected" : "writable")})");
         try
