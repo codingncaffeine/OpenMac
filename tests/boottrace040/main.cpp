@@ -124,6 +124,17 @@ int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb) {
     }
     // Boot blocks from the source volume make it bootable.
     std::memcpy(out.data(), vol.data(), 1024);
+    // ...and the volume must say WHICH folder holds that System. drFndrInfo[0]
+    // (MDB + 92) is the blessed System Folder's directory id: the ROM's boot
+    // scan reads it to find the System file, and a volume that leaves it zero
+    // is a disk with no startup system as far as the scan is concerned -- the
+    // flashing question mark, however complete the copy underneath.
+    const std::size_t mdb = 1024;
+    out[mdb + 92] = static_cast<u8>(dstSys >> 24);
+    out[mdb + 93] = static_cast<u8>(dstSys >> 16);
+    out[mdb + 94] = static_cast<u8>(dstSys >> 8);
+    out[mdb + 95] = static_cast<u8>(dstSys);
+    std::printf("blessed System Folder: dir id %u\n", dstSys);
 
     std::ofstream f(outPath, std::ios::binary);
     f.write(reinterpret_cast<const char*>(out.data()),
@@ -142,6 +153,7 @@ int main(int argc, char** argv) {
     unsigned long watchMemAt = 0;   // --watch-mem: log writes to this address
     unsigned long countPcAt = 0;    // --count-pc: count executions of this pc
     std::vector<std::pair<int, int>> clicks;   // --click X Y, in order
+    int postFrames = 0;             // --post-frames: run on after the clicks
     const char* hdPath = nullptr;
     const char* cdPath = nullptr;
     const char* shotPath = nullptr;
@@ -187,6 +199,7 @@ int main(int argc, char** argv) {
         else if (a == "--jiggle-at" && i + 1 < argc) jiggleAt = std::atoi(argv[++i]);
         else if (a == "--watch-mem" && i + 1 < argc) watchMemAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--post-frames" && i + 1 < argc) postFrames = std::atoi(argv[++i]);
         else if (a == "--click" && i + 2 < argc) {
             const int cx = std::atoi(argv[++i]);
             clicks.emplace_back(cx, std::atoi(argv[++i]));
@@ -604,11 +617,17 @@ int main(int argc, char** argv) {
                     static_cast<s16>(mac.read16(0x0830)));
     };
     for (const auto& pt : clicks) clickAt(pt.first, pt.second);
+    for (int f = 0; f < postFrames; ++f) {
+        mac.runFrame();
+        if (mac.cpu().halted) { std::printf("HALTED post-click frame %d\n", f); break; }
+    }
 
     {
         // Which volumes does the System actually have on line? The volume name
         // (Str27) sits at vcbVN +44 and the drive number at vcbDrvNum +72.
         u32 vcb = mac.read32(0x0358) & 0x00FFFFFFu;
+        std::printf("hd requests served: %u reads, %u writes\n",
+                    mac.hdReads(), mac.hdWrites());
         std::printf("mounted volumes:");
         for (int n = 0; vcb && n < 8; ++n) {
             char nm[32] = {0};

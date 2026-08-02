@@ -164,9 +164,15 @@ private:
         d[2] = 0x02;   // SCSI-2
         d[3] = 0x02;   // response data format
         d[4] = 31;     // additional length (total 36)
-        std::memcpy(d + 8,  "OpenMac ", 8);           // vendor id (bytes 8-15)
-        std::memcpy(d + 16, "Hard Disk       ", 16);  // product id (bytes 16-31)
-        std::memcpy(d + 32, "0001", 4);               // revision (bytes 32-35)
+        // Apple's own disk tools will not touch a drive that does not say
+        // APPLE here: HD SC Setup answers "unable to locate a suitable drive
+        // connected to the SCSI port" and Drive Setup passes it by, which
+        // leaves no way to initialise or partition the disk inside the guest.
+        // Apple shipped other makers' mechanisms under its own firmware, and
+        // that firmware is what wrote this string.
+        std::memcpy(d + 8,  "APPLE   ", 8);           // vendor id (bytes 8-15)
+        std::memcpy(d + 16, "OpenMac HD      ", 16);  // product id (bytes 16-31)
+        std::memcpy(d + 32, "1.0 ", 4);               // revision (bytes 32-35)
         emit(out, d, sizeof d, allocLen);
     }
 

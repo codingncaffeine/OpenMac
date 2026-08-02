@@ -71,6 +71,8 @@ public:
     u32 adbMousePolls() const;
     u32 adbKbdPolls() const;
     u32 adbMouseReports() const;   // polls that actually carried motion
+    u32 hdReads() const { return hdReadCount_; }
+    u32 hdWrites() const { return hdWriteCount_; }
     u32 adbMouseBytesRead() const; // mouse bytes the guest actually clocked in
     std::vector<u8> adbMouseBytesLog() const;
     void adbClearCmdTrace();
@@ -261,6 +263,8 @@ private:
     bool announceInFlight_ = false;
     u32  hdMountPb_ = 0;        // System-heap param block for the _MountVol retries
     int  hdMountTries_ = 0;
+    u32  hdReadCount_ = 0, hdWriteCount_ = 0;
+    int  hdErrBudget_ = 20;     // report the first failed disk requests
     int scsiDiagBudget_ = 60;   // trace the first 53C96 register accesses
     int iplDiagBudget_ = 12;    // trace the first level-2 interrupt assertions
     int via2DiagBudget_ = 24;   // trace the first VIA2 IFR/IER writes

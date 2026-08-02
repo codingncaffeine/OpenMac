@@ -914,7 +914,16 @@ void QuadraMachine::servePrime() {
     const u32 posOff = read32(pb + 0x2E);
     const u32 dctlPos = read32(dce + 0x10);
 
-    u32 pos = (posMode & 3) == 1 ? posOff : dctlPos;   // fsFromStart : fsAtMark
+    // All four positioning modes, not just the two the File Manager usually
+    // sends: a request that means "from the mark" is not the same as "at the
+    // mark", and serving it as the latter reads the wrong part of the disk.
+    u32 pos = dctlPos;
+    switch (posMode & 3) {
+    case 1: pos = posOff; break;                            // fsFromStart
+    case 2: pos = static_cast<u32>(floppy_.size()) + posOff; break;   // fsFromLEOF
+    case 3: pos = dctlPos + posOff; break;                  // fsFromMark
+    default: break;                                         // fsAtMark
+    }
     s16 result = 0;
     u32 done = 0;
     if (onDiag && primeDiagBudget_ > 0) {
@@ -942,6 +951,15 @@ void QuadraMachine::servePrime() {
             }
             done = n;
         }
+    }
+    if (result != 0 && onDiag && hdErrBudget_ > 0) {
+        --hdErrBudget_;
+        char b[128];
+        std::snprintf(b, sizeof b,
+                      "floppy %s FAILED err=%d pos=%u req=%u mode=%u (size=%u)",
+                      (trap & 1) ? "write" : "read", result, pos, req, posMode,
+                      static_cast<u32>(floppy_.size()));
+        onDiag(b);
     }
     write32(pb + 0x28, done);                      // ioActCount
     write32(dce + 0x10, pos + done);               // dCtlPosition
@@ -1018,7 +1036,13 @@ void QuadraMachine::serveDiskPrime(int unit) {
     const u32 base = (unit ? hfsImageOffset2_ : hfsImageOffset_);
     std::vector<u8>& backing = unit ? scsiImage2_ : scsiImage_;
 
-    u32 pos = (posMode & 3) == 1 ? posOff : dctlPos;
+    u32 pos = dctlPos;
+    switch (posMode & 3) {
+    case 1: pos = posOff; break;                                   // fsFromStart
+    case 2: pos = static_cast<u32>(img.size()) + posOff; break;    // fsFromLEOF
+    case 3: pos = dctlPos + posOff; break;                         // fsFromMark
+    default: break;                                                // fsAtMark
+    }
     s16 result = 0;
     u32 done = 0;
     if (img.empty() || backing.empty()) {
@@ -1042,6 +1066,16 @@ void QuadraMachine::serveDiskPrime(int unit) {
             }
             done = n;
         }
+    }
+    if (trap & 1) ++hdWriteCount_; else ++hdReadCount_;
+    if (result != 0 && onDiag && hdErrBudget_ > 0) {
+        --hdErrBudget_;
+        char b[128];
+        std::snprintf(b, sizeof b,
+                      "hd %s FAILED err=%d pos=%u req=%u buf=%08X (size=%u)",
+                      (trap & 1) ? "write" : "read", result, pos, req, buf,
+                      static_cast<u32>(img.size()));
+        onDiag(b);
     }
     write32(pb + 0x28, done);                          // ioActCount
     write32(dce + 0x10, pos + done);                   // dCtlPosition

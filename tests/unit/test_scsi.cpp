@@ -79,7 +79,8 @@ TEST_CASE("selection picks the present target whose ID bit is on the bus") {
         auto data = drainDataIn(c);
         REQUIRE(data.size() == 36);
         CHECK(data[0] == 0x00);   // direct access
-        CHECK(std::string(data.begin() + 8, data.begin() + 16) == "OpenMac ");
+        // Apple's disk tools refuse a drive whose vendor is not APPLE.
+        CHECK(std::string(data.begin() + 8, data.begin() + 16) == "APPLE   ");
     }
 
     SUBCASE("added target at ID 5") {
