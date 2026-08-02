@@ -269,10 +269,19 @@ void QuadraMachine::reset() {
 // the device blocks below say what those addresses are polling.
 std::string QuadraMachine::diagnosticReport() const {
     std::string s;
-    char b[512];
+    // Wide enough to hold a device's own state line plus this function's
+    // prefix without the compiler having to assume truncation.
+    char b[1024];
     auto add = [&](const char* fmt, auto... args) {
-        std::snprintf(b, sizeof b, fmt, args...);
-        s += b;
+        // With no arguments there is nothing to format, and passing a
+        // non-literal format string to snprintf is a diagnostic in its own
+        // right (-Wformat-security). Take the plain-text path instead.
+        if constexpr (sizeof...(args) == 0) {
+            s += fmt;
+        } else {
+            std::snprintf(b, sizeof b, fmt, args...);
+            s += b;
+        }
         s += '\n';
     };
 
