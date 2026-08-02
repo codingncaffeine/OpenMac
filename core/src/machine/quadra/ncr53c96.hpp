@@ -26,6 +26,7 @@
 #include "../scsi.hpp"
 #include "openmac/types.hpp"
 
+#include <cstdio>
 #include <functional>
 #include <vector>
 
@@ -51,6 +52,32 @@ public:
         updateLines();
     }
 
+    // A selection of an absent target times out ~250ms later on real
+    // silicon -- long after the manager has finished its issue path and
+    // parked in its interrupt-wait. An instant timeout lands mid-issue and
+    // the manager's connection bookkeeping records a half-open transaction
+    // (its completion path then drains a phantom connection forever). The
+    // machine ticks this countdown with CPU time.
+    void tick(int cycles) {
+        if (timeoutCountdown_ > 0) {
+            timeoutCountdown_ -= cycles;
+            if (timeoutCountdown_ <= 0) {
+                timeoutCountdown_ = 0;
+                seqStep_ = 0;
+                raise(0x20);   // disconnected: selection timed out
+                // A command written while the select was running sat in
+                // the command FIFO; it falls to the bottom now (and an
+                // initiator command meets a disconnected chip: one clean
+                // illegal-command, not a storm).
+                if (queuedValid_) {
+                    queuedValid_ = false;
+                    command_ = queuedCmd_;
+                    execute(queuedCmd_);
+                }
+            }
+        }
+    }
+
     // ---- register file ($50010000 + reg) ----
     u8 read(int reg) {
         switch (reg & 0xF) {
@@ -62,22 +89,38 @@ public:
             u8 v = phase_;
             if (tcZero_) v |= 0x10;
             if (statusInt_) v |= 0x80;
+            if (v != lastStatusDiag_) { lastStatusDiag_ = v; diag("SRD status=%02X", v); }
             return v;
         }
         case 0x5: {
             // Reading the interrupt register clears it and (53C90A+) the
             // sticky status error bits. The sequence step SURVIVES -- it is
             // cleared by the next command, and the manager reads it after
-            // the interrupt to learn where a select sequence stopped.
+            // the interrupt to learn where a select sequence stopped. The
+            // terminal-count flag is a counter condition, not an interrupt
+            // latch: only reloading the counter clears it.
             const u8 v = intr_;
             intr_ = 0;
             statusInt_ = false;
-            tcZero_ = false;
             updateLines();
+            diag("SRD intr=%02X", v);
             return v;
         }
-        case 0x6: return seqStep_;
-        case 0x7: return static_cast<u8>(fifoCount() & 0x1F);
+        case 0x6: diag("SRD seq=%02X", seqStep_); return seqStep_;
+        case 0x7: {
+            // Upper three bits DUPLICATE the sequence step (datasheet
+            // Fig. 11) -- the manager judges a select by these mirrored
+            // bits, not by reading register 6. During a DMA data-in the
+            // count presents the staged chunk as the FIFO's fill level.
+            const u8 ss = static_cast<u8>((seqStep_ & 7) << 5);
+            if (dmaActive_ && phase_ == kDataIn) {
+                u32 avail = static_cast<u32>(data_.size() - dataPos_);
+                if (avail > chunkLeft_) avail = chunkLeft_;
+                if (avail > kFifoSize) avail = kFifoSize;
+                return static_cast<u8>(ss | (avail & 0x1F));
+            }
+            return static_cast<u8>(ss | (fifoCount() & 0x1F));
+        }
         case 0x8: return cfg1_;
         case 0xB: return cfg2_;
         case 0xC: return cfg3_;
@@ -90,8 +133,33 @@ public:
         switch (reg & 0xF) {
         case 0x0: tcountLo_ = v; break;
         case 0x1: tcountHi_ = v; break;
-        case 0x2: fifoPush(v); break;
-        case 0x3: command_ = v; execute(v); break;
+        case 0x2:
+            if (cmdFeed_) {
+                // While a command feed is live, a FIFO byte goes straight
+                // out to the target -- the manager polls the FIFO flags for
+                // empty as its "byte accepted" handshake, so bytes must not
+                // linger here.
+                selCdb_.push_back(v);
+                tryFeedCdb();
+            } else {
+                fifoPush(v);
+            }
+            if (onDrq) onDrq(drq());
+            break;
+        case 0x3:
+            // While a select awaits its timeout, non-miscellaneous
+            // commands stack in the command FIFO behind it (datasheet:
+            // a command is only accepted "when it falls to the bottom of
+            // the command FIFO"). Miscellaneous group ($00-$03) runs any
+            // time.
+            if (timeoutCountdown_ > 0 && (v & 0x70) != 0) {
+                queuedCmd_ = v;
+                queuedValid_ = true;
+                break;
+            }
+            command_ = v;
+            execute(v);
+            break;
         case 0x4: destId_ = v & 7; break;
         case 0x5: selTimeout_ = v; break;
         case 0x6: syncPer_ = v; break;
@@ -108,35 +176,59 @@ public:
 
     // ---- pseudo-DMA data path (IOSB pulls 16-bit halves) ----
     bool drq() const {
-        if (dmaSelect_) return counter_ != 0;   // the select pulls its CDB by DMA
+        // A DMA-flagged command feed requests bytes while the counter
+        // stands and the FIFO has room (memory-to-device direction).
+        if (cmdFeed_ && feedDma_) return counter_ != 0 && fifoCount() < kFifoSize;
         if (!dmaActive_) return false;
-        if (phase_ == kDataIn) return dataPos_ < data_.size() && counter_ != 0;
+        if (phase_ == kDataIn) return dataPos_ < data_.size() && chunkLeft_ != 0;
         if (phase_ == kDataOut) return counter_ != 0;
         return false;
     }
 
+    u8 dma8Read() {
+        u8 v = 0xFF;
+        if (phase_ == kDataIn && chunkLeft_ > 0 && dataPos_ < data_.size()) {
+            v = data_[dataPos_++];
+            --chunkLeft_;
+            if (chunkLeft_ == 0 && dataPos_ < data_.size()) raise(0x10);
+        }
+        finishDataIfDone();
+        return v;
+    }
+
     u16 dma16Read() {
         u16 v = 0xFFFF;
-        if (phase_ == kDataIn && dataPos_ < data_.size()) {
+        if (phase_ == kDataIn && chunkLeft_ > 0 && dataPos_ < data_.size()) {
             const u8 hi = data_[dataPos_++];
-            const u8 lo = dataPos_ < data_.size() ? data_[dataPos_++] : 0xFF;
+            --chunkLeft_;
+            u8 lo = 0xFF;
+            if (chunkLeft_ > 0 && dataPos_ < data_.size()) {
+                lo = data_[dataPos_++];
+                --chunkLeft_;
+            }
             v = static_cast<u16>((hi << 8) | lo);
-            counterConsume(2);
+            // A chunk boundary mid-transfer interrupts (bus service) so the
+            // manager starts the next chunk; the LAST chunk's interrupt
+            // comes from the status-phase transition below instead.
+            if (chunkLeft_ == 0 && dataPos_ < data_.size()) raise(0x10);
         }
         finishDataIfDone();
         return v;
     }
 
     void dma16Write(u16 v) {
-        if (dmaSelect_) {
-            // The select sequence's message/CDB bytes arrive by DMA.
-            selBuf_.push_back(static_cast<u8>(v >> 8));
+        if (cmdFeed_) {
+            // CDB bytes through the pseudo-DMA port feed the same live
+            // command sequence the FIFO path does; the counter frames them
+            // (the manager's 5+1 trick puts exactly the last CDB byte
+            // here with tcount=1).
+            selCdb_.push_back(static_cast<u8>(v >> 8));
             counterConsume(1);
             if (counter_ != 0) {
-                selBuf_.push_back(static_cast<u8>(v & 0xFF));
+                selCdb_.push_back(static_cast<u8>(v & 0xFF));
                 counterConsume(1);
             }
-            if (counter_ == 0) completeDmaSelect();
+            tryFeedCdb();
             if (onDrq) onDrq(drq());
             return;
         }
@@ -159,9 +251,28 @@ public:
     int lastCdbLen = 0;
     std::function<void(int id, const u8* cdb, int len)> onCdb;
     std::function<void(u8 cmd, u32 fifoLevel, u8 phase)> onCmd;
+    std::function<void(const char* msg)> onDiag;
 
 private:
     static constexpr u32 kFifoSize = 16;
+
+    void diag(const char* fmt, u32 a) {
+        if (!onDiag || diagBudget_ <= 0) return;
+        --diagBudget_;
+        char line[64];
+        std::snprintf(line, sizeof(line), fmt, a);
+        onDiag(line);
+    }
+
+    // Structural events (selects, CDB completion) keep their own budget so
+    // a polling storm cannot drown them out of the log.
+    void diagEvent(const char* fmt, u32 a) {
+        if (!onDiag || eventBudget_ <= 0) return;
+        --eventBudget_;
+        char line[64];
+        std::snprintf(line, sizeof(line), fmt, a);
+        onDiag(line);
+    }
 
     void resetChip() {
         fifoHead_ = fifoTail_ = 0;
@@ -174,11 +285,17 @@ private:
         tcZero_ = false;
         data_.clear();
         dataPos_ = 0;
+        chunkLeft_ = 0;
         writeBuf_.clear();
         writeExpect_ = 0;
         selected_ = nullptr;
-        dmaSelect_ = false;
-        selBuf_.clear();
+        cmdFeed_ = false;
+        feedIsSelect_ = false;
+        selAtn_ = false;
+        feedDma_ = false;
+        selCdb_.clear();
+        timeoutCountdown_ = 0;
+        queuedValid_ = false;
     }
 
     ScsiTarget* findTarget(int id) {
@@ -194,10 +311,17 @@ private:
     }
     u8 fifoPop() {
         if (fifoCount() == 0) {
-            // An empty FIFO refills from an in-progress polled data-in.
-            if (phase_ == kDataIn && dataPos_ < data_.size()) {
-                fillFifoFromData();
+            // A DMA data-in chunk can be drained through the FIFO register
+            // just as through the pseudo-DMA port -- the old-API manager
+            // polls bytes out of reg 2. Serve from the staged chunk with
+            // the same boundary interrupt the port path raises.
+            if (phase_ == kDataIn && dmaActive_ && chunkLeft_ > 0 &&
+                dataPos_ < data_.size()) {
+                const u8 v = data_[dataPos_++];
+                --chunkLeft_;
+                if (chunkLeft_ == 0 && dataPos_ < data_.size()) raise(0x10);
                 finishDataIfDone();
+                return v;
             }
             if (fifoCount() == 0) return 0xFF;
         }
@@ -239,9 +363,12 @@ private:
         if (onDrq) onDrq(drq());
     }
 
-    // A data phase drains; move to status once it has.
+    // A data phase drains; move to status once it has. The phase change
+    // waits for the FIFO to empty -- the last received byte must be read
+    // out while the phase still says data-in, and only the FOLLOWING
+    // transfer-info sees the target's move to status.
     void finishDataIfDone() {
-        if (phase_ == kDataIn && dataPos_ >= data_.size()) {
+        if (phase_ == kDataIn && dataPos_ >= data_.size() && fifoCount() == 0) {
             dmaActive_ = false;
             phase_ = kStatus;
             raise(0x10);   // bus service: phase change
@@ -257,61 +384,89 @@ private:
         }
     }
 
-    void completeDmaSelect() {
-        dmaSelect_ = false;
-        size_t idx = 0;
-        if (dmaSelectAtn_ && idx < selBuf_.size()) ++idx;   // IDENTIFY message
-        std::vector<u8> cdb(selBuf_.begin() + static_cast<long>(idx), selBuf_.end());
-        if (!cdb.empty() && selected_) {
-            runCdb(cdb.data(), static_cast<int>(cdb.size()));
-            seqStep_ = 4;
-            raise(0x18);
-        } else {
-            phase_ = kCommand;
-            seqStep_ = 3;
-            raise(0x10);
+    // The 53C9x select sequence, as the Quadra ROM family drives it (and as
+    // MAME's ncr53c90 models it -- the undocumented empty-FIFO wait is the
+    // step that "makes macqd700 happy"):
+    //   - selection of an absent target times out: disconnected interrupt,
+    //     step 0, NO other activity;
+    //   - selection of a present target raises NO interrupt: the chip
+    //     parks at step 1 in the command phase (DRQ up if DMA-flagged) and
+    //     sends command bytes to the target as the manager supplies them.
+    //     This manager bulk-writes the leading CDB bytes into the FIFO --
+    //     polling the FIFO flags down to zero as its "bytes went out"
+    //     handshake -- and delivers exactly the LAST byte through the
+    //     pseudo-DMA port, framed by the select's tcount=1 (the 5+1 trick);
+    //   - once the target has a whole CDB it leaves the command phase, and
+    //     only THEN does the chip interrupt: function complete + bus
+    //     service, step 4 when the counter drained and the FIFO emptied,
+    //     step 2 otherwise (tcount=1 is still standing here: step 2).
+    // The same feed serves a transfer-info issued in the command phase (the
+    // manager's non-select command path uses the identical bulk+DMA-tail
+    // shape), completing with bus service alone.
+    void beginSelect(bool withAtn, bool dma) {
+        ++diagSelects;
+        seqStep_ = 0;
+        cmdFeed_ = false;
+        selCdb_.clear();
+        // A DMA-flagged command loads the transfer count the moment it
+        // issues -- present target or not. The manager reads TC0 after a
+        // timed-out select, and a stale terminal count from the previous
+        // transaction reads as a dirty bus (it pad-flushes forever).
+        if (dma) loadCounter();
+        selected_ = findTarget(destId_);
+        if (!selected_) {
+            // Selection timeout: the disconnected interrupt arrives after
+            // the real chip's ~250ms wait (modeled shorter), never
+            // synchronously inside the command write.
+            timeoutCountdown_ = 50000;
+            diagEvent("SEL id=%02X timeout pending", destId_);
+            return;
+        }
+        timeoutCountdown_ = 0;
+        cmdFeed_ = true;
+        feedIsSelect_ = true;
+        selAtn_ = withAtn;
+        feedDma_ = dma;
+        phase_ = kCommand;
+        seqStep_ = 1;
+        diagEvent("SEL id=%02X pending", destId_);
+        // The documented flow pre-loads the CDB before the command; treat
+        // anything already in the FIFO as the first bytes sent.
+        while (fifoCount() > 0) selCdb_.push_back(fifoPop());
+        tryFeedCdb();
+        updateLines();
+    }
+
+    static int cdbLenFor(u8 op) {
+        switch (op >> 5) {
+        case 0: return 6;
+        case 1: case 2: return 10;
+        case 5: return 12;
+        default: return 1;   // vendor/reserved: our targets reject the
+                             // opcode byte itself (ends a pad-byte abort)
         }
     }
 
-    void beginSelect(bool withAtn, bool dma) {
-        ++diagSelects;
-        selected_ = findTarget(destId_);
-        if (!selected_) {
-            // Selection timeout: disconnected.
-            raise(0x20);
-            seqStep_ = 0;
+    void tryFeedCdb() {
+        if (!cmdFeed_) return;
+        const u32 skip = (feedIsSelect_ && selAtn_) ? 1u : 0u;   // IDENTIFY
+        if (selCdb_.size() <= skip) return;
+        const u32 need = skip + static_cast<u32>(cdbLenFor(selCdb_[skip]));
+        if (selCdb_.size() < need) {
+            if (feedIsSelect_ && seqStep_ < 3) seqStep_ = 3;   // bytes flowing
             return;
         }
-        if (dma) {
-            // This manager's DMA-flagged select is a bare selection stage:
-            // it reads the sequence step afterwards to confirm the target
-            // answered, then sends the CDB itself with a transfer-info in
-            // the command phase. Report "stopped before command bytes".
-            loadCounter();
-            phase_ = kCommand;
-            seqStep_ = 3;
-            raise(0x10);
-            return;
-        }
-        fifoBytes_.clear();
-        while (fifoCount() > 0) fifoBytes_.push_back(fifoPop());
-        size_t idx = 0;
-        if (withAtn && idx < fifoBytes_.size()) ++idx;   // IDENTIFY message
-        // The rest of the FIFO is the CDB the select sequence sends.
-        lastCdbLen = 0;
-        std::vector<u8> cdb(fifoBytes_.begin() + static_cast<long>(idx), fifoBytes_.end());
-        if (!cdb.empty()) {
-            runCdb(cdb.data(), static_cast<int>(cdb.size()));
-            seqStep_ = 4;   // completed through the command phase
-            raise(0x18);    // function complete + bus service
+        cmdFeed_ = false;
+        runCdb(selCdb_.data() + skip, static_cast<int>(need - skip));
+        if (feedIsSelect_) {
+            seqStep_ = ((!feedDma_ || tcZero_) && fifoCount() == 0) ? 4 : 2;
+            diagEvent("SEL cdb done seq=%02X", seqStep_);
+            raise(0x18);                      // function complete + bus service
         } else {
-            // Selection succeeded but the sequence stopped before any
-            // command bytes went out (the old-API manager's manual flow):
-            // bus service only, step 3.
-            phase_ = kCommand;
-            seqStep_ = 3;
-            raise(0x10);
+            diagEvent("XFER cdb done phase=%02X", phase_);
+            raise(0x10);                      // bus service: phase changed
         }
+        selCdb_.clear();
     }
 
     void runCdb(const u8* cdb, int len) {
@@ -348,9 +503,11 @@ private:
             break;
         case 0x10: { // transfer information
             if (!selected_) {
-                // Initiator commands are only legal while connected; the
-                // chip answers with an illegal-command interrupt (the ROM's
-                // startup test deliberately provokes exactly this).
+                // Initiator commands are only legal while connected: the
+                // command is ignored, an illegal-command interrupt is
+                // generated and the command register CLEARS (datasheet
+                // p.32 -- the manager's cleanup reads it back).
+                command_ = 0;
                 raise(0x40);
                 break;
             }
@@ -358,20 +515,40 @@ private:
             dmaActive_ = dma;
             if (phase_ == kCommand) {
                 // CDB arriving via transfer info rather than the select
-                // sequence: consume the FIFO as the command.
-                std::vector<u8> cdb;
-                while (fifoCount() > 0) cdb.push_back(fifoPop());
-                if (selected_ && !cdb.empty()) {
-                    runCdb(cdb.data(), static_cast<int>(cdb.size()));
+                // sequence: same live feed, FIFO first, DMA tail.
+                dmaActive_ = false;
+                cmdFeed_ = true;
+                feedIsSelect_ = false;
+                feedDma_ = dma;
+                selCdb_.clear();
+                while (fifoCount() > 0) selCdb_.push_back(fifoPop());
+                tryFeedCdb();
+            } else if (phase_ == kDataIn) {
+                if (dma) {
+                    // The chip leads the target: the whole chunk is fetched
+                    // as soon as the command issues, so terminal count
+                    // reports done BEFORE the host drains the bytes -- the
+                    // manager polls TC, then bursts the FIFO's worth out
+                    // through the pseudo-DMA port.
+                    chunkLeft_ = counter_;
+                    counter_ = 0;
+                    tcZero_ = true;
+                } else if (dataPos_ < data_.size()) {
+                    // Non-DMA receive: exactly ONE byte lands in the FIFO
+                    // and every byte interrupts (bus service). The phase
+                    // flips to status only once the last byte is consumed,
+                    // so the next transfer-info reports the change.
+                    fifoPush(data_[dataPos_++]);
                     raise(0x10);
                 }
-            } else if (phase_ == kDataIn) {
-                if (!dma) fillFifoFromData();
                 finishDataIfDone();
             } else if (phase_ == kDataOut) {
                 if (!dma) {
                     while (fifoCount() > 0 && writeBuf_.size() < writeExpect_)
                         writeBuf_.push_back(fifoPop());
+                    // FIFO emptied with more expected: the target REQs the
+                    // next byte -- transfer complete, bus service.
+                    if (writeBuf_.size() < writeExpect_) raise(0x10);
                 }
                 finishDataIfDone();
             } else if (phase_ == kStatus) {
@@ -384,7 +561,8 @@ private:
             break;
         }
         case 0x11:   // initiator command complete sequence
-            if (!selected_) { raise(0x40); break; }
+            if (!selected_) { command_ = 0; raise(0x40); break; }
+            cmdFeed_ = false;
             fifoClear();
             fifoPush(scsiStatus_);
             fifoPush(0x00);       // COMMAND COMPLETE message
@@ -392,13 +570,14 @@ private:
             raise(0x08);          // function complete
             break;
         case 0x12:   // message accepted
-            if (!selected_) { raise(0x40); break; }
+            if (!selected_) { command_ = 0; raise(0x40); break; }
+            cmdFeed_ = false;
             phase_ = kDataOut;
             selected_ = nullptr;
             raise(0x20);          // disconnected
             break;
         case 0x18:   // transfer pad
-            if (!selected_) { raise(0x40); break; }
+            if (!selected_) { command_ = 0; raise(0x40); break; }
             if (dma) loadCounter();
             if (phase_ == kDataIn) { dataPos_ = data_.size(); }
             finishDataIfDone();
@@ -421,7 +600,6 @@ private:
 
     u8 fifo_[32]{};
     u32 fifoHead_ = 0, fifoTail_ = 0;
-    std::vector<u8> fifoBytes_;
 
     u8 tcountLo_ = 0, tcountHi_ = 0;
     u32 counter_ = 0;
@@ -434,15 +612,24 @@ private:
     u8 intr_ = 0;
     bool statusInt_ = false;
     bool dmaActive_ = false;
-    bool dmaSelect_ = false;
-    bool dmaSelectAtn_ = false;
-    std::vector<u8> selBuf_;
+    bool cmdFeed_ = false;
+    bool feedIsSelect_ = false;
+    bool selAtn_ = false;
+    bool feedDma_ = false;
+    std::vector<u8> selCdb_;
+    u8 lastStatusDiag_ = 0xFF;
+    int timeoutCountdown_ = 0;
+    u8 queuedCmd_ = 0;
+    bool queuedValid_ = false;
 
     std::vector<u8> data_;
     size_t dataPos_ = 0;
+    u32 chunkLeft_ = 0;
     std::vector<u8> writeBuf_;
     u32 writeExpect_ = 0;
     u8 scsiStatus_ = 0;
+    int diagBudget_ = 800;
+    int eventBudget_ = 4000;
 };
 
 } // namespace openmac

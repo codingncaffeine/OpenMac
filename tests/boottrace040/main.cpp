@@ -139,12 +139,17 @@ int main(int argc, char** argv) {
     const char* hdPath = nullptr;
     const char* cdPath = nullptr;
     const char* shotPath = nullptr;
+    const char* wavPath = nullptr;
     int frames = 600;
     int ramMb = 8;
     bool showLog = true;
     bool profile = false;
+    int traceTraps = 0;      // log this many A-line traps (with opcodes)
+    int trapsAfterCdbs = 0;  // ...once this many SCSI CDBs have run
+    const char* findHex = nullptr;  // scan guest RAM for these bytes at exit
     unsigned long dumpMem = 0;
     unsigned long breakPc = 0;
+    int breakSkip = 0;
     unsigned long traceFrom = 0;
     int traceCount = 200;
 
@@ -162,10 +167,17 @@ int main(int argc, char** argv) {
         else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
         else if (a == "--ram-mb" && i + 1 < argc) ramMb = std::atoi(argv[++i]);
         else if (a == "--dump-screen" && i + 1 < argc) shotPath = argv[++i];
+        else if (a == "--dump-audio" && i + 1 < argc) wavPath = argv[++i];
         else if (a == "--no-log") showLog = false;
         else if (a == "--profile") profile = true;
         else if (a == "--dump-mem" && i + 1 < argc) dumpMem = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--trace-traps" && i + 2 < argc) {
+            trapsAfterCdbs = std::atoi(argv[++i]);
+            traceTraps = std::atoi(argv[++i]);
+        }
+        else if (a == "--find" && i + 1 < argc) findHex = argv[++i];
         else if (a == "--break-pc" && i + 1 < argc) breakPc = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--break-skip" && i + 1 < argc) breakSkip = std::atoi(argv[++i]);
         else if (a == "--trace-from" && i + 1 < argc) traceFrom = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--trace-count" && i + 1 < argc) traceCount = std::atoi(argv[++i]);
     }
@@ -185,7 +197,11 @@ int main(int argc, char** argv) {
     QuadraMachine::Config cfg;
     cfg.ramSize = static_cast<u32>(ramMb) * 1024u * 1024u;
     QuadraMachine mac(std::move(rom), cfg);
-    mac.onDiag = [](const char* m) { std::printf("%s\n", m); };
+    int cdbCount = 0;
+    mac.onDiag = [&cdbCount](const char* m) {
+        if (m[0] == 'C' && m[1] == 'D' && m[2] == 'B') ++cdbCount;
+        std::printf("%s\n", m);
+    };
     int vramBudget = 10;
     mac.onVramWrite = [&](u32 off, u32 pc) {
         if (vramBudget > 0) {
@@ -196,6 +212,12 @@ int main(int argc, char** argv) {
     std::map<u32, int> busErrSites;
     int excBudget = 60;
     mac.cpu().onException = [&](int vector, u32 pc) {
+        if (vector == 10 && traceTraps > 0 && cdbCount >= trapsAfterCdbs) {
+            --traceTraps;
+            const u16 op = static_cast<u16>((mac.read8(pc) << 8) | mac.read8(pc + 1));
+            std::printf("TRAP %04X pc=%08X a0=%08X d0=%08X\n", op, pc,
+                        mac.cpu().a[0], mac.cpu().d[0]);
+        }
         // A-line/F-line/TRAP are routine; bus errors are aggregated (the
         // ROM's presence probes take them on purpose).
         if (vector == 10 || vector == 11 || (vector >= 32 && vector < 48)) return;
@@ -251,8 +273,8 @@ int main(int argc, char** argv) {
         // ring of PCs OUTSIDE the target's own module (the sad-mac painter
         // spins long enough to flush the CPU's ring), so the trail shows who
         // jumped in.
-        const u32 modLo = static_cast<u32>(breakPc) & 0xFFFFF800u;
-        const u32 modHi = modLo + 0x800;
+        const u32 modLo = static_cast<u32>(breakPc) & 0xFFFFFF80u;
+        const u32 modHi = modLo + 0x80;
         u32 outside[48] = {};
         int op = 0;
         u32 prev = 0;
@@ -268,7 +290,11 @@ int main(int argc, char** argv) {
             prev = pc;
         };
         u64 guard = 3'000'000'000ull;
-        while (mac.cpu().pc != static_cast<u32>(breakPc) && !mac.cpu().halted && guard--) {
+        while (!mac.cpu().halted && guard--) {
+            if (mac.cpu().pc == static_cast<u32>(breakPc)) {
+                if (breakSkip <= 0) break;
+                --breakSkip;
+            }
             mac.stepInstruction();
         }
         mac.cpu().onStep = nullptr;
@@ -279,6 +305,7 @@ int main(int argc, char** argv) {
         frames = 0;
     }
 
+    std::vector<u8> audio;
     for (int i = 0; i < frames; ++i) {
         if (profile && (i % 60) == 30) {
             // One frame of unique-PC ranges: the shape of the active code.
@@ -304,10 +331,19 @@ int main(int argc, char** argv) {
             continue;
         }
         mac.runFrame();
+        std::vector<u8> chunk;
+        mac.drainAudio(chunk);
+        audio.insert(audio.end(), chunk.begin(), chunk.end());
         if (mac.cpu().halted) {
             std::printf("HALTED at frame %d pc=%08X\n", i, mac.cpu().pc);
             break;
         }
+    }
+    {
+        std::size_t loud = 0;
+        for (u8 s : audio)
+            if (s > 0x84 || s < 0x7C) ++loud;
+        std::printf("audio: %zu samples, %zu non-silent\n", audio.size(), loud);
     }
 
     if (!busErrSites.empty()) {
@@ -349,6 +385,33 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (findHex) {
+        std::vector<u8> pat;
+        for (const char* p = findHex; p[0] && p[1]; p += 2) {
+            auto nyb = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return 0;
+            };
+            pat.push_back(static_cast<u8>((nyb(p[0]) << 4) | nyb(p[1])));
+        }
+        const u32 ramTop = static_cast<u32>(ramMb) * 1024u * 1024u;
+        int hits = 0;
+        for (u32 a = 0; a + pat.size() <= ramTop && hits < 8; ++a) {
+            bool ok = true;
+            for (std::size_t k = 0; k < pat.size(); ++k)
+                if (mac.read8(a + static_cast<u32>(k)) != pat[k]) { ok = false; break; }
+            if (ok) {
+                ++hits;
+                std::printf("FOUND at %08X:", a);
+                for (int k = 0; k < 32; ++k) std::printf(" %02X", mac.read8(a + static_cast<u32>(k)));
+                std::printf("\n");
+            }
+        }
+        if (!hits) std::printf("pattern not found in RAM\n");
+    }
+
     if (dumpMem) {
         std::printf("\n-- memory at %08lX --\n", dumpMem);
         for (int row = 0; row < 8; ++row) {
@@ -358,6 +421,32 @@ int main(int argc, char** argv) {
                                                static_cast<u32>(row * 16 + i)));
             std::printf("\n");
         }
+    }
+
+    if (wavPath && !audio.empty()) {
+        // Minimal WAV: PCM u8 mono at the machine's 22.25 kHz sample rate.
+        std::ofstream f(wavPath, std::ios::binary);
+        const u32 rate = 22254;
+        const u32 dataSize = static_cast<u32>(audio.size());
+        u8 hdr[44] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E',
+                      'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 1, 0};
+        auto p32 = [&](int off, u32 v) {
+            hdr[off] = static_cast<u8>(v);
+            hdr[off + 1] = static_cast<u8>(v >> 8);
+            hdr[off + 2] = static_cast<u8>(v >> 16);
+            hdr[off + 3] = static_cast<u8>(v >> 24);
+        };
+        p32(4, 36 + dataSize);
+        p32(24, rate);
+        p32(28, rate);
+        hdr[32] = 1;
+        hdr[34] = 8;
+        hdr[36] = 'd'; hdr[37] = 'a'; hdr[38] = 't'; hdr[39] = 'a';
+        p32(40, dataSize);
+        f.write(reinterpret_cast<char*>(hdr), 44);
+        f.write(reinterpret_cast<const char*>(audio.data()),
+                static_cast<std::streamsize>(audio.size()));
+        std::printf("audio dumped: %s\n", wavPath);
     }
 
     if (shotPath) {

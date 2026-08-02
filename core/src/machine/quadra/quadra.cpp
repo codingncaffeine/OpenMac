@@ -130,8 +130,10 @@ void QuadraMachine::wireDevices() {
 
     dafb_->onIrq = [this](bool level) { via2_->setSlotIrq(level); };
     easc_->onIrq = [this](bool level) { via2_->setAscIrq(level); };
+    easc_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     scsi_->onIrq = [this](bool level) { via2_->setScsiIrq(level); };
     scsi_->onDrq = [this](bool level) { via2_->setScsiDrq(level); };
+    scsi_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     scsi_->onCmd = [this](u8 cmd, u32 fifoLevel, u8 phase) {
         if (cdbDiagBudget_ <= 0) return;
         char b[80];
@@ -139,8 +141,11 @@ void QuadraMachine::wireDevices() {
         if (onDiag) onDiag(b);
     };
     scsi_->onCdb = [this](int id, const u8* cdb, int len) {
-        if (cdbDiagBudget_ <= 0) return;
-        --cdbDiagBudget_;
+        // The 8th CDB is the probe's boot-block read; re-arm the register
+        // trace there so the storm before it cannot exhaust the budget.
+        if (++cdbSeen_ == 8) cdbDiagBudget_ = 5000;
+        if (cdbListBudget_ <= 0) return;
+        --cdbListBudget_;
         char b[112];
         int n = std::snprintf(b, sizeof b, "CDB id%d:", id);
         for (int i = 0; i < len && n < 100; ++i)
@@ -290,6 +295,9 @@ u16 QuadraMachine::read16(u32 addr) {
         if (off >= 0x0A000u && off < 0x0B100u) {   // SONIC: 16-bit lanes
             return sonicRegs_[(off >> 2) & 0x3F];
         }
+        // The SCSI pseudo-DMA port is a true 16-bit lane: a word read moves
+        // two data bytes (the manager bursts MOVE.W/MOVE.L from it).
+        if (off >= 0x10100u && off < 0x10104u) return scsi_->dma16Read();
         // 8-bit peripherals answer 16-bit reads with the byte in both lanes
         // (the SCC glue's documented behavior; safe for the VIAs too since
         // it decodes the register only once).
@@ -327,6 +335,11 @@ void QuadraMachine::write16(u32 addr, u16 value) {
         }
         if (off >= 0x0C000u && off < 0x0E000u) {
             ioWrite8(addr, static_cast<u8>(value >> 8));   // SCC: high byte
+            return;
+        }
+        // The SCSI pseudo-DMA port takes both bytes of a word write.
+        if (off >= 0x10100u && off < 0x10104u) {
+            scsi_->dma16Write(value);
             return;
         }
         ioWrite8(addr, static_cast<u8>(value >> 8));
@@ -450,8 +463,8 @@ u8 QuadraMachine::ioRead8(u32 addr) {
         return v;
     }
     if (off >= 0x10100u && off < 0x10104u) {
-        const u16 v = scsi_->dma16Read();
-        return static_cast<u8>((off & 1) ? v : (v >> 8));
+        // A byte-wide pseudo-DMA read hands over exactly one byte.
+        return scsi_->dma8Read();
     }
     if (off >= 0x14000u && off < 0x15000u) {
         const u8 v = easc_->read(off & 0xFFF);
@@ -514,7 +527,7 @@ void QuadraMachine::ioWrite8(u32 addr, u8 v) {
     }
     if (off >= 0x10000u && off < 0x10100u) {
         const u32 reg = (off >> 4) & 0xF;
-        if ((reg <= 1 || reg == 3) && cdbDiagBudget_ > 0) {
+        if (reg <= 4 && cdbDiagBudget_ > 0) {
             --cdbDiagBudget_;
             char b[64];
             std::snprintf(b, sizeof b, "SREG%u W %02X", reg, v);
@@ -649,6 +662,7 @@ void QuadraMachine::tickDevices(int cpuCycles) {
         via1_->tick(1);
         via1Remainder_ -= 4255;
     }
+    scsi_->tick(cpuCycles);
     secondAcc_ += static_cast<u64>(cpuCycles);
     if (secondAcc_ >= kCpuHz) {
         secondAcc_ -= kCpuHz;

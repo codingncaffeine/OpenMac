@@ -195,7 +195,9 @@ private:
     int scsiDiagBudget_ = 60;   // trace the first 53C96 register accesses
     int iplDiagBudget_ = 12;    // trace the first level-2 interrupt assertions
     int via2DiagBudget_ = 24;   // trace the first VIA2 IFR/IER writes
-    int cdbDiagBudget_ = 1200;    // trace the first SCSI CDBs
+    int cdbDiagBudget_ = 2000;    // trace the first SCSI register writes
+    int cdbListBudget_ = 600;     // CDB completions: own budget, storm-proof
+    int cdbSeen_ = 0;             // completions so far (re-arms the reg trace)
     std::vector<std::string> accessLog_;
     std::vector<u8> audioOut_;
 };

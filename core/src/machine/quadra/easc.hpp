@@ -11,15 +11,17 @@
 //   $802 control                      $807 clock rate (EASC: fixed 3)
 //   $803 FIFO mode                    $F00+ EASC extended block (stored)
 //
-// The FIFO output is NOT the analog output: IOSB bit-bangs a separate DFAC
-// chip (latch/data/clock on VIA2 port B bits 0/3/4), and DFAC's settings
-// byte bit 1 gates whether anything is audible at all -- it resets to
-// silent, so the chime only sounds once the ROM programs DFAC.
+// IOSB also bit-bangs the separate DFAC chip (latch/data/clock on VIA2
+// port B bits 0/3/4, LSB-first). On this board the DFAC handles the
+// input/record side; the EASC's own output feeds the speaker directly, so
+// the DFAC settings byte is tracked but does not gate playback (the ROM
+// chimes with the DFAC output-mix bit clear).
 //
 // Reference: Quadra 650 hardware dossier (EASC/DFAC sections). Clean-room.
 
 #include "openmac/types.hpp"
 
+#include <cstdio>
 #include <functional>
 
 namespace openmac {
@@ -79,17 +81,20 @@ public:
     void write(u32 offset, u8 v) {
         offset &= 0xFFF;
         if (offset < 0x400) {
+            if (++pushesA_ == 1) diag("EASC first A push (mode=%02X dfac=%02X)", mode_, dfacSettings_);
             push(headA_, tailA_, bufA_, v);
             if (fifoLevelA() <= kFifo / 2) latch(0x01);
             return;
         }
         if (offset < 0x800) {
+            if (++pushesB_ == 1) diag("EASC first B push (mode=%02X dfac=%02X)", mode_, dfacSettings_);
             push(headB_, tailB_, bufB_, v);
             if (fifoLevelB() <= kFifo / 2) latch(0x04);
             return;
         }
         switch (offset) {
         case 0x801:
+            diag("EASC mode<-%02X (pushes A=%u)", v, pushesA_);
             mode_ = v;
             if (v == 1) {   // entering FIFO mode: room is announced
                 if (fifoLevelA() <= kFifo / 2) latch(0x01);
@@ -103,7 +108,7 @@ public:
                 headA_ = tailA_ = headB_ = tailB_ = 0;
             }
             break;
-        case 0x806: volume_ = v; break;
+        case 0x806: diag("EASC vol<-%02X (%u)", v, 0); volume_ = v; break;
         default:
             if (offset >= 0xF00 && offset < 0xF40) ext_[offset - 0xF00] = v;
             break;
@@ -111,12 +116,18 @@ public:
     }
 
     // ---- DFAC 3-wire link (VIA2 PB0 = latch, PB3 = data, PB4 = clock) ----
+    // The chip caches the last 8 bits seen on ConfigData at each ConfigClk
+    // rising edge -- LSB-first, each new bit lands at bit 7 and walks down --
+    // and a ConfigLE rising edge commits that byte. Within one port write
+    // the latch edge acts before the clock edge shifts the new data bit
+    // (IOSB drives latch, data, clock in that order).
     void dfacLines(bool latch, bool data, bool clock) {
-        if (clock && !dfacPrevClock_) {
-            dfacShift_ = static_cast<u8>((dfacShift_ << 1) | (data ? 1 : 0));
-        }
         if (latch && !dfacPrevLatch_) {
             dfacSettings_ = dfacShift_;
+            diag("DFAC settings<-%02X (pushes A=%u)", dfacSettings_, pushesA_);
+        }
+        if (clock && !dfacPrevClock_) {
+            dfacShift_ = static_cast<u8>((dfacShift_ >> 1) | (data ? 0x80 : 0));
         }
         dfacPrevClock_ = clock;
         dfacPrevLatch_ = latch;
@@ -124,12 +135,14 @@ public:
 
     // ---- output ----
     // One 8-bit unsigned sample per pull, mixing both FIFO channels; the
-    // machine pulls at the classic 22.25kHz rate. Silence when the DFAC
-    // output mix is off or the EASC isn't in FIFO mode.
+    // machine pulls at the classic 22.25kHz rate. On this board the EASC
+    // output feeds the speaker directly -- the DFAC sits on the input/gain
+    // side, so its settings byte does NOT gate playback (the ROM chimes
+    // with the DFAC's output mix bit clear).
     u8 pullSample() {
         const u32 beforeA = fifoLevelA(), beforeB = fifoLevelB();
         u8 a = 0x80, b = 0x80;
-        if (mode_ != 1 || !(dfacSettings_ & 0x02)) {
+        if (mode_ != 1) {
             pop(headA_, tailA_);        // FIFOs drain even while inaudible
             pop(headB_, tailB_);
         } else {
@@ -137,9 +150,7 @@ public:
             b = pop(headB_, tailB_) ? lastB_ : 0x80;
         }
         crossings(beforeA, beforeB);
-        if (mode_ != 1 || !(dfacSettings_ & 0x02)) return 0x80;
-        // DFAC volume: 3-bit attenuation from the settings byte's top bits
-        // is modeled coarsely through the EASC volume register instead.
+        if (mode_ != 1) return 0x80;
         const int mixed = (static_cast<int>(a) + b) / 2;
         const int vol = (volume_ >> 5) & 7;
         return static_cast<u8>(0x80 + ((mixed - 0x80) * (vol + 1)) / 8);
@@ -149,9 +160,18 @@ public:
     u32 fifoLevelB() const { return (tailB_ - headB_) & (kFifo - 1); }
 
     std::function<void(bool level)> onIrq;
+    std::function<void(const char* msg)> onDiag;
 
 private:
     static constexpr u32 kFifo = 1024;
+
+    void diag(const char* fmt, u32 a, u32 b) {
+        if (!onDiag || diagBudget_ <= 0) return;
+        --diagBudget_;
+        char line[96];
+        std::snprintf(line, sizeof(line), fmt, a, b);
+        onDiag(line);
+    }
 
     void push(u32& head, u32& tail, u8* buf, u8 v) {
         const u32 next = (tail + 1) & (kFifo - 1);
@@ -216,6 +236,8 @@ private:
 
     u8 dfacSettings_ = 0, dfacShift_ = 0;
     bool dfacPrevClock_ = false, dfacPrevLatch_ = false;
+    u32 pushesA_ = 0, pushesB_ = 0;
+    int diagBudget_ = 48;
 };
 
 } // namespace openmac
