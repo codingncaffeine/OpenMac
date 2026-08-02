@@ -903,11 +903,10 @@ void QuadraMachine::adbIdleWake() {
 // routine would run the SWIM2's MFM engine; this one moves the bytes and
 // returns through jIODone exactly as the hardware path would have.
 void QuadraMachine::servePrime() {
-    // The System passes the DCE around with the locked-master-pointer flag
-    // riding bit 31; the guest's 24-bit translation strips it, so strip it
-    // here too before touching memory through these pointers.
-    const u32 pb = cpu_.a[0] & 0x00FFFFFFu;
-    const u32 dce = cpu_.a[1] & 0x00FFFFFFu;
+    // The System passes these with Memory Manager flag bits riding the high
+    // byte; guestPtr drops them without truncating a real address (see there).
+    const u32 pb = guestPtr(cpu_.a[0]);
+    const u32 dce = guestPtr(cpu_.a[1]);
     const u16 trap = read16(pb + 0x06);
     const u32 buf = read32(pb + 0x20);
     const u32 req = read32(pb + 0x24);
@@ -958,10 +957,10 @@ void QuadraMachine::servePrime() {
 // header, qHead at $0358); each VCB carries its drive number at vcbDrvNum
 // (+$6E). This is how we tell "the System mounted it itself" from "nobody has".
 bool QuadraMachine::volumeMountedFor(u16 drive) {
-    u32 vcb = read32(0x0358) & 0x00FFFFFFu;
-    for (int n = 0; vcb && n < 16; ++n) {
+    u32 vcb = guestPtr(read32(0x0358));
+    for (int n = 0; vcb && vcb + 80 < ram_.size() && n < 16; ++n) {
         if (read16(vcb + 72) == drive) return true;   // vcbDrvNum
-        vcb = read32(vcb) & 0x00FFFFFFu;              // qLink
+        vcb = guestPtr(read32(vcb));                  // qLink
     }
     return false;
 }
@@ -972,16 +971,16 @@ bool QuadraMachine::volumeMountedFor(u16 drive) {
 // offset. Cached once the System has installed the driver.
 void QuadraMachine::findDiskDriverPrime() {
     static const int kUnits[2] = {1, 33};
-    const u32 uTable = read32(0x011C) & 0x00FFFFFFu;
-    if (!uTable) return;
+    const u32 uTable = guestPtr(read32(0x011C));
+    if (!uTable || uTable + 256 >= ram_.size()) return;
     for (int i = 0; i < 2; ++i) {
         if (diskPrimePc_[i]) continue;
-        const u32 h = read32(uTable + static_cast<u32>(kUnits[i]) * 4u) & 0x00FFFFFFu;
-        if (!h) continue;
-        const u32 dce = read32(h) & 0x00FFFFFFu;
-        if (!dce) continue;
-        const u32 drvr = read32(dce) & 0x00FFFFFFu;   // dCtlDriver
-        if (!drvr) continue;
+        const u32 h = guestPtr(read32(uTable + static_cast<u32>(kUnits[i]) * 4u));
+        if (!h || h + 4 >= ram_.size()) continue;
+        const u32 dce = guestPtr(read32(h));
+        if (!dce || dce + 4 >= ram_.size()) continue;
+        const u32 drvr = guestPtr(read32(dce));       // dCtlDriver
+        if (!drvr || drvr + 0x20 >= ram_.size()) continue;
         // Only OUR driver: its name field is ".ScsiHD".
         if (read8(drvr + 0x12) != 7 || read8(drvr + 0x13) != '.' ||
             read8(drvr + 0x14) != 'S' || read8(drvr + 0x15) != 'c')
@@ -1005,10 +1004,10 @@ void QuadraMachine::findDiskDriverPrime() {
 // only the transfer itself is done by the machine -- and gives the writes the
 // installer needs as well.
 void QuadraMachine::serveDiskPrime(int unit) {
-    const u32 pb = cpu_.a[0] & 0x00FFFFFFu;
-    const u32 dce = cpu_.a[1] & 0x00FFFFFFu;
+    const u32 pb = guestPtr(cpu_.a[0]);
+    const u32 dce = guestPtr(cpu_.a[1]);
     const u16 trap = read16(pb + 0x06);
-    const u32 buf = read32(pb + 0x20) & 0x00FFFFFFu;
+    const u32 buf = guestPtr(read32(pb + 0x20));
     const u32 req = read32(pb + 0x24);
     const u16 posMode = read16(pb + 0x2C);
     const u32 posOff = read32(pb + 0x2E);
@@ -1058,9 +1057,16 @@ void QuadraMachine::serveDiskPrime(int unit) {
 // until control returns to the following word (the dispatcher adjusts the
 // return PC past the A-line). The Classic's proven injection shape.
 void QuadraMachine::execute68kTrap(u16 trap) {
-    const u32 scratch = static_cast<u32>(ram_.size()) - 8;
-    ram_[scratch] = static_cast<u8>(trap >> 8);
-    ram_[scratch + 1] = static_cast<u8>(trap & 0xFF);
+    // ApplScratch, the twelve low-memory bytes reserved for applications. The
+    // Classic put this word at the top of RAM, which works on a machine with
+    // no MMU -- but here the '040 runs the System's own address space, and
+    // fetching from the far top of physical RAM lands somewhere the guest has
+    // not mapped: the CPU faults, the guard loop spins on the fault, and the
+    // machine ends up executing address 10. Low memory is identity-mapped on
+    // every Macintosh, because the vector table and the globals live there.
+    const u32 scratch = 0x0A78;
+    write8(scratch, static_cast<u8>(trap >> 8));
+    write8(scratch + 1, static_cast<u8>(trap & 0xFF));
     const u32 savedPc = cpu_.pc;
     const u16 savedSr = cpu_.getSR();
     cpu_.pc = scratch;

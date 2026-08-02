@@ -180,6 +180,18 @@ private:
     void execute68kTrap(u16 trap);
     void announceHardDisks();
     // The on-disk SCSI driver's Prime, served in C++ (see the definition).
+    // A pointer handed over by the guest can carry Memory Manager flag bits in
+    // its high byte -- the 24-bit era's locked/purgeable marks ride there, and
+    // the guest's own translation drops them. Strip them ONLY when the address
+    // does not already point into RAM: with more than 16 MB fitted, a real
+    // address has significant bits above bit 23, and truncating it aims the
+    // transfer at the wrong memory. (That is a System Error a few instructions
+    // later, and it is why 136 MB behaved differently from 8 MB.)
+    u32 guestPtr(u32 p) const {
+        if (p < ram_.size()) return p;
+        const u32 stripped = p & 0x00FFFFFFu;
+        return stripped < ram_.size() ? stripped : p;
+    }
     void serveDiskPrime(int unit);
     void findDiskDriverPrime();
     bool volumeMountedFor(u16 drive);
