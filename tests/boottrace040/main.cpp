@@ -154,8 +154,9 @@ int main(int argc, char** argv) {
     unsigned long countPcAt = 0;    // --count-pc: count executions of this pc
     std::vector<std::pair<int, int>> clicks;   // --click X Y, in order
     int postFrames = 0;             // --post-frames: run on after the clicks
-    bool trapRingOn = false, trapRingArmed = false;   // --trap-ring (armed after the clicks)
-    struct TrapRec { u16 op; u32 pc, d0, a0; };
+    bool trapRingOn = false, trapRingArmed = false;   // --trap-ring
+    int trapRingAfter = 0;          // --trap-ring-after: post-frame to arm at
+    struct TrapRec { u16 op; u32 pc, d0, a0; s16 res; };
     std::vector<TrapRec> trapRing(256);
     std::size_t trapRingPos = 0;
     const char* hdPath = nullptr;
@@ -205,6 +206,7 @@ int main(int argc, char** argv) {
         else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--post-frames" && i + 1 < argc) postFrames = std::atoi(argv[++i]);
         else if (a == "--trap-ring") trapRingArmed = true;
+        else if (a == "--trap-ring-after" && i + 1 < argc) trapRingAfter = std::atoi(argv[++i]);
         else if (a == "--click" && i + 2 < argc) {
             const int cx = std::atoi(argv[++i]);
             clicks.emplace_back(cx, std::atoi(argv[++i]));
@@ -280,12 +282,31 @@ int main(int argc, char** argv) {
         // Keep the tail of the trap stream. When an application gives up with
         // a message of its own, the call it gave up on is a few entries from
         // the end -- and the register it passed says which file or volume.
-        if (vector == 10 && trapRingOn) {
-            // A true ring: shifting a vector down by one on every trap costs a
-            // memmove per call, and the guest issues millions of them.
-            const u16 op = static_cast<u16>((mac.read8(pc) << 8) | mac.read8(pc + 1));
-            trapRing[trapRingPos % trapRing.size()] = {op, pc, mac.cpu().d[0], mac.cpu().a[0]};
-            ++trapRingPos;
+        // Cheap gate first -- only traps issued from RAM (the System and the
+        // application, not the ROM) -- then one 16-bit fetch instead of two
+        // 8-bit ones. The guest issues these in the millions, so the cost of
+        // looking has to stay well under the cost of running.
+        if (vector == 10 && trapRingOn && pc < 0x40000000u) {
+            const u16 op = mac.read16(pc);
+            // Only the File Manager's own calls. $A000-$A0FF also holds the
+            // Memory Manager, and its idle traffic (HPurge, GetHandleSize,
+            // OSEventAvail) floods the ring, pushing the interesting tail out
+            // before anyone can read it.
+            const bool fileTrap =
+                (op >= 0xA000 && op <= 0xA01F) || op == 0xA044 || op == 0xA060 ||
+                (op >= 0xA200 && op <= 0xA21F) || op == 0xA260;
+            if (fileTrap) {
+                // The call before this one has finished by now, so its
+                // parameter block carries its ioResult (+16). That is the
+                // answer the application acted on -- and the reason it gave up.
+                if (trapRingPos > 0) {
+                    auto& prev = trapRing[(trapRingPos - 1) % trapRing.size()];
+                    prev.res = static_cast<s16>(mac.read16(prev.a0 + 16));
+                }
+                trapRing[trapRingPos % trapRing.size()] =
+                    {op, pc, mac.cpu().d[0], mac.cpu().a[0], 0};
+                ++trapRingPos;
+            }
         }
         if (vector == 10 && traceTraps > 0 && cdbCount >= trapsAfterCdbs) {
             --traceTraps;
@@ -627,8 +648,8 @@ int main(int argc, char** argv) {
     for (const auto& pt : clicks) clickAt(pt.first, pt.second);
     // Only record from here on: the boot issues millions of traps and logging
     // them all costs more than the run itself. What matters is the tail.
-    trapRingOn = trapRingArmed;
     for (int f = 0; f < postFrames; ++f) {
+        if (f == trapRingAfter) trapRingOn = trapRingArmed;
         mac.runFrame();
         if (mac.cpu().halted) { std::printf("HALTED post-click frame %d\n", f); break; }
     }
@@ -639,7 +660,7 @@ int main(int argc, char** argv) {
         u32 vcb = mac.read32(0x0358) & 0x00FFFFFFu;
         std::printf("hd requests served: %u reads, %u writes\n",
                     mac.hdReads(), mac.hdWrites());
-        if (trapRingOn) {
+        if (trapRingArmed) {
             auto trapName = [](u16 op) -> const char* {
                 switch (op) {
                 case 0xA000: return "Open";        case 0xA001: return "Close";
@@ -667,8 +688,9 @@ int main(int argc, char** argv) {
             std::printf("-- last %zu of %zu traps --\n", show, trapRingPos);
             for (std::size_t k = show; k > 0; --k) {
                 const auto& t = trapRing[(trapRingPos - k) % trapRing.size()];
-                std::printf("  %04X %-14s pc=%08X d0=%08X a0=%08X\n",
-                            t.op, trapName(t.op), t.pc, t.d0, t.a0);
+                std::printf("  %04X %-14s pc=%08X d0=%08X a0=%08X -> %d%s\n",
+                            t.op, trapName(t.op), t.pc, t.d0, t.a0, t.res,
+                            t.res < 0 ? "   <-- ERROR" : "");
             }
         }
         std::printf("mounted volumes:");
