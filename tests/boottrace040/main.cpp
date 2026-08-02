@@ -441,7 +441,14 @@ int main(int argc, char** argv) {
     // built somewhere else; this is how that gets settled instead of argued.
     std::vector<u32> watchPcs;
     int watchFrom = 0;               // --watch-from: ignore hits before this frame
-    std::vector<std::pair<int, int>> clicks;   // --click X Y, in order
+    // --click X Y / --dclick X Y, in the order given. Opening a control panel
+    // needs a double click, so driving the guest's own UI to a bug needs both.
+    // A menu is not a click: the title is pressed, the pointer moves to the
+    // item with the button still down, and the release selects. --drag models
+    // that, and its screenshot is taken while the button is still held, which
+    // is the only moment an open menu is on screen to read item positions from.
+    struct Click { int x, y; bool dbl; bool drag; int x2, y2, x3, y3; };
+    std::vector<Click> clicks;
     int postFrames = 0;             // --post-frames: run on after the clicks
     bool trapRingOn = false, trapRingArmed = false;   // --trap-ring
     int trapRingAfter = 0;          // --trap-ring-after: post-frame to arm at
@@ -565,7 +572,25 @@ int main(int argc, char** argv) {
         else if (a == "--save-hd" && i + 1 < argc) saveHdPath = argv[++i];
         else if (a == "--click" && i + 2 < argc) {
             const int cx = std::atoi(argv[++i]);
-            clicks.emplace_back(cx, std::atoi(argv[++i]));
+            clicks.push_back({cx, std::atoi(argv[++i]), false, false, 0, 0, -1, -1});
+        }
+        else if (a == "--dclick" && i + 2 < argc) {
+            const int cx = std::atoi(argv[++i]);
+            clicks.push_back({cx, std::atoi(argv[++i]), true, false, 0, 0, -1, -1});
+        }
+        else if (a == "--drag" && i + 4 < argc) {
+            const int cx = std::atoi(argv[++i]);
+            const int cy = std::atoi(argv[++i]);
+            const int dx = std::atoi(argv[++i]);
+            clicks.push_back({cx, cy, false, true, dx, std::atoi(argv[++i]), -1, -1});
+        }
+        else if (a == "--drag3" && i + 6 < argc) {
+            const int cx = std::atoi(argv[++i]);
+            const int cy = std::atoi(argv[++i]);
+            const int dx = std::atoi(argv[++i]);
+            const int dy = std::atoi(argv[++i]);
+            const int ex = std::atoi(argv[++i]);
+            clicks.push_back({cx, cy, false, true, dx, dy, ex, std::atoi(argv[++i])});
         }
         else if (a == "--harddisk" && i + 1 < argc) hdPath = argv[++i];
         else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
@@ -1307,31 +1332,91 @@ int main(int argc, char** argv) {
     // the cursor across the screen cost thousands of emulated frames per click
     // and the System's acceleration made it overshoot besides. MTemp, RawMouse
     // and Mouse all name the same position; CrsrNew asks for a redraw.
+    // Every frame run outside the boot loop must still drain audio. The
+    // machine's buffer is small and silently drops what is not taken, so a
+    // guest sound played WHILE the pointer is being driven would vanish
+    // before --dump-audio ever saw it -- and the recording's silence would
+    // look like the machine's.
+    auto stepFrame = [&] {
+        mac.runFrame();
+        std::vector<u8> chunk;
+        mac.drainAudio(chunk);
+        audio.insert(audio.end(), chunk.begin(), chunk.end());
+    };
     auto moveTo = [&](int tx, int ty) {
         const u16 x = static_cast<u16>(tx), y = static_cast<u16>(ty);
         mac.write16(0x0828, y); mac.write16(0x082A, x);   // MTemp
         mac.write16(0x082C, y); mac.write16(0x082E, x);   // RawMouse
         mac.write16(0x0830, y); mac.write16(0x0832, x);   // Mouse
         mac.write8(0x08CE, 0xFF);                         // CrsrNew
-        for (int f = 0; f < 3; ++f) mac.runFrame();
+        for (int f = 0; f < 3; ++f) stepFrame();
     };
-    auto clickAt = [&](int x, int y) {
+    auto clickAt = [&](int x, int y, bool dbl) {
         moveTo(x, y);
-        mac.mouseMove(0, 0, true);
-        for (int f = 0; f < 5; ++f) mac.runFrame();
-        mac.mouseMove(0, 0, false);
-        for (int f = 0; f < 30; ++f) mac.runFrame();
-        std::printf("clicked at %d,%d (cursor now %d,%d)\n", x, y,
-                    static_cast<s16>(mac.read16(0x0832)),
+        const int taps = dbl ? 2 : 1;
+        for (int t = 0; t < taps; ++t) {
+            mac.mouseMove(0, 0, true);
+            for (int f = 0; f < 5; ++f) stepFrame();
+            mac.mouseMove(0, 0, false);
+            // The second tap has to land inside DoubleTime (about 8 ticks by
+            // default) or the System sees two separate clicks.
+            for (int f = 0; f < (t + 1 < taps ? 4 : 30); ++f) stepFrame();
+        }
+        std::printf("%s at %d,%d (cursor now %d,%d)\n", dbl ? "dclicked" : "clicked",
+                    x, y, static_cast<s16>(mac.read16(0x0832)),
                     static_cast<s16>(mac.read16(0x0830)));
     };
-    for (const auto& pt : clicks) clickAt(pt.first, pt.second);
+    // A shot after every click: driving the guest's UI blind means guessing
+    // coordinates, and the only way to correct a guess is to see what the
+    // click actually hit.
+    int clickNo = 0;
+    auto shot = [&] {
+        if (!shotPath) return;
+        char p[512];
+        std::snprintf(p, sizeof p, "%s.c%d.bmp", shotPath, ++clickNo);
+        const int w = mac.screenWidth(), h = mac.screenHeight();
+        std::vector<u32> px(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+        mac.renderScreen(px.data());
+        writeBmp(p, px, w, h);
+    };
+    for (const auto& pt : clicks) {
+        if (!pt.drag) {
+            clickAt(pt.x, pt.y, pt.dbl);
+            shot();
+            continue;
+        }
+        moveTo(pt.x, pt.y);
+        mac.mouseMove(0, 0, true);
+        for (int f = 0; f < 20; ++f) stepFrame();
+        moveTo(pt.x2, pt.y2);
+        // A hierarchical item needs the pointer to rest on it before the
+        // submenu appears; 40 frames is comfortably past that delay.
+        for (int f = 0; f < 40; ++f) stepFrame();
+        if (pt.x3 >= 0) {
+            moveTo(pt.x3, pt.y3);
+            for (int f = 0; f < 40; ++f) stepFrame();
+        }
+        shot();                       // the menu is open only while held
+        mac.mouseMove(0, 0, false);
+        for (int f = 0; f < 40; ++f) mac.runFrame();
+        std::printf("dragged %d,%d -> %d,%d\n", pt.x, pt.y, pt.x2, pt.y2);
+    }
     if (!watchPcs.empty() && !mac.cpu().onStep) installWatch();
     // Only record from here on: the boot issues millions of traps and logging
     // them all costs more than the run itself. What matters is the tail.
     for (int f = 0; f < postFrames; ++f) {
         if (f == trapRingAfter) trapRingOn = trapRingArmed;
         mac.runFrame();
+        // Keep collecting audio here too. The machine's buffer is small and
+        // drops what is not taken, so a --dump-audio that only drained during
+        // the boot loop could not contain a sound the guest played AFTER a
+        // click -- and its silence would look like the machine's, not the
+        // instrument's.
+        {
+            std::vector<u8> chunk;
+            mac.drainAudio(chunk);
+            audio.insert(audio.end(), chunk.begin(), chunk.end());
+        }
         // Feed the disk set: when the guest has ejected the current floppy,
         // give the mechanism a moment to settle and put the next disk in.
         if (!floppyQueue.empty()) {

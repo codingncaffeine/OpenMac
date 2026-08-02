@@ -36,10 +36,12 @@ public:
         irqStatus_ = 0;
         volume_ = 0;
         for (auto& r : ext_) r = 0;
-        // FIFO interrupts start gated off (inverted-sense enables); the ROM
-        // opens them only for its interrupt-driven player phase.
-        ext_[0x0B] = 1;
-        ext_[0x2B] = 1;
+        // FIFO interrupts start gated off (inverted-sense enables at $09 and
+        // $29); the ROM leaves them off because it polls, and the Sound
+        // Manager opens channel B's when it wants callbacks.
+        ext_[0x09] = 1;
+        ext_[0x29] = 1;
+        linePending_ = false;
         // CD-XA ADPCM coefficient tables power up with the documented
         // defaults (four (K1,K0) filter pairs); the chime relies on them.
         static constexpr u8 kXaDefault[8] = {0x00, 0x00, 0x00, 0x3C,
@@ -83,7 +85,7 @@ public:
             // an idle empty FIFO never storms the slot interrupt.
             const u8 v = static_cast<u8>(liveStatus() | irqStatus_);
             irqStatus_ = 0;
-            if (onIrq) onIrq(false);
+            updateLine();
             return v;
         }
         case 0x806: return volume_;
@@ -116,6 +118,7 @@ public:
                 if (fifoLevelA() <= kFifo / 2) latch(0x01);
                 if (fifoLevelB() <= kFifo / 2) latch(0x04);
             }
+            updateLine();   // leaving FIFO mode drops the line
             break;
         case 0x802: control_ = v; break;
         case 0x803:
@@ -126,7 +129,13 @@ public:
             break;
         case 0x806: diag("EASC vol<-%02X (%u)", v, 0); volume_ = v; break;
         default:
-            if (offset >= 0xF00 && offset < 0xF40) ext_[offset - 0xF00] = v;
+            if (offset >= 0xF00 && offset < 0xF40) {
+                const u32 r = offset - 0xF00;
+                ext_[r] = v;
+                // Enabling an interrupt is itself an event: the condition it
+                // asks about may already be latched.
+                if (r == 0x09 || r == 0x29) updateLine();
+            }
             break;
         }
     }
@@ -296,18 +305,34 @@ private:
     }
 
     void latch(u8 bits) {
-        // The extended block's per-channel FIFO IRQ enables gate the LINE
-        // (inverted sense: 0 = enabled). The ROM polls with them off and
-        // turns them on only for the interrupt-driven player -- without the
-        // gate a stale VIA2 edge from the polled phase fires reentrantly
-        // the moment the IER opens.
-        u8 lineBits = bits;
-        if (ext_[0x0B] & 1) lineBits &= static_cast<u8>(~0x03);
-        if (ext_[0x2B] & 1) lineBits &= static_cast<u8>(~0x0C);
-        if ((irqStatus_ | bits) != irqStatus_) {
-            irqStatus_ |= bits;
-            if (lineBits && mode_ == 1 && onIrq) onIrq(true);
-        }
+        irqStatus_ |= bits;
+        updateLine();
+    }
+
+    // The per-channel FIFO interrupt enables, inverted sense: 0 = enabled.
+    // Channel A's is extended register $09, channel B's is $29 -- the ROM
+    // writes 1 to both at init because it drives the chime by POLLING $804,
+    // and System 7's Sound Manager writes 0 to $29 when it wants to be
+    // called back for more samples. Nothing ever writes $0B/$2B.
+    u8 enabledMask() const {
+        u8 m = 0;
+        if (!(ext_[0x09] & 1)) m |= 0x03;
+        if (!(ext_[0x29] & 1)) m |= 0x0C;
+        return m;
+    }
+
+    // The interrupt output is a LEVEL, not an edge: it is asserted for as
+    // long as an enabled condition is latched. Enabling an interrupt whose
+    // condition is ALREADY pending must therefore raise the line -- that is
+    // exactly what the Sound Manager does (it sets FIFO mode on an empty
+    // FIFO, so "room available" is true before it enables the interrupt),
+    // and treating the raise as an edge on the status bit left it waiting
+    // for a callback that could never come.
+    void updateLine() {
+        const bool pending = mode_ == 1 && (irqStatus_ & enabledMask()) != 0;
+        if (pending == linePending_) return;
+        linePending_ = pending;
+        if (onIrq) onIrq(pending);
     }
 
     // Drain crossings latch and edge the line; a FIFO simply sitting empty
@@ -331,6 +356,7 @@ private:
     bool dfacPrevClock_ = false, dfacPrevLatch_ = false;
     u32 pushesA_ = 0, pushesB_ = 0;
     int diagBudget_ = 48;
+    bool linePending_ = false;
 
     // CD-XA decoder state, per channel.
     u8 xaParam_[2]{};
