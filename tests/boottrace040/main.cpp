@@ -57,7 +57,11 @@ void writeBmp(const char* path, const std::vector<u32>& px, int w, int h) {
 // signature, extract the System Folder tree, rebuild it into a fresh
 // volume, and graft the source volume's boot blocks (the part the
 // formatter leaves zeroed) so the ROM's boot scan accepts it.
-int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb) {
+// `except` names files to leave behind, which turns this into a bisection
+// harness: rebuild an installed volume without a suspect extension and see
+// whether the boot gets further.
+int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb,
+                   const std::vector<std::string>& except = {}) {
     auto src = loadFile(srcPath);
     if (src.empty()) {
         std::fprintf(stderr, "cannot read %s\n", srcPath);
@@ -108,6 +112,10 @@ int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb) {
     std::function<void(u32, u32)> copyDir = [&](u32 srcDir, u32 dstDir) {
         for (const auto& it : items) {
             if (it.parent != srcDir) continue;
+            if (std::find(except.begin(), except.end(), it.name) != except.end()) {
+                std::printf("  left behind: %s\n", it.name.c_str());
+                continue;
+            }
             if (it.isDir) {
                 const u32 nd = b.addDir(dstDir, it.name, it.crDate, it.mdDate);
                 copyDir(it.id, nd);
@@ -432,6 +440,7 @@ int main(int argc, char** argv) {
     // an address. A pointer that is already wrong when a routine is entered was
     // built somewhere else; this is how that gets settled instead of argued.
     std::vector<u32> watchPcs;
+    int watchFrom = 0;               // --watch-from: ignore hits before this frame
     std::vector<std::pair<int, int>> clicks;   // --click X Y, in order
     int postFrames = 0;             // --post-frames: run on after the clicks
     bool trapRingOn = false, trapRingArmed = false;   // --trap-ring
@@ -439,6 +448,10 @@ int main(int argc, char** argv) {
     int trapRingFrom = -1;          // --trap-ring-from: BOOT frame to arm at
     bool ringFilesOnly = false;     // --ring-files-only: skip the resource spam
     bool ringNull = false;          // --ring-null: fetch+match, record nothing
+    // --ring-all: EVERY A-line trap. The four families the ring normally keeps
+    // are the ones with readable results, but their absence does NOT mean the
+    // guest is idle -- an event loop calls none of them.
+    bool ringAll = false;
     bool noAnnounce = false;        // --no-announce: no injected HD mount
     const char* saveHdPath = nullptr;   // --save-hd: dump the disk at exit
     // kind 0 = File Manager (result from the param block's ioResult), 1 =
@@ -485,7 +498,12 @@ int main(int argc, char** argv) {
             const char* srcP = argv[++i];
             const char* outP = argv[++i];
             const int mb = std::atoi(argv[++i]);
-            return makeBootableHd(srcP, outP, static_cast<u32>(mb));
+            std::vector<std::string> except;
+            while (i + 2 < argc && std::string(argv[i + 1]) == "--except") {
+                i += 2;
+                except.emplace_back(argv[i]);
+            }
+            return makeBootableHd(srcP, outP, static_cast<u32>(mb), except);
         }
         if (a == "--ls" && i + 1 < argc) return lsVolume(argv[++i]);
         if (a == "--rls" && i + 1 < argc) return lsResources(argv[++i]);
@@ -520,6 +538,7 @@ int main(int argc, char** argv) {
         else if (a == "--jiggle-at" && i + 1 < argc) jiggleAt = std::atoi(argv[++i]);
         else if (a == "--watch-mem" && i + 1 < argc) watchMemAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--watch-from" && i + 1 < argc) watchFrom = std::atoi(argv[++i]);
         else if (a == "--watch-pc" && i + 1 < argc)
             watchPcs.push_back(static_cast<u32>(std::strtoul(argv[++i], nullptr, 16)));
         else if (a == "--post-frames" && i + 1 < argc) postFrames = std::atoi(argv[++i]);
@@ -528,6 +547,7 @@ int main(int argc, char** argv) {
         else if (a == "--trap-ring-from" && i + 1 < argc) trapRingFrom = std::atoi(argv[++i]);
         else if (a == "--ring-files-only") ringFilesOnly = true;
         else if (a == "--ring-null") ringNull = true;
+        else if (a == "--ring-all") ringAll = true;
         else if (a == "--no-announce") noAnnounce = true;
         else if (a == "--save-hd" && i + 1 < argc) saveHdPath = argv[++i];
         else if (a == "--click" && i + 2 < argc) {
@@ -733,7 +753,7 @@ int main(int argc, char** argv) {
                 // skipped, so a behavior difference that survives --ring-null
                 // lives in the fetch above, and one that disappears lives in
                 // the recording.
-            } else if (fileTrap || resTrap || gesTrap || scsiTrap) {
+            } else if (fileTrap || resTrap || gesTrap || scsiTrap || ringAll) {
                 // The call before this one has finished by now: a File Manager
                 // call's parameter block carries its ioResult (+16), and a
                 // Resource Manager call has left its verdict in the ResErr
@@ -1011,6 +1031,33 @@ int main(int argc, char** argv) {
         frames = 0;
     }
 
+    // --watch-pc: registers and the top of the stack each time execution
+    // reaches an address. Armed for the boot run as well as the post-click
+    // one, because a stall during startup never reaches the clicks.
+    const u32 ramTop_ = static_cast<u32>(ramMb) * 1024u * 1024u;
+    auto installWatch = [&] {
+        mac.cpu().onStep = [&](u32 pc) {
+            for (u32 w : watchPcs) {
+                if (pc != w) continue;
+                // A polling loop hits its address hundreds of thousands of
+                // times; the first handful say everything the rest repeat.
+                if (static_cast<int>(mac.frameCount()) < watchFrom) continue;
+                static std::map<u32, int> seen;
+                if (++seen[w] > 40) continue;
+                const M68040& c = mac.cpu();
+                std::printf("WATCH %08X f=%u a0=%08X a1=%08X a6=%08X a7=%08X "
+                            "d0=%08X d1=%08X stack:",
+                            pc, static_cast<unsigned>(mac.frameCount()),
+                            c.a[0], c.a[1], c.a[6], c.a[7], c.d[0], c.d[1]);
+                for (u32 k = 0; k < 6; ++k)
+                    std::printf(" %08X",
+                                c.a[7] + 4 * k + 3 < ramTop_ ? mac.read32(c.a[7] + 4 * k) : 0);
+                std::printf("\n");
+            }
+        };
+    };
+    if (!watchPcs.empty()) installWatch();
+
     std::vector<u8> audio;
     for (int i = 0; i < frames; ++i) {
         if (i == trapRingFrom) trapRingOn = trapRingArmed;
@@ -1223,23 +1270,7 @@ int main(int argc, char** argv) {
                     static_cast<s16>(mac.read16(0x0830)));
     };
     for (const auto& pt : clicks) clickAt(pt.first, pt.second);
-    const u32 ramTop_ = static_cast<u32>(ramMb) * 1024u * 1024u;
-    if (!watchPcs.empty()) {
-        mac.cpu().onStep = [&](u32 pc) {
-            for (u32 w : watchPcs) {
-                if (pc != w) continue;
-                const M68040& c = mac.cpu();
-                std::printf("WATCH %08X f=%u a0=%08X a1=%08X a6=%08X a7=%08X "
-                            "d0=%08X d1=%08X stack:",
-                            pc, static_cast<unsigned>(mac.frameCount()),
-                            c.a[0], c.a[1], c.a[6], c.a[7], c.d[0], c.d[1]);
-                for (u32 k = 0; k < 6; ++k)
-                    std::printf(" %08X",
-                                c.a[7] + 4 * k + 3 < ramTop_ ? mac.read32(c.a[7] + 4 * k) : 0);
-                std::printf("\n");
-            }
-        };
-    }
+    if (!watchPcs.empty() && !mac.cpu().onStep) installWatch();
     // Only record from here on: the boot issues millions of traps and logging
     // them all costs more than the run itself. What matters is the tail.
     for (int f = 0; f < postFrames; ++f) {
