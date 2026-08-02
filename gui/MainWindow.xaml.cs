@@ -23,8 +23,8 @@ public partial class MainWindow : Window
 
     private readonly Settings _settings;
     private IEmulator _emulator;
-    private readonly WriteableBitmap _bitmap;
-    private readonly byte[] _bgra;
+    private WriteableBitmap _bitmap = null!;
+    private byte[] _bgra = null!;
 
     // The backend runs emulation and audio on its own thread, so playback is never
     // stalled by this UI thread. The window only displays the latest frame:
@@ -47,15 +47,12 @@ public partial class MainWindow : Window
         WindowTheming.ApplyDarkTitleBar(this);
 
         _settings = Settings.Load();
-        _emulator = CreateBackend();
+        _emulator = CreateBackend(_settings);
         _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
-        int w = _emulator.ScreenWidth, h = _emulator.ScreenHeight;
-        _bgra = new byte[w * h * 4];
-        _bitmap = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
-        ScreenImage.Source = _bitmap;
+        RebuildScreen();
 
         StatusBackend.Text = _emulator.IsRealCore ? "core: native" : "core: stub (not linked)";
-        Log.Line($"GUI ready — {_emulator.BackendName} backend, screen {w}x{h}");
+        Log.Line($"GUI ready — {_emulator.BackendName} backend, screen {_emulator.ScreenWidth}x{_emulator.ScreenHeight}");
 
         timeBeginPeriod(1);                       // sharpen OS timer resolution for the emu thread's pacing
         _renderHandler = (_, _) => Tick();
@@ -72,8 +69,8 @@ public partial class MainWindow : Window
         Loaded += (_, _) =>
         {
             ApplyScale();
-            if (!string.IsNullOrEmpty(_settings.LastRom) && File.Exists(_settings.LastRom))
-                LoadRom(_settings.LastRom!);
+            if (!string.IsNullOrEmpty(_settings.ModelLastRom) && File.Exists(_settings.ModelLastRom))
+                LoadRom(_settings.ModelLastRom!);
             // Files handed on the command line ride the same router as a drop,
             // so "openmac.exe game.img" and double-click associations both work.
             string[] args = Environment.GetCommandLineArgs();
@@ -91,13 +88,19 @@ public partial class MainWindow : Window
         };
     }
 
-    /// <summary>Real core if openmac_c.dll loads; otherwise the stub preview.</summary>
-    private static IEmulator CreateBackend()
+    /// <summary>Real core if openmac_c.dll loads; otherwise the stub preview.
+    /// The settings' model picks which machine the native backend drives.</summary>
+    private static IEmulator CreateBackend(Settings settings)
     {
         try
         {
             Native.omac_version();   // probes the native DLL; throws if it's missing
-            Log.Line("backend: native core (openmac_c.dll)");
+            if (settings.IsQuadra)
+            {
+                Log.Line("backend: native core (openmac_c.dll), Quadra 650");
+                return new QuadraEmulator();
+            }
+            Log.Line("backend: native core (openmac_c.dll), Macintosh Classic");
             return new NativeEmulator();
         }
         catch (Exception ex)
@@ -106,6 +109,37 @@ public partial class MainWindow : Window
             return new StubEmulator();
         }
     }
+
+    /// <summary>Size the framebuffer to the current machine's screen.</summary>
+    private void RebuildScreen()
+    {
+        int w = _emulator.ScreenWidth, h = _emulator.ScreenHeight;
+        _bgra = new byte[w * h * 4];
+        _bitmap = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
+        ScreenImage.Source = _bitmap;
+    }
+
+    /// <summary>Switch machine models: tear the current machine down (persisting
+    /// its media), bring the other up at its own screen size, and load that
+    /// model's remembered ROM if it is still around.</summary>
+    private void SwitchModel(string model)
+    {
+        if (_settings.Model == model) return;
+        Log.Line($"model switch: {_settings.Model} -> {model}");
+        _emulator.Dispose();
+        _settings.Model = model;
+        _settings.Save();
+        _emulator = CreateBackend(_settings);
+        _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
+        RebuildScreen();
+        ApplyScale();
+        UpdateUi();
+        if (!string.IsNullOrEmpty(_settings.ModelLastRom) && File.Exists(_settings.ModelLastRom))
+            LoadRom(_settings.ModelLastRom!);
+    }
+
+    private void ModelClassic_Click(object sender, RoutedEventArgs e) => SwitchModel("classic");
+    private void ModelQuadra_Click(object sender, RoutedEventArgs e) => SwitchModel("quadra650");
 
     private void Tick()
     {
@@ -253,46 +287,54 @@ public partial class MainWindow : Window
     // ---- machine lifecycle ----
     private void LoadRom(string path)
     {
-        Log.Line($"load ROM: {path}  (RAM={_settings.RamMB} MB, bootRomDisk={_settings.BootRomDisk}, "
+        Log.Line($"load ROM: {path}  (RAM={_settings.ModelRamMB} MB, bootRomDisk={_settings.BootRomDisk}, "
                  + $"floppies {(_settings.WriteProtectFloppies ? "write-protected" : "writable")})");
         try
         {
-            _emulator.LoadRom(path, _settings.RamMB, _settings.BootRomDisk);
+            _emulator.LoadRom(path, _settings.ModelRamMB, _settings.BootRomDisk);
             // Before any disk goes in: the tab is read at insertion.
             _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
-            // A remembered path the core now refuses is forgotten rather than
-            // retried on every boot; the refusal is in the log.
-            if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy) &&
-                !_emulator.InsertFloppy(_settings.LastFloppy!))
+            // The Quadra build carries only the SCSI hard disk so far; the
+            // Classic's other remembered media stay its own.
+            if (!_settings.IsQuadra)
             {
-                Log.Line($"floppy refused: {_settings.LastFloppy} -- {_emulator.MediumNote(0)}");
-                _settings.LastFloppy = null;
+                // A remembered path the core now refuses is forgotten rather
+                // than retried on every boot; the refusal is in the log.
+                if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy) &&
+                    !_emulator.InsertFloppy(_settings.LastFloppy!))
+                {
+                    Log.Line($"floppy refused: {_settings.LastFloppy} -- {_emulator.MediumNote(0)}");
+                    _settings.LastFloppy = null;
+                }
+                if (_settings.ExternalDrive) _emulator.SetExternalDrive(true);
+                if (!string.IsNullOrEmpty(_settings.LastExternalFloppy) &&
+                    File.Exists(_settings.LastExternalFloppy) &&
+                    !_emulator.InsertExternalFloppy(_settings.LastExternalFloppy!))
+                {
+                    Log.Line($"floppy refused: {_settings.LastExternalFloppy} -- {_emulator.MediumNote(1)}");
+                    _settings.LastExternalFloppy = null;
+                }
             }
-            if (_settings.ExternalDrive) _emulator.SetExternalDrive(true);
-            if (!string.IsNullOrEmpty(_settings.LastExternalFloppy) &&
-                File.Exists(_settings.LastExternalFloppy) &&
-                !_emulator.InsertExternalFloppy(_settings.LastExternalFloppy!))
+            if (!string.IsNullOrEmpty(_settings.ModelLastHardDisk) && File.Exists(_settings.ModelLastHardDisk))
+                _emulator.AttachHardDisk(_settings.ModelLastHardDisk!);
+            if (!_settings.IsQuadra)
             {
-                Log.Line($"floppy refused: {_settings.LastExternalFloppy} -- {_emulator.MediumNote(1)}");
-                _settings.LastExternalFloppy = null;
+                if (_settings.CdRomAttached) _emulator.SetCdRomAttached(true);
+                if (!string.IsNullOrEmpty(_settings.LastCd) && File.Exists(_settings.LastCd) &&
+                    !_emulator.InsertCd(_settings.LastCd!))
+                {
+                    Log.Line($"cd refused: {_settings.LastCd} -- {_emulator.CdMediumNote()}");
+                    _settings.LastCd = null;
+                }
+                if (!string.IsNullOrEmpty(_settings.LastFolderDisk) &&
+                    Directory.Exists(_settings.LastFolderDisk) &&
+                    !_emulator.AttachFolderDisk(_settings.LastFolderDisk!, out string fdErr))
+                {
+                    Log.Line($"folder disk refused: {_settings.LastFolderDisk} -- {fdErr}");
+                    _settings.LastFolderDisk = null;
+                }
+                if (_settings.Networking) _emulator.SetNetworking(true);
             }
-            if (!string.IsNullOrEmpty(_settings.LastHardDisk) && File.Exists(_settings.LastHardDisk))
-                _emulator.AttachHardDisk(_settings.LastHardDisk!);
-            if (_settings.CdRomAttached) _emulator.SetCdRomAttached(true);
-            if (!string.IsNullOrEmpty(_settings.LastCd) && File.Exists(_settings.LastCd) &&
-                !_emulator.InsertCd(_settings.LastCd!))
-            {
-                Log.Line($"cd refused: {_settings.LastCd} -- {_emulator.CdMediumNote()}");
-                _settings.LastCd = null;
-            }
-            if (!string.IsNullOrEmpty(_settings.LastFolderDisk) &&
-                Directory.Exists(_settings.LastFolderDisk) &&
-                !_emulator.AttachFolderDisk(_settings.LastFolderDisk!, out string fdErr))
-            {
-                Log.Line($"folder disk refused: {_settings.LastFolderDisk} -- {fdErr}");
-                _settings.LastFolderDisk = null;
-            }
-            if (_settings.Networking) _emulator.SetNetworking(true);
         }
         catch (Exception ex)
         {
@@ -312,7 +354,7 @@ public partial class MainWindow : Window
     {
         if (FilePicker.Open(this, _settings, FilePicker.Rom, "Open Macintosh ROM",
                             "Macintosh ROM (*.rom;*.bin)|*.rom;*.bin|All files (*.*)|*.*",
-                            _settings.LastRom) is { } path)
+                            _settings.ModelLastRom) is { } path)
             LoadRom(path);
     }
 
@@ -481,7 +523,7 @@ public partial class MainWindow : Window
     {
         Log.Line($"attach hard disk: {path}");
         _emulator.AttachHardDisk(path);
-        _settings.LastHardDisk = path;
+        _settings.ModelLastHardDisk = path;
         _settings.Save();
         UpdateUi();
         // SCSI disks are found only during the ROM's boot scan, so one attached to a
@@ -500,7 +542,7 @@ public partial class MainWindow : Window
     private void DetachHardDisk_Click(object sender, RoutedEventArgs e)
     {
         _emulator.DetachHardDisk();
-        _settings.LastHardDisk = null;
+        _settings.ModelLastHardDisk = null;
         _settings.Save();
         UpdateUi();
     }
@@ -1001,7 +1043,7 @@ public partial class MainWindow : Window
 
         StatusState.Text = _emulator.IsRomLoaded ? "Running" : "Stopped";
         string machine = _emulator.IsRomLoaded
-            ? $"{_settings.RamMB} MB"
+            ? (_settings.IsQuadra ? "Quadra 650  •  " : "") + $"{_settings.ModelRamMB} MB"
               + (_emulator.FloppyPath is { } f ? $"  •  Floppy: {Path.GetFileName(f)}" : "")
               + (_emulator.ExternalFloppyPath is { } f2
                   ? $"  •  External: {Path.GetFileName(f2)}" : "")
@@ -1016,10 +1058,14 @@ public partial class MainWindow : Window
         Title = _emulator.IsRomLoaded && _emulator.RomPath is { } r
             ? $"OpenMac — {Path.GetFileName(r)}" : "OpenMac";
 
-        Mem1Item.IsChecked = _settings.RamMB == 1;
-        Mem2Item.IsChecked = _settings.RamMB == 2;
-        Mem4Item.IsChecked = _settings.RamMB == 4;
+        ModelClassicItem.IsChecked = !_settings.IsQuadra;
+        ModelQuadraItem.IsChecked = _settings.IsQuadra;
+        Mem1Item.IsChecked = !_settings.IsQuadra && _settings.RamMB == 1;
+        Mem2Item.IsChecked = !_settings.IsQuadra && _settings.RamMB == 2;
+        Mem4Item.IsChecked = !_settings.IsQuadra && _settings.RamMB == 4;
+        Mem1Item.IsEnabled = Mem2Item.IsEnabled = Mem4Item.IsEnabled = !_settings.IsQuadra;
         BootRomDiskItem.IsChecked = _settings.BootRomDisk;
+        BootRomDiskItem.IsEnabled = !_settings.IsQuadra;
         WriteProtectItem.IsChecked = _settings.WriteProtectFloppies;
 
         ScaleFitItem.IsChecked = _settings.Scale == 0;

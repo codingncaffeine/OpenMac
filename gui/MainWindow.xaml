@@ -42,6 +42,14 @@
                 <MenuItem Header="Exit" InputGestureText="Alt+F4" Click="Exit_Click" />
             </MenuItem>
             <MenuItem Header="_Machine">
+                <MenuItem Header="Model">
+                    <MenuItem x:Name="ModelClassicItem" Header="Macintosh Classic"
+                              Click="ModelClassic_Click" />
+                    <MenuItem x:Name="ModelQuadraItem" Header="Macintosh Quadra 650"
+                              Click="ModelQuadra_Click"
+                              ToolTip="68040 @ 33 MHz with color DAFB video. Needs the 1 MB Quadra 650 family ROM and boots from a SCSI hard disk; each model remembers its own ROM and disk." />
+                </MenuItem>
+                <Separator />
                 <MenuItem Header="Reset" InputGestureText="Ctrl+R" Click="Reset_Click" />
                 <Separator />
                 <MenuItem x:Name="Mem1Item" Header="1 MB RAM" Tag="1" Click="Memory_Click" />

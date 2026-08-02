@@ -8,6 +8,31 @@ public sealed class Settings
 {
     public int RamMB { get; set; } = 4;
     public bool BootRomDisk { get; set; }
+
+    /// <summary>Which machine the GUI runs: "classic" or "quadra650". Each model
+    /// remembers its own ROM and hard disk — they are not interchangeable.</summary>
+    public string Model { get; set; } = "classic";
+    public string? LastRomQuadra { get; set; }
+    public string? LastHardDiskQuadra { get; set; }
+    public int RamMBQuadra { get; set; } = 8;
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsQuadra => Model == "quadra650";
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? ModelLastRom
+    {
+        get => IsQuadra ? LastRomQuadra : LastRom;
+        set { if (IsQuadra) LastRomQuadra = value; else LastRom = value; }
+    }
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? ModelLastHardDisk
+    {
+        get => IsQuadra ? LastHardDiskQuadra : LastHardDisk;
+        set { if (IsQuadra) LastHardDiskQuadra = value; else LastHardDisk = value; }
+    }
+    [System.Text.Json.Serialization.JsonIgnore]
+    public int ModelRamMB => IsQuadra ? RamMBQuadra : RamMB;
+
     public int Scale { get; set; } = 2;              // 0 = fit, else fixed multiplier
     public string? LastRom { get; set; }
     public string? LastFloppy { get; set; }

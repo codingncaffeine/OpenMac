@@ -512,3 +512,70 @@ OMAC_API void omac_poll_log(OMac* m, char* out, size_t cap)
 OMAC_API const char* omac_version(void) { return "OpenMac core 0.5.0"; }
 
 } // extern "C"
+
+// ---- Quadra 650 surface -----------------------------------------------------
+
+#include "openmac/quadra.hpp"
+
+struct OMacQ {
+    openmac::QuadraMachine mac;
+    std::vector<u8> audioBuf;
+
+    OMacQ(std::vector<u8> rom, uint32_t ramMB)
+        : mac(std::move(rom), openmac::QuadraMachine::Config{ramMB * 1024u * 1024u}) {}
+};
+
+extern "C" {
+
+OMAC_API OMacQ* omac_q_create(const uint8_t* rom, size_t rom_len, uint32_t ram_mb)
+{
+    if (!rom || rom_len == 0) return nullptr;
+    try {
+        return new OMacQ(std::vector<u8>(rom, rom + rom_len), ram_mb ? ram_mb : 8u);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+OMAC_API void omac_q_destroy(OMacQ* m) { delete m; }
+OMAC_API void omac_q_reset(OMacQ* m) { if (m) m->mac.reset(); }
+OMAC_API void omac_q_run_frame(OMacQ* m) { if (m) m->mac.runFrame(); }
+OMAC_API int  omac_q_screen_w(OMacQ* m) { return m ? m->mac.screenWidth() : 640; }
+OMAC_API int  omac_q_screen_h(OMacQ* m) { return m ? m->mac.screenHeight() : 480; }
+OMAC_API void omac_q_render(OMacQ* m, uint32_t* argb) { if (m && argb) m->mac.renderScreen(argb); }
+
+OMAC_API size_t omac_q_drain_audio(OMacQ* m, uint8_t* out, size_t cap)
+{
+    if (!m || !out || cap == 0) return 0;
+    m->mac.drainAudio(m->audioBuf);
+    const size_t n = m->audioBuf.size() < cap ? m->audioBuf.size() : cap;
+    if (n) std::memcpy(out, m->audioBuf.data(), n);
+    return n;
+}
+
+OMAC_API void omac_q_mouse(OMacQ* m, int dx, int dy, int button)
+{
+    if (m) m->mac.mouseMove(dx, dy, button != 0);
+}
+
+OMAC_API void omac_q_key(OMacQ* m, int adb_code, int down)
+{
+    if (m) m->mac.keyEvent(static_cast<u8>(adb_code), down != 0);
+}
+
+OMAC_API void omac_q_insert_harddisk(OMacQ* m, const uint8_t* img, size_t len, int ro)
+{
+    if (m && img) m->mac.insertHardDisk(std::vector<u8>(img, img + len), ro != 0);
+}
+
+OMAC_API size_t omac_q_harddisk_data(OMacQ* m, uint8_t* out, size_t cap)
+{
+    if (!m || !m->mac.hardDiskPresent()) return 0;
+    const auto& img = m->mac.hardDiskImage();
+    if (!out) return img.size();
+    if (cap < img.size()) return 0;
+    std::copy(img.begin(), img.end(), out);
+    return img.size();
+}
+
+} // extern "C"

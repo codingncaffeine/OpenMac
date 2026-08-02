@@ -195,6 +195,26 @@ OMAC_API int  omac_net_attached(OMac*);
 OMAC_API int  omac_net_inject(OMac*, const uint8_t* frame, size_t len);
 OMAC_API size_t omac_net_drain(OMac*, uint8_t* out, size_t cap);
 
+/* ---- Quadra 650 (a second machine beside the Classic) ----
+   Additive surface with its own opaque handle: 68040 board, color DAFB
+   video whose geometry follows what the ROM programs (ask, don't assume),
+   EASC audio on the same 8-bit 22.25 kHz drain contract, and a SCSI hard
+   disk that takes the same raw HFS images the Classic does. */
+typedef struct OMacQ OMacQ;
+OMAC_API OMacQ* omac_q_create(const uint8_t* rom, size_t rom_len, uint32_t ram_mb);
+OMAC_API void   omac_q_destroy(OMacQ*);
+OMAC_API void   omac_q_reset(OMacQ*);
+OMAC_API void   omac_q_run_frame(OMacQ*);
+OMAC_API int    omac_q_screen_w(OMacQ*);
+OMAC_API int    omac_q_screen_h(OMacQ*);
+/* Fill argb with omac_q_screen_w * omac_q_screen_h pixels (0xAARRGGBB). */
+OMAC_API void   omac_q_render(OMacQ*, uint32_t* argb);
+OMAC_API size_t omac_q_drain_audio(OMacQ*, uint8_t* out, size_t cap);
+OMAC_API void   omac_q_mouse(OMacQ*, int dx, int dy, int button);
+OMAC_API void   omac_q_key(OMacQ*, int adb_code, int down);
+OMAC_API void   omac_q_insert_harddisk(OMacQ*, const uint8_t* img, size_t len, int read_only);
+OMAC_API size_t omac_q_harddisk_data(OMacQ*, uint8_t* out, size_t cap);
+
 /* Version string for the About box / logs. */
 OMAC_API const char* omac_version(void);
 
