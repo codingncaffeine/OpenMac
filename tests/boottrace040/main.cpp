@@ -147,6 +147,7 @@ int main(int argc, char** argv) {
     int traceTraps = 0;      // log this many A-line traps (with opcodes)
     int trapsAfterCdbs = 0;  // ...once this many SCSI CDBs have run
     const char* findHex = nullptr;  // scan guest RAM for these bytes at exit
+    bool inputTest = false;         // move the mouse + press a key at the end
     unsigned long dumpMem = 0;
     unsigned long breakPc = 0;
     int breakSkip = 0;
@@ -176,6 +177,7 @@ int main(int argc, char** argv) {
             traceTraps = std::atoi(argv[++i]);
         }
         else if (a == "--find" && i + 1 < argc) findHex = argv[++i];
+        else if (a == "--input-test") inputTest = true;
         else if (a == "--break-pc" && i + 1 < argc) breakPc = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--break-skip" && i + 1 < argc) breakSkip = std::atoi(argv[++i]);
         else if (a == "--trace-from" && i + 1 < argc) traceFrom = std::strtoul(argv[++i], nullptr, 16);
@@ -383,6 +385,29 @@ int main(int argc, char** argv) {
                 break;
             }
         }
+    }
+
+    if (inputTest) {
+        // The cursor is drawn at the boot-device wait screen; if the ADB
+        // path works, injected motion moves it and the framebuffer changes.
+        const int w = mac.screenWidth(), h = mac.screenHeight();
+        std::vector<u32> before(static_cast<std::size_t>(w) * h);
+        std::vector<u32> after(before.size());
+        mac.renderScreen(before.data());
+        for (int burst = 0; burst < 12; ++burst) {
+            mac.mouseMove(10, 6, false);
+            for (int f = 0; f < 4; ++f) mac.runFrame();
+        }
+        mac.keyEvent(0x00, true);    // 'A' down
+        for (int f = 0; f < 6; ++f) mac.runFrame();
+        mac.keyEvent(0x00, false);
+        for (int f = 0; f < 20; ++f) mac.runFrame();
+        mac.renderScreen(after.data());
+        std::size_t diff = 0;
+        for (std::size_t i = 0; i < before.size(); ++i)
+            if (before[i] != after[i]) ++diff;
+        std::printf("input test: %zu pixels changed; polls mouse=%u kbd=%u\n",
+                    diff, mac.adbMousePolls(), mac.adbKbdPolls());
     }
 
     if (findHex) {

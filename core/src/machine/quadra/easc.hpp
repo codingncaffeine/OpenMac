@@ -40,6 +40,22 @@ public:
         // opens them only for its interrupt-driven player phase.
         ext_[0x0B] = 1;
         ext_[0x2B] = 1;
+        // CD-XA ADPCM coefficient tables power up with the documented
+        // defaults (four (K1,K0) filter pairs); the chime relies on them.
+        static constexpr u8 kXaDefault[8] = {0x00, 0x00, 0x00, 0x3C,
+                                             0xCC, 0x73, 0xC9, 0x62};
+        for (int i = 0; i < 8; ++i) {
+            ext_[0x10 + i] = kXaDefault[i];
+            ext_[0x30 + i] = kXaDefault[i];
+        }
+        for (int ch = 0; ch < 2; ++ch) {
+            xaParam_[ch] = 0;
+            xaPos_[ch] = 0;
+            xaSubpos_[ch] = 0;
+            xaByte_[ch] = 0;
+            xaS0_[ch] = 0;
+            xaS1_[ch] = 0;
+        }
         // DFAC state survives reset on real hardware only insofar as the
         // chip's own reset line is separate; model the documented power-on
         // default (settings byte 0 = silent).
@@ -141,19 +157,23 @@ public:
     // with the DFAC's output mix bit clear).
     u8 pullSample() {
         const u32 beforeA = fifoLevelA(), beforeB = fifoLevelB();
-        u8 a = 0x80, b = 0x80;
+        int a = 0, b = 0;   // signed 16-bit sample space
         if (mode_ != 1) {
             pop(headA_, tailA_);        // FIFOs drain even while inaudible
             pop(headB_, tailB_);
         } else {
-            a = pop(headA_, tailA_) ? lastA_ : 0x80;
-            b = pop(headB_, tailB_) ? lastB_ : 0x80;
+            a = channelSample(0);
+            b = channelSample(1);
         }
         crossings(beforeA, beforeB);
         if (mode_ != 1) return 0x80;
-        const int mixed = (static_cast<int>(a) + b) / 2;
+        const int mixed = (a + b) / 2;
         const int vol = (volume_ >> 5) & 7;
-        return static_cast<u8>(0x80 + ((mixed - 0x80) * (vol + 1)) / 8);
+        const int scaled = (mixed * (vol + 1)) / 8;
+        int out = 0x80 + (scaled >> 8);
+        if (out < 0) out = 0;
+        if (out > 255) out = 255;
+        return static_cast<u8>(out);
     }
 
     u32 fifoLevelA() const { return (tailA_ - headA_) & (kFifo - 1); }
@@ -187,6 +207,79 @@ private:
         else                  lastB_ = bufB_[head];
         head = (head + 1) & (kFifo - 1);
         return true;
+    }
+
+    // Pop one byte from a channel's FIFO; repeats the last byte when empty
+    // (the decoder keeps its cadence across a momentary underrun).
+    u8 popByte(int ch) {
+        if (ch == 0) { pop(headA_, tailA_); return lastA_; }
+        pop(headB_, tailB_);
+        return lastB_;
+    }
+
+    // One output sample for a channel, honoring the FIFO control's CD-XA
+    // mode bits ($F08/$F28 bits 1-0): 0 = linear signed PCM, 1 = 8-bit
+    // ADPCM, 2 = 4-bit ADPCM (the boot chime), 3 = 2-bit ADPCM. Returns a
+    // signed 16-bit sample.
+    int channelSample(int ch) {
+        const u8 ctrl = ext_[ch ? 0x28 : 0x08];
+        const int mode = ctrl & 3;
+        if (mode == 0) {
+            const bool had = ch == 0 ? pop(headA_, tailA_) : pop(headB_, tailB_);
+            if (!had) return 0;
+            const u8 raw = ch == 0 ? lastA_ : lastB_;
+            return static_cast<int>(static_cast<s8>(raw ^ 0x80)) << 8;
+        }
+        return decodeXa(ch, mode);
+    }
+
+    // CD-XA ADPCM: 28-sample blocks led by a parameter byte (filter in
+    // bits 5:4, right-shift range in bits 3:0), packed 8/4/2-bit residuals,
+    // and a two-tap predictor whose (K1,K0) pairs live in the coefficient
+    // registers ($F10/$F30). K0 scales the previous sample, K1 the one
+    // before it, in 1/64 steps.
+    int decodeXa(int ch, int mode) {
+        if (xaPos_[ch] == 0) {
+            xaParam_[ch] = popByte(ch);
+            xaSubpos_[ch] = 0;
+        }
+        const int base = ch ? 0x30 : 0x10;
+        const int filter = (xaParam_[ch] >> 4) & 3;
+        int shift = xaParam_[ch] & 0xF;
+        if (shift > 12) shift = 12;
+        const int k0 = static_cast<s8>(ext_[base + filter * 2 + 1]);
+        const int k1 = static_cast<s8>(ext_[base + filter * 2]);
+
+        int raw = 0;
+        switch (mode) {
+        case 1:
+            raw = static_cast<s16>(static_cast<u16>(popByte(ch)) << 8);
+            break;
+        case 2:
+            if (xaSubpos_[ch] == 0) {
+                xaByte_[ch] = popByte(ch);
+                raw = static_cast<s16>(static_cast<u16>(xaByte_[ch] & 0xF) << 12);
+                xaSubpos_[ch] = 1;
+            } else {
+                raw = static_cast<s16>(static_cast<u16>((xaByte_[ch] >> 4) & 0xF) << 12);
+                xaSubpos_[ch] = 0;
+            }
+            break;
+        default:   // mode 3
+            if (xaSubpos_[ch] == 0) xaByte_[ch] = popByte(ch);
+            raw = static_cast<s16>(
+                static_cast<u16>((xaByte_[ch] >> (xaSubpos_[ch] * 2)) & 0x3) << 14);
+            xaSubpos_[ch] = (xaSubpos_[ch] + 1) & 3;
+            break;
+        }
+
+        int sample = (raw >> shift) + ((k0 * xaS0_[ch] + k1 * xaS1_[ch] + 32) >> 6);
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        xaS1_[ch] = xaS0_[ch];
+        xaS0_[ch] = sample;
+        if (++xaPos_[ch] >= 28) xaPos_[ch] = 0;
+        return sample;
     }
 
     // Live conditions: bit0/bit2 = the A/B FIFO has room (at or below
@@ -238,6 +331,14 @@ private:
     bool dfacPrevClock_ = false, dfacPrevLatch_ = false;
     u32 pushesA_ = 0, pushesB_ = 0;
     int diagBudget_ = 48;
+
+    // CD-XA decoder state, per channel.
+    u8 xaParam_[2]{};
+    int xaPos_[2]{};
+    int xaSubpos_[2]{};
+    u8 xaByte_[2]{};
+    int xaS0_[2]{};
+    int xaS1_[2]{};
 };
 
 } // namespace openmac

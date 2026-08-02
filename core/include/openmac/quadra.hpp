@@ -67,6 +67,8 @@ public:
     // Input through the ADB modem.
     void mouseMove(int dx, int dy, bool button);
     void keyEvent(u8 adbCode, bool down);
+    u32 adbMousePolls() const;
+    u32 adbKbdPolls() const;
 
     // SCSI media, mirroring the Classic's surface. Images are wrapped in an
     // Apple partition map with a driver the ROM's boot scan can load.

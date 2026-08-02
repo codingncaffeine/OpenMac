@@ -342,6 +342,9 @@ void QuadraMachine::write16(u32 addr, u16 value) {
             scsi_->dma16Write(value);
             return;
         }
+        // (The EASC is an 8-bit device on IOSB's byte-steered lane: a wide
+        // write delivers ONE byte, like every other 8-bit peripheral here.
+        // The ROM's chime player only ever byte-writes the FIFOs anyway.)
         ioWrite8(addr, static_cast<u8>(value >> 8));
         return;
     }
@@ -780,6 +783,9 @@ void QuadraMachine::mouseMove(int dx, int dy, bool button) {
 void QuadraMachine::keyEvent(u8 adbCode, bool down) {
     adb_->injectKey(adbCode, down);
 }
+
+u32 QuadraMachine::adbMousePolls() const { return adb_->mousePolls(); }
+u32 QuadraMachine::adbKbdPolls() const { return adb_->kbdPolls(); }
 
 void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hd_ = std::move(image);
