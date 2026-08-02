@@ -6,6 +6,12 @@
 #include <openmac/hfs.hpp>
 #include <openmac/quadra.hpp>
 
+#include "../../core/src/machine/dc42.hpp"
+#include "../../core/src/machine/macbinary.hpp"
+#include "instacomp.hpp"
+
+#include <algorithm>
+
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -143,6 +149,276 @@ int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb) {
     return 0;
 }
 
+// Load a disk/CD image and peel it down to the HFS volume inside: MacBinary
+// and DiskCopy 4.2 wrappers stripped, then the volume located by its 'BD'
+// signature at a 512-block boundary (a CD's HFS partition sits deep in the
+// image). Returns an empty vector if no volume is found.
+std::vector<u8> loadVolume(const char* path) {
+    auto img = loadFile(path);
+    if (img.empty()) {
+        std::fprintf(stderr, "cannot read %s\n", path);
+        return {};
+    }
+    macbinary::split(img);
+    dc42::split(img);
+    for (std::size_t p = 0; p + 1536 < img.size(); p += 512) {
+        if (img[p + 1024] == 0x42 && img[p + 1025] == 0x44) {   // MDB 'BD'
+            if (p) img.erase(img.begin(), img.begin() + static_cast<std::ptrdiff_t>(p));
+            return img;
+        }
+    }
+    std::fprintf(stderr, "no HFS volume found in %s\n", path);
+    return {};
+}
+
+// --ls: the whole catalog with CNIDs, types and fork sizes, paths composed
+// from the parent chain -- the map a host-side dissection starts from.
+int lsVolume(const char* path) {
+    auto vol = loadVolume(path);
+    if (vol.empty()) return 2;
+    std::vector<hfs::Item> items;
+    if (!hfs::listVolume(vol, items)) {
+        std::fprintf(stderr, "volume does not list\n");
+        return 2;
+    }
+    std::map<u32, const hfs::Item*> byId;
+    for (const auto& it : items) byId[it.id] = &it;
+    auto pathOf = [&](const hfs::Item& it) {
+        std::string s = it.name;
+        for (u32 pa = it.parent; pa != 1;) {
+            auto f = byId.find(pa);
+            if (f == byId.end()) break;
+            s = f->second->name + ":" + s;
+            pa = f->second->parent;
+        }
+        return s;
+    };
+    std::printf("%zu items\n", items.size());
+    for (const auto& it : items) {
+        if (it.isDir) {
+            std::printf("%5u  dir                                   %s\n",
+                        it.id, pathOf(it).c_str());
+            continue;
+        }
+        char ty[5] = {}, cr[5] = {};
+        for (int k = 0; k < 4; ++k) {
+            const char t = static_cast<char>(it.type >> (24 - 8 * k));
+            const char c = static_cast<char>(it.creator >> (24 - 8 * k));
+            ty[k] = (t >= 0x20 && t < 0x7F) ? t : '.';
+            cr[k] = (c >= 0x20 && c < 0x7F) ? c : '.';
+        }
+        std::printf("%5u  %s/%s  d=%9u r=%9u  %s\n", it.id, ty, cr,
+                    it.dataLen, it.rsrcLen, pathOf(it).c_str());
+    }
+    return 0;
+}
+
+// --extract: both forks of one file (by CNID, from --ls) to host files.
+int extractFile(const char* path, u32 cnid, const char* outBase) {
+    auto vol = loadVolume(path);
+    if (vol.empty()) return 2;
+    bool any = false;
+    for (int r = 0; r < 2; ++r) {
+        std::vector<u8> fork;
+        if (!hfs::readFork(vol, cnid, r != 0, fork)) {
+            std::fprintf(stderr, "cannot read %s fork of id %u\n",
+                         r ? "resource" : "data", cnid);
+            continue;
+        }
+        const std::string out = std::string(outBase) + (r ? ".rsrc" : ".data");
+        std::ofstream f(out, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(fork.data()),
+                static_cast<std::streamsize>(fork.size()));
+        std::printf("wrote %s (%zu bytes)\n", out.c_str(), fork.size());
+        any = true;
+    }
+    return any ? 0 : 2;
+}
+
+// ---- resource forks (host-side dissection) -----------------------------
+//
+// A resource fork: 16-byte header (data offset, map offset, lengths), a data
+// section of length-prefixed blobs, and a map holding the type list, per-type
+// reference lists, and a name list. All offsets big-endian; ref-list data
+// offsets are 24-bit, from the data section's start.
+
+u32 rbe32(const std::vector<u8>& v, std::size_t at) {
+    return (static_cast<u32>(v[at]) << 24) | (static_cast<u32>(v[at + 1]) << 16) |
+           (static_cast<u32>(v[at + 2]) << 8) | static_cast<u32>(v[at + 3]);
+}
+u16 rbe16(const std::vector<u8>& v, std::size_t at) {
+    return static_cast<u16>((v[at] << 8) | v[at + 1]);
+}
+
+struct ResEntry {
+    u32 type = 0;
+    s16 id = 0;
+    std::string name;
+    u32 offset = 0;   // into the fork's data section (past the length word)
+    u32 length = 0;
+};
+
+std::string fourccStr(u32 v) {
+    std::string s;
+    for (int k = 0; k < 4; ++k) {
+        const char c = static_cast<char>(v >> (24 - 8 * k));
+        s += (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+    return s;
+}
+
+bool listResources(const std::vector<u8>& fork, std::vector<ResEntry>& out) {
+    if (fork.size() < 16) return false;
+    const u32 dataOff = rbe32(fork, 0), mapOff = rbe32(fork, 4);
+    if (mapOff + 30 > fork.size()) return false;
+    const u16 typeListOff = rbe16(fork, mapOff + 24);
+    const u16 nameListOff = rbe16(fork, mapOff + 26);
+    const std::size_t tl = mapOff + typeListOff;
+    if (tl + 2 > fork.size()) return false;
+    const int nTypes = static_cast<s16>(rbe16(fork, tl)) + 1;
+    for (int t = 0; t < nTypes; ++t) {
+        const std::size_t te = tl + 2 + static_cast<std::size_t>(t) * 8;
+        if (te + 8 > fork.size()) return false;
+        const u32 type = rbe32(fork, te);
+        const int n = rbe16(fork, te + 4) + 1;
+        const u16 refOff = rbe16(fork, te + 6);
+        for (int r = 0; r < n; ++r) {
+            const std::size_t re = tl + refOff + static_cast<std::size_t>(r) * 12;
+            if (re + 12 > fork.size()) return false;
+            ResEntry e;
+            e.type = type;
+            e.id = static_cast<s16>(rbe16(fork, re));
+            const u16 nameOff = rbe16(fork, re + 2);
+            // re+4 is the attribute byte; the 24-bit data offset follows it.
+            const u32 dOff = (static_cast<u32>(fork[re + 5]) << 16) |
+                             (static_cast<u32>(fork[re + 6]) << 8) |
+                             static_cast<u32>(fork[re + 7]);
+            const std::size_t d = dataOff + dOff;
+            if (d + 4 > fork.size()) {
+                std::fprintf(stderr, "  (%s %d: data offset %X out of range)\n",
+                             fourccStr(type).c_str(), e.id, dOff);
+                return false;
+            }
+            e.length = rbe32(fork, d);
+            e.offset = static_cast<u32>(d + 4);
+            if (e.offset + e.length > fork.size()) {
+                std::fprintf(stderr, "  (%s %d: length %u at %zX out of range)\n",
+                             fourccStr(type).c_str(), e.id, e.length,
+                             static_cast<std::size_t>(d));
+                return false;
+            }
+            if (nameOff != 0xFFFF) {
+                const std::size_t nm = mapOff + nameListOff + nameOff;
+                if (nm < fork.size()) {
+                    const unsigned len = fork[nm];
+                    if (nm + 1 + len <= fork.size())
+                        e.name.assign(reinterpret_cast<const char*>(&fork[nm + 1]), len);
+                }
+            }
+            out.push_back(std::move(e));
+        }
+    }
+    return true;
+}
+
+// --rls: list every resource in a raw resource-fork file (from --extract).
+int lsResources(const char* path) {
+    auto fork = loadFile(path);
+    std::vector<ResEntry> res;
+    if (!listResources(fork, res)) {
+        std::fprintf(stderr, "not a resource fork: %s\n", path);
+        return 2;
+    }
+    std::printf("%zu resources\n", res.size());
+    for (const auto& e : res)
+        std::printf("%s %6d  len=%8u  %s\n", fourccStr(e.type).c_str(),
+                    e.id, e.length, e.name.c_str());
+    return 0;
+}
+
+// --rget: dump one resource's bytes to a host file.
+int getResource(const char* path, const char* type, int id, const char* outP) {
+    auto fork = loadFile(path);
+    std::vector<ResEntry> res;
+    if (!listResources(fork, res)) {
+        std::fprintf(stderr, "not a resource fork: %s\n", path);
+        return 2;
+    }
+    u32 ty = 0;
+    for (int k = 0; k < 4 && type[k]; ++k) ty |= static_cast<u32>(static_cast<u8>(type[k])) << (24 - 8 * k);
+    for (const auto& e : res) {
+        if (e.type != ty || e.id != id) continue;
+        std::vector<u8> body(fork.begin() + e.offset, fork.begin() + e.offset + e.length);
+        // Script resources arrive InstaCompOne-packed; the guest runs 'dcmp' 3
+        // on them, so serve the same bytes the Installer would see.
+        if (instacomp::isCompressed(body)) {
+            std::vector<u8> plain;
+            std::string why;
+            if (instacomp::unpack(body, plain, why)) {
+                std::printf("(decompressed %zu -> %zu bytes)\n", body.size(), plain.size());
+                body = std::move(plain);
+            } else {
+                std::fprintf(stderr, "(compressed, not decoded: %s)\n", why.c_str());
+            }
+        }
+        std::ofstream f(outP, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(body.data()),
+                static_cast<std::streamsize>(body.size()));
+        std::printf("wrote %s (%zu bytes) [%s %d \"%s\"]\n", outP, body.size(),
+                    fourccStr(e.type).c_str(), e.id, e.name.c_str());
+        return 0;
+    }
+    std::fprintf(stderr, "no %s %d in %s\n", type, id, path);
+    return 2;
+}
+
+// --tls: list an Installation Tome's directory (data fork of an 'idcp' file).
+// Layout: 'kc' u16 magic, u16 version, then header words; entry count u16 at
+// 0x1A; 128-byte entries from 0x24. Entry: u16 w0, u32 index, PStr name
+// (garbage-padded), then at +0x26 type/creator/crDate/mdDate, u16s at
+// +0x36/+0x38/+0x3A, and at +0x4C the file's total uncompressed size, +0x50
+// the piece's OFFSET in this fork, +0x54 the piece's compressed length, +0x58
+// a checksum. Entry order and piece order are unrelated; bytes not covered by
+// any entry's [offset, offset+len) are reported as gaps.
+int lsTome(const char* path) {
+    auto d = loadFile(path);
+    if (d.size() < 0x24 || d[0] != 0x6B || d[1] != 0x63) {
+        std::fprintf(stderr, "not a tome data fork: %s\n", path);
+        return 2;
+    }
+    const u16 count = rbe16(d, 0x1A);
+    std::printf("tome: %u files, %zu bytes\n", count, d.size());
+    std::vector<std::pair<u32, u32>> spans;   // offset, length
+    for (u16 i = 0; i < count; ++i) {
+        const std::size_t e = 0x24 + static_cast<std::size_t>(i) * 0x80;
+        if (e + 0x80 > d.size()) { std::fprintf(stderr, "truncated directory\n"); return 2; }
+        const u16 w0 = rbe16(d, e);
+        const u32 idx = rbe32(d, e + 2);
+        const unsigned nl = d[e + 6] <= 57 ? d[e + 6] : 57;
+        std::string name(reinterpret_cast<const char*>(&d[e + 7]), nl);
+        const u32 ty = rbe32(d, e + 0x26), cr = rbe32(d, e + 0x2A);
+        const u16 wa = rbe16(d, e + 0x36), wb = rbe16(d, e + 0x38), wc = rbe16(d, e + 0x3A);
+        const u32 total = rbe32(d, e + 0x4C), off = rbe32(d, e + 0x50);
+        const u32 pieceLen = rbe32(d, e + 0x54), w58 = rbe32(d, e + 0x58);
+        std::printf("%3u  w0=%04X idx=%u  %s/%s  w=%04X,%04X,%04X  "
+                    "total=%7u piece=%7u@%-7X x58=%08X  %s\n",
+                    i + 1, w0, idx, fourccStr(ty).c_str(), fourccStr(cr).c_str(),
+                    wa, wb, wc, total, pieceLen, off, w58, name.c_str());
+        spans.emplace_back(off, pieceLen);
+    }
+    std::sort(spans.begin(), spans.end());
+    u32 at = 0x24 + static_cast<u32>(count) * 0x80;
+    for (const auto& [off, len] : spans) {
+        if (off > at) std::printf("  GAP %7u bytes at %X..%X\n", off - at, at, off);
+        if (off < at) std::printf("  OVERLAP at %X (prev ran to %X)\n", off, at);
+        at = off + len;
+    }
+    if (at < d.size())
+        std::printf("  GAP %7zu bytes at %X..end\n", d.size() - at, at);
+    std::printf("coverage checked against %zX\n", d.size());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -152,6 +428,10 @@ int main(int argc, char** argv) {
     int jiggleAt = -1;              // --jiggle-at: click+move the mouse mid-boot
     unsigned long watchMemAt = 0;   // --watch-mem: log writes to this address
     unsigned long countPcAt = 0;    // --count-pc: count executions of this pc
+    // --watch-pc (repeatable): report the registers each time execution reaches
+    // an address. A pointer that is already wrong when a routine is entered was
+    // built somewhere else; this is how that gets settled instead of argued.
+    std::vector<u32> watchPcs;
     std::vector<std::pair<int, int>> clicks;   // --click X Y, in order
     int postFrames = 0;             // --post-frames: run on after the clicks
     bool trapRingOn = false, trapRingArmed = false;   // --trap-ring
@@ -207,6 +487,21 @@ int main(int argc, char** argv) {
             const int mb = std::atoi(argv[++i]);
             return makeBootableHd(srcP, outP, static_cast<u32>(mb));
         }
+        if (a == "--ls" && i + 1 < argc) return lsVolume(argv[++i]);
+        if (a == "--rls" && i + 1 < argc) return lsResources(argv[++i]);
+        if (a == "--rtiers") { instacomp::traceTiers() = true; continue; }
+        if (a == "--tls" && i + 1 < argc) return lsTome(argv[++i]);
+        if (a == "--rget" && i + 4 < argc) {
+            const char* rP = argv[++i];
+            const char* rT = argv[++i];
+            const int rI = std::atoi(argv[++i]);
+            return getResource(rP, rT, rI, argv[++i]);
+        }
+        if (a == "--extract" && i + 3 < argc) {
+            const char* imgP = argv[++i];
+            const u32 cnid = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
+            return extractFile(imgP, cnid, argv[++i]);
+        }
         if (a == "--make-blank" && i + 3 < argc) {
             const char* outP = argv[++i];
             const u32 mb = static_cast<u32>(std::atoi(argv[++i]));
@@ -225,6 +520,8 @@ int main(int argc, char** argv) {
         else if (a == "--jiggle-at" && i + 1 < argc) jiggleAt = std::atoi(argv[++i]);
         else if (a == "--watch-mem" && i + 1 < argc) watchMemAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--watch-pc" && i + 1 < argc)
+            watchPcs.push_back(static_cast<u32>(std::strtoul(argv[++i], nullptr, 16)));
         else if (a == "--post-frames" && i + 1 < argc) postFrames = std::atoi(argv[++i]);
         else if (a == "--trap-ring") trapRingArmed = true;
         else if (a == "--trap-ring-after" && i + 1 < argc) trapRingAfter = std::atoi(argv[++i]);
@@ -566,9 +863,14 @@ int main(int argc, char** argv) {
             static bool trailShown = false;
             if (!trailShown && pc < 0x40000000u && pc >= 0x1000u) {
                 trailShown = true;
+                // A wild jump runs on through the weeds before it faults, so a
+                // short trail is all landing site and no caller. The ring holds
+                // 128; print them all and the road in is at the far end.
                 std::printf("BUSERR trail (newest first):");
-                for (int k = 0; k < 16; ++k)
+                for (int k = 0; k < 128; ++k) {
+                    if (k % 12 == 0) std::printf("\n  ");
                     std::printf(" %08X", mac.cpu().recentPc(k));
+                }
                 std::printf("\n");
                 // The registers name the pointer that was jumped through,
                 // and the caller's code bytes name the instruction.
@@ -582,9 +884,13 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < 16; ++k) {
                     const u32 p = mac.cpu().recentPc(k);
                     if (p < 0x40000000u && p != pc && (p < 0x08000000u || p >= 0x09000000u)) {
-                        std::printf("code at %08X:", p - 16);
-                        for (u32 b = 0; b < 32; ++b)
-                            std::printf(" %02X", mac.read8(p - 16 + b));
+                        // Enough of the routine to find where the pointer it
+                        // jumped through was built, not just the jump itself.
+                        const u32 lo = (p - 0x180) & ~0xFu;
+                        for (u32 b = 0; b < 0x1A0; ++b) {
+                            if (b % 16 == 0) std::printf("\ncode %08X:", lo + b);
+                            std::printf(" %02X", mac.read8(lo + b));
+                        }
                         std::printf("\n");
                         break;
                     }
@@ -917,6 +1223,23 @@ int main(int argc, char** argv) {
                     static_cast<s16>(mac.read16(0x0830)));
     };
     for (const auto& pt : clicks) clickAt(pt.first, pt.second);
+    const u32 ramTop_ = static_cast<u32>(ramMb) * 1024u * 1024u;
+    if (!watchPcs.empty()) {
+        mac.cpu().onStep = [&](u32 pc) {
+            for (u32 w : watchPcs) {
+                if (pc != w) continue;
+                const M68040& c = mac.cpu();
+                std::printf("WATCH %08X f=%u a0=%08X a1=%08X a6=%08X a7=%08X "
+                            "d0=%08X d1=%08X stack:",
+                            pc, static_cast<unsigned>(mac.frameCount()),
+                            c.a[0], c.a[1], c.a[6], c.a[7], c.d[0], c.d[1]);
+                for (u32 k = 0; k < 6; ++k)
+                    std::printf(" %08X",
+                                c.a[7] + 4 * k + 3 < ramTop_ ? mac.read32(c.a[7] + 4 * k) : 0);
+                std::printf("\n");
+            }
+        };
+    }
     // Only record from here on: the boot issues millions of traps and logging
     // them all costs more than the run itself. What matters is the tail.
     for (int f = 0; f < postFrames; ++f) {
