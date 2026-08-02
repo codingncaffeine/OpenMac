@@ -195,10 +195,12 @@ private:
         return stripped < ram_.size() ? stripped : p;
     }
     void serveDiskPrime(int unit);
+    void serveDiskCtlStatus(int unit, bool status);
     void findDiskDriverPrime();
     bool volumeMountedFor(u16 drive);
     bool inDriver_ = false;      // serving a driver request: no nested traps
     u32 diskPrimePc_[2] = {0, 0};   // unit 1 (drive 4) and unit 33 (drive 5)
+    u32 diskCtlPc_[2] = {0, 0}, diskStatusPc_[2] = {0, 0};
 
     std::unique_ptr<SonyDrive> fd_;
     std::vector<u8> floppy_;

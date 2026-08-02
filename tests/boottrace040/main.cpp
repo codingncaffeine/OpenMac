@@ -154,6 +154,10 @@ int main(int argc, char** argv) {
     unsigned long countPcAt = 0;    // --count-pc: count executions of this pc
     std::vector<std::pair<int, int>> clicks;   // --click X Y, in order
     int postFrames = 0;             // --post-frames: run on after the clicks
+    bool trapRingOn = false, trapRingArmed = false;   // --trap-ring (armed after the clicks)
+    struct TrapRec { u16 op; u32 pc, d0, a0; };
+    std::vector<TrapRec> trapRing(256);
+    std::size_t trapRingPos = 0;
     const char* hdPath = nullptr;
     const char* cdPath = nullptr;
     const char* shotPath = nullptr;
@@ -200,6 +204,7 @@ int main(int argc, char** argv) {
         else if (a == "--watch-mem" && i + 1 < argc) watchMemAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--post-frames" && i + 1 < argc) postFrames = std::atoi(argv[++i]);
+        else if (a == "--trap-ring") trapRingArmed = true;
         else if (a == "--click" && i + 2 < argc) {
             const int cx = std::atoi(argv[++i]);
             clicks.emplace_back(cx, std::atoi(argv[++i]));
@@ -256,7 +261,9 @@ int main(int argc, char** argv) {
         if (!showLog && (std::strncmp(m, "SCMD", 4) == 0 || std::strncmp(m, "SREG", 4) == 0 ||
                          std::strncmp(m, "SRD", 3) == 0 || std::strncmp(m, "SEL ", 4) == 0 ||
                          std::strncmp(m, "VIFR", 4) == 0 || std::strncmp(m, "DRQ", 3) == 0 ||
-                         std::strncmp(m, "SDMA", 4) == 0))
+                         std::strncmp(m, "SDMA", 4) == 0 || std::strncmp(m, "SWIM", 4) == 0 ||
+                         std::strncmp(m, "XFER", 4) == 0 || std::strncmp(m, "PRIME", 5) == 0 ||
+                         std::strncmp(m, "EASC", 4) == 0 || std::strncmp(m, "VIA2", 4) == 0))
             return;
         std::printf("%s\n", m);
     };
@@ -270,6 +277,16 @@ int main(int argc, char** argv) {
     std::map<u32, int> busErrSites;
     int excBudget = 60;
     mac.cpu().onException = [&](int vector, u32 pc) {
+        // Keep the tail of the trap stream. When an application gives up with
+        // a message of its own, the call it gave up on is a few entries from
+        // the end -- and the register it passed says which file or volume.
+        if (vector == 10 && trapRingOn) {
+            // A true ring: shifting a vector down by one on every trap costs a
+            // memmove per call, and the guest issues millions of them.
+            const u16 op = static_cast<u16>((mac.read8(pc) << 8) | mac.read8(pc + 1));
+            trapRing[trapRingPos % trapRing.size()] = {op, pc, mac.cpu().d[0], mac.cpu().a[0]};
+            ++trapRingPos;
+        }
         if (vector == 10 && traceTraps > 0 && cdbCount >= trapsAfterCdbs) {
             --traceTraps;
             const u16 op = static_cast<u16>((mac.read8(pc) << 8) | mac.read8(pc + 1));
@@ -584,30 +601,21 @@ int main(int argc, char** argv) {
     // mouse is relative, and the System accelerates larger deltas, so this
     // closes the loop on the low-memory cursor position ($0830 = v,h) with
     // small steps rather than trying to compute one jump.
+    // Put the pointer where we want it by writing the mouse globals the cursor
+    // task reads, rather than nudging it there a few pixels per frame: walking
+    // the cursor across the screen cost thousands of emulated frames per click
+    // and the System's acceleration made it overshoot besides. MTemp, RawMouse
+    // and Mouse all name the same position; CrsrNew asks for a redraw.
     auto moveTo = [&](int tx, int ty) {
-        // Steps stay under the System's acceleration threshold: a bigger delta
-        // is scaled up by the mouse driver, so the cursor overshoots and the
-        // correction overshoots back -- it never settles on the target.
-        for (int iter = 0; iter < 900; ++iter) {
-            const int cy = static_cast<s16>(mac.read16(0x0830));
-            const int cx = static_cast<s16>(mac.read16(0x0832));
-            const int dx = tx - cx, dy = ty - cy;
-            if (dx == 0 && dy == 0) break;
-            const int sx = dx > 3 ? 3 : (dx < -3 ? -3 : dx);
-            const int sy = dy > 3 ? 3 : (dy < -3 ? -3 : dy);
-            mac.mouseMove(sx, sy, false);
-            mac.runFrame();
-        }
+        const u16 x = static_cast<u16>(tx), y = static_cast<u16>(ty);
+        mac.write16(0x0828, y); mac.write16(0x082A, x);   // MTemp
+        mac.write16(0x082C, y); mac.write16(0x082E, x);   // RawMouse
+        mac.write16(0x0830, y); mac.write16(0x0832, x);   // Mouse
+        mac.write8(0x08CE, 0xFF);                         // CrsrNew
+        for (int f = 0; f < 3; ++f) mac.runFrame();
     };
     auto clickAt = [&](int x, int y) {
-        // Settle: motion already handed to the transceiver lands a frame or
-        // two later, so re-aim until the cursor stops where we asked.
-        for (int pass = 0; pass < 6; ++pass) {
-            moveTo(x, y);
-            for (int f = 0; f < 4; ++f) mac.runFrame();
-            if (static_cast<s16>(mac.read16(0x0832)) == x &&
-                static_cast<s16>(mac.read16(0x0830)) == y) break;
-        }
+        moveTo(x, y);
         mac.mouseMove(0, 0, true);
         for (int f = 0; f < 5; ++f) mac.runFrame();
         mac.mouseMove(0, 0, false);
@@ -617,6 +625,9 @@ int main(int argc, char** argv) {
                     static_cast<s16>(mac.read16(0x0830)));
     };
     for (const auto& pt : clicks) clickAt(pt.first, pt.second);
+    // Only record from here on: the boot issues millions of traps and logging
+    // them all costs more than the run itself. What matters is the tail.
+    trapRingOn = trapRingArmed;
     for (int f = 0; f < postFrames; ++f) {
         mac.runFrame();
         if (mac.cpu().halted) { std::printf("HALTED post-click frame %d\n", f); break; }
@@ -628,6 +639,38 @@ int main(int argc, char** argv) {
         u32 vcb = mac.read32(0x0358) & 0x00FFFFFFu;
         std::printf("hd requests served: %u reads, %u writes\n",
                     mac.hdReads(), mac.hdWrites());
+        if (trapRingOn) {
+            auto trapName = [](u16 op) -> const char* {
+                switch (op) {
+                case 0xA000: return "Open";        case 0xA001: return "Close";
+                case 0xA002: return "Read";        case 0xA003: return "Write";
+                case 0xA004: return "Control";     case 0xA005: return "Status";
+                case 0xA007: return "GetVolInfo";  case 0xA008: return "Create";
+                case 0xA009: return "Delete";      case 0xA00A: return "OpenRF";
+                case 0xA00B: return "Rename";      case 0xA00C: return "GetFileInfo";
+                case 0xA00D: return "SetFileInfo"; case 0xA00E: return "UnmountVol";
+                case 0xA00F: return "MountVol";    case 0xA010: return "Allocate";
+                case 0xA011: return "GetEOF";      case 0xA012: return "SetEOF";
+                case 0xA013: return "FlushVol";    case 0xA014: return "GetVol";
+                case 0xA015: return "SetVol";      case 0xA018: return "GetFPos";
+                case 0xA044: return "SetFPos";     case 0xA060: return "FSDispatch/HFS";
+                case 0xA207: return "HGetVInfo";   case 0xA208: return "HCreate";
+                case 0xA260: return "HFSDispatch"; case 0xA9A0: return "GetResource";
+                case 0xA997: return "OpenResFile"; case 0xA998: return "UseResFile";
+                case 0xA9AB: return "AddResource"; case 0xA9B0: return "WriteResource";
+                case 0xA81A: return "ExitToShell(ish)";
+                default: return "";
+                }
+            };
+            const std::size_t have = trapRingPos < trapRing.size() ? trapRingPos : trapRing.size();
+            const std::size_t show = have < 70 ? have : 70;
+            std::printf("-- last %zu of %zu traps --\n", show, trapRingPos);
+            for (std::size_t k = show; k > 0; --k) {
+                const auto& t = trapRing[(trapRingPos - k) % trapRing.size()];
+                std::printf("  %04X %-14s pc=%08X d0=%08X a0=%08X\n",
+                            t.op, trapName(t.op), t.pc, t.d0, t.a0);
+            }
+        }
         std::printf("mounted volumes:");
         for (int n = 0; vcb && n < 8; ++n) {
             char nm[32] = {0};

@@ -1005,6 +1005,8 @@ void QuadraMachine::findDiskDriverPrime() {
             continue;
         const u32 prime = drvr + read16(drvr + 0x0A);
         diskPrimePc_[i] = prime;
+        diskCtlPc_[i] = drvr + read16(drvr + 0x0C);      // drvrCtl
+        diskStatusPc_[i] = drvr + read16(drvr + 0x0E);   // drvrStatus
         if (onDiag) {
             char b[72];
             std::snprintf(b, sizeof b, "hd: driver unit %d Prime at %08X",
@@ -1082,6 +1084,34 @@ void QuadraMachine::serveDiskPrime(int unit) {
     write16(pb + 0x10, static_cast<u16>(result));      // ioResult
     cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
     const u32 target = read32(0x08FC);                 // jIODone
+    cpu_.a[0] = target;
+    cpu_.pc = target;
+}
+
+// The driver's Control and Status entries, answered the way the Classic
+// answers them for its own hard disk. Our on-disk driver stubs both to "no
+// error" without touching the parameter block, so anything that asks the
+// drive about itself -- a format list, a drive size -- reads back whatever
+// was in the block already.
+void QuadraMachine::serveDiskCtlStatus(int unit, bool status) {
+    const u32 pb = guestPtr(cpu_.a[0]);
+    const u16 csCode = read16(pb + 0x1A);
+    std::vector<u8>& img = unit ? hd2_ : hd_;
+    s16 result = 0;
+    if (status) {
+        // csCode 6, the format list: one format covering the whole medium.
+        if (csCode == 6) {
+            write16(pb + 0x1C, 1);
+            write32(pb + 0x1E, static_cast<u32>(img.size() / 512));
+        }
+    } else {
+        // KillIO is the one worth refusing; a fixed disk cannot be ejected and
+        // the rest (verify, format, tag buffer, track cache) are done already.
+        if (csCode == 1) result = -17;              // controlErr
+    }
+    write16(pb + 0x10, static_cast<u16>(result));   // ioResult
+    cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+    const u32 target = read32(0x08FC);              // jIODone
     cpu_.a[0] = target;
     cpu_.pc = target;
 }
@@ -1204,6 +1234,21 @@ int QuadraMachine::stepInstruction() {
         inDriver_ = false;
         tickDevices(40);
         return 40;
+    }
+    for (int u = 0; u < 2; ++u) {
+        if ((diskCtlPc_[u] && cpu_.pc == diskCtlPc_[u]) ||
+            (diskStatusPc_[u] && cpu_.pc == diskStatusPc_[u])) {
+            const bool isStatus = diskStatusPc_[u] && cpu_.pc == diskStatusPc_[u];
+            inDriver_ = true;
+            try { serveDiskCtlStatus(u, isStatus); } catch (const BusFault&) {
+                cpu_.d[0] = static_cast<u32>(-36);
+                cpu_.pc = read32(0x08FC);
+                cpu_.a[0] = cpu_.pc;
+            }
+            inDriver_ = false;
+            tickDevices(40);
+            return 40;
+        }
     }
     if (cpu_.pc == kSonyPrime || cpu_.pc == kSonyPrimeAlias) {
         try {
