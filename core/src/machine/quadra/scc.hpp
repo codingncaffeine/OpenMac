@@ -142,6 +142,19 @@ public:
         tickChan(ch_[1], cycles);
     }
 
+    // Read-only snapshot. Not via read(): that advances the register pointer.
+    void debugState(char* out, std::size_t cap) const {
+        std::snprintf(out, cap,
+                      "ptr=%d wr9=%02X irq=%d | B: rr0=%02X txEmpty=%d "
+                      "underrun=%d armed=%d ip(e/t/r)=%d%d%d sent=%u | "
+                      "A: rr0=%02X sent=%u",
+                      ptr_, wr9_, irqAsserted() ? 1 : 0, rr0(ch_[0]),
+                      ch_[0].txEmpty ? 1 : 0, ch_[0].underrun ? 1 : 0,
+                      ch_[0].underrunArmed ? 1 : 0, ch_[0].extIp ? 1 : 0,
+                      ch_[0].txIp ? 1 : 0, ch_[0].rxIp ? 1 : 0,
+                      ch_[0].bytesSent, rr0(ch_[1]), ch_[1].bytesSent);
+    }
+
     bool irqAsserted() const {
         if (!(wr9_ & 0x08)) return false;  // master interrupt enable
         for (const Chan& c : ch_)

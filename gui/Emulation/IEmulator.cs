@@ -109,6 +109,10 @@ public interface IEmulator : IDisposable
     bool CdPresent { get; }
     string CdMediumNote();
 
+    // A text snapshot of the machine for a bug report: CPU, recent PCs, low
+    // memory and every device. Empty string when the backend has none.
+    string DiagnosticReport();
+
     void MouseMove(int dx, int dy, bool button);
     void MouseButton(bool down);
     void KeyEvent(int adbCode, bool down);

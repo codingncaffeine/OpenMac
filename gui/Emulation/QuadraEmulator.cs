@@ -253,6 +253,16 @@ public sealed class QuadraEmulator : IEmulator
         "The SCSI CD-ROM takes a raw ISO or Apple-partitioned disc image. The 7.1 install CD is "
         + "readable, but the ROM does not auto-boot a CD — boot a floppy, then mount the disc.";
 
+    public string DiagnosticReport()
+    {
+        if (_h == IntPtr.Zero) return "";
+        nuint size = Native.omac_q_diagnostics(_h, null, 0);
+        if (size == 0) return "";
+        var buf = new byte[size];
+        nuint n = Native.omac_q_diagnostics(_h, buf, size);
+        return System.Text.Encoding.ASCII.GetString(buf, 0, (int)n);
+    }
+
     // ---- hard disk ----
     public void AttachHardDisk(string path)
     {

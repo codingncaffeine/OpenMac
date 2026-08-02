@@ -191,6 +191,22 @@ public:
     std::function<void(bool level)> onIrq;
     std::function<void(const char* msg)> onDiag;
 
+    // Read-only snapshot for a diagnostic capture. Deliberately does NOT go
+    // through read(): reading $804 clears the latch and drops the interrupt
+    // line, so an observer that used it would change the thing it reports.
+    void debugState(char* out, std::size_t cap) const {
+        std::snprintf(out, cap,
+                      "mode=%02X vol=%02X irqStatus=%02X line=%d "
+                      "enA=%02X(%s) enB=%02X(%s) ctrlA=%02X ctrlB=%02X "
+                      "fifoA=%u fifoB=%u pushedA=%u pushedB=%u",
+                      mode_, volume_, irqStatus_, linePending_ ? 1 : 0,
+                      ext_[0x09], (ext_[0x09] & 1) ? "off" : "ON",
+                      ext_[0x29], (ext_[0x29] & 1) ? "off" : "ON",
+                      ext_[0x08], ext_[0x28],
+                      static_cast<unsigned>(fifoLevelA()),
+                      static_cast<unsigned>(fifoLevelB()), pushesA_, pushesB_);
+    }
+
 private:
     static constexpr u32 kFifo = 1024;
 

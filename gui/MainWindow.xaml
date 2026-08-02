@@ -100,6 +100,9 @@
                 <MenuItem Header="Debugger…" Click="Debugger_Click" />
             </MenuItem>
             <MenuItem Header="_Help">
+                <MenuItem Header="Capture Diagnostics…" Click="CaptureDiagnostics_Click"
+                          ToolTip="Save a snapshot of what the machine is doing — take it while it is misbehaving." />
+                <Separator />
                 <MenuItem Header="About OpenMac" Click="About_Click" />
             </MenuItem>
         </Menu>

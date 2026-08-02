@@ -472,6 +472,7 @@ int main(int argc, char** argv) {
     std::vector<TrapRec> trapRing(512);
     std::size_t trapRingPos = 0;
     bool askGestalt = false;        // --gestalt: query the guest at exit
+    bool showDiag = false;          // --diag: print the machine snapshot at exit
     const char* trapLogPath = nullptr;   // --trap-log: every ringed trap, to a file
     std::ofstream trapLog;
     int shotEvery = 0;              // --shot-every: screen strip during post-frames
@@ -624,6 +625,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--find" && i + 1 < argc) findHex = argv[++i];
         else if (a == "--gestalt") askGestalt = true;
+        else if (a == "--diag") showDiag = true;
         else if (a == "--trap-log" && i + 1 < argc) trapLogPath = argv[++i];
         else if (a == "--shot-every" && i + 1 < argc) shotEvery = std::atoi(argv[++i]);
         else if (a == "--floppy-next" && i + 1 < argc) floppyQueue.push_back(argv[++i]);
@@ -1597,6 +1599,8 @@ int main(int argc, char** argv) {
         writeBmp(shotPath, px, w, h);
         std::printf("screen dumped: %s\n", shotPath);
     }
+    if (showDiag) std::printf("\n%s\n", mac.diagnosticReport().c_str());
+
     if (saveHdPath) {
         // Everything the guest wrote, so the result of an install can be
         // rebooted or inspected.

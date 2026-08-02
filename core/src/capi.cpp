@@ -578,6 +578,17 @@ OMAC_API size_t omac_q_harddisk_data(OMacQ* m, uint8_t* out, size_t cap)
     return img.size();
 }
 
+OMAC_API size_t omac_q_diagnostics(OMacQ* m, char* out, size_t cap)
+{
+    if (!m) return 0;
+    const std::string s = m->mac.diagnosticReport();
+    if (!out || cap == 0) return s.size() + 1;
+    const size_t n = s.size() < cap - 1 ? s.size() : cap - 1;
+    std::copy(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n), out);
+    out[n] = '\0';
+    return n;
+}
+
 OMAC_API int omac_q_insert_floppy(OMacQ* m, const uint8_t* img, size_t len, int ro)
 {
     if (!m || !img) return 0;

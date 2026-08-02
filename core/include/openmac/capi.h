@@ -214,6 +214,11 @@ OMAC_API void   omac_q_mouse(OMacQ*, int dx, int dy, int button);
 OMAC_API void   omac_q_key(OMacQ*, int adb_code, int down);
 OMAC_API void   omac_q_insert_harddisk(OMacQ*, const uint8_t* img, size_t len, int read_only);
 OMAC_API size_t omac_q_harddisk_data(OMacQ*, uint8_t* out, size_t cap);
+
+/* A text snapshot of CPU, low memory and every device, for capturing what a
+   wedged guest was doing. Pass out=NULL to learn the size needed. Reads model
+   state only, so taking it cannot disturb the machine. */
+OMAC_API size_t omac_q_diagnostics(OMacQ*, char* out, size_t cap);
 /* Floppy in the internal SuperDrive. Raw 400K/800K/1.44MB dumps and DiskCopy
    4.2 / MacBinary wrappers all mount; returns 1 if the drive took the disk,
    0 if the file is not floppy media. omac_q_floppy_data copies the medium out

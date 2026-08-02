@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -1075,6 +1076,86 @@ public partial class MainWindow : Window
             "OpenMac\nA from-scratch Macintosh Classic emulator.\n\n"
             + "Custom 68000 core, VIA 6522 / RTC / ADB / IWM, and a high-level .Sony disk driver.",
             "About OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+
+    // Capture what the machine is doing right now, next to the app log. Taken
+    // while the guest is misbehaving this is the whole picture: where the CPU
+    // is looping, and which device it is waiting on. It reads model state
+    // only, so it is safe at any moment -- including while the guest is
+    // wedged, which is exactly when it is wanted.
+    private void CaptureDiagnostics_Click(object sender, RoutedEventArgs e)
+    {
+        string report;
+        try { report = _emulator.DiagnosticReport(); }
+        catch (Exception ex) { report = "diagnostic capture failed: " + ex; }
+
+        if (string.IsNullOrEmpty(report))
+        {
+            MessageBox.Show(this,
+                _emulator.IsRomLoaded
+                    ? "This machine does not provide a diagnostic snapshot yet."
+                    : "Load a ROM first — there is no machine to report on.",
+                "Capture Diagnostics", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        string dir = System.IO.Path.GetDirectoryName(Log.Path)!;
+        string file = System.IO.Path.Combine(
+            dir, "openmac-diagnostics-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt");
+        try
+        {
+            Directory.CreateDirectory(dir);
+            // The log rides along: the snapshot says what the machine is
+            // doing, the log says how it got there.
+            var text = new StringBuilder();
+            text.AppendLine(report);
+            text.AppendLine();
+            text.AppendLine("---- app log (tail) ----");
+            text.AppendLine(ReadLogTail(200));
+            File.WriteAllText(file, text.ToString());
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Could not write the report:\n" + ex.Message,
+                "Capture Diagnostics", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        Log.Line("diagnostics captured: " + file);
+        if (MessageBox.Show(this, "Saved:\n" + file + "\n\nShow it in Explorer?",
+                "Capture Diagnostics", MessageBoxButton.YesNo,
+                MessageBoxImage.Information) == MessageBoxResult.Yes)
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(
+                    new System.Diagnostics.ProcessStartInfo(
+                        "explorer.exe", "/select,\"" + file + "\"")
+                    { UseShellExecute = true });
+            }
+            catch (Exception ex) { Log.Line("open diagnostics folder failed: " + ex.Message); }
+        }
+    }
+
+    private static string ReadLogTail(int lines)
+    {
+        try
+        {
+            if (!File.Exists(Log.Path)) return "(no log)";
+            // Share the handle -- the logger keeps the file open.
+            using var fs = new FileStream(Log.Path, FileMode.Open, FileAccess.Read,
+                                          FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            var tail = new Queue<string>(lines);
+            string? line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (tail.Count == lines) tail.Dequeue();
+                tail.Enqueue(line);
+            }
+            return string.Join(Environment.NewLine, tail);
+        }
+        catch (Exception ex) { return "(log unavailable: " + ex.Message + ")"; }
+    }
 
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();
 

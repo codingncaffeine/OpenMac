@@ -76,6 +76,10 @@ public:
     u32 hdWrites() const { return hdWriteCount_; }
     u32 fdReads() const { return fdReadCount_; }
     u32 fdWrites() const { return fdWriteCount_; }
+    // A text snapshot of CPU, low memory and every device -- what to capture
+    // when the guest stops responding. Reads model state only, so taking it
+    // cannot perturb the machine.
+    std::string diagnosticReport() const;
     u32 adbMouseBytesRead() const; // mouse bytes the guest actually clocked in
     std::vector<u8> adbMouseBytesLog() const;
     void adbClearCmdTrace();

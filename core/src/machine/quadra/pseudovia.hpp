@@ -110,6 +110,15 @@ public:
     std::function<void(const char* msg)> onDiag;
     void rearmDiag(int reads, int edges) { rdBudget_ = reads; drqDiagBudget_ = edges; }
 
+    // Read-only views for a diagnostic snapshot. A guest IFR read is
+    // side-effect free here, but going through read() would still route via
+    // the port-A input callback, so expose the latches directly instead.
+    u8 peekIfr() const {
+        return static_cast<u8>(ifr_ | (scsiDrqPrev_ ? 0x01 : 0) |
+                               (scsiIrqPrev_ ? 0x08 : 0));
+    }
+    u8 peekIer() const { return ier_; }
+
 private:
     int rdBudget_ = 0;
     int drqDiagBudget_ = 0;

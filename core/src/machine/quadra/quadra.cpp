@@ -16,7 +16,9 @@
 #include "pseudovia.hpp"
 #include "scc.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <map>
 
 // Machine wiring and address decode per the Quadra 650 hardware dossier:
 // djMEMC owns the map (RAM, ROM alias/overlay, DAFB), IOSB's I/O window is
@@ -254,6 +256,85 @@ void QuadraMachine::reset() {
     vblAcc_ = 0;
     bootTraceFrame_ = 0;
     cpu_.reset();
+}
+
+// A snapshot of everything that has ever mattered when this machine stopped
+// responding. Every value is read from model state, never through a device
+// read() -- several of those clear latches or advance a register pointer, and
+// an observer that changes the machine invents its own bugs.
+//
+// The question a hang always comes down to is "what is the stopped thread
+// waiting for", so the report leads with the CPU's recent-PC ring: a thread
+// spinning on a status bit shows up as a handful of addresses repeating, and
+// the device blocks below say what those addresses are polling.
+std::string QuadraMachine::diagnosticReport() const {
+    std::string s;
+    char b[512];
+    auto add = [&](const char* fmt, auto... args) {
+        std::snprintf(b, sizeof b, fmt, args...);
+        s += b;
+        s += '\n';
+    };
+
+    const M68040& c = cpu_;
+    add("OpenMac Quadra 650 diagnostic snapshot");
+    add("frame %llu  cycles %llu  ram %u MB",
+        static_cast<unsigned long long>(frameCounter_),
+        static_cast<unsigned long long>(totalCycles_),
+        static_cast<unsigned>(ram_.size() / (1024 * 1024)));
+    add("pc=%08X sr=%04X (%s, IPL %d)%s", c.pc, c.getSR(),
+        (c.getSR() & 0x2000) ? "supervisor" : "USER",
+        (c.getSR() >> 8) & 7, c.halted ? "  *** HALTED ***" : "");
+    add("d0-7 %08X %08X %08X %08X %08X %08X %08X %08X", c.d[0], c.d[1], c.d[2],
+        c.d[3], c.d[4], c.d[5], c.d[6], c.d[7]);
+    add("a0-7 %08X %08X %08X %08X %08X %08X %08X %08X", c.a[0], c.a[1], c.a[2],
+        c.a[3], c.a[4], c.a[5], c.a[6], c.a[7]);
+
+    // The PC ring, and then the same addresses counted. A tight wait loop is
+    // a few PCs with high counts; a healthy machine is 128 different ones.
+    s += "\nrecent PCs (newest first)\n";
+    for (int i = 0; i < 128; ++i) {
+        std::snprintf(b, sizeof b, "%08X%s", c.recentPc(i),
+                      (i % 8 == 7) ? "\n" : " ");
+        s += b;
+    }
+    std::map<u32, int> hot;
+    for (int i = 0; i < 128; ++i) ++hot[c.recentPc(i)];
+    std::vector<std::pair<int, u32>> byCount;
+    for (const auto& [pc, n] : hot) byCount.emplace_back(n, pc);
+    std::sort(byCount.rbegin(), byCount.rend());
+    add("\n%zu distinct addresses in the last 128 instructions%s", hot.size(),
+        hot.size() <= 8 ? "  <-- looks like a wait loop" : "");
+    for (std::size_t i = 0; i < byCount.size() && i < 6; ++i)
+        add("   %08X  x%d", byCount[i].second, byCount[i].first);
+
+    s += "\nlow memory\n";
+    auto peek16 = [&](u32 a) { return const_cast<QuadraMachine*>(this)->read16(a); };
+    auto peek32 = [&](u32 a) { return const_cast<QuadraMachine*>(this)->read32(a); };
+    add("   Ticks $016A = %u", peek32(0x016A));
+    add("   MemErr $0220 = %d   FSBusy $0360 = %04X",
+        static_cast<s16>(peek16(0x0220)), peek16(0x0360));
+    add("   VCBQHdr $0358 = %08X   DrvQHdr $0308 = %08X",
+        peek32(0x0358), peek32(0x0308));
+    add("   Mouse $0830 = %d,%d   SCCRd $01D8 = %08X",
+        static_cast<s16>(peek16(0x0832)), static_cast<s16>(peek16(0x0830)),
+        peek32(0x01D8));
+
+    s += "\ndevices\n";
+    add("   VIA1  ifr=%02X ier=%02X irq=%d", via1_->ifr(), via1_->ier(),
+        via1_->irqAsserted() ? 1 : 0);
+    add("   VIA2  ifr=%02X ier=%02X irq=%d", via2_->peekIfr(), via2_->peekIer(),
+        via2_->irqAsserted() ? 1 : 0);
+    // A separate buffer: `add` formats into `b`, and formatting a buffer into
+    // itself is undefined -- it truncated these lines mid-word.
+    char dev[512];
+    scc_->debugState(dev, sizeof dev);
+    add("   SCC   %s", dev);
+    easc_->debugState(dev, sizeof dev);
+    add("   EASC  %s", dev);
+    add("   disk  %u reads, %u writes served; floppy %u/%u",
+        hdReadCount_, hdWriteCount_, fdReadCount_, fdWriteCount_);
+    return s;
 }
 
 void QuadraMachine::updateIpl() {

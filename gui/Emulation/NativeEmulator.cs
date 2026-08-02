@@ -624,6 +624,10 @@ public sealed class NativeEmulator : IEmulator
         }
     }
 
+    // The Classic backend has its own monitor views rather than one snapshot;
+    // the capture menu item is a Quadra facility for now.
+    public string DiagnosticReport() => "";
+
     public string CdMediumNote()
     {
         lock (_sync)

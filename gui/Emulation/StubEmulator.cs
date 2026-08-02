@@ -127,6 +127,7 @@ public sealed class StubEmulator : IEmulator
     public void EjectCd() => CdPath = null;
     public bool CdPresent => CdPath is not null;
     public string CdMediumNote() => "";
+    public string DiagnosticReport() => "";
 
     public void MouseMove(int dx, int dy, bool button) { }
     public void MouseButton(bool down) { }
