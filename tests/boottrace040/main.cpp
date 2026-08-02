@@ -296,6 +296,9 @@ int main(int argc, char** argv) {
         case 0xA81B: return "HCreateResFile";
         case 0xA81C: return "Count1Types";
         case 0xA81F: return "Get1Resource";
+        case 0xA822: return "ReadPartialRes";
+        case 0xA823: return "WritePartialRes";
+        case 0xA824: return "SetResourceSize";
         case 0xA9C4: return "OpenRFPerm";
         case 0xA997: return "OpenResFile"; case 0xA998: return "UseResFile";
         case 0xA999: return "UpdateResFile";
@@ -421,6 +424,7 @@ int main(int argc, char** argv) {
                                  ((op >= 0xA997 && op <= 0xA9B1) ||
                                   (op >= 0xA80C && op <= 0xA810) ||
                                   (op >= 0xA81A && op <= 0xA81C) ||
+                                  (op >= 0xA822 && op <= 0xA824) ||
                                   op == 0xA81F || op == 0xA9C4);
             const bool gesTrap = op == 0xA1AD;    // selector rides in D0
             const bool scsiTrap = op == 0xA815;   // selector rides on the stack
@@ -531,12 +535,58 @@ int main(int argc, char** argv) {
                         mac.cpu().a[0], mac.cpu().d[0]);
         }
         // A-line/F-line/TRAP are routine; bus errors are aggregated (the
-        // ROM's presence probes take them on purpose).
+        // ROM's presence probes take them on purpose). Late F-lines are the
+        // exception: an unimplemented FPU op punting to the ROM's support
+        // package is exactly the kind of rare event a crash hides behind.
+        if (vector == 11 && mac.frameCount() > 8000) {
+            static int flineBudget = 24;
+            if (flineBudget > 0) {
+                --flineBudget;
+                std::printf("FLINE pc=%08X op=%04X%04X f=%u\n", pc,
+                            pc + 3 < 0x40000000u || pc >= 0x40800000u
+                                ? mac.read16(pc) : 0,
+                            pc + 3 < 0x40000000u || pc >= 0x40800000u
+                                ? mac.read16(pc + 2) : 0,
+                            static_cast<unsigned>(mac.frameCount()));
+            }
+        }
         if (vector == 10 || vector == 11 || (vector >= 32 && vector < 48)) return;
         if (vector == 2) {
             ++busErrSites[pc];
             if (busErrSites[pc] <= 2)
-                std::printf("BUSERR pc=%08X addr=%08X\n", pc, mac.cpu().lastFaultAddr);
+                std::printf("BUSERR pc=%08X addr=%08X f=%u\n", pc,
+                            mac.cpu().lastFaultAddr,
+                            static_cast<unsigned>(mac.frameCount()));
+            // The first fault from RAM code (not the ROM's deliberate sizing
+            // probes) gets its recent-PC trail: the jump that landed in the
+            // weeds is a few entries back, and the trail names the caller.
+            static bool trailShown = false;
+            if (!trailShown && pc < 0x40000000u && pc >= 0x1000u) {
+                trailShown = true;
+                std::printf("BUSERR trail (newest first):");
+                for (int k = 0; k < 16; ++k)
+                    std::printf(" %08X", mac.cpu().recentPc(k));
+                std::printf("\n");
+                // The registers name the pointer that was jumped through,
+                // and the caller's code bytes name the instruction.
+                const M68040& cc = mac.cpu();
+                std::printf("at fault:");
+                for (int k = 0; k < 8; ++k) std::printf(" d%d=%08X", k, cc.d[k]);
+                std::printf("\n         ");
+                for (int k = 0; k < 8; ++k) std::printf(" a%d=%08X", k, cc.a[k]);
+                std::printf("\n");
+                // The most recent RAM pc below the weeds is the jump site.
+                for (int k = 0; k < 16; ++k) {
+                    const u32 p = mac.cpu().recentPc(k);
+                    if (p < 0x40000000u && p != pc && (p < 0x08000000u || p >= 0x09000000u)) {
+                        std::printf("code at %08X:", p - 16);
+                        for (u32 b = 0; b < 32; ++b)
+                            std::printf(" %02X", mac.read8(p - 16 + b));
+                        std::printf("\n");
+                        break;
+                    }
+                }
+            }
             return;
         }
         if (excBudget > 0) {

@@ -162,12 +162,20 @@ bool listVolume(const std::vector<u8>& img, std::vector<Item>& items) {
     std::vector<Item> out;
     const bool ok = walkLeaves(img, g, cat, [&](const u8* rec, u16 len) {
         const u8 keyLen = rec[0];
-        if (keyLen < 6 || u16(1 + keyLen) + 2 > len) return;
+        // The record data starts word-aligned after the key. Apple's own
+        // volumes keep the pad byte OUTSIDE ckrKeyLen (a key over an
+        // even-length name is even, and a pad follows), while our builder
+        // folds it in; rounding 1+keyLen up to even reads both. Taking
+        // 1+keyLen literally made every even-length name on real media --
+        // "System", "Finder" -- parse its pad byte as a record type of 0
+        // and vanish from the listing.
+        const u16 dataOff = u16((1 + keyLen + 1) & ~1);
+        if (keyLen < 6 || dataOff + 2 > len) return;
         const u32 parId = rd32(rec + 2);
         const u8 nameLen = rec[6];
         if (nameLen > 31 || 7 + nameLen > 1 + keyLen) return;
-        const u8* d = rec + 1 + keyLen;
-        const u16 dataLen = u16(len - (1 + keyLen));
+        const u8* d = rec + dataOff;
+        const u16 dataLen = u16(len - dataOff);
         Item it;
         it.parent = parId;
         it.name.assign(reinterpret_cast<const char*>(rec + 7), nameLen);
@@ -212,8 +220,10 @@ bool readFork(const std::vector<u8>& img, u32 fileId, bool rsrc, std::vector<u8>
     walkLeaves(img, g, cat, [&](const u8* rec, u16 len) {
         if (found) return;
         const u8 keyLen = rec[0];
-        if (keyLen < 6 || u16(1 + keyLen) + 102 > len) return;
-        const u8* d = rec + 1 + keyLen;
+        // Word-aligned record data; see listVolume.
+        const u16 dataOff = u16((1 + keyLen + 1) & ~1);
+        if (keyLen < 6 || dataOff + 102 > len) return;
+        const u8* d = rec + dataOff;
         if (d[0] != 2 || rd32(d + 20) != fileId) return;
         found = true;
         if (!rsrc) {
