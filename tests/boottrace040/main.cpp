@@ -141,6 +141,7 @@ int main(int argc, char** argv) {
     int jiggleAt = -1;              // --jiggle-at: click+move the mouse mid-boot
     unsigned long watchMemAt = 0;   // --watch-mem: log writes to this address
     unsigned long countPcAt = 0;    // --count-pc: count executions of this pc
+    std::vector<std::pair<int, int>> clicks;   // --click X Y, in order
     const char* hdPath = nullptr;
     const char* cdPath = nullptr;
     const char* shotPath = nullptr;
@@ -186,6 +187,10 @@ int main(int argc, char** argv) {
         else if (a == "--jiggle-at" && i + 1 < argc) jiggleAt = std::atoi(argv[++i]);
         else if (a == "--watch-mem" && i + 1 < argc) watchMemAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--click" && i + 2 < argc) {
+            const int cx = std::atoi(argv[++i]);
+            clicks.emplace_back(cx, std::atoi(argv[++i]));
+        }
         else if (a == "--harddisk" && i + 1 < argc) hdPath = argv[++i];
         else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
         else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
@@ -560,6 +565,60 @@ int main(int argc, char** argv) {
         if (countPcAt)
             std::printf("count-pc %08lX: executed %u times during the test\n",
                         countPcAt, mac.countPcHits());
+    }
+
+    // Drive the guest's pointer to a screen position and click there. The
+    // mouse is relative, and the System accelerates larger deltas, so this
+    // closes the loop on the low-memory cursor position ($0830 = v,h) with
+    // small steps rather than trying to compute one jump.
+    auto moveTo = [&](int tx, int ty) {
+        // Steps stay under the System's acceleration threshold: a bigger delta
+        // is scaled up by the mouse driver, so the cursor overshoots and the
+        // correction overshoots back -- it never settles on the target.
+        for (int iter = 0; iter < 900; ++iter) {
+            const int cy = static_cast<s16>(mac.read16(0x0830));
+            const int cx = static_cast<s16>(mac.read16(0x0832));
+            const int dx = tx - cx, dy = ty - cy;
+            if (dx == 0 && dy == 0) break;
+            const int sx = dx > 3 ? 3 : (dx < -3 ? -3 : dx);
+            const int sy = dy > 3 ? 3 : (dy < -3 ? -3 : dy);
+            mac.mouseMove(sx, sy, false);
+            mac.runFrame();
+        }
+    };
+    auto clickAt = [&](int x, int y) {
+        // Settle: motion already handed to the transceiver lands a frame or
+        // two later, so re-aim until the cursor stops where we asked.
+        for (int pass = 0; pass < 6; ++pass) {
+            moveTo(x, y);
+            for (int f = 0; f < 4; ++f) mac.runFrame();
+            if (static_cast<s16>(mac.read16(0x0832)) == x &&
+                static_cast<s16>(mac.read16(0x0830)) == y) break;
+        }
+        mac.mouseMove(0, 0, true);
+        for (int f = 0; f < 5; ++f) mac.runFrame();
+        mac.mouseMove(0, 0, false);
+        for (int f = 0; f < 30; ++f) mac.runFrame();
+        std::printf("clicked at %d,%d (cursor now %d,%d)\n", x, y,
+                    static_cast<s16>(mac.read16(0x0832)),
+                    static_cast<s16>(mac.read16(0x0830)));
+    };
+    for (const auto& pt : clicks) clickAt(pt.first, pt.second);
+
+    {
+        // Which volumes does the System actually have on line? The volume name
+        // (Str27) sits at vcbVN +44 and the drive number at vcbDrvNum +72.
+        u32 vcb = mac.read32(0x0358) & 0x00FFFFFFu;
+        std::printf("mounted volumes:");
+        for (int n = 0; vcb && n < 8; ++n) {
+            char nm[32] = {0};
+            const int len = mac.read8(vcb + 44);
+            for (int k = 0; k < len && k < 27; ++k)
+                nm[k] = static_cast<char>(mac.read8(vcb + 45 + static_cast<u32>(k)));
+            std::printf(" [drive %d \"%s\"]", static_cast<s16>(mac.read16(vcb + 72)), nm);
+            vcb = mac.read32(vcb) & 0x00FFFFFFu;
+        }
+        std::printf("\n");
     }
 
     if (findHex) {

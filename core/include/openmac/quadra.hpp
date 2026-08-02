@@ -182,6 +182,8 @@ private:
     // The on-disk SCSI driver's Prime, served in C++ (see the definition).
     void serveDiskPrime(int unit);
     void findDiskDriverPrime();
+    bool volumeMountedFor(u16 drive);
+    bool inDriver_ = false;      // serving a driver request: no nested traps
     u32 diskPrimePc_[2] = {0, 0};   // unit 1 (drive 4) and unit 33 (drive 5)
 
     std::unique_ptr<SonyDrive> fd_;
@@ -245,6 +247,8 @@ private:
     bool hdAnnouncePending_ = false, hd2AnnouncePending_ = false;
     int  hdAnnounceDelay_ = 0;
     bool announceInFlight_ = false;
+    u32  hdMountPb_ = 0;        // System-heap param block for the _MountVol retries
+    int  hdMountTries_ = 0;
     int scsiDiagBudget_ = 60;   // trace the first 53C96 register accesses
     int iplDiagBudget_ = 12;    // trace the first level-2 interrupt assertions
     int via2DiagBudget_ = 24;   // trace the first VIA2 IFR/IER writes

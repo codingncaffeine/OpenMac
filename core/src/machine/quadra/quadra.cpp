@@ -839,7 +839,6 @@ void QuadraMachine::tickDevices(int cpuCycles) {
         rtc_->tickSecond();
         via1_->setCA2(true);
         ca2PulseSlices_ = 2;
-        if (!hd_.empty() || !hd2_.empty()) findDiskDriverPrime();
         announceHardDisks();
     }
     // The whole machine cadence rides device time so that frame-driven and
@@ -861,6 +860,12 @@ void QuadraMachine::tickDevices(int cpuCycles) {
         if (++sliceInFrame_ >= kSlicesPerFrame) {
             sliceInFrame_ = 0;
             ++frameCounter_;
+            // Claim the disk driver's Prime as soon as the ROM's boot scan has
+            // installed it -- BEFORE the System's startup mount runs. Hooked
+            // late, that mount goes through the SCSI Manager's discard drain,
+            // fails, and the volume is written off for the rest of the session.
+            if ((!hd_.empty() && !diskPrimePc_[0]) || (!hd2_.empty() && !diskPrimePc_[1]))
+                findDiskDriverPrime();
             // DAFB VBL at ~66.67 Hz against the 60.15 Hz tick frame.
             vblAcc_ += 6667;
             dafb_->vblank();
@@ -947,6 +952,18 @@ void QuadraMachine::servePrime() {
     const u32 target = read32(0x08FC);
     cpu_.a[0] = target;
     cpu_.pc = target;
+}
+
+// Is a volume already on line for this drive? Walk the VCB queue ($0356 is the
+// header, qHead at $0358); each VCB carries its drive number at vcbDrvNum
+// (+$6E). This is how we tell "the System mounted it itself" from "nobody has".
+bool QuadraMachine::volumeMountedFor(u16 drive) {
+    u32 vcb = read32(0x0358) & 0x00FFFFFFu;
+    for (int n = 0; vcb && n < 16; ++n) {
+        if (read16(vcb + 72) == drive) return true;   // vcbDrvNum
+        vcb = read32(vcb) & 0x00FFFFFFu;              // qLink
+    }
+    return false;
 }
 
 // Locate the Prime entry of each installed .ScsiHD driver, so the machine can
@@ -1065,24 +1082,68 @@ void QuadraMachine::announceHardDisks() {
     if (read32(0x0358) == 0) return;              // no live VCB: System not up
     if (read8(0x0360) & 1) return;                // FSBusy: a file op is running
     if ((cpu_.getSR() & 0x0700) != 0) return;     // mid-interrupt: not now
-    if (++hdAnnounceDelay_ < 5) return;           // settle a few seconds first
+    // Never from inside a driver request we are serving: the guest's own
+    // driver call is still in flight and a nested File Manager call there is
+    // the re-entrancy the Classic learned to refuse.
+    if (inDriver_) return;
+    // One second's grace for the System's own startup mount, then do it
+    // ourselves. Waiting longer means an application is already running and
+    // has enumerated its disks -- the 7.5 Installer builds its destination
+    // list at launch, so a volume mounted after that never appears in it.
+    if (++hdAnnounceDelay_ < 2) return;
+    // If the System already mounted the volume by itself -- which it does once
+    // the driver's Prime is hooked before startup -- there is nothing to
+    // announce. Injecting anyway disturbs whatever is running: the 7.5
+    // Installer loses its window and hangs on a watch cursor (measured).
+    if (volumeMountedFor(4)) hdAnnouncePending_ = false;
+    if (volumeMountedFor(5)) hd2AnnouncePending_ = false;
+    if (!hdAnnouncePending_ && !hd2AnnouncePending_) return;
+    // The File Manager's own queue must be initialised, or _MountVol enqueues
+    // into a header the System has not built yet (the Classic address-errored
+    // on exactly this).
+    if ((((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) == 0xFFFFFFFFu))
+        return;
     announceInFlight_ = true;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-    if (hdAnnouncePending_) {
+    // A param block from the System heap, not a corner of RAM we picked: the
+    // trap keeps it only for the call, but the heap is the one place nothing
+    // else claims. Allocated once, reused for every retry.
+    if (!hdMountPb_) {
+        cpu_.d[0] = 80;
+        execute68kTrap(0xA71E);                   // _NewPtr,Sys,Clear
+        hdMountPb_ = cpu_.a[0] & 0x00FFFFFFu;
+    }
+    // Mount the volume, THEN announce it. Posting the event alone is not
+    // enough: on a real insertion the File Manager mounts the volume before
+    // the driver's event reaches the application, and the message carries the
+    // drive number in its high word with the mount's result in the low word.
+    // The Finder recovers from a bare event by mounting the drive itself,
+    // which is why the desktop showed the disk -- but the Installer runs in
+    // the Finder's place off the install floppy and does not, so the disk it
+    // was told about was never a volume it could see.
+    auto mountDrive = [&](u16 drive) -> bool {
+        if (!hdMountPb_) return false;
+        for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
+        write16(hdMountPb_ + 22, drive);          // ioVRefNum = drive number
+        cpu_.a[0] = hdMountPb_;
+        execute68kTrap(0xA00F);                   // _MountVol
+        const s16 res = static_cast<s16>(cpu_.d[0] & 0xFFFF);
         cpu_.a[0] = 7;                            // diskEvt
-        cpu_.d[0] = 4;                            // message: drive number
+        cpu_.d[0] = (static_cast<u32>(drive) << 16) | static_cast<u16>(res);
         execute68kTrap(0xA02F);                   // _PostEvent
-        hdAnnouncePending_ = false;
-        if (onDiag) onDiag("hd: drive 4 announced to the System");
-    }
-    if (hd2AnnouncePending_) {
-        cpu_.a[0] = 7;
-        cpu_.d[0] = 5;
-        execute68kTrap(0xA02F);
-        hd2AnnouncePending_ = false;
-        if (onDiag) onDiag("hd: drive 5 announced to the System");
-    }
+        if (onDiag) {
+            char b[72];
+            std::snprintf(b, sizeof b, "hd: drive %u mount result %d", drive, res);
+            onDiag(b);
+        }
+        // 0 = mounted, -55 = volOnLinErr = already on line. Either way, done.
+        return res == 0 || res == -55;
+    };
+    ++hdMountTries_;
+    if (hdAnnouncePending_ && mountDrive(4)) hdAnnouncePending_ = false;
+    if (hd2AnnouncePending_ && mountDrive(5)) hd2AnnouncePending_ = false;
+    if (hdMountTries_ >= 15) { hdAnnouncePending_ = hd2AnnouncePending_ = false; }
     for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     announceInFlight_ = false;
 }
@@ -1091,21 +1152,16 @@ int QuadraMachine::stepInstruction() {
     if (countPc_ && (cpu_.pc | 0x40000000u) == (countPc_ | 0x40000000u)) ++countPcHits_;
     // The ROM's .Sony driver runs through both its 32-bit face and the 24-bit
     // alias; hook Prime at either and serve the request from the image.
-    if (diskPrimePc_[0] && cpu_.pc == diskPrimePc_[0]) {
-        try { serveDiskPrime(0); } catch (const BusFault&) {
+    if ((diskPrimePc_[0] && cpu_.pc == diskPrimePc_[0]) ||
+        (diskPrimePc_[1] && cpu_.pc == diskPrimePc_[1])) {
+        const int unit = (diskPrimePc_[0] && cpu_.pc == diskPrimePc_[0]) ? 0 : 1;
+        inDriver_ = true;
+        try { serveDiskPrime(unit); } catch (const BusFault&) {
             cpu_.d[0] = static_cast<u32>(-36);
             cpu_.pc = read32(0x08FC);
             cpu_.a[0] = cpu_.pc;
         }
-        tickDevices(40);
-        return 40;
-    }
-    if (diskPrimePc_[1] && cpu_.pc == diskPrimePc_[1]) {
-        try { serveDiskPrime(1); } catch (const BusFault&) {
-            cpu_.d[0] = static_cast<u32>(-36);
-            cpu_.pc = read32(0x08FC);
-            cpu_.a[0] = cpu_.pc;
-        }
+        inDriver_ = false;
         tickDevices(40);
         return 40;
     }
