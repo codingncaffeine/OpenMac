@@ -34,6 +34,7 @@ public sealed class QuadraEmulator : IEmulator
     private readonly byte[] _sharedFrame = new byte[640 * 480 * 4];
     private readonly byte[] _audioBuf = new byte[8192];
     private bool _frameDirty;
+    private long _loudFed;   // non-silent samples handed to the audio device
     private readonly Thread _worker;
     private volatile bool _stop;
     private const double FrameSeconds = 1.0 / 60.147;
@@ -104,7 +105,12 @@ public sealed class QuadraEmulator : IEmulator
                     if (_audio.Ok)
                     {
                         int n = (int)Native.omac_q_drain_audio(_h, _audioBuf, (nuint)_audioBuf.Length);
-                        if (n > 0) _audio.Feed(_audioBuf, n);
+                        if (n > 0)
+                        {
+                            for (int k = 0; k < n; k++)
+                                if (_audioBuf[k] > 0x84 || _audioBuf[k] < 0x7C) _loudFed++;
+                            _audio.Feed(_audioBuf, n);
+                        }
                     }
                 }
                 acc -= FrameSeconds;
@@ -117,7 +123,7 @@ public sealed class QuadraEmulator : IEmulator
             if (fpsElapsed >= 1.0)
             {
                 string audio = _audio.Ok ? _audio.Stats() : "audio: (no device)";
-                Log.Line($"perf: fps={fpsFrames / fpsElapsed:F1}  {audio}");
+                Log.Line($"perf: fps={fpsFrames / fpsElapsed:F1}  {audio} loud={_loudFed}");
                 fpsFrames = 0;
                 fpsElapsed = 0;
             }
