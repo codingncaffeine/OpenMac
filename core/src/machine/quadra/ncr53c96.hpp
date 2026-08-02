@@ -253,6 +253,10 @@ public:
     std::function<void(u8 cmd, u32 fifoLevel, u8 phase)> onCmd;
     std::function<void(const char* msg)> onDiag;
 
+    // Re-open the register-read trace window (bring-up: aim it at the
+    // transaction under study after the earlier traffic burned the budget).
+    void rearmDiag(int n) { diagBudget_ = n; lastStatusDiag_ = 0xFF; }
+
 private:
     static constexpr u32 kFifoSize = 16;
 
@@ -408,6 +412,11 @@ private:
         seqStep_ = 0;
         cmdFeed_ = false;
         selCdb_.clear();
+        // Guarantee the pseudo-VIA sees a fresh RISING edge for this
+        // select's DRQ: drop the line first (the manager's select poll
+        // watches the VIA2 IFR bit, which latches only on edges).
+        dmaActive_ = false;
+        if (onDrq) onDrq(false);
         // A DMA-flagged command loads the transfer count the moment it
         // issues -- present target or not. The manager reads TC0 after a
         // timed-out select, and a stale terminal count from the previous
@@ -563,6 +572,7 @@ private:
         case 0x11:   // initiator command complete sequence
             if (!selected_) { command_ = 0; raise(0x40); break; }
             cmdFeed_ = false;
+            dmaActive_ = false;   // DRQ falls with the data phase over
             fifoClear();
             fifoPush(scsiStatus_);
             fifoPush(0x00);       // COMMAND COMPLETE message
@@ -572,8 +582,10 @@ private:
         case 0x12:   // message accepted
             if (!selected_) { command_ = 0; raise(0x40); break; }
             cmdFeed_ = false;
-            phase_ = kDataOut;
-            selected_ = nullptr;
+            dmaActive_ = false;
+            counter_ = 0;         // nothing outstanding once the bus frees;
+            phase_ = kDataOut;    // a held-high DRQ would eat the NEXT
+            selected_ = nullptr;  // select's rising edge at the pseudo-VIA
             raise(0x20);          // disconnected
             break;
         case 0x18:   // transfer pad

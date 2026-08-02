@@ -39,7 +39,16 @@ public:
         case 1: case 15: return ina ? ina() : ora_;
         case 2:  return ddrb_;
         case 3:  return ddra_;
-        case 13: return static_cast<u8>(ifr_ | (irqOut_ ? 0x80 : 0));
+        case 13: {
+            const u8 v = static_cast<u8>(effIfr() | (irqOut_ ? 0x80 : 0));
+            if (onDiag && rdBudget_ > 0) {
+                --rdBudget_;
+                char b[32];
+                std::snprintf(b, sizeof b, "VIFR rd=%02X", v);
+                onDiag(b);
+            }
+            return v;
+        }
         case 14: return static_cast<u8>(ier_ | 0x80);
         default: return 0;
         }
@@ -71,9 +80,25 @@ public:
 
     // Interrupt inputs from the machine. Edge semantics: a rising edge sets
     // the IFR bit; clearing is software's job (write-1-to-clear).
-    void setScsiDrq(bool level)  { edge(0x01, level, scsiDrqPrev_); }
+    // SCSI DRQ and the SCSI interrupt read as LIVE LEVELS in the IFR: the
+    // manager's select and transfer loops poll these bits as ready lines,
+    // and a latched stale bit satisfies the poll with old state (the exact
+    // failure: every select then evaluates garbage). The power-on $1B in
+    // the latch still covers the ROM's first read; once cleared, bits 0
+    // and 3 mirror the wires.
+    void setScsiDrq(bool level)
+    {
+        if (onDiag && drqDiagBudget_ > 0 && level != scsiDrqPrev_) {
+            --drqDiagBudget_;
+            char b[24];
+            std::snprintf(b, sizeof b, "DRQ->%d", level ? 1 : 0);
+            onDiag(b);
+        }
+        scsiDrqPrev_ = level;
+        update();
+    }
     void setSlotIrq(bool level)  { edge(0x02, level, slotPrev_); }
-    void setScsiIrq(bool level)  { edge(0x08, level, scsiIrqPrev_); }
+    void setScsiIrq(bool level)  { scsiIrqPrev_ = level; update(); }
     void setAscIrq(bool level)   { edge(0x10, level, ascPrev_); }
 
     bool irqAsserted() const { return irqOut_; }
@@ -82,8 +107,13 @@ public:
     std::function<u8()> ina;
     std::function<void(u8 value, u8 ddr)> outB;
     std::function<void(bool level)> onIrq;
+    std::function<void(const char* msg)> onDiag;
+    void rearmDiag(int reads, int edges) { rdBudget_ = reads; drqDiagBudget_ = edges; }
 
 private:
+    int rdBudget_ = 0;
+    int drqDiagBudget_ = 0;
+
     void edge(u8 bit, bool level, bool& prev) {
         if (level && !prev) {
             ifr_ = static_cast<u8>(ifr_ | bit);
@@ -92,8 +122,14 @@ private:
         prev = level;
     }
 
+    // The latch plus the live SCSI lines: what a guest IFR read sees.
+    u8 effIfr() const {
+        return static_cast<u8>(ifr_ | (scsiDrqPrev_ ? 0x01 : 0) |
+                               (scsiIrqPrev_ ? 0x08 : 0));
+    }
+
     void update() {
-        const bool now = (ifr_ & ier_ & 0x1B) != 0;
+        const bool now = (effIfr() & ier_ & 0x1B) != 0;
         if (now != irqOut_) {
             irqOut_ = now;
             if (onIrq) onIrq(now);

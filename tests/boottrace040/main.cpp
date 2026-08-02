@@ -148,6 +148,7 @@ int main(int argc, char** argv) {
     int trapsAfterCdbs = 0;  // ...once this many SCSI CDBs have run
     const char* findHex = nullptr;  // scan guest RAM for these bytes at exit
     bool inputTest = false;         // move the mouse + press a key at the end
+    int breakFlush = 0;             // break at the Nth FIFO flush after CDB #8
     unsigned long dumpMem = 0;
     unsigned long breakPc = 0;
     int breakSkip = 0;
@@ -178,6 +179,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--find" && i + 1 < argc) findHex = argv[++i];
         else if (a == "--input-test") inputTest = true;
+        else if (a == "--break-flush" && i + 1 < argc) breakFlush = std::atoi(argv[++i]);
         else if (a == "--break-pc" && i + 1 < argc) breakPc = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--break-skip" && i + 1 < argc) breakSkip = std::atoi(argv[++i]);
         else if (a == "--trace-from" && i + 1 < argc) traceFrom = std::strtoul(argv[++i], nullptr, 16);
@@ -200,8 +202,10 @@ int main(int argc, char** argv) {
     cfg.ramSize = static_cast<u32>(ramMb) * 1024u * 1024u;
     QuadraMachine mac(std::move(rom), cfg);
     int cdbCount = 0;
-    mac.onDiag = [&cdbCount](const char* m) {
+    int flushCount = 0;
+    mac.onDiag = [&](const char* m) {
         if (m[0] == 'C' && m[1] == 'D' && m[2] == 'B') ++cdbCount;
+        if (cdbCount >= 8 && std::strncmp(m, "SCMD 01", 7) == 0) ++flushCount;
         std::printf("%s\n", m);
     };
     int vramBudget = 10;
@@ -267,6 +271,27 @@ int main(int argc, char** argv) {
                         cc.d[0], cc.d[1], cc.a[0], cc.a[1], cc.getSR());
             mac.stepInstruction();
         }
+        frames = 0;
+    }
+
+    if (breakFlush) {
+        // Single-step to the Nth FIFO flush after the probe's CDB and show
+        // the PC trail into it -- the flush count is chip-event ground truth,
+        // so this lands in the exact routine that decided the transfer's fate.
+        u32 ring[64] = {};
+        int rp = 0;
+        mac.cpu().onStep = [&](u32 pc) {
+            ring[rp] = pc;
+            rp = (rp + 1) % 64;
+        };
+        u64 guard = 6'000'000'000ull;
+        while (flushCount < breakFlush && !mac.cpu().halted && guard--) {
+            mac.stepInstruction();
+        }
+        mac.cpu().onStep = nullptr;
+        std::printf("-- flush #%d reached at pc=%08X --\ntrail:", breakFlush, mac.cpu().pc);
+        for (int i = 0; i < 64; ++i) std::printf(" %08X", ring[(rp + i) % 64]);
+        std::printf("\n");
         frames = 0;
     }
 

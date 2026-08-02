@@ -127,6 +127,7 @@ void QuadraMachine::wireDevices() {
         easc_->dfacLines((eff & 0x01) != 0, (eff & 0x08) != 0, (eff & 0x10) != 0);
     };
     via2_->onIrq = [this](bool) { updateIpl(); };
+    via2_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
 
     dafb_->onIrq = [this](bool level) { via2_->setSlotIrq(level); };
     easc_->onIrq = [this](bool level) { via2_->setAscIrq(level); };
@@ -143,7 +144,11 @@ void QuadraMachine::wireDevices() {
     scsi_->onCdb = [this](int id, const u8* cdb, int len) {
         // The 8th CDB is the probe's boot-block read; re-arm the register
         // trace there so the storm before it cannot exhaust the budget.
-        if (++cdbSeen_ == 8) cdbDiagBudget_ = 5000;
+        if (++cdbSeen_ == 7) {
+            cdbDiagBudget_ = 5000;
+            scsi_->rearmDiag(3000);
+            via2_->rearmDiag(60000, 500);
+        }
         if (cdbListBudget_ <= 0) return;
         --cdbListBudget_;
         char b[112];
@@ -296,8 +301,12 @@ u16 QuadraMachine::read16(u32 addr) {
             return sonicRegs_[(off >> 2) & 0x3F];
         }
         // The SCSI pseudo-DMA port is a true 16-bit lane: a word read moves
-        // two data bytes (the manager bursts MOVE.W/MOVE.L from it).
-        if (off >= 0x10100u && off < 0x10104u) return scsi_->dma16Read();
+        // two data bytes (the manager bursts MOVE.W/MOVE.L from it), and
+        // touching it without DRQ bus-errors (the not-ready handshake).
+        if (off >= 0x10100u && off < 0x10104u) {
+            if (!scsi_->drq()) throw BusFault{addr, true, 2};
+            return scsi_->dma16Read();
+        }
         // 8-bit peripherals answer 16-bit reads with the byte in both lanes
         // (the SCC glue's documented behavior; safe for the VIAs too since
         // it decodes the register only once).
@@ -337,8 +346,10 @@ void QuadraMachine::write16(u32 addr, u16 value) {
             ioWrite8(addr, static_cast<u8>(value >> 8));   // SCC: high byte
             return;
         }
-        // The SCSI pseudo-DMA port takes both bytes of a word write.
+        // The SCSI pseudo-DMA port takes both bytes of a word write, and
+        // faults when the chip isn't requesting (the not-ready handshake).
         if (off >= 0x10100u && off < 0x10104u) {
+            if (!scsi_->drq()) throw BusFault{addr, false, 2};
             scsi_->dma16Write(value);
             return;
         }
@@ -466,6 +477,10 @@ u8 QuadraMachine::ioRead8(u32 addr) {
         return v;
     }
     if (off >= 0x10100u && off < 0x10104u) {
+        // Pseudo-DMA handshake: touching the port without DRQ is a real
+        // bus error on this hardware -- the fault IS the not-ready signal,
+        // and the SCSI Manager paces its blind transfers on it.
+        if (!scsi_->drq()) throw BusFault{addr, true, 1};
         // A byte-wide pseudo-DMA read hands over exactly one byte.
         return scsi_->dma8Read();
     }
@@ -541,6 +556,7 @@ void QuadraMachine::ioWrite8(u32 addr, u8 v) {
         return;
     }
     if (off >= 0x10100u && off < 0x10104u) {
+        if (!scsi_->drq()) throw BusFault{addr, false, 1};
         if (cdbDiagBudget_ > 0) {
             --cdbDiagBudget_;
             char b[48];
@@ -577,6 +593,7 @@ u32 QuadraMachine::ioRead32(u32 addr) {
     const u32 off = addr & 0x0003FFFFu;
     if (off >= 0x0E000u && off < 0x10000u) return djmemcRegs_[(off >> 2) & 0xF];
     if (off >= 0x10100u && off < 0x10104u) {
+        if (!scsi_->drq()) throw BusFault{addr, true, 4};
         const u32 hi = scsi_->dma16Read();
         const u32 lo = scsi_->dma16Read();
         return (hi << 16) | lo;
@@ -597,6 +614,7 @@ void QuadraMachine::ioWrite32(u32 addr, u32 v) {
         return;
     }
     if (off >= 0x10100u && off < 0x10104u) {
+        if (!scsi_->drq()) throw BusFault{addr, false, 4};
         if (cdbDiagBudget_ > 0) {
             --cdbDiagBudget_;
             char b[48];
