@@ -407,6 +407,14 @@ public partial class MainWindow : Window
         UpdateUi();
     }
 
+    private void MemoryQuadra_Click(object sender, RoutedEventArgs e)
+    {
+        _settings.RamMBQuadra = int.Parse((string)((MenuItem)sender).Tag);
+        _settings.Save();
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
+        UpdateUi();
+    }
+
     private void BootRomDisk_Click(object sender, RoutedEventArgs e)
     {
         _settings.BootRomDisk = !_settings.BootRomDisk;
@@ -1076,12 +1084,22 @@ public partial class MainWindow : Window
 
         ModelClassicItem.IsChecked = !_settings.IsQuadra;
         ModelQuadraItem.IsChecked = _settings.IsQuadra;
-        Mem1Item.IsChecked = !_settings.IsQuadra && _settings.RamMB == 1;
-        Mem2Item.IsChecked = !_settings.IsQuadra && _settings.RamMB == 2;
-        Mem4Item.IsChecked = !_settings.IsQuadra && _settings.RamMB == 4;
-        Mem1Item.IsEnabled = Mem2Item.IsEnabled = Mem4Item.IsEnabled = !_settings.IsQuadra;
+        bool q = _settings.IsQuadra;
+        Mem1Item.IsChecked = !q && _settings.RamMB == 1;
+        Mem2Item.IsChecked = !q && _settings.RamMB == 2;
+        Mem4Item.IsChecked = !q && _settings.RamMB == 4;
+        Mem1Item.IsEnabled = Mem2Item.IsEnabled = Mem4Item.IsEnabled = !q;
+        Mem1Item.Visibility = Mem2Item.Visibility = Mem4Item.Visibility =
+            q ? Visibility.Collapsed : Visibility.Visible;
+        var quadraMems = new[] { MemQ8Item, MemQ16Item, MemQ32Item, MemQ64Item, MemQ128Item, MemQ136Item };
+        foreach (var item in quadraMems)
+        {
+            item.Visibility = q ? Visibility.Visible : Visibility.Collapsed;
+            item.IsEnabled = q;
+            item.IsChecked = q && _settings.RamMBQuadra == int.Parse((string)item.Tag);
+        }
         BootRomDiskItem.IsChecked = _settings.BootRomDisk;
-        BootRomDiskItem.IsEnabled = !_settings.IsQuadra;
+        BootRomDiskItem.IsEnabled = !q;
         WriteProtectItem.IsChecked = _settings.WriteProtectFloppies;
 
         ScaleFitItem.IsChecked = _settings.Scale == 0;

@@ -55,6 +55,12 @@
                 <MenuItem x:Name="Mem1Item" Header="1 MB RAM" Tag="1" Click="Memory_Click" />
                 <MenuItem x:Name="Mem2Item" Header="2 MB RAM" Tag="2" Click="Memory_Click" />
                 <MenuItem x:Name="Mem4Item" Header="4 MB RAM" Tag="4" Click="Memory_Click" />
+                <MenuItem x:Name="MemQ8Item" Header="8 MB RAM" Tag="8" Click="MemoryQuadra_Click" />
+                <MenuItem x:Name="MemQ16Item" Header="16 MB RAM" Tag="16" Click="MemoryQuadra_Click" />
+                <MenuItem x:Name="MemQ32Item" Header="32 MB RAM" Tag="32" Click="MemoryQuadra_Click" />
+                <MenuItem x:Name="MemQ64Item" Header="64 MB RAM" Tag="64" Click="MemoryQuadra_Click" />
+                <MenuItem x:Name="MemQ128Item" Header="128 MB RAM" Tag="128" Click="MemoryQuadra_Click" />
+                <MenuItem x:Name="MemQ136Item" Header="136 MB RAM (max)" Tag="136" Click="MemoryQuadra_Click" />
                 <Separator />
                 <MenuItem x:Name="BootRomDiskItem" Header="Boot from ROM Disk (Cmd-Opt-X-O)"
                           Click="BootRomDisk_Click" />
