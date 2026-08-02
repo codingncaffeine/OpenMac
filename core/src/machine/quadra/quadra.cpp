@@ -366,6 +366,12 @@ u16 QuadraMachine::read16(u32 addr) {
         // touching it without DRQ bus-errors (the not-ready handshake).
         if (off >= 0x10100u && off < 0x10104u) {
             if (!scsi_->drq()) throw BusFault{addr, true, 2};
+            if (dataInPcBudget_ > 0 && onDiag) {
+                --dataInPcBudget_;
+                char b[48];
+                std::snprintf(b, sizeof b, "PDMArd16 pc=%08X", cpu_.pc);
+                onDiag(b);
+            }
             return scsi_->dma16Read();
         }
         // 8-bit peripherals answer 16-bit reads with the byte in both lanes
@@ -552,7 +558,14 @@ u8 QuadraMachine::ioRead8(u32 addr) {
         return static_cast<u8>(v >> (8 * (3 - (off & 3))));
     }
     if (off >= 0x10000u && off < 0x10100u) {
-        const u8 v = scsi_->read((off >> 4) & 0xF);
+        const int sreg = (off >> 4) & 0xF;
+        const u8 v = scsi_->read(sreg);
+        if (sreg == 2 && dataInPcBudget_ > 0 && onDiag) {
+            --dataInPcBudget_;
+            char b[48];
+            std::snprintf(b, sizeof b, "FIFOrd pc=%08X v=%02X", cpu_.pc, v);
+            onDiag(b);
+        }
         if (scsiDiagBudget_ > 0) {
             --scsiDiagBudget_;
             logAccess("SCSI", addr, false, v);
@@ -565,6 +578,12 @@ u8 QuadraMachine::ioRead8(u32 addr) {
         // and the SCSI Manager paces its blind transfers on it.
         if (!scsi_->drq()) throw BusFault{addr, true, 1};
         // A byte-wide pseudo-DMA read hands over exactly one byte.
+        if (dataInPcBudget_ > 0 && onDiag) {
+            --dataInPcBudget_;
+            char b[48];
+            std::snprintf(b, sizeof b, "PDMArd8 pc=%08X", cpu_.pc);
+            onDiag(b);
+        }
         return scsi_->dma8Read();
     }
     if (off >= 0x14000u && off < 0x15000u) {
@@ -820,6 +839,8 @@ void QuadraMachine::tickDevices(int cpuCycles) {
         rtc_->tickSecond();
         via1_->setCA2(true);
         ca2PulseSlices_ = 2;
+        if (!hd_.empty() || !hd2_.empty()) findDiskDriverPrime();
+        announceHardDisks();
     }
     // The whole machine cadence rides device time so that frame-driven and
     // single-stepped execution behave identically: audio samples per slice,
@@ -928,10 +949,166 @@ void QuadraMachine::servePrime() {
     cpu_.pc = target;
 }
 
+// Locate the Prime entry of each installed .ScsiHD driver, so the machine can
+// serve its requests directly. The unit table ($011C) holds a handle per unit;
+// the DCE's dCtlDriver points at the DRVR, whose header carries the Prime
+// offset. Cached once the System has installed the driver.
+void QuadraMachine::findDiskDriverPrime() {
+    static const int kUnits[2] = {1, 33};
+    const u32 uTable = read32(0x011C) & 0x00FFFFFFu;
+    if (!uTable) return;
+    for (int i = 0; i < 2; ++i) {
+        if (diskPrimePc_[i]) continue;
+        const u32 h = read32(uTable + static_cast<u32>(kUnits[i]) * 4u) & 0x00FFFFFFu;
+        if (!h) continue;
+        const u32 dce = read32(h) & 0x00FFFFFFu;
+        if (!dce) continue;
+        const u32 drvr = read32(dce) & 0x00FFFFFFu;   // dCtlDriver
+        if (!drvr) continue;
+        // Only OUR driver: its name field is ".ScsiHD".
+        if (read8(drvr + 0x12) != 7 || read8(drvr + 0x13) != '.' ||
+            read8(drvr + 0x14) != 'S' || read8(drvr + 0x15) != 'c')
+            continue;
+        const u32 prime = drvr + read16(drvr + 0x0A);
+        diskPrimePc_[i] = prime;
+        if (onDiag) {
+            char b[72];
+            std::snprintf(b, sizeof b, "hd: driver unit %d Prime at %08X",
+                          kUnits[i], prime);
+            onDiag(b);
+        }
+    }
+}
+
+// The on-disk SCSI driver's Prime, served from the image the way the .Sony
+// hook serves floppies. The ROM's old-API SCSI Manager takes our driver's
+// read down its DISCARD drain (measured: every byte of a correct MDB read out
+// at ROM $D1CCC and thrown away), so the volume never mounts. Moving the
+// bytes here keeps the guest's own driver, DCE and completion path intact --
+// only the transfer itself is done by the machine -- and gives the writes the
+// installer needs as well.
+void QuadraMachine::serveDiskPrime(int unit) {
+    const u32 pb = cpu_.a[0] & 0x00FFFFFFu;
+    const u32 dce = cpu_.a[1] & 0x00FFFFFFu;
+    const u16 trap = read16(pb + 0x06);
+    const u32 buf = read32(pb + 0x20) & 0x00FFFFFFu;
+    const u32 req = read32(pb + 0x24);
+    const u16 posMode = read16(pb + 0x2C);
+    const u32 posOff = read32(pb + 0x2E);
+    const u32 dctlPos = read32(dce + 0x10);
+
+    std::vector<u8>& img = unit ? hd2_ : hd_;
+    const bool ro = unit ? false : hdRO_;
+    const u32 base = (unit ? hfsImageOffset2_ : hfsImageOffset_);
+    std::vector<u8>& backing = unit ? scsiImage2_ : scsiImage_;
+
+    u32 pos = (posMode & 3) == 1 ? posOff : dctlPos;
+    s16 result = 0;
+    u32 done = 0;
+    if (img.empty() || backing.empty()) {
+        result = -65;                                  // offLinErr
+    } else if ((trap & 1) && ro) {
+        result = -44;                                  // wPrErr
+    } else {
+        const u32 size = static_cast<u32>(img.size());
+        if (pos >= size) {
+            result = -39;                              // eofErr
+        } else {
+            u32 n = req;
+            if (pos + n > size) { n = size - pos; result = -39; }
+            // The guest addresses the VOLUME; the backing store is the whole
+            // partitioned disk, so the partition offset goes on here.
+            const u32 at = base + pos;
+            if (trap & 1) {
+                for (u32 i = 0; i < n; ++i) backing[at + i] = read8(buf + i);
+            } else {
+                for (u32 i = 0; i < n; ++i) write8(buf + i, backing[at + i]);
+            }
+            done = n;
+        }
+    }
+    write32(pb + 0x28, done);                          // ioActCount
+    write32(dce + 0x10, pos + done);                   // dCtlPosition
+    write16(pb + 0x10, static_cast<u16>(result));      // ioResult
+    cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+    const u32 target = read32(0x08FC);                 // jIODone
+    cpu_.a[0] = target;
+    cpu_.pc = target;
+}
+
+// Run one A-line trap to completion on the guest CPU: the opcode goes in a
+// scratch cell at the top of RAM, the PC points at it, and stepping continues
+// until control returns to the following word (the dispatcher adjusts the
+// return PC past the A-line). The Classic's proven injection shape.
+void QuadraMachine::execute68kTrap(u16 trap) {
+    const u32 scratch = static_cast<u32>(ram_.size()) - 8;
+    ram_[scratch] = static_cast<u8>(trap >> 8);
+    ram_[scratch + 1] = static_cast<u8>(trap & 0xFF);
+    const u32 savedPc = cpu_.pc;
+    const u16 savedSr = cpu_.getSR();
+    cpu_.pc = scratch;
+    for (int guard = 0; guard < 64000000 && cpu_.pc != scratch + 2 && !cpu_.halted;
+         ++guard) {
+        stepInstruction();
+    }
+    cpu_.pc = savedPc;
+    cpu_.setSR(savedSr);
+}
+
+// A drive that has sat in the queue since the ROM scan never gets mounted:
+// its disk-inserted announcement fell in the window startup flushes. Posting
+// the event once the System is up makes the insertion the same event a user's
+// insertion is -- the System mounts the volume and the Finder shows it.
+void QuadraMachine::announceHardDisks() {
+    if (announceInFlight_) return;
+    if (!hdAnnouncePending_ && !hd2AnnouncePending_) return;
+    if (read32(0x0358) == 0) return;              // no live VCB: System not up
+    if (read8(0x0360) & 1) return;                // FSBusy: a file op is running
+    if ((cpu_.getSR() & 0x0700) != 0) return;     // mid-interrupt: not now
+    if (++hdAnnounceDelay_ < 5) return;           // settle a few seconds first
+    announceInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    if (hdAnnouncePending_) {
+        cpu_.a[0] = 7;                            // diskEvt
+        cpu_.d[0] = 4;                            // message: drive number
+        execute68kTrap(0xA02F);                   // _PostEvent
+        hdAnnouncePending_ = false;
+        if (onDiag) onDiag("hd: drive 4 announced to the System");
+    }
+    if (hd2AnnouncePending_) {
+        cpu_.a[0] = 7;
+        cpu_.d[0] = 5;
+        execute68kTrap(0xA02F);
+        hd2AnnouncePending_ = false;
+        if (onDiag) onDiag("hd: drive 5 announced to the System");
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    announceInFlight_ = false;
+}
+
 int QuadraMachine::stepInstruction() {
     if (countPc_ && (cpu_.pc | 0x40000000u) == (countPc_ | 0x40000000u)) ++countPcHits_;
     // The ROM's .Sony driver runs through both its 32-bit face and the 24-bit
     // alias; hook Prime at either and serve the request from the image.
+    if (diskPrimePc_[0] && cpu_.pc == diskPrimePc_[0]) {
+        try { serveDiskPrime(0); } catch (const BusFault&) {
+            cpu_.d[0] = static_cast<u32>(-36);
+            cpu_.pc = read32(0x08FC);
+            cpu_.a[0] = cpu_.pc;
+        }
+        tickDevices(40);
+        return 40;
+    }
+    if (diskPrimePc_[1] && cpu_.pc == diskPrimePc_[1]) {
+        try { serveDiskPrime(1); } catch (const BusFault&) {
+            cpu_.d[0] = static_cast<u32>(-36);
+            cpu_.pc = read32(0x08FC);
+            cpu_.a[0] = cpu_.pc;
+        }
+        tickDevices(40);
+        return 40;
+    }
     if (cpu_.pc == kSonyPrime || cpu_.pc == kSonyPrimeAlias) {
         try {
             servePrime();
@@ -1078,6 +1255,8 @@ void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hfsImageOffset_ = static_cast<u32>(scsiImage_.size() - hd_.size());
     disk_->attach(&scsiImage_, 0);
     disk_->readOnly = readOnly;
+    hdAnnouncePending_ = true;
+    hdAnnounceDelay_ = 0;
 }
 
 const std::vector<u8>& QuadraMachine::hardDiskImage() const {
@@ -1099,6 +1278,8 @@ void QuadraMachine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     hfsImageOffset2_ = static_cast<u32>(scsiImage2_.size() - hd2_.size());
     disk2_->attach(&scsiImage2_, 1);
     disk2_->readOnly = readOnly;
+    hd2AnnouncePending_ = true;
+    hdAnnounceDelay_ = 0;
 }
 
 void QuadraMachine::detachHardDisk2() {

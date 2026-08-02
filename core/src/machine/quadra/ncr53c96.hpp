@@ -581,6 +581,8 @@ private:
             break;
         case 0x12:   // message accepted
             if (!selected_) { command_ = 0; raise(0x40); break; }
+            if (!data_.empty())
+                diagEvent("XFER end drained %u", static_cast<u32>(dataPos_));
             cmdFeed_ = false;
             dmaActive_ = false;
             counter_ = 0;         // nothing outstanding once the bus frees;

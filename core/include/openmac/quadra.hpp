@@ -79,6 +79,7 @@ public:
     void watchMem(u32 addr, u32 len, int budget) {         // log RAM writes w/ PCs
         watchAddr_ = addr; watchLen_ = len; watchBudget_ = budget;
     }
+    void armDataInTrace(int n) { dataInPcBudget_ = n; }
     void countPc(u32 pc) { countPc_ = pc; countPcHits_ = 0; }
     u32 countPcHits() const { return countPcHits_; }
     bool dafbVblEnabled() const;
@@ -176,6 +177,12 @@ private:
     u8 macProm_[8]{};
 
     void servePrime();
+    void execute68kTrap(u16 trap);
+    void announceHardDisks();
+    // The on-disk SCSI driver's Prime, served in C++ (see the definition).
+    void serveDiskPrime(int unit);
+    void findDiskDriverPrime();
+    u32 diskPrimePc_[2] = {0, 0};   // unit 1 (drive 4) and unit 33 (drive 5)
 
     std::unique_ptr<SonyDrive> fd_;
     std::vector<u8> floppy_;
@@ -227,10 +234,17 @@ private:
     int swimDiagBudget_ = 400;  // trace the first SWIM2 accesses (with PCs)
     int primeDiagBudget_ = 48;  // trace the first .Sony Prime requests we serve
     int adbSrTraceBudget_ = 0;  // armed by the input test: log SR reads with PCs
+    int dataInPcBudget_ = 0;    // log which routine drains SCSI data-in bytes
     u32 watchAddr_ = 0, watchLen_ = 0;   // RAM write-watch window
     int watchBudget_ = 0;
     u32 countPc_ = 0, countPcHits_ = 0;  // execution counter for one address
     bool dafbIrq_ = false;               // internal video interrupt line (VIA2 PA6)
+    // A hard disk present at power-on entered the drive queue during the ROM
+    // scan, whose announcement startup flushes; once the System settles, a
+    // disk-inserted event makes it the same event a user's insertion is.
+    bool hdAnnouncePending_ = false, hd2AnnouncePending_ = false;
+    int  hdAnnounceDelay_ = 0;
+    bool announceInFlight_ = false;
     int scsiDiagBudget_ = 60;   // trace the first 53C96 register accesses
     int iplDiagBudget_ = 12;    // trace the first level-2 interrupt assertions
     int via2DiagBudget_ = 24;   // trace the first VIA2 IFR/IER writes

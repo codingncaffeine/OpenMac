@@ -168,6 +168,18 @@ int main(int argc, char** argv) {
             const int mb = std::atoi(argv[++i]);
             return makeBootableHd(srcP, outP, static_cast<u32>(mb));
         }
+        if (a == "--make-blank" && i + 3 < argc) {
+            const char* outP = argv[++i];
+            const u32 mb = static_cast<u32>(std::atoi(argv[++i]));
+            const char* volName = argv[++i];
+            auto img = openmac::hfs::formatVolume(mb * 1024u * 1024u, volName);
+            if (img.empty()) { std::fprintf(stderr, "format failed\n"); return 2; }
+            std::ofstream f(outP, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(img.data()),
+                    static_cast<std::streamsize>(img.size()));
+            std::printf("wrote %s (%zu bytes, blank HFS \"%s\")\n", outP, img.size(), volName);
+            return 0;
+        }
         if (a == "--rom" && i + 1 < argc) romPath = argv[++i];
         else if (a == "--floppy" && i + 1 < argc) fdPath = argv[++i];
         else if (a == "--floppy-after" && i + 2 < argc) { fdPath = argv[++i]; fdAfter = std::atoi(argv[++i]); }
@@ -215,6 +227,10 @@ int main(int argc, char** argv) {
     int flushCount = 0;
     mac.onDiag = [&](const char* m) {
         if (m[0] == 'C' && m[1] == 'D' && m[2] == 'B') ++cdbCount;
+        // The System's mount reads the volume's MDB (LBA 7 on our layout).
+        // Arm the data-in PC trace exactly there, so the log shows which ROM
+        // routine takes the bytes -- the real reader or the discard drain.
+        if (std::strncmp(m, "CDB id0: 08 00 00 07", 20) == 0) mac.armDataInTrace(24);
         if (cdbCount >= 8 && std::strncmp(m, "SCMD 01", 7) == 0) ++flushCount;
         // Without --no-log everything prints; with it, the register-level
         // SCSI chatter (millions of lines on a long run) stays quiet and
@@ -480,6 +496,18 @@ int main(int argc, char** argv) {
                     mac.dafbVblEnabled() ? 1 : 0,
                     mac.read8(0x50F02000u + (13u << 9)),
                     mac.read8(0x50F02000u + (14u << 9)));
+        {
+            // The drive queue: whether the SCSI driver ever installed a drive.
+            u32 e = mac.read32(0x030A);   // DrvQHdr.qHead
+            std::printf("drive queue:");
+            for (int n = 0; e && n < 8; ++n) {
+                const u16 drive = mac.read16(e + 6);
+                const u16 refNum = mac.read16(e + 8);
+                std::printf(" [drive %u ref %d]", drive, static_cast<s16>(refNum));
+                e = mac.read32(e);
+            }
+            std::printf("\n");
+        }
         std::printf("DAFB swatch regs 100-13C:");
         for (int i = 0; i < 16; ++i) std::printf(" %03X", mac.dafbSwatchReg(i));
         std::printf("\n");
