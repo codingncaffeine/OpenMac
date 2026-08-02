@@ -73,6 +73,8 @@ public:
     u32 adbMouseReports() const;   // polls that actually carried motion
     u32 hdReads() const { return hdReadCount_; }
     u32 hdWrites() const { return hdWriteCount_; }
+    u32 fdReads() const { return fdReadCount_; }
+    u32 fdWrites() const { return fdWriteCount_; }
     u32 adbMouseBytesRead() const; // mouse bytes the guest actually clocked in
     std::vector<u8> adbMouseBytesLog() const;
     void adbClearCmdTrace();
@@ -115,6 +117,9 @@ public:
     void ejectFloppy();
     bool floppyPresent() const;
     const std::vector<u8>& floppyImage() const { return floppy_; }
+    // The medium a guest-commanded eject pushed out, with every byte the
+    // guest wrote still in it; empty when nothing has been ejected.
+    std::vector<u8> takeEjectedFloppy() { return std::move(floppyEjected_); }
 
     // Diagnostics.
     struct ScsiDiag {
@@ -123,6 +128,13 @@ public:
         int lastCdbLen;
     };
     ScsiDiag scsiDiag() const;
+    // Ask the guest's Gestalt a question by running the trap on the guest
+    // CPU. Headless diagnosis only: the answer is whatever the System's own
+    // table holds. Returns the OSErr; the response lands in `response`.
+    s32 gestaltQuery(u32 selector, u32& response);
+    // Diagnosis switch: skip the injected mount/announce of hard disks, to
+    // separate "our injection perturbs the boot" from everything else.
+    bool suppressHdAnnounce = false;
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }
     std::function<void(const char* msg)> onDiag;
@@ -204,7 +216,14 @@ private:
 
     std::unique_ptr<SonyDrive> fd_;
     std::vector<u8> floppy_;
-    bool floppySel_ = false;      // VIA1 PA5 = the drive's SEL line
+    std::vector<u8> floppyEjected_;
+    // VIA1 PA5 = the drive's SEL line. Undriven pins read HIGH (the outA
+    // handler models the pull-up with value|~ddr), so the power-on state is
+    // high too: at reset the ROM walks the SWIM2 phase lines before touching
+    // the VIA, and with SEL low that walk's one LSTRB rise addresses control
+    // register 6 -- EJECT -- and throws out whatever disk was in the drive.
+    // With SEL high it addresses register 7, which no drive implements.
+    bool floppySel_ = true;
     u8 swimPhasePrev_ = 0;        // LSTRB edge detection
 
     std::unique_ptr<Via6522> via1_;
@@ -250,6 +269,7 @@ private:
 
     int eascDiagBudget_ = 24;   // trace the first EASC control reads
     int swimDiagBudget_ = 400;  // trace the first SWIM2 accesses (with PCs)
+    int cmdDiagBudget_ = 120;   // trace notable drive command strobes
     int primeDiagBudget_ = 48;  // trace the first .Sony Prime requests we serve
     int adbSrTraceBudget_ = 0;  // armed by the input test: log SR reads with PCs
     int dataInPcBudget_ = 0;    // log which routine drains SCSI data-in bytes
@@ -266,6 +286,7 @@ private:
     u32  hdMountPb_ = 0;        // System-heap param block for the _MountVol retries
     int  hdMountTries_ = 0;
     u32  hdReadCount_ = 0, hdWriteCount_ = 0;
+    u32  fdReadCount_ = 0, fdWriteCount_ = 0;
     int  hdErrBudget_ = 20;     // report the first failed disk requests
     int scsiDiagBudget_ = 60;   // trace the first 53C96 register accesses
     int iplDiagBudget_ = 12;    // trace the first level-2 interrupt assertions

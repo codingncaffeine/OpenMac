@@ -613,15 +613,39 @@ u8 QuadraMachine::ioRead8(u32 addr) {
             // register's driven nibble, SEL from VIA1 PA5.
             const int sense = ((swimPhases_ & 4) << 1) | ((swimPhases_ & 2) << 1) |
                               ((swimPhases_ & 1) << 1) | (floppySel_ ? 1 : 0);
-            rv = static_cast<u8>(0xF7 | (fd_->sense(sense, totalCycles_) ? 0x08 : 0));
+            // The mode register's devsel (bits 1-2, gated by motor-on bit 7)
+            // names which drive is listening. This machine has one mechanism:
+            // a probe of the second position (mode $84, measured) must float
+            // the line high -- there is nothing there to pull it low --
+            // or the ROM registers a phantom drive 2 and the System mounts
+            // the same floppy twice. Probes with motor-on CLEAR (mode $18,
+            // measured) are how the internal drive is found: those keep
+            // answering from the mechanism.
+            const bool drive2 = (swimMode_ & 0x80) && ((swimMode_ >> 1) & 3) == 2;
+            const bool line = drive2 ? true : fd_->sense(sense, totalCycles_);
+            // SWITCHED (address 6) is the one ACTIVE-HIGH status line: a high
+            // answer tells the poll "this drive's disk just changed", and the
+            // System flushes + ejects on it. Log every high reading.
+            if ((sense & 0xF) == 0x6 && line && onDiag && cmdDiagBudget_ > 0) {
+                --cmdDiagBudget_;
+                char b[96];
+                std::snprintf(b, sizeof b,
+                              "SWITCHED high dev=%d d2=%d ph=%02X pc=%08X f=%u",
+                              (swimMode_ & 0x80) ? (swimMode_ >> 1) & 3 : 0,
+                              drive2 ? 1 : 0, swimPhases_, cpu_.pc,
+                              static_cast<unsigned>(frameCounter_));
+                onDiag(b);
+            }
+            rv = static_cast<u8>(0xF7 | (line ? 0x08 : 0));
             break;
         }
         default: rv = 0xFF; break;             // empty FIFO / floating
         }
         if (swimDiagBudget_ > 0) {
             --swimDiagBudget_;
-            char b[64];
-            std::snprintf(b, sizeof b, "SWIM R reg%d=%02X pc=%08X", reg, rv, cpu_.pc);
+            char b[80];
+            std::snprintf(b, sizeof b, "SWIM R reg%d=%02X mode=%02X ph=%02X pc=%08X",
+                          reg, rv, swimMode_, swimPhases_, cpu_.pc);
             if (onDiag) onDiag(b);
         }
         return rv;
@@ -701,16 +725,44 @@ void QuadraMachine::ioWrite8(u32 addr, u8 v) {
         switch (reg) {
         case 3: swimParams_[swimParamPtr_++ & 15] = v; break;
         case 4: {
-            // Phase lines: bits 0-2 = CA0-CA2, bit 3 = LSTRB. A rising
-            // strobe latches a drive command -- register CA1:CA0:SEL, data
-            // level CA2 (the classic Sony control convention).
+            // Phase lines: low nibble = CA0-CA2 + LSTRB levels, HIGH nibble =
+            // the per-line output enables (MAME applefdintf update_phases: a
+            // line is driven only when its enable bit is set). A command
+            // strobe exists only when LSTRB is DRIVEN high: the ROM's
+            // presence probe writes $0F -- all levels high, every driver
+            // disabled -- and a latch that ignores the enables reads that as
+            // EJECT (CA1=CA0=1, data=1) and throws the boot disk out the
+            // moment eject requests are actually consumed.
             const u8 prev = swimPhasePrev_;
             swimPhases_ = v;
-            swimPhasePrev_ = static_cast<u8>(v & 0xF);
-            if ((v & 0x08) && !(prev & 0x08)) {
-                const int reg35 = ((v & 2) << 1) | ((v & 1) << 1) |
+            const u8 driven = static_cast<u8>(v & (v >> 4) & 0x0F);
+            swimPhasePrev_ = driven;
+            if ((driven & 0x08) && !(prev & 0x08)) {
+                const int reg35 = ((driven & 2) << 1) | ((driven & 1) << 1) |
                                   (floppySel_ ? 1 : 0);
-                fd_->command(reg35, (v & 4) != 0, totalCycles_);
+                // A command reaches only the drive whose ENABLE is asserted:
+                // devsel (mode bits 1-2, gated by motor-on) must name the
+                // internal mechanism. The ROM's power-on phase walk strobes
+                // an EJECT shape with NO drive selected (mode $40, measured)
+                // and the driver's init ejects the absent second drive (mode
+                // $84, measured) -- on the metal neither reaches our drive,
+                // and a model that delivers them throws out the boot disk.
+                const int devsel =
+                    (swimMode_ & 0x80) ? (swimMode_ >> 1) & 3 : 0;
+                if (onDiag && cmdDiagBudget_ > 0 &&
+                    (reg35 == 6 || reg35 == 1 || devsel != 1)) {
+                    --cmdDiagBudget_;
+                    char b[112];
+                    std::snprintf(b, sizeof b,
+                                  "CMD strobe reg=%d data=%d pc=%08X mode=%02X sel=%d dev=%d f=%u%s",
+                                  reg35, (driven & 4) ? 1 : 0, cpu_.pc, swimMode_,
+                                  floppySel_ ? 1 : 0, devsel,
+                                  static_cast<unsigned>(frameCounter_),
+                                  devsel == 1 ? "" : " DROPPED");
+                    onDiag(b);
+                }
+                if (devsel == 1)
+                    fd_->command(reg35, (driven & 4) != 0, totalCycles_);
             }
             break;
         }
@@ -866,6 +918,26 @@ void QuadraMachine::tickDevices(int cpuCycles) {
             // fails, and the volume is written off for the rest of the session.
             if ((!hd_.empty() && !diskPrimePc_[0]) || (!hd2_.empty() && !diskPrimePc_[1]))
                 findDiskDriverPrime();
+            // The eject is a mechanism on its own clock, not a strobe (the
+            // Classic's lesson): advance it, and when it completes take the
+            // medium out so the driver's next status poll finds the drive
+            // empty. Without this a guest-commanded eject never finishes and
+            // an installer can never ask for the next disk of a set.
+            fd_->tickEject(totalCycles_);
+            if (fd_->takeEjectRequest()) {
+                if (onDiag) {
+                    char b[96];
+                    std::snprintf(b, sizeof b,
+                                  "floppy: guest ejected the disk (frame %u)",
+                                  static_cast<unsigned>(frameCounter_));
+                    onDiag(b);
+                }
+                fd_->removeDisk();
+                // Ejecting does not destroy the disk: keep the bytes so the
+                // host can still write back everything the guest changed.
+                floppyEjected_ = std::move(floppy_);
+                floppy_.clear();
+            }
             // DAFB VBL at ~66.67 Hz against the 60.15 Hz tick frame.
             vblAcc_ += 6667;
             dafb_->vblank();
@@ -908,7 +980,12 @@ void QuadraMachine::servePrime() {
     const u32 pb = guestPtr(cpu_.a[0]);
     const u32 dce = guestPtr(cpu_.a[1]);
     const u16 trap = read16(pb + 0x06);
-    const u32 buf = read32(pb + 0x20);
+    // The buffer pointer arrives with Memory Manager flag bits riding the
+    // high byte when the caller's heap manages 24-bit master pointers -- the
+    // 7.5 Installer's does. Serving it raw bus-faults on the flag, the read
+    // completes ioErr, and the Installer cancels the whole installation
+    // ("leaving your disk untouched"). The HD hook already stripped it.
+    const u32 buf = guestPtr(read32(pb + 0x20));
     const u32 req = read32(pb + 0x24);
     const u16 posMode = read16(pb + 0x2C);
     const u32 posOff = read32(pb + 0x2E);
@@ -952,6 +1029,7 @@ void QuadraMachine::servePrime() {
             done = n;
         }
     }
+    if (trap & 1) ++fdWriteCount_; else ++fdReadCount_;
     if (result != 0 && onDiag && hdErrBudget_ > 0) {
         --hdErrBudget_;
         char b[128];
@@ -1105,9 +1183,14 @@ void QuadraMachine::serveDiskCtlStatus(int unit, bool status) {
             write32(pb + 0x1E, static_cast<u32>(img.size() / 512));
         }
     } else {
-        // KillIO is the one worth refusing; a fixed disk cannot be ejected and
-        // the rest (verify, format, tag buffer, track cache) are done already.
-        if (csCode == 1) result = -17;              // controlErr
+        // KillIO is refused; a fixed disk cannot be ejected and the rest
+        // (verify, format, tag buffer, track cache) are done already. The
+        // icon calls (21 = drive icon, 22 = media icon) must be refused too:
+        // they answer with a POINTER in csParam, and "no error" over whatever
+        // the block happened to hold sends the caller off to draw from a wild
+        // address. controlErr makes the caller use its default icon instead.
+        if (csCode == 1 || csCode == 21 || csCode == 22)
+            result = -17;                           // controlErr
     }
     write16(pb + 0x10, static_cast<u16>(result));   // ioResult
     cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
@@ -1142,11 +1225,23 @@ void QuadraMachine::execute68kTrap(u16 trap) {
     cpu_.setSR(savedSr);
 }
 
+s32 QuadraMachine::gestaltQuery(u32 selector, u32& response) {
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    cpu_.d[0] = selector;
+    execute68kTrap(0xA1AD);                       // _Gestalt
+    const s32 err = static_cast<s16>(cpu_.d[0] & 0xFFFF);
+    response = cpu_.a[0];
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    return err;
+}
+
 // A drive that has sat in the queue since the ROM scan never gets mounted:
 // its disk-inserted announcement fell in the window startup flushes. Posting
 // the event once the System is up makes the insertion the same event a user's
 // insertion is -- the System mounts the volume and the Finder shows it.
 void QuadraMachine::announceHardDisks() {
+    if (suppressHdAnnounce) return;
     if (announceInFlight_) return;
     if (!hdAnnouncePending_ && !hd2AnnouncePending_) return;
     if (read32(0x0358) == 0) return;              // no live VCB: System not up
@@ -1182,16 +1277,18 @@ void QuadraMachine::announceHardDisks() {
     if (!hdMountPb_) {
         cpu_.d[0] = 80;
         execute68kTrap(0xA71E);                   // _NewPtr,Sys,Clear
-        hdMountPb_ = cpu_.a[0] & 0x00FFFFFFu;
+        // Strip only what is not already a RAM address: above 16 MB the
+        // high byte is significant, below it it may carry flag bits.
+        hdMountPb_ = guestPtr(cpu_.a[0]);
     }
-    // Mount the volume, THEN announce it. Posting the event alone is not
-    // enough: on a real insertion the File Manager mounts the volume before
-    // the driver's event reaches the application, and the message carries the
-    // drive number in its high word with the mount's result in the low word.
-    // The Finder recovers from a bare event by mounting the drive itself,
-    // which is why the desktop showed the disk -- but the Installer runs in
-    // the Finder's place off the install floppy and does not, so the disk it
-    // was told about was never a volume it could see.
+    // Mount the volume -- and post NO event. The applications that must see
+    // the disk (the Finder, the 7.5 Installer) enumerate the VCB queue, so
+    // the mount alone puts the volume in front of them. Posting a diskEvt as
+    // well poisons the 7.5 startup: with the event in the queue, the System's
+    // event processing re-runs a drive-1 mount mid-startup, the re-mount
+    // comes back volOnLinErr, and the recovery FLUSHES AND EJECTS the boot
+    // floppy and asks for it back by name (measured -- the please-insert
+    // screen at frame ~1700 appears with the event and not without it).
     auto mountDrive = [&](u16 drive) -> bool {
         if (!hdMountPb_) return false;
         for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
@@ -1199,9 +1296,6 @@ void QuadraMachine::announceHardDisks() {
         cpu_.a[0] = hdMountPb_;
         execute68kTrap(0xA00F);                   // _MountVol
         const s16 res = static_cast<s16>(cpu_.d[0] & 0xFFFF);
-        cpu_.a[0] = 7;                            // diskEvt
-        cpu_.d[0] = (static_cast<u32>(drive) << 16) | static_cast<u16>(res);
-        execute68kTrap(0xA02F);                   // _PostEvent
         if (onDiag) {
             char b[72];
             std::snprintf(b, sizeof b, "hd: drive %u mount result %d", drive, res);
@@ -1226,7 +1320,15 @@ int QuadraMachine::stepInstruction() {
         (diskPrimePc_[1] && cpu_.pc == diskPrimePc_[1])) {
         const int unit = (diskPrimePc_[0] && cpu_.pc == diskPrimePc_[0]) ? 0 : 1;
         inDriver_ = true;
-        try { serveDiskPrime(unit); } catch (const BusFault&) {
+        try { serveDiskPrime(unit); } catch (const BusFault& f) {
+            if (onDiag) {
+                char b[112];
+                std::snprintf(b, sizeof b,
+                              "hd prime FAULT pb=%08X dce=%08X addr=%08X (f %u)",
+                              cpu_.a[0], cpu_.a[1], f.addr,
+                              static_cast<unsigned>(frameCounter_));
+                onDiag(b);
+            }
             cpu_.d[0] = static_cast<u32>(-36);
             cpu_.pc = read32(0x08FC);
             cpu_.a[0] = cpu_.pc;
@@ -1240,7 +1342,15 @@ int QuadraMachine::stepInstruction() {
             (diskStatusPc_[u] && cpu_.pc == diskStatusPc_[u])) {
             const bool isStatus = diskStatusPc_[u] && cpu_.pc == diskStatusPc_[u];
             inDriver_ = true;
-            try { serveDiskCtlStatus(u, isStatus); } catch (const BusFault&) {
+            try { serveDiskCtlStatus(u, isStatus); } catch (const BusFault& f) {
+                if (onDiag) {
+                    char b[112];
+                    std::snprintf(b, sizeof b,
+                                  "hd ctl/status FAULT pb=%08X addr=%08X (f %u)",
+                                  cpu_.a[0], f.addr,
+                                  static_cast<unsigned>(frameCounter_));
+                    onDiag(b);
+                }
                 cpu_.d[0] = static_cast<u32>(-36);
                 cpu_.pc = read32(0x08FC);
                 cpu_.a[0] = cpu_.pc;
@@ -1253,9 +1363,19 @@ int QuadraMachine::stepInstruction() {
     if (cpu_.pc == kSonyPrime || cpu_.pc == kSonyPrimeAlias) {
         try {
             servePrime();
-        } catch (const BusFault&) {
+        } catch (const BusFault& f) {
             // A malformed parameter block must not take the emulator down;
-            // answer as a driver would and let the caller cope.
+            // answer as a driver would and let the caller cope. Say what
+            // faulted: an ioErr here fails whatever the guest was doing with
+            // the floppy, and silence cost a day's hunt once already.
+            if (onDiag) {
+                char b[112];
+                std::snprintf(b, sizeof b,
+                              "sony prime FAULT pb=%08X dce=%08X addr=%08X (f %u)",
+                              cpu_.a[0], cpu_.a[1], f.addr,
+                              static_cast<unsigned>(frameCounter_));
+                onDiag(b);
+            }
             cpu_.d[0] = static_cast<u32>(-36);   // ioErr
             cpu_.pc = read32(0x08FC);
             cpu_.a[0] = cpu_.pc;
