@@ -129,12 +129,43 @@ void QuadraMachine::wireDevices() {
         rtc_->setLines((eff & 0x01) != 0, (eff & 0x02) != 0, (eff & 0x04) != 0);
         const int prev = adb_->state();
         adb_->setState((eff >> 4) & 3);   // PB4/PB5 = "newaction"
-        if (adb_->state() != prev) adbMaybeClock();
+        if (adb_->state() != prev) {
+            // Push model, as the real transceiver behaves: entering a data
+            // state clocks the device's next byte ~700 us later whether or not
+            // the CPU has armed the shift register. The System's PATCHED RAM
+            // ADB manager (the one running once the desktop is up) does NOT
+            // pre-read the SR, so an arm-driven input shift never completes
+            // under it -- which is why the autopolled mouse reported motion
+            // (12 reports) that never reached the guest. Listen transfers stay
+            // CPU-driven: a pushed byte there would collide with the write.
+            const int st = adb_->state();
+            if ((st == 1 || st == 2) && !adb_->listening()) {
+                adbPending_ = kAdbShiftCycles;
+                adbPendingInput_ = true;
+                adbArmed_ = false;
+            } else if (st == 3 && adb_->responsePending()) {
+                // The settled poll collects a flush byte at idle before it
+                // reads the data states; serve it the same pushed way.
+                adbPending_ = kAdbShiftCycles;
+                adbPendingInput_ = true;
+                adbArmed_ = false;
+            } else if (st == 3) {
+                adbArmed_ = false;   // idle, nothing staged: the transaction is over
+                adbPending_ = 0;
+            } else if (adbPendingInput_) {
+                adbPending_ = 0;     // command window: cancel a stale input shift
+            }
+            adbMaybeClock();         // output shifts armed by SR writes still clock
+        }
         updateIpl();
     };
     via1_->srArmed = [this](bool input) {
+        // Input bytes are PUSHED by state changes (see outB); an SR read is
+        // just the CPU collecting the latched byte. Only OUTPUT shifts -- the
+        // CPU writing a command or Listen data -- arm a transfer here.
+        if (input) return;
         adbArmed_ = true;
-        adbArmedInput_ = input;
+        adbArmedInput_ = false;
         adbMaybeClock();
     };
     via1_->srDisarmed = [this] { adbArmed_ = false; };
@@ -146,8 +177,19 @@ void QuadraMachine::wireDevices() {
     };
     via2_->onIrq = [this](bool) { updateIpl(); };
     via2_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
+    via2_->ina = [this]() {
+        // Port A carries the per-slot interrupt lines, ACTIVE LOW (an idle
+        // bus reads $FF). The ROM's slot dispatcher reads this to learn which
+        // source interrupted; internal video (the DAFB) rides bit 6. Serving
+        // zeros here reads as "every slot at once" and the dispatcher can
+        // neither identify nor acknowledge anything.
+        return static_cast<u8>(0xFFu & ~(dafbIrq_ ? 0x40u : 0u));
+    };
 
-    dafb_->onIrq = [this](bool level) { via2_->setSlotIrq(level); };
+    dafb_->onIrq = [this](bool level) {
+        dafbIrq_ = level;
+        via2_->setSlotIrq(level);
+    };
     easc_->onIrq = [this](bool level) { via2_->setAscIrq(level); };
     easc_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     scsi_->onIrq = [this](bool level) { via2_->setScsiIrq(level); };
@@ -261,6 +303,12 @@ u8 QuadraMachine::read8(u32 addr) {
 
 void QuadraMachine::write8(u32 addr, u8 value) {
     if (addr < 0x40000000u) {
+        if (watchLen_ && addr - watchAddr_ < watchLen_ && watchBudget_ > 0 && onDiag) {
+            --watchBudget_;
+            char b[64];
+            std::snprintf(b, sizeof b, "WATCH w8 %08X=%02X pc=%08X", addr, value, cpu_.pc);
+            onDiag(b);
+        }
         if (addr < ram_.size()) ram_[addr] = value;
         return;   // writes to holes vanish, as on the real bus
     }
@@ -342,6 +390,12 @@ u16 QuadraMachine::read16(u32 addr) {
 
 void QuadraMachine::write16(u32 addr, u16 value) {
     if (addr < 0x40000000u) {
+        if (watchLen_ && addr - watchAddr_ < watchLen_ + 1 && watchBudget_ > 0 && onDiag) {
+            --watchBudget_;
+            char b[64];
+            std::snprintf(b, sizeof b, "WATCH w16 %08X=%04X pc=%08X", addr, value, cpu_.pc);
+            onDiag(b);
+        }
         if (addr + 1 < ram_.size()) {
             ram_[addr] = static_cast<u8>(value >> 8);
             ram_[addr + 1] = static_cast<u8>(value);
@@ -426,6 +480,12 @@ u32 QuadraMachine::read32(u32 addr) {
 
 void QuadraMachine::write32(u32 addr, u32 value) {
     if (addr < 0x40000000u) {
+        if (watchLen_ && addr - watchAddr_ < watchLen_ + 3 && watchBudget_ > 0 && onDiag) {
+            --watchBudget_;
+            char b[72];
+            std::snprintf(b, sizeof b, "WATCH w32 %08X=%08X pc=%08X", addr, value, cpu_.pc);
+            onDiag(b);
+        }
         if (addr + 3 < ram_.size()) {
             ram_[addr] = static_cast<u8>(value >> 24);
             ram_[addr + 1] = static_cast<u8>(value >> 16);
@@ -460,7 +520,17 @@ u8 QuadraMachine::ioRead8(u32 addr) {
         return static_cast<u8>(v >> (8 * (3 - (addr & 3))));
     }
     const u32 off = addr & 0x0003FFFFu;
-    if (off < 0x02000u) return via1_->read((off >> 9) & 0xF);
+    if (off < 0x02000u) {
+        const int vreg = (off >> 9) & 0xF;
+        const u8 v = via1_->read(vreg);
+        if (vreg == 10 && adbSrTraceBudget_ > 0) {
+            --adbSrTraceBudget_;
+            char b[48];
+            std::snprintf(b, sizeof b, "SRread pc=%08X v=%02X", cpu_.pc, v);
+            if (onDiag) onDiag(b);
+        }
+        return v;
+    }
     if (off < 0x04000u) return via2_->read((off >> 9) & 0xF);
     if (off >= 0x08000u && off < 0x08008u) return macProm_[off & 7];
     if (off >= 0x0A000u && off < 0x0B100u) {
@@ -859,6 +929,7 @@ void QuadraMachine::servePrime() {
 }
 
 int QuadraMachine::stepInstruction() {
+    if (countPc_ && (cpu_.pc | 0x40000000u) == (countPc_ | 0x40000000u)) ++countPcHits_;
     // The ROM's .Sony driver runs through both its 32-bit face and the 24-bit
     // alias; hook Prime at either and serve the request from the image.
     if (cpu_.pc == kSonyPrime || cpu_.pc == kSonyPrimeAlias) {
@@ -934,6 +1005,13 @@ void QuadraMachine::keyEvent(u8 adbCode, bool down) {
 
 u32 QuadraMachine::adbMousePolls() const { return adb_->mousePolls(); }
 u32 QuadraMachine::adbKbdPolls() const { return adb_->kbdPolls(); }
+u32 QuadraMachine::adbMouseReports() const { return adb_->mouseReports(); }
+bool QuadraMachine::dafbVblEnabled() const { return dafb_->vblIntEnabled(); }
+u32 QuadraMachine::dafbSwatchReg(int i) const { return dafb_->swatchReg(i); }
+u32 QuadraMachine::adbMouseBytesRead() const { return adb_->mouseBytesRead(); }
+std::vector<u8> QuadraMachine::adbMouseBytesLog() const { return adb_->mouseBytesLog(); }
+void QuadraMachine::adbClearCmdTrace() { adb_->clearCmdTrace(); }
+std::vector<u8> QuadraMachine::adbCmdTrace() const { return adb_->cmdTrace(); }
 
 int QuadraMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
     // Peel the wrappers the archived media wears -- MacBinary around DiskCopy

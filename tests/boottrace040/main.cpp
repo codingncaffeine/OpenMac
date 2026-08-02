@@ -138,6 +138,9 @@ int main(int argc, char** argv) {
     const char* romPath = nullptr;
     const char* fdPath = nullptr;
     int fdAfter = -1;               // --floppy-after: insert mid-run at this frame
+    int jiggleAt = -1;              // --jiggle-at: click+move the mouse mid-boot
+    unsigned long watchMemAt = 0;   // --watch-mem: log writes to this address
+    unsigned long countPcAt = 0;    // --count-pc: count executions of this pc
     const char* hdPath = nullptr;
     const char* cdPath = nullptr;
     const char* shotPath = nullptr;
@@ -168,6 +171,9 @@ int main(int argc, char** argv) {
         if (a == "--rom" && i + 1 < argc) romPath = argv[++i];
         else if (a == "--floppy" && i + 1 < argc) fdPath = argv[++i];
         else if (a == "--floppy-after" && i + 2 < argc) { fdPath = argv[++i]; fdAfter = std::atoi(argv[++i]); }
+        else if (a == "--jiggle-at" && i + 1 < argc) jiggleAt = std::atoi(argv[++i]);
+        else if (a == "--watch-mem" && i + 1 < argc) watchMemAt = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--harddisk" && i + 1 < argc) hdPath = argv[++i];
         else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
         else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
@@ -386,6 +392,13 @@ int main(int argc, char** argv) {
             std::printf("floppy (mid-run, frame %d): %s\n", i,
                         mac.insertFloppy(std::move(fdDeferred)) ? "inserted" : "REFUSED");
         }
+        // Simulate a user clicking to lock and jiggling the mouse over a span of
+        // frames, to see whether injecting ADB traffic mid-boot wedges the machine.
+        if (jiggleAt >= 0 && i >= jiggleAt && i < jiggleAt + 40) {
+            if (i == jiggleAt) mac.mouseMove(0, 0, true);        // click (lock)
+            if (i == jiggleAt + 2) mac.mouseMove(0, 0, false);
+            mac.mouseMove((i & 1) ? 7 : -7, (i & 2) ? 5 : -5, false);
+        }
         mac.runFrame();
         std::vector<u8> chunk;
         mac.drainAudio(chunk);
@@ -442,26 +455,83 @@ int main(int argc, char** argv) {
     }
 
     if (inputTest) {
-        // The cursor is drawn at the boot-device wait screen; if the ADB
-        // path works, injected motion moves it and the framebuffer changes.
+        // Isolate the two devices: move ONLY the mouse and see whether the
+        // cursor tracks it, then press ONLY a key and see the keyboard's
+        // effect. Reporting them apart tells a dead mouse from a dead
+        // keyboard -- the two ride separate ADB delivery paths.
         const int w = mac.screenWidth(), h = mac.screenHeight();
         std::vector<u32> before(static_cast<std::size_t>(w) * h);
-        std::vector<u32> after(before.size());
+        std::vector<u32> afterMouse(before.size());
+        std::vector<u32> afterKey(before.size());
         mac.renderScreen(before.data());
+        const u32 mp0 = mac.adbMousePolls();
+        // Low-mem mouse globals: RawMouse (ADB writes it), Mouse (the cursor
+        // follows it). If RawMouse moves but the cursor does not, the ADB path
+        // works and the cursor task is the problem; if neither moves, the
+        // System never applied our report.
+        const u16 mtV0 = mac.read16(0x0828), mtH0 = mac.read16(0x082A);
+        const u16 rawV0 = mac.read16(0x082C), rawH0 = mac.read16(0x082E);
+        const u16 msV0 = mac.read16(0x0830), msH0 = mac.read16(0x0832);
+        mac.adbClearCmdTrace();
+        mac.armAdbSrTrace(30);
+        if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), 16, 60);
+        if (countPcAt) mac.countPc(static_cast<u32>(countPcAt));
+        std::printf("VBL plumbing: dafb vblEnabled=%d  via2 IFR=%02X IER=%02X\n",
+                    mac.dafbVblEnabled() ? 1 : 0,
+                    mac.read8(0x50F02000u + (13u << 9)),
+                    mac.read8(0x50F02000u + (14u << 9)));
+        std::printf("DAFB swatch regs 100-13C:");
+        for (int i = 0; i < 16; ++i) std::printf(" %03X", mac.dafbSwatchReg(i));
+        std::printf("\n");
+        {
+            const u32 adbBase = mac.read32(0x0CF8);
+            std::printf("ADB globals at %08X:\n", adbBase);
+            for (int row = 0; row < 28; ++row) {
+                std::printf("  +%03X:", row * 16);
+                for (int i = 0; i < 16; ++i)
+                    std::printf(" %02X", mac.read8(adbBase + static_cast<u32>(row * 16 + i)));
+                std::printf("\n");
+            }
+        }
         for (int burst = 0; burst < 12; ++burst) {
             mac.mouseMove(10, 6, false);
             for (int f = 0; f < 4; ++f) mac.runFrame();
         }
+        std::printf("mouse lowmem: MTemp %d,%d->%d,%d  RawMouse %d,%d->%d,%d  Mouse %d,%d->%d,%d\n",
+                    static_cast<s16>(mtH0), static_cast<s16>(mtV0),
+                    static_cast<s16>(mac.read16(0x082A)), static_cast<s16>(mac.read16(0x0828)),
+                    static_cast<s16>(rawH0), static_cast<s16>(rawV0),
+                    static_cast<s16>(mac.read16(0x082E)), static_cast<s16>(mac.read16(0x082C)),
+                    static_cast<s16>(msH0), static_cast<s16>(msV0),
+                    static_cast<s16>(mac.read16(0x0832)), static_cast<s16>(mac.read16(0x0830)));
+        std::printf("mouse bytes delivered to guest:");
+        for (u8 b : mac.adbMouseBytesLog()) std::printf(" %02X", b);
+        std::printf("\nADB commands the CPU issued during the burst:");
+        {
+            const auto cmds = mac.adbCmdTrace();
+            std::size_t shown = 0;
+            for (u8 cb : cmds) { std::printf(" %02X", cb); if (++shown >= 48) break; }
+            std::printf(" (%zu total)\n", cmds.size());
+        }
+        mac.renderScreen(afterMouse.data());
+        const u32 kp0 = mac.adbKbdPolls();
         mac.keyEvent(0x00, true);    // 'A' down
         for (int f = 0; f < 6; ++f) mac.runFrame();
         mac.keyEvent(0x00, false);
         for (int f = 0; f < 20; ++f) mac.runFrame();
-        mac.renderScreen(after.data());
-        std::size_t diff = 0;
-        for (std::size_t i = 0; i < before.size(); ++i)
-            if (before[i] != after[i]) ++diff;
-        std::printf("input test: %zu pixels changed; polls mouse=%u kbd=%u\n",
-                    diff, mac.adbMousePolls(), mac.adbKbdPolls());
+        mac.renderScreen(afterKey.data());
+        std::size_t mouseDiff = 0, keyDiff = 0;
+        for (std::size_t i = 0; i < before.size(); ++i) {
+            if (before[i] != afterMouse[i]) ++mouseDiff;
+            if (afterMouse[i] != afterKey[i]) ++keyDiff;
+        }
+        std::printf("input test: MOUSE moved %zu px (polls %u, reports %u, bytesRead %u), "
+                    "KEYBOARD changed %zu px (polls %u)\n",
+                    mouseDiff, mac.adbMousePolls() - mp0, mac.adbMouseReports(),
+                    mac.adbMouseBytesRead(), keyDiff, mac.adbKbdPolls() - kp0);
+        if (countPcAt)
+            std::printf("count-pc %08lX: executed %u times during the test\n",
+                        countPcAt, mac.countPcHits());
     }
 
     if (findHex) {

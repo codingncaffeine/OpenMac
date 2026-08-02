@@ -48,6 +48,8 @@ public:
         depthCtl_ = 0;
         vblEnabled_ = false;
         vblPending_ = false;
+        cursorPending_ = false;
+        intMask_ = 0;
         clockShift_ = 0;
     }
 
@@ -89,6 +91,12 @@ public:
             if (reg == 0x08) {   // IRQ status: bit0 = VBL, bit2 = cursor line
                 return (vblPending_ ? 1u : 0u) | (cursorPending_ ? 4u : 0u);
             }
+            // The interrupt CLEARS work on a read as well as a write (MAME
+            // dafb.cpp swatch_r) -- the ISR's TST of the register is its ack.
+            // Leaving read-clear out sticks the pending bit, and the level-
+            // routed slot interrupt then storms the moment the mask enables.
+            if (reg == 0x0C) { cursorPending_ = false; updateIrq(); return 0; }
+            if (reg == 0x14) { vblPending_ = false; updateIrq(); return 0; }
             return swatch_[reg >> 2] & 0xFFFu;
         case 2:
             if (reg == 0x00) return clutAddr_;
@@ -118,9 +126,23 @@ public:
             break;
         case 1:
             swatch_[reg >> 2] = v & 0xFFFu;
-            if (reg == 0x04) vblEnabled_ = (v & 1) != 0;
-            if (reg == 0x0C) cursorPending_ = false;             // clear cursor int
-            if (reg == 0x14) { vblPending_ = false; updateIrq(); }
+            // Interrupt mask (+$104): bit 0 = vertical blank, bit 2 = the
+            // beam crossing the cursor scanline. System 7.5's Cursor Device
+            // Manager runs its cursor task off the CURSOR interrupt, not the
+            // VBL -- it enables mask $004 and nothing else, so a model that
+            // only raises the line for VBL leaves the cursor frozen while
+            // the mouse deltas pile up unconsumed in the CDM record.
+            // Disabling a source drops its pending bit (MAME dafb.cpp), so a
+            // latch left over from the mask-off era cannot fire at enable.
+            if (reg == 0x04) {
+                intMask_ = v & 7u;
+                vblEnabled_ = (v & 1) != 0;
+                if (!(v & 1)) vblPending_ = false;
+                if (!(v & 4)) cursorPending_ = false;
+                updateIrq();
+            }
+            if (reg == 0x0C) { cursorPending_ = false; updateIrq(); }   // clear cursor int
+            if (reg == 0x14) { vblPending_ = false; updateIrq(); }      // clear VBL int
             break;
         case 2:
             if (reg == 0x00) {
@@ -231,7 +253,11 @@ public:
         cursorPending_ = true;
         updateIrq();
     }
-    bool irqAsserted() const { return vblPending_ && vblEnabled_; }
+    bool irqAsserted() const {
+        return (vblPending_ && (intMask_ & 1u)) || (cursorPending_ && (intMask_ & 4u));
+    }
+    bool vblIntEnabled() const { return vblEnabled_; }
+    u32 swatchReg(int i) const { return swatch_[i & 63]; }
     std::function<void(bool level)> onIrq;
 
     // Hi-res color 13"/14" (640x480): base sense code 6.
@@ -252,6 +278,7 @@ private:
     bool vblEnabled_ = false;
     bool vblPending_ = false;
     bool cursorPending_ = false;
+    u32 intMask_ = 0;           // +$104: bit0 VBL, bit2 cursor scanline
     u64 clockShift_ = 0;
 };
 

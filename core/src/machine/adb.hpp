@@ -91,11 +91,14 @@ public:
     u32 mousePolls() const { return mousePolls_; }
     u32 kbdPolls() const { return kbdPolls_; }
     u32 mouseReports() const { return mouseReports_; }
+    u32 mouseBytesRead() const { return mouseBytesRead_; }   // mouse bytes the guest actually clocked in
+    const std::vector<u8>& mouseBytesLog() const { return mouseBytesLog_; }
     u32 kbdReg2() const { return kbdReg2_; }   // ROM read modifier state
     u32 kbdReg3() const { return kbdReg3_; }   // keyboard enumerated (device info)
     u32 mouseReg3() const { return mouseReg3_; }
     const std::vector<u8>& cmdTrace() const { return cmdTrace_; }
     const std::vector<u8>& respTrace() const { return respTrace_; }
+    void clearCmdTrace() { cmdTrace_.clear(); respTrace_.clear(); }
 
     void cpuShiftOut(u8 value) {
         if (state_ == 0) {
@@ -122,6 +125,10 @@ public:
             // poll as unsolicited device data and wedge the boot (see emit()).
             // The ROM tells a real report from an empty address by the byte
             // value it clocks in (0xFF = empty), never by a /INT edge.
+            if (lastEmitMouse_) {
+                ++mouseBytesRead_;
+                if (mouseBytesLog_.size() < 16) mouseBytesLog_.push_back(buf_[idx_]);
+            }
             return buf_[idx_++];
         }
         if (responsePending()) {
@@ -236,6 +243,7 @@ private:
     }
 
     void talkKeyboard(int reg) {
+        lastEmitMouse_ = false;
         if (reg == 0) {
             ++kbdPolls_;
             if (kbdHead_ == kbdTail_) return;          // no transitions pending
@@ -286,6 +294,7 @@ private:
             // byte1: bit7 = 1,                  bits6-0 = X delta (7-bit signed)
             const u8 b0 = static_cast<u8>((mouseButton_ ? 0x00 : 0x80) | (dy & 0x7F));
             const u8 b1 = static_cast<u8>(0x80 | (dx & 0x7F));
+            lastEmitMouse_ = true;
             emit(b0, b1);
         } else if (reg == 3) {
             ++mouseReg3_;
@@ -319,6 +328,9 @@ private:
     int listenReg_ = -1, listenAddr_ = 0, listenPos_ = 0;
     u8 listenBuf_[2]{};
     u32 mousePolls_ = 0, kbdPolls_ = 0, mouseReports_ = 0;
+    u32 mouseBytesRead_ = 0;
+    bool lastEmitMouse_ = false;
+    std::vector<u8> mouseBytesLog_;
     u32 kbdReg2_ = 0, kbdReg3_ = 0, mouseReg3_ = 0;
     std::vector<u8> cmdTrace_;
     std::vector<u8> respTrace_;
