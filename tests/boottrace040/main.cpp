@@ -487,6 +487,19 @@ int main(int argc, char** argv) {
     bool inputTest = false;         // move the mouse + press a key at the end
     int breakFlush = 0;             // break at the Nth FIFO flush after CDB #8
     unsigned long dumpMem = 0;
+    // --dump-range START END FILE (hex bounds, repeatable): raw guest memory to
+    // a file at exit. --dump-mem is a 128-byte glance; this feeds a byte search
+    // or a hand disassembly of a whole routine.
+    struct DumpRange { u32 lo, hi; const char* path; };
+    std::vector<DumpRange> dumpRanges;
+    // --io-trace FROM TO PCLO PCHI BUDGET: every device access a range of
+    // code makes in a frame window. The PC filter is what makes it readable:
+    // the ROM's own interrupt traffic drowns a driver's few dozen accesses.
+    bool ioTrace = false;
+    u32 ioFrom = 0, ioTo = 0, ioPcLo = 0, ioPcHi = 0xFFFFFFFFu;
+    int ioBudget = 400;
+    u32 trailPc = 0;                // --trail <pc> <n>, gated by --watch-from
+    int trailCount = 0;
     unsigned long breakPc = 0;
     int breakSkip = 0;
     unsigned long traceFrom = 0;
@@ -563,6 +576,23 @@ int main(int argc, char** argv) {
         else if (a == "--no-log") showLog = false;
         else if (a == "--profile") profile = true;
         else if (a == "--dump-mem" && i + 1 < argc) dumpMem = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--trail" && i + 2 < argc) {
+            trailPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            trailCount = std::atoi(argv[++i]);
+        }
+        else if (a == "--io-trace" && i + 5 < argc) {
+            ioTrace = true;
+            ioFrom = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
+            ioTo = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
+            ioPcLo = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            ioPcHi = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            ioBudget = std::atoi(argv[++i]);
+        }
+        else if (a == "--dump-range" && i + 3 < argc) {
+            const u32 lo = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            const u32 hi = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            dumpRanges.push_back({lo, hi, argv[++i]});
+        }
         else if (a == "--trace-traps" && i + 2 < argc) {
             trapsAfterCdbs = std::atoi(argv[++i]);
             traceTraps = std::atoi(argv[++i]);
@@ -692,10 +722,11 @@ int main(int argc, char** argv) {
                          std::strncmp(m, "XFER", 4) == 0 || std::strncmp(m, "PRIME", 5) == 0 ||
                          std::strncmp(m, "EASC", 4) == 0 || std::strncmp(m, "VIA2", 4) == 0))
             return;
-        std::printf("%s\n", m);
+        std::printf("f=%u %s\n", static_cast<unsigned>(mac.frameCount()), m);
     };
     // The write watch serves any investigation, not just the input test.
     if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), 4, 60);
+    if (ioTrace) mac.traceIoWindow(ioFrom, ioTo, ioPcLo, ioPcHi, ioBudget);
     if (countPcAt) mac.countPc(static_cast<u32>(countPcAt));
     int vramBudget = 10;
     mac.onVramWrite = [&](u32 off, u32 pc) {
@@ -1045,10 +1076,11 @@ int main(int argc, char** argv) {
                 static std::map<u32, int> seen;
                 if (++seen[w] > 40) continue;
                 const M68040& c = mac.cpu();
-                std::printf("WATCH %08X f=%u a0=%08X a1=%08X a6=%08X a7=%08X "
-                            "d0=%08X d1=%08X stack:",
-                            pc, static_cast<unsigned>(mac.frameCount()),
-                            c.a[0], c.a[1], c.a[6], c.a[7], c.d[0], c.d[1]);
+                std::printf("WATCH %08X f=%u", pc,
+                            static_cast<unsigned>(mac.frameCount()));
+                for (int k = 0; k < 8; ++k) std::printf(" d%d=%08X", k, c.d[k]);
+                for (int k = 0; k < 8; ++k) std::printf(" a%d=%08X", k, c.a[k]);
+                std::printf(" stack:");
                 for (u32 k = 0; k < 6; ++k)
                     std::printf(" %08X",
                                 c.a[7] + 4 * k + 3 < ramTop_ ? mac.read32(c.a[7] + 4 * k) : 0);
@@ -1056,7 +1088,31 @@ int main(int argc, char** argv) {
             }
         };
     };
-    if (!watchPcs.empty()) installWatch();
+    // --trail <pc> <n>: the next n instructions once execution first reaches
+    // an address in the frame window. A watch says a routine was entered
+    // with these registers; this says where it went -- which is the question
+    // when a call does not come back.
+    if (trailPc) {
+        int left = trailCount;
+        bool armed = false;
+        mac.cpu().onStep = [&, left, armed](u32 pc) mutable {
+            if (!armed) {
+                if (pc != trailPc) return;
+                if (static_cast<int>(mac.frameCount()) < watchFrom) return;
+                armed = true;
+                std::printf("-- trail from %08X at frame %u --\n", pc,
+                            static_cast<unsigned>(mac.frameCount()));
+            }
+            if (left-- <= 0) return;
+            const M68040& c = mac.cpu();
+            std::printf("T %08X d0=%08X d1=%08X a0=%08X a1=%08X a2=%08X "
+                        "sp=%08X sr=%04X\n",
+                        pc, c.d[0], c.d[1], c.a[0], c.a[1], c.a[2], c.a[7],
+                        c.getSR());
+        };
+    } else if (!watchPcs.empty()) {
+        installWatch();
+    }
 
     std::vector<u8> audio;
     for (int i = 0; i < frames; ++i) {
@@ -1401,6 +1457,15 @@ int main(int argc, char** argv) {
             }
         }
         if (!hits) std::printf("pattern not found in RAM\n");
+    }
+
+    for (const auto& r : dumpRanges) {
+        std::ofstream f(r.path, std::ios::binary);
+        for (u32 a = r.lo; a < r.hi; ++a) {
+            const char b = static_cast<char>(mac.read8(a));
+            f.write(&b, 1);
+        }
+        std::printf("dumped %08X-%08X: %s\n", r.lo, r.hi, r.path);
     }
 
     if (dumpMem) {
