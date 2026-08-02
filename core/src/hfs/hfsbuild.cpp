@@ -62,18 +62,29 @@ struct Writer {
     void str(const std::string& s) { data.insert(data.end(), s.begin(), s.end()); }
 };
 
+// A catalog key the way Apple's own File Manager writes one: ckrKeyLen
+// counts reserved byte + parent id + name, EXCLUDING the alignment pad. When
+// 1+keyLen is odd a pad byte follows so the record data starts on a word
+// boundary. The guest's B*-tree insert code computes with exactly this
+// layout; a builder that folded the pad into keyLen produced trees the ROM
+// could search but not extend -- the Finder's very first "create the
+// desktop folder" failed on every built disk.
 Writer catKey(u32 parID, const std::string& name) {
     const u32 nameLen = static_cast<u32>(name.size());
-    const u32 cnamePascal = 1 + nameLen;
-    const u32 keyLen = 5 + cnamePascal + (cnamePascal & 1);
+    const u32 keyLen = 6 + nameLen;
     Writer w;
     w.u8v(u8(keyLen));
     w.u8v(0);
     w.u32v(parID);
     w.u8v(u8(nameLen));
     w.str(name);
-    w.zeros(cnamePascal & 1);
+    if ((1 + keyLen) & 1) w.zeros(1);
     return w;
+}
+
+// Record data starts word-aligned past the key and its pad.
+u16 recDataOff(const std::vector<u8>& bytes) {
+    return u16((1 + bytes[0] + 1) & ~1);
 }
 
 // The safe subset: characters whose case-folded ASCII order matches the Mac's
@@ -375,7 +386,7 @@ std::vector<u8> VolumeBuilder::build(u32 sizeBytes) {
         for (std::size_t i = 0; i < recs.size(); ++i)
             if (recs[i].parID == p.e->parent && recs[i].name == p.e->name &&
                 recs[i].bytes.size() > 6 &&
-                recs[i].bytes[1 + recs[i].bytes[0]] == kCdrFil) {
+                recs[i].bytes[recDataOff(recs[i].bytes)] == kCdrFil) {
                 p.recIndex = i;
                 break;
             }
@@ -399,11 +410,16 @@ std::vector<u8> VolumeBuilder::build(u32 sizeBytes) {
                 Record ix;
                 ix.parID = first->parID;
                 ix.name = first->name;
-                // Index record = the child's first key + the child node number.
-                const u8 keyTotal = u8(1 + first->bytes[0]);
-                ix.bytes.assign(first->bytes.begin(), first->bytes.begin() + keyTotal);
-                ix.bytes.resize(keyTotal + 4);
-                put32(ix.bytes.data() + keyTotal, nodeNum);
+                // Index record = the child's first key at the tree's FULL
+                // key width (an index key always spans bthKeyLen, name area
+                // zero-padded), then the child node number. Variable-width
+                // index keys searched fine but broke the guest's inserts.
+                const u8 childKeyLen = first->bytes[0];
+                ix.bytes.assign(1 + kCatKeyLen + 4, 0);
+                ix.bytes[0] = u8(kCatKeyLen);
+                std::memcpy(ix.bytes.data() + 1, first->bytes.data() + 1,
+                            std::min<std::size_t>(childKeyLen, kCatKeyLen));
+                put32(ix.bytes.data() + 1 + kCatKeyLen, nodeNum);
                 lvl.recs.push_back(std::move(ix));
                 ++nodeNum;
             }
@@ -506,7 +522,7 @@ std::vector<u8> VolumeBuilder::build(u32 sizeBytes) {
     for (const FilePatch& p : patches) {
         const Entry& e = *p.e;
         Record& r = recs[p.recIndex];
-        u8* d = r.bytes.data() + 1 + r.bytes[0];   // past the packed key
+        u8* d = r.bytes.data() + recDataOff(r.bytes);   // past the packed key
         put16(d + 24, e.dataStart);
         put32(d + 30, u32(e.dataABs) * alBlkSiz);
         put16(d + 34, e.rsrcStart);

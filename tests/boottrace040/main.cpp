@@ -377,6 +377,9 @@ int main(int argc, char** argv) {
             return;
         std::printf("%s\n", m);
     };
+    // The write watch serves any investigation, not just the input test.
+    if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), 4, 60);
+    if (countPcAt) mac.countPc(static_cast<u32>(countPcAt));
     int vramBudget = 10;
     mac.onVramWrite = [&](u32 off, u32 pc) {
         if (vramBudget > 0) {
