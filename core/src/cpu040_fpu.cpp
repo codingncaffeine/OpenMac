@@ -460,7 +460,22 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
             else c.a[reg] = *regp;
             return 4;
         }
-        u32 addr = calcEA(c, mode, reg, 2);
+        // The whole list moves as one block, so predecrement must step back over
+        // ALL of it before writing and postincrement must step over all of it
+        // after: adjusting by one long regardless of the count leaves the block
+        // straddling the address register, overwriting the caller's longword
+        // just above it. (The ROM's SANE environment call saves a return address
+        // exactly there and then jumps through it.)
+        u32 addr;
+        if (mode == 3) {
+            addr = c.a[reg];
+            c.a[reg] += 4u * static_cast<u32>(n);
+        } else if (mode == 4) {
+            c.a[reg] -= 4u * static_cast<u32>(n);
+            addr = c.a[reg];
+        } else {
+            addr = calcEA(c, mode, reg, 2);
+        }
         // Transfers highest to lowest: FPCR, FPSR, FPIAR at ascending addresses.
         for (int b = 2; b >= 0; --b) {
             if (!((list >> b) & 1)) continue;

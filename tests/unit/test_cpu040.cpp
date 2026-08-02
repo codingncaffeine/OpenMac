@@ -466,6 +466,44 @@ TEST_CASE("040 FMOVEM.X saves and restores registers through memory") {
     CHECK(f.cpu.a[7] == 0x0F000);
 }
 
+TEST_CASE("040 FMOVEM control list moves the address register by the whole list") {
+    Cpu040Fix f;
+    // A caller's saved longword sits just above the stack pointer. A control
+    // list of two registers must be pushed BELOW it, not straddle it: the ROM's
+    // SANE environment call keeps a return address there and later jumps
+    // through it, so an eight-byte block written after a four-byte predecrement
+    // sends the guest to whatever the FPSR happened to hold.
+    f.cpu.a[7] = 0x0F000;
+    f.bus.write32(0x0F000, 0xCAFEF00D);
+    f.cpu.fpcr = 0x00000030;
+    f.cpu.fpsr = 0x08000000;
+    f.run({0xF227, 0xB800});   // FMOVEM.L FPCR/FPSR,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 8);
+    CHECK(f.bus.read32(0x0F000 - 8) == 0x00000030);   // FPCR lowest
+    CHECK(f.bus.read32(0x0F000 - 4) == 0x08000000);   // then FPSR
+    CHECK(f.bus.read32(0x0F000) == 0xCAFEF00D);       // caller's slot intact
+
+    f.cpu.fpcr = f.cpu.fpsr = 0;
+    f.run({0xF21F, 0x9800});   // FMOVEM.L (A7)+,FPCR/FPSR
+    CHECK(f.cpu.a[7] == 0x0F000);
+    CHECK(f.cpu.fpcr == 0x00000030);
+    CHECK(f.cpu.fpsr == 0x08000000);
+
+    // A single control register still moves exactly one long.
+    f.run({0xF227, 0xA800});   // FMOVEM.L FPSR,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 4);
+    CHECK(f.bus.read32(0x0F000 - 4) == 0x08000000);
+
+    // ...and all three move twelve.
+    f.cpu.a[7] = 0x0F000;
+    f.cpu.fpiar = 0x00001234;
+    f.run({0xF227, 0xBC00});   // FMOVEM.L FPCR/FPSR/FPIAR,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 12);
+    CHECK(f.bus.read32(0x0F000 - 12) == 0x00000030);
+    CHECK(f.bus.read32(0x0F000 - 8) == 0x08000000);
+    CHECK(f.bus.read32(0x0F000 - 4) == 0x00001234);
+}
+
 TEST_CASE("040 FSAVE produces NULL before use and IDLE after; FRESTORE resets") {
     Cpu040Fix f;
     f.cpu.a[0] = 0xC000;
