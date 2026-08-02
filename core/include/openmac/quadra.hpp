@@ -30,6 +30,7 @@ class AdbTransceiver;
 class Dafb;
 class Easc;
 class Ncr53c96;
+class Scc8530;
 class ScsiDisk;
 class ScsiCdRom;
 class ScsiEthernet;
@@ -84,6 +85,14 @@ public:
         watchAddr_ = addr; watchLen_ = len; watchBudget_ = budget;
     }
     void armDataInTrace(int n) { dataInPcBudget_ = n; }
+    // Log every device access made between two frames by code inside a PC
+    // range: which registers a routine actually touches, and what they
+    // answered. Answers "what is this driver waiting on" directly.
+    void traceIoWindow(u32 fromFrame, u32 toFrame, u32 pcLo, u32 pcHi,
+                       int budget) {
+        ioTraceFromFrame_ = fromFrame; ioTraceToFrame_ = toFrame;
+        ioTracePcLo_ = pcLo; ioTracePcHi_ = pcHi; ioTraceBudget_ = budget;
+    }
     void countPc(u32 pc) { countPc_ = pc; countPcHits_ = 0; }
     u32 countPcHits() const { return countPcHits_; }
     bool dafbVblEnabled() const;
@@ -156,9 +165,13 @@ private:
     void adbIdleWake();
     void logAccess(const char* what, u32 addr, bool write, u32 value);
 
-    // I/O window dispatch ($50000000 block, mirrors folded).
+    // I/O window dispatch ($50000000 block, mirrors folded). The public
+    // entry points trace; the Impl bodies do the decode.
     u8   ioRead8(u32 off);
     void ioWrite8(u32 off, u8 v);
+    u8   ioRead8Impl(u32 off);
+    void ioWrite8Impl(u32 off, u8 v);
+    void traceIo(u32 off, bool write, u8 v);
     u32  ioRead32(u32 off);
     void ioWrite32(u32 off, u32 v);
     void sonicWrite(u32 reg, u16 v);
@@ -173,9 +186,9 @@ private:
     u32 djmemcRegs_[16]{};
     u16 iosbRegs_[32]{};
 
-    // SCC functional stub (Classic-style: pointer + a live RR0/RR1).
-    int sccPtr_ = 0;
-    u8 sccRegs_[16]{};
+    // Z8530 SCC: interrupt-capable model (System 7.5's LocalTalk driver is
+    // interrupt-driven; a chip that never interrupts stalls its node
+    // acquisition at the Welcome screen). Lives in machine/quadra/scc.hpp.
 
     // SWIM2 stub: mode set/clear pair, a phases latch the ROM's presence
     // probe writes patterns into and reads back, and a no-disk handshake.
@@ -232,6 +245,7 @@ private:
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<Dafb> dafb_;
     std::unique_ptr<Easc> easc_;
+    std::unique_ptr<Scc8530> scc_;
     std::unique_ptr<Ncr53c96> scsi_;
     std::unique_ptr<ScsiDisk> disk_;
     std::unique_ptr<ScsiDisk> disk2_;
@@ -275,6 +289,18 @@ private:
     int dataInPcBudget_ = 0;    // log which routine drains SCSI data-in bytes
     u32 watchAddr_ = 0, watchLen_ = 0;   // RAM write-watch window
     int watchBudget_ = 0;
+
+    // Device-access trace, gated by frame window and by the PC that issued
+    // the access. A stalled driver's whole conversation with its chip is a
+    // few dozen lines once the ROM's own interrupt traffic is filtered out
+    // by PC -- unfiltered it is millions.
+    u32 ioTraceFromFrame_ = 0, ioTraceToFrame_ = 0;
+    u32 ioTracePcLo_ = 0, ioTracePcHi_ = 0xFFFFFFFFu;
+    int ioTraceBudget_ = 0;
+    u64 ioRecent_[8]{};        // last few printed accesses (pc+reg+value)
+    int ioRecentLen_ = 0;
+    u32 ioRepeatCount_ = 0;
+    void flushIoCycle();
     u32 countPc_ = 0, countPcHits_ = 0;  // execution counter for one address
     bool dafbIrq_ = false;               // internal video interrupt line (VIA2 PA6)
     // A hard disk present at power-on entered the drive queue during the ROM

@@ -14,6 +14,7 @@
 #include "easc.hpp"
 #include "ncr53c96.hpp"
 #include "pseudovia.hpp"
+#include "scc.hpp"
 
 #include <cstdio>
 
@@ -66,6 +67,7 @@ QuadraMachine::QuadraMachine(std::vector<u8> rom, const Config& cfg)
       adb_(std::make_unique<AdbTransceiver>()),
       dafb_(std::make_unique<Dafb>()),
       easc_(std::make_unique<Easc>()),
+      scc_(std::make_unique<Scc8530>()),
       scsi_(std::make_unique<Ncr53c96>()),
       disk_(std::make_unique<ScsiDisk>()),
       disk2_(std::make_unique<ScsiDisk>()),
@@ -77,6 +79,7 @@ QuadraMachine::QuadraMachine(std::vector<u8> rom, const Config& cfg)
     rom_.resize(rs, 0xFF);
     romMask_ = rs - 1;
 
+    scc_->onDiag = [this](const char* s) { if (onDiag) onDiag(s); };
     scsi_->addTarget(disk_.get());
     scsi_->addTarget(disk2_.get());
     scsi_->addTarget(cdrom_.get());
@@ -234,7 +237,7 @@ void QuadraMachine::reset() {
     for (auto& r : sonicRegs_) r = 0;
     sonicRegs_[0x29] = 6;                 // silicon revision
     sonicRegs_[0x00] = 0x0094;            // CR: RST | STP | RXDIS
-    sccPtr_ = 0;
+    scc_->reset();
     swimMode_ = 0x40;
     via1_->reset();
     via2_->reset();
@@ -254,10 +257,11 @@ void QuadraMachine::reset() {
 }
 
 void QuadraMachine::updateIpl() {
-    // SCC would be level 4; the stub never interrupts. VIA2 aggregate is
-    // level 2, VIA1 level 1.
+    // IOSB priority order: SCC is level 4, VIA2's aggregate level 2, VIA1
+    // level 1.
     int ipl = 0;
-    if (via2_->irqAsserted()) ipl = 2;
+    if (scc_->irqAsserted()) ipl = 4;
+    else if (via2_->irqAsserted()) ipl = 2;
     else if (via1_->irqAsserted()) ipl = 1;
     if (ipl == 2 && iplDiagBudget_ > 0) {
         --iplDiagBudget_;
@@ -519,7 +523,79 @@ void QuadraMachine::write32(u32 addr, u32 value) {
 
 // ---- the $50000000 I/O window, mirrors folded to 256KB ----
 
+// Names the device block an offset lands in, so a trace line reads as a
+// conversation with a chip rather than as an address.
+namespace {
+const char* ioBlockName(u32 off) {
+    if (off < 0x02000u) return "VIA1";
+    if (off < 0x04000u) return "VIA2";
+    if (off >= 0x08000u && off < 0x08008u) return "PROM";
+    if (off >= 0x0A000u && off < 0x0B100u) return "SONIC";
+    if (off >= 0x0C000u && off < 0x0E000u) return "SCC";
+    if (off >= 0x0E000u && off < 0x10000u) return "DJMEMC";
+    if (off >= 0x10000u && off < 0x10100u) return "SCSI";
+    if (off >= 0x10100u && off < 0x10104u) return "SCSIDMA";
+    if (off >= 0x14000u && off < 0x16000u) return "EASC";
+    if (off >= 0x1E000u && off < 0x20000u) return "SWIM";
+    return "IO";
+}
+} // namespace
+
+void QuadraMachine::traceIo(u32 off, bool write, u8 v) {
+    if (ioTraceBudget_ <= 0 || !onDiag) return;
+    const u32 f = static_cast<u32>(frameCounter_);
+    if (f < ioTraceFromFrame_ || f > ioTraceToFrame_) return;
+    const u32 pc = cpu_.pc;
+    if (pc < ioTracePcLo_ || pc > ioTracePcHi_) return;
+    // A poll loop repeats the same few accesses millions of times, and an
+    // unrolled one cycles through several addresses reading one register.
+    // Any access matching one of the last few printed lines is counted, not
+    // printed: a spin costs one line, and the traffic on either side of it
+    // -- which is the part worth reading -- still fits in the budget.
+    const u64 key = (static_cast<u64>(pc) << 32) | (off << 12) |
+                    (static_cast<u64>(v) << 1) | (write ? 1u : 0u);
+    for (int i = 0; i < ioRecentLen_; ++i) {
+        if (ioRecent_[i] == key) { ++ioRepeatCount_; return; }
+    }
+    flushIoCycle();
+    if (ioRecentLen_ < static_cast<int>(sizeof ioRecent_ / sizeof ioRecent_[0]))
+        ioRecent_[ioRecentLen_++] = key;
+    else {
+        for (int i = 1; i < ioRecentLen_; ++i) ioRecent_[i - 1] = ioRecent_[i];
+        ioRecent_[ioRecentLen_ - 1] = key;
+    }
+    --ioTraceBudget_;
+    char b[96];
+    std::snprintf(b, sizeof b, "IOT %-7s %05X %c %02X pc=%08X",
+                  ioBlockName(off), off, write ? 'W' : 'R', v, pc);
+    onDiag(b);
+}
+
+void QuadraMachine::flushIoCycle() {
+    if (ioRepeatCount_ > 0 && onDiag) {
+        char b[96];
+        std::snprintf(b, sizeof b, "IOT   ... repeats of the last %d line(s) x%u",
+                      ioRecentLen_, ioRepeatCount_);
+        onDiag(b);
+    }
+    ioRepeatCount_ = 0;
+    // The window of recent accesses SURVIVES the flush: an unrolled poll
+    // reads one register from several addresses in turn, and clearing here
+    // would print a fresh line for each pass instead of counting the cycle.
+}
+
 u8 QuadraMachine::ioRead8(u32 addr) {
+    const u8 v = ioRead8Impl(addr);
+    if (ioTraceBudget_ > 0) traceIo(addr & 0x0003FFFFu, false, v);
+    return v;
+}
+
+void QuadraMachine::ioWrite8(u32 addr, u8 v) {
+    if (ioTraceBudget_ > 0) traceIo(addr & 0x0003FFFFu, true, v);
+    ioWrite8Impl(addr, v);
+}
+
+u8 QuadraMachine::ioRead8Impl(u32 addr) {
     if ((addr & 0x00FF0000u) == 0x00FF0000u) {
         // IOSB chip id, every read in the top 64KB window.
         const u32 v = 0xA55A2BADu;
@@ -543,15 +619,10 @@ u8 QuadraMachine::ioRead8(u32 addr) {
         const u16 v = sonicRegs_[(off >> 2) & 0x3F];
         return static_cast<u8>((off & 1) ? v : (v >> 8));
     }
-    if (off >= 0x0C000u && off < 0x0E000u) {   // SCC (functional stub)
-        if ((off & 0x2) == 0) {                // control
-            const int reg = sccPtr_;
-            sccPtr_ = 0;
-            if (reg == 0) return 0x54;         // Tx empty | underrun | hunt
-            if (reg == 1) return 0x01;         // all sent
-            return sccRegs_[reg & 15];
-        }
-        return 0;                              // data
+    if (off >= 0x0C000u && off < 0x0E000u) {   // SCC
+        // Ports at base+0/2/4/6 (ctl B, ctl A, data B, data A), aliased
+        // through the window. SCCRd/SCCWr point at $50F0C020.
+        return scc_->read(off & 6);
     }
     if (off >= 0x0E000u && off < 0x10000u) {
         const u32 v = djmemcRegs_[(off >> 2) & 0xF];
@@ -654,7 +725,7 @@ u8 QuadraMachine::ioRead8(u32 addr) {
     return 0xFF;
 }
 
-void QuadraMachine::ioWrite8(u32 addr, u8 v) {
+void QuadraMachine::ioWrite8Impl(u32 addr, u8 v) {
     if ((addr & 0x00FF0000u) == 0x00FF0000u) return;
     const u32 off = addr & 0x0003FFFFu;
     if (off < 0x02000u) { via1_->write((off >> 9) & 0xF, v); updateIpl(); return; }
@@ -671,10 +742,8 @@ void QuadraMachine::ioWrite8(u32 addr, u8 v) {
         return;
     }
     if (off >= 0x0C000u && off < 0x0E000u) {
-        if ((off & 0x2) == 0) {
-            if (sccPtr_ == 0) sccPtr_ = v & 0x0F;
-            else { sccRegs_[sccPtr_] = v; sccPtr_ = 0; }
-        }
+        scc_->write(off & 6, v);
+        updateIpl();
         return;
     }
     if (off >= 0x0E000u && off < 0x10000u) {
@@ -880,6 +949,7 @@ void QuadraMachine::tickDevices(int cpuCycles) {
         via1Remainder_ -= 4255;
     }
     scsi_->tick(cpuCycles);
+    scc_->tick(static_cast<s32>(cpuCycles));
     if (fd_->takeEjectRequest()) {
         floppy_.clear();
         fd_->removeDisk();
