@@ -136,6 +136,7 @@ int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb) {
 
 int main(int argc, char** argv) {
     const char* romPath = nullptr;
+    const char* fdPath = nullptr;
     const char* hdPath = nullptr;
     const char* cdPath = nullptr;
     const char* shotPath = nullptr;
@@ -164,6 +165,7 @@ int main(int argc, char** argv) {
             return makeBootableHd(srcP, outP, static_cast<u32>(mb));
         }
         if (a == "--rom" && i + 1 < argc) romPath = argv[++i];
+        else if (a == "--floppy" && i + 1 < argc) fdPath = argv[++i];
         else if (a == "--harddisk" && i + 1 < argc) hdPath = argv[++i];
         else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
         else if (a == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
@@ -206,6 +208,14 @@ int main(int argc, char** argv) {
     mac.onDiag = [&](const char* m) {
         if (m[0] == 'C' && m[1] == 'D' && m[2] == 'B') ++cdbCount;
         if (cdbCount >= 8 && std::strncmp(m, "SCMD 01", 7) == 0) ++flushCount;
+        // Without --no-log everything prints; with it, the register-level
+        // SCSI chatter (millions of lines on a long run) stays quiet and
+        // the structural lines still land.
+        if (!showLog && (std::strncmp(m, "SCMD", 4) == 0 || std::strncmp(m, "SREG", 4) == 0 ||
+                         std::strncmp(m, "SRD", 3) == 0 || std::strncmp(m, "SEL ", 4) == 0 ||
+                         std::strncmp(m, "VIFR", 4) == 0 || std::strncmp(m, "DRQ", 3) == 0 ||
+                         std::strncmp(m, "SDMA", 4) == 0))
+            return;
         std::printf("%s\n", m);
     };
     int vramBudget = 10;
@@ -247,6 +257,14 @@ int main(int argc, char** argv) {
         }
         mac.insertHardDisk(std::move(hd));
         std::printf("hd: attached\n");
+    }
+    if (fdPath) {
+        auto fd = loadFile(fdPath);
+        if (fd.empty()) {
+            std::fprintf(stderr, "cannot read floppy: %s\n", fdPath);
+            return 2;
+        }
+        std::printf("floppy: %s\n", mac.insertFloppy(std::move(fd)) ? "inserted" : "REFUSED");
     }
     if (cdPath) {
         auto cd = loadFile(cdPath);

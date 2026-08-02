@@ -1,11 +1,14 @@
 #include "openmac/quadra.hpp"
 
 #include "../adb.hpp"
+#include "../dc42.hpp"
+#include "../macbinary.hpp"
 #include "../rtc.hpp"
 #include "../scsi.hpp"
 #include "../scsicd.hpp"
 #include "../scsiimage.hpp"
 #include "../scsinet.hpp"
+#include "../sony.hpp"
 #include "../via.hpp"
 #include "dafb.hpp"
 #include "easc.hpp"
@@ -35,6 +38,11 @@ constexpr int kAdbShiftCycles = 23150;
 // The 4-bit machine-ID strap on VIA1 port A: Quadra 650 = PA6|PA4|PA1.
 constexpr u8 kMachineId = 0x52;
 
+// The ROM's .Sony DRVR (header at $4086C3E0): Prime = header + $26. The
+// driver executes through the 24-bit alias as well, so both faces hook.
+constexpr u32 kSonyPrime = 0x4086C406u;
+constexpr u32 kSonyPrimeAlias = 0x0086C406u;
+
 u8 bitswapNibbles(u8 v) {
     // MAC PROM bytes store the low nibble's bits reversed against the high:
     // bit order 0,1,2,3,7,6,5,4 of the source byte.
@@ -51,6 +59,7 @@ u8 bitswapNibbles(u8 v) {
 QuadraMachine::QuadraMachine(std::vector<u8> rom, const Config& cfg)
     : ram_(cfg.ramSize, 0),
       rom_(std::move(rom)),
+      fd_(std::make_unique<SonyDrive>()),
       via1_(std::make_unique<Via6522>()),
       via2_(std::make_unique<PseudoVia>()),
       rtc_(std::make_unique<Rtc>()),
@@ -72,6 +81,10 @@ QuadraMachine::QuadraMachine(std::vector<u8> rom, const Config& cfg)
     scsi_->addTarget(disk2_.get());
     scsi_->addTarget(cdrom_.get());
     scsi_->addTarget(netdev_.get());
+
+    fd_->installed = true;      // the internal SuperDrive is always fitted
+    fd_->superDrive = true;
+    fd_->doubleSided = true;
 
     // Ethernet MAC PROM: Apple OUI 08:00:07 + a fixed station id, each byte
     // nibble-bit-swizzled, byte 7 = inverted XOR checksum.
@@ -105,7 +118,12 @@ void QuadraMachine::wireDevices() {
         if (!adb_->intLine()) v = static_cast<u8>(v & ~0x08);   // PB3, active low
         return v;
     };
-    via1_->outA = [](u8, u8) { /* PA5 = floppy HDSEL; nothing modeled yet */ };
+    via1_->outA = [this](u8 value, u8 ddr) {
+        // PA5 is the floppy mechanism's SEL line (the fourth sense-address
+        // bit); the .Sony driver drives it while walking the drive status.
+        const u8 eff = static_cast<u8>(value | ~ddr);
+        floppySel_ = (eff & 0x20) != 0;
+    };
     via1_->outB = [this](u8 value, u8 ddr) {
         const u8 eff = static_cast<u8>(value | ~ddr);
         rtc_->setLines((eff & 0x01) != 0, (eff & 0x02) != 0, (eff & 0x04) != 0);
@@ -144,11 +162,6 @@ void QuadraMachine::wireDevices() {
     scsi_->onCdb = [this](int id, const u8* cdb, int len) {
         // The 8th CDB is the probe's boot-block read; re-arm the register
         // trace there so the storm before it cannot exhaust the budget.
-        if (++cdbSeen_ == 7) {
-            cdbDiagBudget_ = 5000;
-            scsi_->rearmDiag(3000);
-            via2_->rearmDiag(60000, 500);
-        }
         if (cdbListBudget_ <= 0) return;
         --cdbListBudget_;
         char b[112];
@@ -498,16 +511,31 @@ u8 QuadraMachine::ioRead8(u32 addr) {
     }
     if (off >= 0x1E000u && off < 0x20000u) {   // SWIM2 stub
         const int reg = static_cast<int>((off >> 9) & 7);
+        u8 rv;
         switch (reg) {
-        case 2: return 0;                      // error, reads clear
-        case 3: return swimParams_[swimParamPtr_++ & 15];
-        case 4: return swimPhases_;            // presence probe reads back
-        case 5: return swimSetup_;
-        case 6: return swimMode_;
-        case 7: return 0xFF;                   // handshake: an empty port floats
-                                               // every line high (no drive)
-        default: return 0xFF;                  // empty FIFO / floating
+        case 2: rv = 0; break;                 // error, reads clear
+        case 3: rv = swimParams_[swimParamPtr_++ & 15]; break;
+        case 4: rv = swimPhases_; break;       // presence probe reads back
+        case 5: rv = swimSetup_; break;
+        case 6: rv = swimMode_; break;
+        case 7: {
+            // Handshake: the drive's multiplexed sense line answers on bit 3.
+            // Sense address = CA2:CA1:CA0:SEL -- CA lines from the phases
+            // register's driven nibble, SEL from VIA1 PA5.
+            const int sense = ((swimPhases_ & 4) << 1) | ((swimPhases_ & 2) << 1) |
+                              ((swimPhases_ & 1) << 1) | (floppySel_ ? 1 : 0);
+            rv = static_cast<u8>(0xF7 | (fd_->sense(sense, totalCycles_) ? 0x08 : 0));
+            break;
         }
+        default: rv = 0xFF; break;             // empty FIFO / floating
+        }
+        if (swimDiagBudget_ > 0) {
+            --swimDiagBudget_;
+            char b[64];
+            std::snprintf(b, sizeof b, "SWIM R reg%d=%02X pc=%08X", reg, rv, cpu_.pc);
+            if (onDiag) onDiag(b);
+        }
+        return rv;
     }
     logAccess("IO?", addr, false, 0);
     return 0xFF;
@@ -575,12 +603,39 @@ void QuadraMachine::ioWrite8(u32 addr, u8 v) {
     }
     if (off >= 0x1E000u && off < 0x20000u) {
         const int reg = static_cast<int>((off >> 9) & 7);
+        if (swimDiagBudget_ > 0) {
+            --swimDiagBudget_;
+            char b[64];
+            std::snprintf(b, sizeof b, "SWIM W reg%d=%02X pc=%08X", reg, v, cpu_.pc);
+            if (onDiag) onDiag(b);
+        }
         switch (reg) {
         case 3: swimParams_[swimParamPtr_++ & 15] = v; break;
-        case 4: swimPhases_ = v; break;
+        case 4: {
+            // Phase lines: bits 0-2 = CA0-CA2, bit 3 = LSTRB. A rising
+            // strobe latches a drive command -- register CA1:CA0:SEL, data
+            // level CA2 (the classic Sony control convention).
+            const u8 prev = swimPhasePrev_;
+            swimPhases_ = v;
+            swimPhasePrev_ = static_cast<u8>(v & 0xF);
+            if ((v & 0x08) && !(prev & 0x08)) {
+                const int reg35 = ((v & 2) << 1) | ((v & 1) << 1) |
+                                  (floppySel_ ? 1 : 0);
+                fd_->command(reg35, (v & 4) != 0, totalCycles_);
+            }
+            break;
+        }
         case 5: swimSetup_ = v; break;
-        case 6: swimMode_ = static_cast<u8>(swimMode_ & ~v); break;   // mode clear
-        case 7: swimMode_ = static_cast<u8>(swimMode_ | v); break;    // mode set
+        case 6:
+            swimMode_ = static_cast<u8>(swimMode_ & ~v);   // mode clear
+            fd_->setEnabled((swimMode_ & 0x80) && ((swimMode_ >> 1) & 3) == 1,
+                            totalCycles_);
+            break;
+        case 7:
+            swimMode_ = static_cast<u8>(swimMode_ | v);    // mode set
+            fd_->setEnabled((swimMode_ & 0x80) && ((swimMode_ >> 1) & 3) == 1,
+                            totalCycles_);
+            break;
         default: break;
         }
         return;
@@ -684,6 +739,11 @@ void QuadraMachine::tickDevices(int cpuCycles) {
         via1Remainder_ -= 4255;
     }
     scsi_->tick(cpuCycles);
+    if (fd_->takeEjectRequest()) {
+        floppy_.clear();
+        fd_->removeDisk();
+        if (onDiag) onDiag("floppy: guest ejected the disk");
+    }
     secondAcc_ += static_cast<u64>(cpuCycles);
     if (secondAcc_ >= kCpuHz) {
         secondAcc_ -= kCpuHz;
@@ -743,7 +803,77 @@ void QuadraMachine::adbIdleWake() {
     }
 }
 
+// The ROM's .Sony Prime, served from the image at driver level: the real
+// routine would run the SWIM2's MFM engine; this one moves the bytes and
+// returns through jIODone exactly as the hardware path would have.
+void QuadraMachine::servePrime() {
+    // The System passes the DCE around with the locked-master-pointer flag
+    // riding bit 31; the guest's 24-bit translation strips it, so strip it
+    // here too before touching memory through these pointers.
+    const u32 pb = cpu_.a[0] & 0x00FFFFFFu;
+    const u32 dce = cpu_.a[1] & 0x00FFFFFFu;
+    const u16 trap = read16(pb + 0x06);
+    const u32 buf = read32(pb + 0x20);
+    const u32 req = read32(pb + 0x24);
+    const u16 posMode = read16(pb + 0x2C);
+    const u32 posOff = read32(pb + 0x2E);
+    const u32 dctlPos = read32(dce + 0x10);
+
+    u32 pos = (posMode & 3) == 1 ? posOff : dctlPos;   // fsFromStart : fsAtMark
+    s16 result = 0;
+    u32 done = 0;
+    if (onDiag && primeDiagBudget_ > 0) {
+        --primeDiagBudget_;
+        char b[96];
+        std::snprintf(b, sizeof b, "PRIME %s pos=%u req=%u buf=%08X",
+                      (trap & 1) ? "write" : "read", pos, req, buf);
+        onDiag(b);
+    }
+    if (!fd_->hasDisk()) {
+        result = -65;                              // offLinErr
+    } else if ((trap & 1) && fd_->readOnly) {
+        result = -44;                              // wPrErr
+    } else {
+        const u32 size = static_cast<u32>(floppy_.size());
+        if (pos >= size) {
+            result = -39;                          // eofErr
+        } else {
+            u32 n = req;
+            if (pos + n > size) { n = size - pos; result = -39; }
+            if (trap & 1) {
+                for (u32 i = 0; i < n; ++i) floppy_[pos + i] = read8(buf + i);
+            } else {
+                for (u32 i = 0; i < n; ++i) write8(buf + i, floppy_[pos + i]);
+            }
+            done = n;
+        }
+    }
+    write32(pb + 0x28, done);                      // ioActCount
+    write32(dce + 0x10, pos + done);               // dCtlPosition
+    write16(pb + 0x10, static_cast<u16>(result));  // ioResult (IODone rewrites)
+    cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+    // Return through jIODone: A1 = DCE, D0 = result, jump via ($08FC).
+    const u32 target = read32(0x08FC);
+    cpu_.a[0] = target;
+    cpu_.pc = target;
+}
+
 int QuadraMachine::stepInstruction() {
+    // The ROM's .Sony driver runs through both its 32-bit face and the 24-bit
+    // alias; hook Prime at either and serve the request from the image.
+    if (cpu_.pc == kSonyPrime || cpu_.pc == kSonyPrimeAlias) {
+        try {
+            servePrime();
+        } catch (const BusFault&) {
+            // A malformed parameter block must not take the emulator down;
+            // answer as a driver would and let the caller cope.
+            cpu_.d[0] = static_cast<u32>(-36);   // ioErr
+            cpu_.pc = read32(0x08FC);
+            cpu_.a[0] = cpu_.pc;
+        }
+        tickDevices(40);
+        return 40;
+    }
     const int c = cpu_.step();
     tickDevices(c);
     return c;
@@ -804,6 +934,59 @@ void QuadraMachine::keyEvent(u8 adbCode, bool down) {
 
 u32 QuadraMachine::adbMousePolls() const { return adb_->mousePolls(); }
 u32 QuadraMachine::adbKbdPolls() const { return adb_->kbdPolls(); }
+
+int QuadraMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
+    // Peel the wrappers the archived media wears -- MacBinary around DiskCopy
+    // 4.2 around the sectors, either or both -- down to the raw disk data the
+    // .Sony Prime hook serves. Most 7.1 install floppies are DiskCopy 4.2: an
+    // 84-byte header in front of the sectors, so a 1.44 MB disk is 1,474,644
+    // bytes on disk rather than 1,474,560, and read raw every sector lands 84
+    // bytes out of place and nothing mounts.
+    const char* container = "raw image";
+    if (macbinary::isMacBinary(image)) {
+        macbinary::split(image);
+        container = "MacBinary";
+    }
+    if (dc42::isDiskCopy(image)) {
+        dc42::split(image);
+        container = "DiskCopy 4.2";
+    }
+
+    // The three geometries a Macintosh SuperDrive frames. Size alone settles
+    // the medium once the wrappers are off.
+    const std::size_t n = image.size();
+    const bool hd = n == 1474560;
+    const bool dsGCR = n == 819200;   // 800K double-sided GCR
+    const bool ssGCR = n == 409600;   // 400K single-sided GCR
+    if (!hd && !dsGCR && !ssGCR) {
+        if (onDiag) {
+            char b[128];
+            std::snprintf(b, sizeof b,
+                          "floppy refused: %zu bytes (%s) is no floppy geometry -- "
+                          "need 400K/800K/1.44 MB of sectors", n, container);
+            onDiag(b);
+        }
+        return 0;
+    }
+
+    floppy_ = std::move(image);
+    fd_->doubleSided = !ssGCR;
+    fd_->insert(&floppy_, readOnly, hd);
+    if (onDiag) {
+        char b[128];
+        std::snprintf(b, sizeof b, "floppy: %s disk in the internal drive (%s)",
+                      hd ? "1.44 MB" : dsGCR ? "800K" : "400K", container);
+        onDiag(b);
+    }
+    return 1;
+}
+
+void QuadraMachine::ejectFloppy() {
+    fd_->removeDisk();
+    floppy_.clear();
+}
+
+bool QuadraMachine::floppyPresent() const { return fd_->hasDisk(); }
 
 void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hd_ = std::move(image);

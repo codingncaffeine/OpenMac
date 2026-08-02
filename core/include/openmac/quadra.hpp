@@ -33,6 +33,7 @@ class Ncr53c96;
 class ScsiDisk;
 class ScsiCdRom;
 class ScsiEthernet;
+class SonyDrive;
 
 class QuadraMachine final : public IBus040 {
 public:
@@ -89,6 +90,15 @@ public:
     bool netAttached() const;
     bool netInject(const u8* frame, u32 len);
     bool netDrain(std::vector<u8>& out);
+
+    // Floppy: the internal SuperDrive, served at driver level (the ROM's own
+    // .Sony sees a present mechanism through the SWIM2 sense lines; Prime is
+    // answered from the image). Raw 1.44 MB dumps only for now.
+    // Returns 1 when the drive took the disk, 0 when the file was refused.
+    int insertFloppy(std::vector<u8> image, bool readOnly = false);
+    void ejectFloppy();
+    bool floppyPresent() const;
+    const std::vector<u8>& floppyImage() const { return floppy_; }
 
     // Diagnostics.
     struct ScsiDiag {
@@ -152,6 +162,13 @@ private:
 
     u8 macProm_[8]{};
 
+    void servePrime();
+
+    std::unique_ptr<SonyDrive> fd_;
+    std::vector<u8> floppy_;
+    bool floppySel_ = false;      // VIA1 PA5 = the drive's SEL line
+    u8 swimPhasePrev_ = 0;        // LSTRB edge detection
+
     std::unique_ptr<Via6522> via1_;
     std::unique_ptr<PseudoVia> via2_;
     std::unique_ptr<Rtc> rtc_;
@@ -194,6 +211,8 @@ private:
     u32 bootTraceFrame_ = 0;
 
     int eascDiagBudget_ = 24;   // trace the first EASC control reads
+    int swimDiagBudget_ = 400;  // trace the first SWIM2 accesses (with PCs)
+    int primeDiagBudget_ = 48;  // trace the first .Sony Prime requests we serve
     int scsiDiagBudget_ = 60;   // trace the first 53C96 register accesses
     int iplDiagBudget_ = 12;    // trace the first level-2 interrupt assertions
     int via2DiagBudget_ = 24;   // trace the first VIA2 IFR/IER writes
