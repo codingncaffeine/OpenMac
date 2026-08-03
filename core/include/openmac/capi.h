@@ -97,6 +97,13 @@ OMAC_API int omac_harddisk2_booted(OMac*);
    it back. Returns non-zero once the volume is off line. */
 OMAC_API int omac_unmount_harddisk2(OMac*);
 
+/* Push out every block the File Manager is still holding. Call this before
+   persisting a disk image to a file: the driver serves writes synchronously, so
+   the image is current for everything the System has ISSUED, but not for what
+   it is still caching -- and an image saved without it was consistent at no
+   point in time. Returns non-zero if a volume was flushed. */
+OMAC_API int omac_flush_volumes(OMac*);
+
 /* ---- HFS folder-volume builder / reader (host-side, no machine needed) ----
    Builder: begin -> add_dir/add_file (parent 2 = the root) -> build (NULL out
    queries the size; the volume is built once and cached) -> free. Names are

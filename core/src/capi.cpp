@@ -171,6 +171,11 @@ OMAC_API int omac_unmount_harddisk2(OMac* m)
     return (m && m->mac.unmountSecondDisk()) ? 1 : 0;
 }
 
+OMAC_API int omac_flush_volumes(OMac* m)
+{
+    return (m && m->mac.flushVolumes()) ? 1 : 0;
+}
+
 OMAC_API size_t omac_harddisk2_data(OMac* m, uint8_t* out, size_t cap)
 {
     if (!m || !m->mac.hardDisk2Present()) return 0;

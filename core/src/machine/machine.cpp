@@ -914,6 +914,43 @@ void Machine::detachHardDisk2() {
     if (onDiag) onDiag("hd2: disk detached");
 }
 
+// Push every block the File Manager is still holding out to the media, before
+// the host writes an image to a file the user keeps.
+//
+// Our driver serves writes synchronously into the image, so the image is
+// current for everything the System has ISSUED -- but not for what it is still
+// caching. Persisting without this saves a volume missing those blocks, which
+// is a volume that was consistent at no point in time. It costs nothing when
+// there is nothing cached.
+//
+// Flush only, no unmount: this ROM does not test the clean-unmount flag the way
+// the Quadra's does, and unmounting a volume the machine goes on running from
+// would be worse than the problem.
+bool Machine::flushVolumes() {
+    if (inSony_) return false;
+    if (read8(0x0360) & 1) return false;               // FSBusy
+    if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
+        return false;                                  // FS queue not built
+    if ((cpu_.getSR() & 0x0700) != 0) return false;    // mid-interrupt
+    if (hdMountPb_ == 0 && hd2MountPb_ == 0) return false;
+    const u32 pb = hdMountPb_ ? hdMountPb_ : hd2MountPb_;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    bool any = false;
+    // Every drive the machine can be serving. A drive with no volume answers an
+    // error and costs one trap.
+    for (u16 drive : {u16(2), u16(3), u16(4), u16(5)}) {
+        for (u32 i = 0; i < 80; ++i) write8(pb + i, 0);
+        write16(pb + ioVRefNum, drive);
+        cpu_.a[0] = pb;
+        execute68kTrap(kTrapFlushVol);
+        if (static_cast<s16>(cpu_.d[0] & 0xFFFF) == 0) any = true;
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    if (onDiag) onDiag(any ? "fs: volumes flushed" : "fs: nothing to flush");
+    return any;
+}
+
 // The first half of a drop-box republish: get the guest off the second volume
 // so the host may rebuild it, leaving the boot volume alone.
 //

@@ -158,6 +158,12 @@ public:
     // the image -- before the host may rebuild it and put it back. Returns true
     // once the volume is off line, which includes it never having been mounted.
     bool unmountSecondDisk();
+    // Push out every block the File Manager is still holding, before the host
+    // writes an image to a file the user keeps. Our driver serves writes
+    // synchronously, so the image is current for everything the System has
+    // ISSUED -- but not for what it is still caching, and persisting without
+    // this saves a volume that was consistent at no point in time.
+    bool flushVolumes();
 
     // CD-ROM: an AppleCD SC-class SCSI drive. The drive is attached to the bus
     // (a device, persisting across discs); a disc image is inserted into it

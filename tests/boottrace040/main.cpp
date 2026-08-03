@@ -544,6 +544,7 @@ int main(int argc, char** argv) {
     int hdTrace = 0;                // --hd-trace N: log N disk requests in order
     bool doShutdown = false;        // --shutdown: flush+unmount before saving
     int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
+    const char* hd2Path = nullptr;  // --harddisk2 FILE: an existing image on seat 2
     std::string dropBoxDir;         // --dropbox DIR: serve DIR on the second seat
     std::string dropBoxAdd;         // --dropbox-add FILE: drop FILE in at republish time
     int dropBoxRepublishAt = -1;    // --dropbox-republish N: swap the volume at frame N
@@ -744,6 +745,7 @@ int main(int argc, char** argv) {
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
         else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
+        else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
         else if (a == "--dropbox-add" && i + 1 < argc) dropBoxAdd = argv[++i];
         else if (a == "--dropbox-rounds" && i + 1 < argc) dropBoxRounds = std::atoi(argv[++i]);
         else if (a == "--dropbox-republish" && i + 1 < argc)
@@ -1133,6 +1135,18 @@ int main(int argc, char** argv) {
         mac.suppressHdAnnounce = noAnnounce;
         mac.insertHardDisk(std::move(hd));
         std::printf("hd: attached\n");
+    }
+    // An existing volume image on the second seat, read-only -- a small disk
+    // someone downloaded to get one application out of, mounting beside the
+    // startup disk rather than replacing it.
+    if (hd2Path) {
+        auto img = loadFile(hd2Path);
+        if (img.empty()) {
+            std::fprintf(stderr, "cannot read disk2: %s\n", hd2Path);
+            return 2;
+        }
+        std::printf("hd2: %s attached read-only (%zu bytes)\n", hd2Path, img.size());
+        mac.insertHardDisk2(std::move(img), true);
     }
     // The drop box goes on before the first frame, so the ROM's startup bus
     // scan loads its driver -- exactly as the front end attaches it during

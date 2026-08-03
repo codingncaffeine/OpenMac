@@ -396,6 +396,23 @@ public sealed class NativeEmulator : IEmulator
         catch { /* best-effort persistence */ }
     }
 
+    /// <summary>Flush what the File Manager is still holding, so an image we are
+    /// about to persist is one that was consistent at some point in time.</summary>
+    private void FlushVolumes()
+    {
+        try
+        {
+            lock (_sync)
+            {
+                if (_h == IntPtr.Zero) return;
+                Log.Line(Native.omac_flush_volumes(_h) != 0
+                    ? "hard disk: volumes flushed"
+                    : "hard disk: nothing to flush (no volume was mounted)");
+            }
+        }
+        catch (Exception ex) { Log.Line("volume flush failed: " + ex.Message); }
+    }
+
     public void AttachHardDisk(string path)
     {
         if (_h == IntPtr.Zero) return;
@@ -418,9 +435,18 @@ public sealed class NativeEmulator : IEmulator
     }
 
     /// <summary>Persist the live hard-disk image (with guest writes) back to its file.</summary>
+    /// <remarks>
+    /// ⛔ The flush is INSIDE this method on purpose. It used to be the caller's
+    /// job, and the callers known to need it got it while AttachHardDisk and
+    /// DetachHardDisk did not — so swapping a disk wrote the previous volume out
+    /// mid-flight, without the blocks the System was still holding. There is
+    /// exactly one place an image becomes a file, so there is exactly one place
+    /// this can be forgotten. Calling it twice is free.
+    /// </remarks>
     private void WriteBackHardDisk()
     {
         if (!HardDiskAttached || string.IsNullOrEmpty(HardDiskPath)) return;
+        FlushVolumes();
         byte[]? buf = null;
         try
         {
@@ -542,6 +568,26 @@ public sealed class NativeEmulator : IEmulator
 
     public bool RetargetFolderDisk(string folder, out string error) =>
         Seat.Request(null, folder, out error);
+
+    public bool AttachSecondDisk(string imagePath, out string error)
+    {
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        byte[] img;
+        try { img = File.ReadAllBytes(imagePath); }
+        catch (Exception ex) { error = ex.Message; return false; }
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            Native.omac_insert_harddisk2(_h, img, (nuint)img.Length, 1);   // read-only
+        }
+        Seat.Cancel();
+        Seat.Folder = null;          // the seat now holds a disk, not a folder
+        TransferDiskLabel = Path.GetFileName(imagePath);
+        Log.Line($"[disk] second disk: {TransferDiskLabel} "
+                 + $"({img.Length / (1024 * 1024)} MB, read-only)");
+        return true;
+    }
 
     public bool RepublishPending => _seat?.Pending == true;
 

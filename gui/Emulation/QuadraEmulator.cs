@@ -410,6 +410,26 @@ public sealed class QuadraEmulator : IEmulator
     public bool RetargetFolderDisk(string folder, out string error) =>
         Seat.Request(null, folder, out error);
 
+    public bool AttachSecondDisk(string imagePath, out string error)
+    {
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        byte[] img;
+        try { img = File.ReadAllBytes(imagePath); }
+        catch (Exception ex) { error = ex.Message; return false; }
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            Native.omac_q_insert_harddisk2(_h, img, (nuint)img.Length, 1);   // read-only
+        }
+        Seat.Cancel();
+        Seat.Folder = null;          // the seat now holds a disk, not a folder
+        TransferDiskLabel = Path.GetFileName(imagePath);
+        Log.Line($"[disk] second disk: {TransferDiskLabel} "
+                 + $"({img.Length / (1024 * 1024)} MB, read-only)");
+        return true;
+    }
+
     public bool RepublishPending => _seat?.Pending == true;
 
     // ---- transfer disk (shares the seat with the folder disk) ----
@@ -521,6 +541,14 @@ public sealed class QuadraEmulator : IEmulator
     public void AttachHardDisk(string path)
     {
         if (_h == IntPtr.Zero) return;
+        // ⛔ SETTLE BEFORE PERSISTING. Swapping the hard disk out from under a
+        // running System is exactly as violent as closing the window, and the
+        // image written below is the disk the user keeps. Without the flush the
+        // System's cached blocks never reach it and the volume is saved in the
+        // "in use" state -- a disk this ROM refuses at the next boot. Every
+        // path that writes the image out needs this; three of them did not have
+        // it, which is how a dropped disk image cost somebody their volume.
+        SettleVolumes();
         WriteBackHardDisk();
         byte[] img = File.ReadAllBytes(path);
         lock (_sync)
@@ -534,14 +562,28 @@ public sealed class QuadraEmulator : IEmulator
 
     public void DetachHardDisk()
     {
+        SettleVolumes();          // as above: the volume is still mounted here
         WriteBackHardDisk();
         HardDiskAttached = false;
         HardDiskPath = null;
     }
 
+    /// <summary>
+    /// Persist the live hard-disk image back to its file.
+    /// </summary>
+    /// <remarks>
+    /// ⛔ The settle is INSIDE this method on purpose. It used to be the
+    /// caller's job, and the callers that were known to need it got it while
+    /// AttachHardDisk and DetachHardDisk did not — so dropping a disk image on
+    /// the window wrote somebody's volume out mid-flight and cost them the
+    /// blocks the System was still holding. There is exactly one place an image
+    /// becomes a file, so there is exactly one place this can be forgotten.
+    /// Calling it twice is free: the second finds nothing mounted.
+    /// </remarks>
     private void WriteBackHardDisk()
     {
         if (!HardDiskAttached || string.IsNullOrEmpty(HardDiskPath)) return;
+        SettleVolumes();
         byte[]? buf = null;
         try
         {

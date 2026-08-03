@@ -186,6 +186,9 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int omac_unmount_harddisk2(IntPtr h);
 
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_flush_volumes(IntPtr h);
+
     // The second SCSI disk (ID 1, drive 5): the drop box / folder disk seat.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_q_insert_harddisk2(IntPtr h, byte[] img, nuint len, int readOnly);

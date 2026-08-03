@@ -110,6 +110,18 @@ public interface IEmulator : IDisposable
     /// </summary>
     bool RetargetFolderDisk(string folder, out string error);
 
+    /// <summary>
+    /// Put an existing disk IMAGE on the second SCSI seat, read-only, so it
+    /// mounts beside the startup disk instead of replacing it. This is what a
+    /// small HFS volume someone downloaded to get one application out of
+    /// actually wants — attaching it as THE hard disk swaps the machine's
+    /// startup disk for a 3 MB utility volume, which is never the intent.
+    ///
+    /// Distinct from <see cref="AttachTransferDisk"/>: that wraps a loose FILE
+    /// in a volume it builds, this serves a volume that already exists.
+    /// </summary>
+    bool AttachSecondDisk(string imagePath, out string error);
+
     bool RepublishPending { get; }
 
     // ---- transfer disk ----

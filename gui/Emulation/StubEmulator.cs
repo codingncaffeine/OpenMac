@@ -115,6 +115,12 @@ public sealed class StubEmulator : IEmulator
         FolderDiskPath = folder;
         return true;
     }
+    public bool AttachSecondDisk(string imagePath, out string error)
+    {
+        error = "";
+        TransferDiskLabel = System.IO.Path.GetFileName(imagePath);
+        return true;
+    }
     public bool RepublishPending => false;
 
     public string? TransferDiskLabel { get; private set; }

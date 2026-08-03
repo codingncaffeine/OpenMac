@@ -1106,6 +1106,15 @@ public partial class MainWindow : Window
 
         if (LooksLikeHardDisk(path))
         {
+            // A disk image dropped while one is ALREADY the startup disk is
+            // almost never meant to replace it -- it is a volume somebody
+            // downloaded to get one application out of. Replacing the startup
+            // disk swaps the machine's whole world for a 3 MB utility volume,
+            // and the swap has to persist the outgoing disk, which is a write
+            // nobody asked for. Put it on the second seat instead, read-only,
+            // where it mounts beside the startup disk the way a second drive
+            // on the bus would.
+            if (_emulator.HardDiskAttached && SecondSeatDrop(path)) return;
             Log.Line($"drop: {Path.GetFileName(path)} -> hard disk");
             AttachHardDisk(path);
             return;
@@ -1123,6 +1132,44 @@ public partial class MainWindow : Window
             "\n\nTo copy it into the Mac as a file, turn on File ▸ Drop Box ▸ " +
             "Keep Drop Box on the Desktop and drop it again.",
             "OpenMac", MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
+
+    /// <summary>Mount a dropped disk image on the second SCSI seat, read-only,
+    /// beside the startup disk. False when the seat is not free, which leaves
+    /// the caller to fall back on replacing the hard disk.</summary>
+    private bool SecondSeatDrop(string path)
+    {
+        string name = Path.GetFileName(path);
+        if (_emulator.FolderDiskPath is { } fd)
+        {
+            var r = MessageBox.Show(this,
+                $"“{name}” can mount beside your startup disk, but the drop box " +
+                $"“{Path.GetFileName(fd.TrimEnd('\\', '/'))}” is using that seat.\n\n" +
+                "Close the drop box and mount this disk instead?",
+                "Second Disk", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (r != MessageBoxResult.Yes) return true;   // handled: they said no
+            _emulator.DetachFolderDisk();
+            _settings.DropBox = false;
+            _settings.Save();
+        }
+        if (!_emulator.AttachSecondDisk(path, out string error))
+        {
+            Log.Line($"second disk refused: {path} -- {error}");
+            return false;         // let the caller try the old route
+        }
+        Log.Line($"drop: {name} -> second disk (read-only)");
+        UpdateUi();
+        if (!_emulator.TransferDiskResident && _emulator.RomPath is { } rom)
+        {
+            var r = MessageBox.Show(this,
+                $"“{name}” is on the SCSI bus beside your startup disk, but the " +
+                "driver for that seat is loaded by the Mac's startup scan — and " +
+                "this Mac started without one.\n\nRestart now so it appears?" +
+                "\n\n(Your startup disk is not being replaced.)",
+                "Second Disk", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (r == MessageBoxResult.Yes) LoadRom(rom);
+        }
+        return true;
     }
 
     /// <summary>Put a loose file in the drop box and republish, so it turns up
