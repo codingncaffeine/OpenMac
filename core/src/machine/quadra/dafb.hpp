@@ -161,6 +161,13 @@ public:
                 clutAddr_ = v & 0xFF;
                 clutPhase_ = 0;
             } else if (reg == 0x10) {
+                if (clutDiag_ > 0 && onDiag) {
+                    --clutDiag_;
+                    char b[80];
+                    std::snprintf(b, sizeof b, "CLUT[%u] phase %d <- %08X",
+                                  clutAddr_, clutPhase_, v);
+                    onDiag(b);
+                }
                 // Three successive byte writes: R, G, B; autoincrement after
                 // the blue byte lands.
                 const int shift = 16 - clutPhase_ * 8;
@@ -225,9 +232,17 @@ public:
             u32* dst = out + static_cast<size_t>(y) * static_cast<size_t>(w);
             switch (depth) {
             case 1:
+                // One bit is black on white, and the System says so by never
+                // programming a palette for it -- a 1-bit screen has no
+                // colours to choose. Measured: a whole boot on a 1-bit display
+                // makes 18 CLUT writes, every one of them the ROM's power-on
+                // test, against 2316 on the same machine at 8 bits. Reading
+                // the table here hands back whatever that test left behind,
+                // which is why a 1152x870 desktop came up entirely blue.
                 for (int x = 0; x < w; ++x) {
                     const u8 b = vramRead8(row + static_cast<u32>(x >> 3));
-                    dst[x] = clut_[(b >> (7 - (x & 7))) & 1];
+                    dst[x] = ((b >> (7 - (x & 7))) & 1) ? 0xFF000000u
+                                                        : 0xFFFFFFFFu;
                 }
                 break;
             case 2:
@@ -270,6 +285,7 @@ public:
     u32 swatchReg(int i) const { return swatch_[i & 63]; }
     u32 ctlReg(int i) const { return regs_[i & 63]; }
     u32 depthCtlRaw() const { return depthCtl_; }
+    u32 clutEntry(int i) const { return clut_[i & 0xFF]; }
     // Diagnosis override: render at a stated geometry regardless of what the
     // registers decode to, to settle what the guest is actually drawing.
     void forceMode(int w, int h, int bpp) { forceW_ = w; forceH_ = h; forceBpp_ = bpp; }
@@ -337,6 +353,7 @@ private:
     }
     MonitorWiring monitor_{};
     mutable int senseDiag_ = 60;
+    int clutDiag_ = 24;
     int forceW_ = 0, forceH_ = 0, forceBpp_ = 0;
 
     std::vector<u8> vram_;

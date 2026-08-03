@@ -352,6 +352,19 @@ std::string QuadraMachine::diagnosticReport() const {
         dafb_->strideBytes(), dafb_->read(0x1C));
     add("   depthCtl=%02X", dafb_->depthCtlRaw());
     {
+        // The first entries and the last: at low depths Apple's DACs index the
+        // table by replicating the pixel across all eight bits, so 1-bit black
+        // lives at 255 rather than at 1.
+        std::string t = "   clut";
+        char one[32];
+        for (int i : {0, 1, 2, 3, 85, 170, 254, 255}) {
+            std::snprintf(one, sizeof one, " %d=%06X", i, dafb_->clutEntry(i) & 0xFFFFFF);
+            t += one;
+        }
+        s += t;
+        s += '\n';
+    }
+    {
         // The swatch's horizontal and vertical timing: what the ROM programmed
         // from the monitor it sensed, and where the geometry above comes from.
         std::string t = "   dafbreg";

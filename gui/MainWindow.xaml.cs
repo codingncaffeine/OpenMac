@@ -201,9 +201,18 @@ public partial class MainWindow : Window
         // Display only. The emulator produces frames (and audio) on its own thread;
         // copy the most recent one and blit it. TryGetFrame returns false when
         // nothing new has been produced since the previous refresh.
+        int w = _emulator.ScreenWidth, h = _emulator.ScreenHeight;
+        // A machine can come up on a different display than the window was
+        // built for. Re-fit rather than write past the bitmap: this runs from
+        // the render handler, where an exception takes the application down.
+        if (_bitmap.PixelWidth != w || _bitmap.PixelHeight != h)
+        {
+            RebuildScreen();
+            ApplyScale();
+            return;
+        }
         if (_emulator.TryGetFrame(_bgra))
-            _bitmap.WritePixels(new Int32Rect(0, 0, _emulator.ScreenWidth, _emulator.ScreenHeight),
-                                _bgra, _emulator.ScreenWidth * 4, 0);
+            _bitmap.WritePixels(new Int32Rect(0, 0, w, h), _bgra, w * 4, 0);
         // The machine ejects disks on its own; keep the menus and status honest.
         if (_emulator.ConsumeDiskStateChanged()) UpdateUi();
     }
@@ -363,6 +372,16 @@ public partial class MainWindow : Window
         try
         {
             _emulator.LoadRom(path, _settings.ModelRamMB, _settings.BootRomDisk);
+            // The machine's screen is only known once it exists -- the monitor
+            // on its video port decides it. Match the framebuffer to it here,
+            // or a display larger than the one this window was built for gets
+            // written past the end of the bitmap on the very next frame.
+            if (_bitmap is null || _bitmap.PixelWidth != _emulator.ScreenWidth ||
+                _bitmap.PixelHeight != _emulator.ScreenHeight)
+            {
+                RebuildScreen();
+                ApplyScale();
+            }
             // Before any disk goes in: the tab is read at insertion.
             _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
             // The Quadra build carries only the SCSI hard disk so far; the
