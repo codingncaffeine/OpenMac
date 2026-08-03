@@ -1761,7 +1761,8 @@ const QuadraMachine::DisplayInfo* QuadraMachine::displays(int& count) {
         {"12-inch RGB",       512,  384, 0x3, 0},
         {"13-inch RGB",       640,  480, 0x1, 0},
         {"15-inch Portrait",  640,  870, 0x2, 0},
-        {"19-inch Color",    1024,  768, 0x0, 0},
+        {"16-inch Color",     832,  624, 0x0, 4},
+        {"19-inch Color",    1024,  768, 0x0, 1},
         {"21-inch Color",    1152,  870, 0x4, 0},
     };
     count = static_cast<int>(sizeof kList / sizeof kList[0]);

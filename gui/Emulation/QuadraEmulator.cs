@@ -13,8 +13,30 @@ namespace OpenMac.Gui.Emulation;
 /// </summary>
 public sealed class QuadraEmulator : IEmulator
 {
-    public int ScreenWidth => 640;
-    public int ScreenHeight => 480;
+    // The screen is whatever the monitor on the video port is, so this follows
+    // the machine rather than naming a size. Cached because the window asks
+    // for it before a ROM is loaded, when there is no machine to ask.
+    public int ScreenWidth => _screenW;
+    public int ScreenHeight => _screenH;
+    private int _screenW = 640, _screenH = 480;
+
+    /// <summary>Which monitor is plugged in, by name from <see cref="Displays"/>.
+    /// The ROM senses the monitor when it starts, so this takes effect at the
+    /// next ROM load -- exactly as swapping a real display would.</summary>
+    public string? Monitor { get; set; }
+
+    /// <summary>The displays this video port can drive, with their sizes.</summary>
+    public static IEnumerable<(string Name, int W, int H)> Displays()
+    {
+        for (int i = 0; ; i++)
+        {
+            IntPtr p = Native.omac_q_display_name(i, out int w, out int h);
+            if (p == IntPtr.Zero) yield break;
+            string? name = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(p);
+            if (name is null) yield break;
+            yield return (name, w, h);
+        }
+    }
     public string BackendName => "native-quadra";
     public bool IsRealCore => true;
 
@@ -30,8 +52,11 @@ public sealed class QuadraEmulator : IEmulator
     private readonly WaveAudio _audio;
     private readonly object _sync = new();
     private readonly object _frameLock = new();
-    private readonly byte[] _emuFrame = new byte[640 * 480 * 4];
-    private readonly byte[] _sharedFrame = new byte[640 * 480 * 4];
+    // Sized to the monitor in use, not to one resolution: a 21-inch screen is
+    // more than three times the pixels of the 13-inch these used to assume,
+    // and the core renders as many as the display has.
+    private byte[] _emuFrame = new byte[640 * 480 * 4];
+    private byte[] _sharedFrame = new byte[640 * 480 * 4];
     private readonly byte[] _audioBuf = new byte[8192];
     private bool _frameDirty;
     private long _loudFed;   // non-silent samples handed to the audio device
@@ -56,11 +81,26 @@ public sealed class QuadraEmulator : IEmulator
             _h = Native.omac_q_create(rom, (nuint)rom.Length, (uint)ramMB);
             if (_h == IntPtr.Zero)
                 throw new InvalidOperationException("Quadra core failed to initialize (bad ROM or size?)");
+            // Plug the monitor in before the machine runs a single frame: the
+            // ROM senses the video port during startup and never looks again.
+            if (!string.IsNullOrEmpty(Monitor) &&
+                Native.omac_q_set_display(_h, Monitor!) == 0)
+                Log.Line($"[core] unknown monitor '{Monitor}', keeping the default");
+            _screenW = Native.omac_q_screen_w(_h);
+            _screenH = Native.omac_q_screen_h(_h);
+            const int guard = 4;   // the core writes w*h pixels, nothing more
+            int bytes = _screenW * _screenH * guard;
+            if (_emuFrame.Length < bytes)
+            {
+                _emuFrame = new byte[bytes];
+                lock (_frameLock) _sharedFrame = new byte[bytes];
+            }
         }
         RomPath = path;
         HardDiskAttached = false;
         HardDiskPath = null;
-        Log.Line($"[core] Quadra 650 created — {ramMB} MB, ROM {Path.GetFileName(path)}");
+        Log.Line($"[core] Quadra 650 created — {ramMB} MB, ROM {Path.GetFileName(path)}, "
+                 + $"monitor {Monitor ?? "13-inch RGB"} ({_screenW}x{_screenH})");
     }
 
     public void Reset()

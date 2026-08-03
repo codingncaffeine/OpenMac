@@ -190,6 +190,12 @@ internal static class Native
     public static extern int omac_q_shutdown_volumes(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr omac_q_display_name(int index, out int w, out int h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_set_display(IntPtr h, [MarshalAs(UnmanagedType.LPStr)] string name);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern nuint omac_q_floppy_writeback(IntPtr h, byte[]? outBuf, nuint cap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

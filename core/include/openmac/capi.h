@@ -227,6 +227,13 @@ OMAC_API size_t omac_q_diagnostics(OMacQ*, char* out, size_t cap);
    non-zero if a volume was settled. */
 OMAC_API int omac_q_shutdown_volumes(OMacQ*);
 
+/* The displays the built-in video port can drive. Walk index 0 upward until
+   this returns NULL; each name is what omac_q_set_display takes. Naming the
+   monitor chooses the resolution: an Apple fixed-frequency display runs one.
+   Set it BEFORE the machine boots -- the ROM senses the monitor at startup. */
+OMAC_API const char* omac_q_display_name(int index, int* w, int* h);
+OMAC_API int omac_q_set_display(OMacQ*, const char* name);
+
 /* The floppy medium as its host file should hold it: the guest's sectors with
    the containers the file arrived in reassembled around them. Returns the disk
    still in the drive, or the one last ejected, so a front end can save it both

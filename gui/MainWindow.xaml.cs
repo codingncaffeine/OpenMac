@@ -65,6 +65,7 @@ public partial class MainWindow : Window
         // this, so a backend swap never leaves it pointing at a dead machine.
         _keyHook = new KeyboardHook((code, down) => _emulator.KeyEvent(code, down), ToggleFullscreen);
         BuildRecentMenu();
+        BuildMonitorMenu();
         UpdateUi();
 
         Loaded += (_, _) =>
@@ -99,7 +100,7 @@ public partial class MainWindow : Window
             if (settings.IsQuadra)
             {
                 Log.Line("backend: native core (openmac_c.dll), Quadra 650");
-                return new QuadraEmulator();
+                return new QuadraEmulator { Monitor = settings.MonitorQuadra };
             }
             Log.Line("backend: native core (openmac_c.dll), Macintosh Classic");
             return new NativeEmulator();
@@ -141,6 +142,48 @@ public partial class MainWindow : Window
 
     private void ModelClassic_Click(object sender, RoutedEventArgs e) => SwitchModel("classic");
     private void ModelQuadra_Click(object sender, RoutedEventArgs e) => SwitchModel("quadra650");
+
+    /// <summary>Fill the Monitor menu from the displays the machine can drive.
+    /// Built from the core's own list so the menu cannot drift from what the
+    /// machine supports.</summary>
+    private void BuildMonitorMenu()
+    {
+        MonitorMenu.Items.Clear();
+        string current = _settings.MonitorQuadra ?? "13-inch RGB";
+        foreach (var (name, w, h) in QuadraEmulator.Displays())
+        {
+            var item = new MenuItem
+            {
+                Header = $"Apple {name} — {w}×{h}",
+                Tag = name,
+                IsCheckable = true,
+                IsChecked = name == current,
+            };
+            item.Click += Monitor_Click;
+            MonitorMenu.Items.Add(item);
+        }
+    }
+
+    private void Monitor_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem item || item.Tag is not string name) return;
+        if (_settings.MonitorQuadra == name) { BuildMonitorMenu(); return; }
+        _settings.MonitorQuadra = name;
+        _settings.Save();
+        Log.Line($"monitor: {name}");
+        BuildMonitorMenu();
+        // The ROM reads the video port's sense lines once, while it starts, so
+        // a different monitor means starting the machine again -- which is what
+        // unplugging one and plugging in another would mean too.
+        if (_emulator is QuadraEmulator q) q.Monitor = name;
+        if (!string.IsNullOrEmpty(_settings.ModelLastRom) && File.Exists(_settings.ModelLastRom))
+        {
+            LoadRom(_settings.ModelLastRom!);
+            RebuildScreen();   // the new display is a different size
+            ApplyScale();
+        }
+        UpdateUi();
+    }
 
     private void Tick()
     {
@@ -382,6 +425,7 @@ public partial class MainWindow : Window
         _settings.PushRecentRom(path);
         _settings.Save();
         BuildRecentMenu();
+        BuildMonitorMenu();
         UpdateUi();
     }
 

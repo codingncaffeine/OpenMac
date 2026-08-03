@@ -49,6 +49,8 @@
                               Click="ModelQuadra_Click"
                               ToolTip="68040 @ 33 MHz with color DAFB video. Needs the 1 MB Quadra 650 family ROM and boots from a SCSI hard disk; each model remembers its own ROM and disk." />
                 </MenuItem>
+                <MenuItem x:Name="MonitorMenu" Header="Monitor"
+                          ToolTip="Which display is plugged into the video port. An Apple monitor of this era runs one resolution, so choosing the monitor chooses the resolution. The ROM senses it at startup, so the machine restarts." />
                 <Separator />
                 <MenuItem Header="Reset" InputGestureText="Ctrl+R" Click="Reset_Click" />
                 <Separator />

@@ -16,6 +16,11 @@ public sealed class Settings
     public string? LastHardDiskQuadra { get; set; }
     public int RamMBQuadra { get; set; } = 8;
 
+    /// <summary>Which monitor is plugged into the Quadra's video port. The
+    /// ROM senses it at startup and the display's own resolution follows, so
+    /// this is how a resolution is chosen. Empty means the default 13-inch.</summary>
+    public string? MonitorQuadra { get; set; }
+
     [System.Text.Json.Serialization.JsonIgnore]
     public bool IsQuadra => Model == "quadra650";
     [System.Text.Json.Serialization.JsonIgnore]
