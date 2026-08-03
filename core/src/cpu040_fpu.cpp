@@ -12,8 +12,17 @@
 // instruction frame internals. The 80-bit extended and packed-decimal MEMORY
 // formats convert correctly, so data structures round-trip.
 //
+// What that tier still owes, stated rather than left to be discovered: the
+// FPCR rounding MODE steers the conversions to an integer format and FINT
+// (where it decides the answer) but not ordinary arithmetic, which rounds to
+// nearest in double; the FPCR precision field is likewise unread, the explicit
+// FSxxx/FDxxx instruction forms carrying that job instead. INEX1/INEX2 are
+// never raised -- an inexact result is the normal case and nothing here can
+// tell it apart -- so the accrued INEX bit only ever comes from an overflow.
+//
 // Reference: M68040UM section 9, MC68881/68882 User's Manual for opmodes and
-// condition predicates, M68000PRM 1.2 for the memory formats. Clean-room.
+// condition predicates, M68000PRM 1.2 for the register layouts and 5.x for the
+// per-instruction status effects. Clean-room.
 
 namespace openmac {
 
@@ -24,6 +33,63 @@ constexpr u32 kFpN   = 1u << 27;
 constexpr u32 kFpZ   = 1u << 26;
 constexpr u32 kFpI   = 1u << 25;
 constexpr u32 kFpNan = 1u << 24;
+
+// FPSR exception status (EXC) byte, bits 15-8.
+constexpr u32 kExcSnan  = 1u << 14;
+constexpr u32 kExcOperr = 1u << 13;
+constexpr u32 kExcOvfl  = 1u << 12;
+constexpr u32 kExcUnfl  = 1u << 11;
+constexpr u32 kExcDz    = 1u << 10;
+constexpr u32 kExcInex2 = 1u << 9;
+constexpr u32 kExcInex1 = 1u << 8;
+
+// The EXC byte reports the MOST RECENT arithmetic or move operation and is
+// cleared at the start of every one of them; the accrued (AEXC) byte collects
+// a history from it and only the program clears that (M68000PRM 1.2.3.3 and
+// 1.2.3.4). Never clearing EXC made one divide by zero read as though every
+// operation after it had divided by zero too -- and this ROM's SANE reads the
+// FPSR and branches on what it finds.
+void beginFpOp(M68040& c) { c.fpsr &= ~0x0000FF00u; }
+
+void accrueFp(M68040& c) {
+    const u32 e = c.fpsr;
+    u32 a = 0;
+    if (e & (kExcSnan | kExcOperr))             a |= 0x80u;   // IOP
+    if (e & kExcOvfl)                           a |= 0x40u;   // OVFL
+    if ((e & kExcUnfl) && (e & kExcInex2))      a |= 0x20u;   // UNFL
+    if (e & kExcDz)                             a |= 0x10u;   // DZ
+    if (e & (kExcInex1 | kExcInex2 | kExcOvfl)) a |= 0x08u;   // INEX
+    c.fpsr |= a;
+}
+
+// Round to an integral value as the FPCR's RND field (bits 5-4) directs.
+double roundByFpcr(const M68040& c, double v) {
+    switch ((c.fpcr >> 4) & 3) {
+    case 0:  return std::nearbyint(v);   // nearest, ties to even (host default)
+    case 1:  return std::trunc(v);       // toward zero
+    case 2:  return std::floor(v);       // toward minus infinity
+    default: return std::ceil(v);        // toward plus infinity
+    }
+}
+
+// Convert to a byte/word/long destination the way FMOVE does: "Rounds the
+// source operand to the size of the specified destination format." A C cast
+// TRUNCATES, which is a different instruction -- truncation is what FINTRZ is
+// for, and FINT exists beside it precisely because the ordinary conversion
+// follows the rounding mode. OPERR reports an infinity or a value the
+// destination cannot hold; the out-of-range result saturates rather than
+// letting an out-of-range cast run into undefined behaviour.
+s32 toIntegerFormat(M68040& c, double v, int bits) {
+    if (std::isnan(v) || std::isinf(v)) { c.fpsr |= kExcOperr; return 0; }
+    double r = roundByFpcr(c, v);
+    const double lo = -std::ldexp(1.0, bits - 1);
+    const double hi = std::ldexp(1.0, bits - 1) - 1.0;
+    if (r < lo || r > hi) {
+        c.fpsr |= kExcOperr;
+        r = r < lo ? lo : hi;
+    }
+    return static_cast<s32>(r);
+}
 
 void setFpccFrom(M68040& c, double v) {
     u32 cc = 0;
@@ -196,6 +262,12 @@ double fpuConstant(int offset) {
     case 0x39: return 1e64;
     case 0x3A: return 1e128;
     case 0x3B: return 1e256;
+    // 10^512 upward do not fit a double. They belong to the extended range the
+    // register file gives up, so they arrive as infinity -- which at least
+    // propagates as an overflow. Answering 0 instead would turn a number too
+    // big to hold into a number too small to notice.
+    case 0x3C: case 0x3D: case 0x3E: case 0x3F:
+        return std::numeric_limits<double>::infinity();
     default:   return 0.0;
     }
 }
@@ -265,8 +337,10 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
             src = c.fp[srcSpec];
         } else if (srcSpec == 7) {   // FMOVECR #ccc,FPn
             c.fpiar = instrStart(c);
+            beginFpOp(c);
             c.fp[dst] = fpuConstant(opmode);
             setFpccFrom(c, c.fp[dst]);
+            accrueFp(c);
             return 4;
         } else {
             // Fetch by format from the EA.
@@ -318,17 +392,19 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
         }
 
         c.fpiar = instrStart(c);
+        beginFpOp(c);
         double& fpd = c.fp[dst];
         double r = fpd;
+        const double dstBefore = fpd;
         const double x = src;
         bool store = true;
         switch (opmode) {
         case 0x00: case 0x40: case 0x44: r = x; break;                 // FMOVE/FSMOVE/FDMOVE
-        case 0x01: r = std::nearbyint(x); break;                       // FINT
+        case 0x01: r = roundByFpcr(c, x); break;                       // FINT
         case 0x02: r = std::sinh(x); break;
         case 0x03: r = std::trunc(x); break;                           // FINTRZ
         case 0x04: case 0x41: case 0x45:                               // FSQRT
-            if (x < 0.0) { r = std::numeric_limits<double>::quiet_NaN(); c.fpsr |= 0x2000u; }
+            if (x < 0.0) r = std::numeric_limits<double>::quiet_NaN();
             else r = std::sqrt(x);
             break;
         case 0x06: r = std::log1p(x); break;                           // FLOGNP1
@@ -351,17 +427,24 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
         case 0x1C: r = std::acos(x); break;
         case 0x1D: r = std::cos(x); break;
         case 0x1E: {                                                   // FGETEXP
-            if (x == 0.0 || std::isinf(x) || std::isnan(x)) r = x;
+            // An infinity has no exponent to report: that is an operand error
+            // answered with a NaN, not the infinity handed straight back.
+            if (std::isinf(x)) r = std::numeric_limits<double>::quiet_NaN();
+            else if (x == 0.0 || std::isnan(x)) r = x;
             else { int e; std::frexp(x, &e); r = static_cast<double>(e - 1); }
             break;
         }
         case 0x1F: {                                                   // FGETMAN
-            if (x == 0.0 || std::isinf(x) || std::isnan(x)) r = x;
+            if (std::isinf(x)) r = std::numeric_limits<double>::quiet_NaN();
+            else if (x == 0.0 || std::isnan(x)) r = x;
             else { int e; r = std::frexp(x, &e) * 2.0; if (x < 0 && r > 0) r = -r; }
             break;
         }
         case 0x20: case 0x24: case 0x60: case 0x64:                    // FDIV/FSGLDIV
-            if (x == 0.0) c.fpsr |= 0x400u;                            // DZ status
+            // Divide by zero is only a divide by zero when the dividend was a
+            // finite non-zero: 0/0 has no answer at all, and the NaN it makes
+            // is reported below as an operand error instead.
+            if (x == 0.0 && fpd != 0.0 && std::isfinite(fpd)) c.fpsr |= kExcDz;
             r = fpd / x;
             break;
         case 0x21: {                                                   // FMOD
@@ -422,10 +505,24 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
                 r = static_cast<double>(static_cast<float>(r));   // FSxxx
             }
         }
+        // A NaN conjured out of operands that were not NaN is an invalid
+        // operation, and an infinity conjured out of finite ones is an
+        // overflow. Reading the result this way catches inf-inf, 0*inf, 0/0,
+        // inf/inf and the square root of a negative from one place, rather
+        // than a rule per opcode that the next opcode added forgets.
+        // The infinity a divide by zero produces is already reported as that,
+        // and is not also an overflow.
+        if (store && !std::isnan(dstBefore) && !std::isnan(x)) {
+            if (std::isnan(r)) c.fpsr |= kExcOperr;
+            else if (std::isinf(r) && !std::isinf(dstBefore) && !std::isinf(x) &&
+                     !(c.fpsr & kExcDz))
+                c.fpsr |= kExcOvfl;
+        }
         if (store) {
             fpd = r;
             setFpccFrom(c, fpd);
         }
+        accrueFp(c);
         return 6;
     }
 
@@ -435,17 +532,20 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
         const int kf = ext & 0x7F;
         const double v = c.fp[src];
         c.fpiar = instrStart(c);
+        beginFpOp(c);
 
         if (mode == 0) {
             if (fmt == 1) c.d[reg] = doubleToSingle(v);
-            else if (fmt == 0) c.d[reg] = static_cast<u32>(static_cast<s32>(v));
-            else if (fmt == 4) writeSized(c.d[reg], static_cast<u32>(static_cast<s32>(v)) & 0xFFFF, 1);
-            else writeSized(c.d[reg], static_cast<u32>(static_cast<s32>(v)) & 0xFF, 0);
+            else if (fmt == 0) c.d[reg] = static_cast<u32>(toIntegerFormat(c, v, 32));
+            else if (fmt == 4)
+                writeSized(c.d[reg], static_cast<u32>(toIntegerFormat(c, v, 16)) & 0xFFFF, 1);
+            else writeSized(c.d[reg], static_cast<u32>(toIntegerFormat(c, v, 8)) & 0xFF, 0);
+            accrueFp(c);
             return 4;
         }
         const u32 addr = fpuOperandEA(c, mode, reg, fmt);
         switch (fmt) {
-        case 0: c.wr32(addr, static_cast<u32>(static_cast<s32>(v))); break;
+        case 0: c.wr32(addr, static_cast<u32>(toIntegerFormat(c, v, 32))); break;
         case 1: c.wr32(addr, doubleToSingle(v)); break;
         case 2: {
             u32 se; u64 mant;
@@ -464,15 +564,16 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
             c.wr32(addr + 8, w2);
             break;
         }
-        case 4: c.wr16(addr, static_cast<u16>(static_cast<s32>(v))); break;
+        case 4: c.wr16(addr, static_cast<u16>(toIntegerFormat(c, v, 16))); break;
         case 5: {
             const u64 bits = doubleToBits(v);
             c.wr32(addr, static_cast<u32>(bits >> 32));
             c.wr32(addr + 4, static_cast<u32>(bits));
             break;
         }
-        default: c.wr8(addr, static_cast<u8>(static_cast<s32>(v))); break;
+        default: c.wr8(addr, static_cast<u8>(toIntegerFormat(c, v, 8))); break;
         }
+        accrueFp(c);
         return 4;
     }
 

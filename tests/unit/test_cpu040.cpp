@@ -520,6 +520,114 @@ TEST_CASE("040 FMOVEM.X predecrement list runs the other way round") {
         CHECK(f.cpu.fp[i] == doctest::Approx(std::ldexp(1.0, i)));
 }
 
+TEST_CASE("040 FMOVE to an integer format rounds, and says when it cannot") {
+    // "Rounds the source operand to the size of the specified destination
+    // format" -- a C cast truncates instead, which is a different instruction
+    // (that is what FINTRZ is for).
+    Cpu040Fix f;
+    f.cpu.fpcr = 0;                       // round to nearest, ties to even
+    f.cpu.fp[0] = 2.6;
+    f.run({0xF200, 0x6000});              // FMOVE.L FP0,D0
+    CHECK(f.cpu.d[0] == 3u);
+
+    f.cpu.fp[0] = -2.6;
+    f.run({0xF200, 0x6000});
+    CHECK(static_cast<s32>(f.cpu.d[0]) == -3);
+
+    f.cpu.fp[0] = 2.5;                    // a tie goes to even
+    f.run({0xF200, 0x6000});
+    CHECK(f.cpu.d[0] == 2u);
+
+    f.cpu.fpcr = 1u << 4;                 // toward zero
+    f.cpu.fp[0] = 2.9;
+    f.run({0xF200, 0x6000});
+    CHECK(f.cpu.d[0] == 2u);
+
+    f.cpu.fpcr = 2u << 4;                 // toward minus infinity
+    f.cpu.fp[0] = 2.9;
+    f.run({0xF200, 0x6000});
+    CHECK(f.cpu.d[0] == 2u);
+    f.cpu.fp[0] = -2.1;
+    f.run({0xF200, 0x6000});
+    CHECK(static_cast<s32>(f.cpu.d[0]) == -3);
+
+    f.cpu.fpcr = 3u << 4;                 // toward plus infinity
+    f.cpu.fp[0] = 2.1;
+    f.run({0xF200, 0x6000});
+    CHECK(f.cpu.d[0] == 3u);
+
+    // FINT follows the same mode; FINTRZ is the one that always truncates.
+    f.cpu.fpcr = 1u << 4;
+    f.cpu.fp[1] = 0.0;
+    f.run({0xF200, 0x0081});              // FINT FP0,FP1 (source FP0 = 2.1)
+    CHECK(f.cpu.fp[1] == doctest::Approx(2.0));
+    f.cpu.fpcr = 3u << 4;
+    f.run({0xF200, 0x0081});
+    CHECK(f.cpu.fp[1] == doctest::Approx(3.0));
+    f.run({0xF200, 0x0083});              // FINTRZ FP0,FP1
+    CHECK(f.cpu.fp[1] == doctest::Approx(2.0));
+
+    // An infinity, or a value the destination cannot hold, is an operand error.
+    f.cpu.fpcr = 0;
+    f.cpu.fp[0] = 1e18;
+    f.run({0xF200, 0x6000});              // FMOVE.L FP0,D0
+    CHECK((f.cpu.fpsr & (1u << 13)) != 0u);
+    CHECK((f.cpu.fpsr & 0x80u) != 0u);    // and it accrues as an invalid op
+}
+
+TEST_CASE("040 packed-decimal reals survive a round trip") {
+    // A real '040 traps the packed formats to software; this one converts them
+    // in place, so every number a program prints or parses through SANE goes
+    // through this code and nothing else checks it.
+    Cpu040Fix f;
+    f.cpu.a[0] = 0x0E000;
+    const double vals[] = {123.456, -0.001953125, 1.0, 98765.4321, -7.0};
+    for (double v : vals) {
+        f.cpu.fp[0] = v;
+        f.cpu.fp[1] = 0.0;
+        f.run({0xF210, 0x6C11});          // FMOVE.P FP0,(A0){#17}
+        f.run({0xF210, 0x4C80});          // FMOVE.P (A0),FP1
+        CHECK(f.cpu.fp[1] == doctest::Approx(v).epsilon(1e-12));
+    }
+    // The sign of the value and the sign of the exponent are separate bits.
+    f.cpu.fp[0] = -123.456;
+    f.run({0xF210, 0x6C11});
+    CHECK((f.bus.read32(0x0E000) & 0x80000000u) != 0u);   // mantissa negative
+    CHECK((f.bus.read32(0x0E000) & 0x40000000u) == 0u);   // exponent positive
+    f.cpu.fp[0] = 0.00123;
+    f.run({0xF210, 0x6C11});
+    CHECK((f.bus.read32(0x0E000) & 0x80000000u) == 0u);
+    CHECK((f.bus.read32(0x0E000) & 0x40000000u) != 0u);   // exponent negative
+}
+
+TEST_CASE("040 the exception byte describes the last operation only") {
+    // The EXC byte "is cleared at the start of all operations that generate
+    // floating-point exceptions" -- so a fault does not follow the program
+    // around. The accrued byte is the one that remembers.
+    Cpu040Fix f;
+    f.cpu.fp[0] = 1.0;
+    f.cpu.fp[1] = 0.0;
+    f.run({0xF200, 0x0420});              // FDIV FP1,FP0  -> divide by zero
+    CHECK((f.cpu.fpsr & (1u << 10)) != 0u);
+    CHECK((f.cpu.fpsr & 0x10u) != 0u);    // accrued DZ
+
+    f.cpu.fp[0] = 6.0;
+    f.cpu.fp[1] = 3.0;
+    f.run({0xF200, 0x0420});              // a clean divide
+    CHECK(f.cpu.fp[0] == doctest::Approx(2.0));
+    CHECK((f.cpu.fpsr & (1u << 10)) == 0u);   // EXC cleared
+    CHECK((f.cpu.fpsr & 0x10u) != 0u);        // AEXC still remembers
+
+    // Zero over zero has no answer at all: an operand error, not a divide by
+    // zero, and the result is a NaN.
+    f.cpu.fp[0] = 0.0;
+    f.cpu.fp[1] = 0.0;
+    f.run({0xF200, 0x0420});
+    CHECK((f.cpu.fpsr & (1u << 13)) != 0u);
+    CHECK((f.cpu.fpsr & (1u << 10)) == 0u);
+    CHECK((f.cpu.fpsr & (1u << 24)) != 0u);   // NAN condition code
+}
+
 TEST_CASE("040 FMOVEM control list moves the address register by the whole list") {
     Cpu040Fix f;
     // A caller's saved longword sits just above the stack pointer. A control
