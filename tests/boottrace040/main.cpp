@@ -477,6 +477,8 @@ int main(int argc, char** argv) {
     bool doShutdown = false;        // --shutdown: flush+unmount before saving
     int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
     const char* saveFdPath = nullptr;  // --save-floppy: medium as its file should be
+    unsigned long monGnd = 0, monPairs = 0;
+    bool monSet = false;            // --monitor GROUNDED PAIRS: which display
     const char* trapLogPath = nullptr;   // --trap-log: every ringed trap, to a file
     std::ofstream trapLog;
     int shotEvery = 0;              // --shot-every: screen strip during post-frames
@@ -634,6 +636,7 @@ int main(int argc, char** argv) {
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
         else if (a == "--save-floppy" && i + 1 < argc) saveFdPath = argv[++i];
+        else if (a == "--monitor" && i + 2 < argc) { monGnd = std::strtoul(argv[++i], nullptr, 0); monPairs = std::strtoul(argv[++i], nullptr, 0); monSet = true; }
         else if (a == "--trap-log" && i + 1 < argc) trapLogPath = argv[++i];
         else if (a == "--shot-every" && i + 1 < argc) shotEvery = std::atoi(argv[++i]);
         else if (a == "--floppy-next" && i + 1 < argc) floppyQueue.push_back(argv[++i]);
@@ -763,6 +766,7 @@ int main(int argc, char** argv) {
     if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), 4, 60);
     if (ioTrace) mac.traceIoWindow(ioFrom, ioTo, ioPcLo, ioPcHi, ioBudget);
     if (hdTrace) mac.traceHdRequests(hdTrace);
+    if (monSet) mac.setMonitorSense(static_cast<u32>(monGnd), static_cast<u32>(monPairs));
     if (countPcAt) mac.countPc(static_cast<u32>(countPcAt));
     int vramBudget = 10;
     mac.onVramWrite = [&](u32 off, u32 pc) {

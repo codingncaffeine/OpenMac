@@ -107,6 +107,10 @@ public:
     u32 countPcHits() const { return countPcHits_; }
     bool dafbVblEnabled() const;
     u32 dafbSwatchReg(int i) const;
+    // Which display is plugged into the video port. The monitor identifies
+    // itself on the connector's sense lines and the ROM picks the timing from
+    // that, so this is how the machine is told to run at another resolution.
+    void setMonitorSense(u32 grounded, u32 pairs);
 
     // SCSI media, mirroring the Classic's surface. Images are wrapped in an
     // Apple partition map with a driver the ROM's boot scan can load.

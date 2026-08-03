@@ -82,6 +82,9 @@ QuadraMachine::QuadraMachine(std::vector<u8> rom, const Config& cfg)
     romMask_ = rs - 1;
 
     scc_->onDiag = [this](const char* s) { if (onDiag) onDiag(s); };
+    // Default display: the 13-inch/14-inch RGB monitor the machine has always
+    // reported. Its sense code is 6, which is one grounded line (bit 0).
+    setMonitorSense(0x1, 0);
     scsi_->addTarget(disk_.get());
     scsi_->addTarget(disk2_.get());
     scsi_->addTarget(cdrom_.get());
@@ -191,6 +194,7 @@ void QuadraMachine::wireDevices() {
         return static_cast<u8>(0xFFu & ~(dafbIrq_ ? 0x40u : 0u));
     };
 
+    dafb_->onDiag = [this](const char* s) { if (onDiag) onDiag(s); };
     dafb_->onIrq = [this](bool level) {
         dafbIrq_ = level;
         via2_->setSlotIrq(level);
@@ -334,6 +338,22 @@ std::string QuadraMachine::diagnosticReport() const {
         via1_->irqAsserted() ? 1 : 0);
     add("   VIA2  ifr=%02X ier=%02X irq=%d", via2_->peekIfr(), via2_->peekIer(),
         via2_->irqAsserted() ? 1 : 0);
+    add("   DAFB  %dx%d %dbpp base=%05X stride=%u sense=%X",
+        dafb_->width(), dafb_->height(), dafb_->bpp(), dafb_->fbBase(),
+        dafb_->strideBytes(), dafb_->read(0x1C));
+    {
+        // The swatch's horizontal and vertical timing: what the ROM programmed
+        // from the monitor it sensed, and where the geometry above comes from.
+        std::string t = "   swatch";
+        char one[32];
+        for (u32 r : {0x40u, 0x44u, 0x48u, 0x4Cu, 0x54u, 0x58u, 0x5Cu, 0x60u}) {
+            std::snprintf(one, sizeof one, " %02X=%03X", r,
+                          dafb_->swatchReg(static_cast<int>(r >> 2)));
+            t += one;
+        }
+        s += t;
+        s += '\n';
+    }
     // A separate buffer: `add` formats into `b`, and formatting a buffer into
     // itself is undefined -- it truncated these lines mid-word.
     char dev[512];
@@ -1712,6 +1732,12 @@ u32 QuadraMachine::adbKbdPolls() const { return adb_->kbdPolls(); }
 u32 QuadraMachine::adbMouseReports() const { return adb_->mouseReports(); }
 bool QuadraMachine::dafbVblEnabled() const { return dafb_->vblIntEnabled(); }
 u32 QuadraMachine::dafbSwatchReg(int i) const { return dafb_->swatchReg(i); }
+void QuadraMachine::setMonitorSense(u32 grounded, u32 pairs) {
+    Dafb::MonitorWiring m;
+    m.grounded = static_cast<u8>(grounded & 7u);
+    m.pairs = static_cast<u8>(pairs & 7u);
+    dafb_->setMonitor(m);
+}
 u32 QuadraMachine::adbMouseBytesRead() const { return adb_->mouseBytesRead(); }
 std::vector<u8> QuadraMachine::adbMouseBytesLog() const { return adb_->mouseBytesLog(); }
 void QuadraMachine::adbClearCmdTrace() { adb_->clearCmdTrace(); }

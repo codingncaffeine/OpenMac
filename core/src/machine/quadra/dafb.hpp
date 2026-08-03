@@ -22,6 +22,7 @@
 
 #include "openmac/types.hpp"
 
+#include <cstdio>
 #include <functional>
 #include <vector>
 
@@ -80,10 +81,15 @@ public:
         switch (block) {
         case 0:
             if (reg == 0x1C) {
-                // Monitor sense: a plain 13" 640x480 monitor has no
-                // cross-wired sense lines, so probing drives change nothing
-                // and every read returns the inverse of the passive code.
-                return (~kSenseCode) & 7u;
+                const u32 v = senseRead();
+                if (senseDiag_ > 0 && onDiag) {
+                    --senseDiag_;
+                    char b[80];
+                    std::snprintf(b, sizeof b, "SENSE read drive=%X -> %X",
+                                  regs_[0x1C >> 2] & 7u, v);
+                    onDiag(b);
+                }
+                return v;
             }
             if (reg == 0x2C) return (3u << 9) | (regs_[0x2C >> 2] & 0x1FFu);
             return regs_[reg >> 2];
@@ -123,6 +129,12 @@ public:
         switch (block) {
         case 0:
             regs_[reg >> 2] = v;
+            if (reg == 0x1C && senseDiag_ > 0 && onDiag) {
+                --senseDiag_;
+                char b[80];
+                std::snprintf(b, sizeof b, "SENSE write %X", v & 7u);
+                onDiag(b);
+            }
             break;
         case 1:
             swatch_[reg >> 2] = v & 0xFFFu;
@@ -259,14 +271,60 @@ public:
     bool vblIntEnabled() const { return vblEnabled_; }
     u32 swatchReg(int i) const { return swatch_[i & 63]; }
     std::function<void(bool level)> onIrq;
+    std::function<void(const char* msg)> onDiag;
 
-    // Hi-res color 13"/14" (640x480): base sense code 6.
-    static constexpr u32 kSenseCode = 6;
+    // ---- monitor sense ----
+    // The video connector's three sense lines are open collector with pull-ups
+    // at the host end. A monitor identifies itself by tying some of them to
+    // ground, or to each other; the host reads the resulting pattern. Three
+    // lines only give eight identities, so later displays are named by an
+    // extended protocol: the host pulls one line low at a time and reads the
+    // other two, and a pair wired together drags its partner down with it.
+    // Three such passes give a 6-bit code.
+    //
+    // The model is therefore not a number but the wiring: which lines this
+    // monitor grounds, and which it ties together. Reads derive from that, so
+    // both the passive read and every extended pass fall out of one
+    // description.
+    struct MonitorWiring {
+        u8 grounded = 0;    // bit n: sense line n tied to ground
+        u8 pairs = 0;       // bit0: 0-1 tied, bit1: 1-2 tied, bit2: 0-2 tied
+    };
+    void setMonitor(const MonitorWiring& m) { monitor_ = m; }
+    MonitorWiring monitor() const { return monitor_; }
 
 private:
+    // What the host reads on the sense lines right now. A line reads low when
+    // the monitor grounds it, when the host is driving it low, or when it is
+    // tied to another line that is low; otherwise the pull-up wins. Register
+    // +$1C's low three bits are the host's drive latch, active low, and the
+    // value read back is the inverse of the line state -- so a monitor that
+    // grounds nothing reads back all ones.
+    u32 senseRead() const {
+        // The drive latch is active LOW. The ROM writes 7 and then reads, and
+        // that write is it letting go of all three lines: taken the other way
+        // up it would be holding all three down, and every monitor read back
+        // the same value (measured -- the whole sense sweep returned one
+        // answer). A zero bit pulls its line to ground for an extended pass.
+        const u8 drive = static_cast<u8>(~regs_[0x1C >> 2] & 7u);
+        u8 low = static_cast<u8>(monitor_.grounded | drive);
+        // Settle the ties: a pair conducts in both directions, and a chain of
+        // pairs conducts along its length, so iterate until nothing changes.
+        for (int pass = 0; pass < 3; ++pass) {
+            const u8 before = low;
+            if (monitor_.pairs & 1) { if (low & 3) low |= 3; }        // 0-1
+            if (monitor_.pairs & 2) { if (low & 6) low |= 6; }        // 1-2
+            if (monitor_.pairs & 4) { if (low & 5) low |= 5; }        // 0-2
+            if (low == before) break;
+        }
+        return low & 7u;
+    }
+
     void updateIrq() {
         if (onIrq) onIrq(irqAsserted());
     }
+    MonitorWiring monitor_{};
+    mutable int senseDiag_ = 60;
 
     std::vector<u8> vram_;
     u32 regs_[64]{};
