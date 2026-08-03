@@ -222,3 +222,46 @@ TEST_CASE("cd media containers normalize to the flat run the drive serves") {
         CHECK_FALSE(cd::normalize(std::vector<u8>(4096, 0xAB)).ok);
     }
 }
+
+// A drive that answers every page code with page 01 is telling the same lie an
+// echoing register stub tells: the initiator gets a well-formed reply that
+// describes something else, and nothing is logged because the command
+// "succeeded". Report the page that was asked for, or say it is not there.
+TEST_CASE("MODE SENSE serves the page it was asked for, and refuses the rest") {
+    ScsiCdRom cd;
+    cd.setAttached(true, 3);
+    cd.insert(std::vector<u8>(4 * 2048, 0x11));
+    run(cd, {0x00});                      // clear the insertion unit attention
+
+    // Page 01, read error recovery: header, block descriptor, then the page.
+    Cmd p1 = run(cd, {0x1A, 0x00, 0x01, 0x00, 0xFF, 0x00});
+    CHECK(p1.status == 0x00);
+    REQUIRE(p1.data.size() >= 14);
+    CHECK(p1.data[3] == 8);               // block descriptor length
+    CHECK(p1.data[12] == 0x01);           // the page code that was asked for
+    CHECK(p1.data[0] == p1.data.size() - 1);   // mode data length excludes itself
+    // The block descriptor still carries the block size the drive is set to.
+    const u32 bs = (u32(p1.data[9]) << 16) | (u32(p1.data[10]) << 8) | p1.data[11];
+    CHECK(bs == cd.blockSize());
+
+    // Page 2A, CD capabilities -- a page a CD driver actually asks for.
+    Cmd p2a = run(cd, {0x1A, 0x00, 0x2A, 0x00, 0xFF, 0x00});
+    CHECK(p2a.status == 0x00);
+    REQUIRE(p2a.data.size() >= 14);
+    CHECK(p2a.data[12] == 0x2A);
+
+    // Page 3F is "all of them", so both show up in one answer.
+    Cmd all = run(cd, {0x1A, 0x00, 0x3F, 0x00, 0xFF, 0x00});
+    CHECK(all.status == 0x00);
+    CHECK(all.data.size() > p1.data.size());
+    CHECK(all.data[12] == 0x01);
+
+    // And a page this drive does not have is refused, not answered with
+    // something else.
+    Cmd bad = run(cd, {0x1A, 0x00, 0x10, 0x00, 0xFF, 0x00});
+    CHECK(bad.status == 0x02);            // CHECK CONDITION
+    Cmd sense = run(cd, {0x03, 0x00, 0x00, 0x00, 0x12, 0x00});
+    REQUIRE(sense.data.size() >= 13);
+    CHECK((sense.data[2] & 0x0F) == 0x05);   // ILLEGAL REQUEST
+    CHECK(sense.data[12] == 0x24);           // invalid field in CDB
+}

@@ -369,8 +369,9 @@ std::string extended(Cursor& c, const char* base) {
                       hexAddr(pcBase + static_cast<u32>(bd)).c_str(),
                       (indexSup || post) ? "" : ",", (indexSup || post) ? "" : idx);
     else
-        std::snprintf(inner, sizeof inner, "%s%s%s%s",
+        std::snprintf(inner, sizeof inner, "%s%s%s%s%s",
                       bd ? disp16(static_cast<u16>(bd)).c_str() : "",
+                      (bd && !baseSup) ? "," : "",
                       baseSup ? "" : base,
                       (indexSup || post) ? "" : ",",
                       (indexSup || post) ? "" : idx);

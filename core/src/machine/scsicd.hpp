@@ -108,8 +108,7 @@ private:
                 modeSelectPending_ = writeBytes != 0;
                 return 0x00;
             case 0x1A:   // MODE SENSE(6)
-                appendModeSense(out, cdb[4]);
-                return 0x00;
+                return appendModeSense(out, cdb[2] & 0x3F, cdb[4]);
             case 0x1B:   // START STOP UNIT: LoEj without Start = eject
                 if ((cdb[4] & 0x02) && !(cdb[4] & 0x01)) {
                     if (prevented_) return check(0x05, 0x53);   // removal prevented
@@ -214,18 +213,42 @@ private:
         emitClamped(out, d, sizeof d, allocLen);
     }
 
-    void appendModeSense(std::vector<u8>& out, u8 allocLen) {
-        // Header + one block descriptor + the error-recovery page, which is
-        // enough for drivers that only want the block size back.
-        u8 d[24] = {};
-        d[0] = 22;     // mode data length (everything after this byte)
+    // Header + block descriptor + the page that was ASKED FOR. Answering every
+    // page code with page 01 is the same lie an echoing register stub tells:
+    // the initiator gets a well-formed reply that describes something else, and
+    // nothing is logged because the command "succeeded". A drive reports
+    // ILLEGAL REQUEST for a page it does not have, and that is an answer a
+    // driver knows how to handle. Page 3F means "all of them".
+    u8 appendModeSense(std::vector<u8>& out, u8 page, u8 allocLen) {
+        u8 d[64] = {};
+        std::size_t n = 4;
         d[3] = 8;      // block descriptor length
-        d[9]  = static_cast<u8>(blockSize_ >> 16);   // descriptor: density 0,
-        d[10] = static_cast<u8>(blockSize_ >> 8);    // 0 blocks (whole medium),
-        d[11] = static_cast<u8>(blockSize_);         // then the block size
-        d[12] = 0x01;  // page 01: read error recovery
-        d[13] = 10;    // page length (zeros: no retry tuning to report)
-        emitClamped(out, d, sizeof d, allocLen);
+        d[4 + 5] = static_cast<u8>(blockSize_ >> 16);  // density 0, 0 blocks
+        d[4 + 6] = static_cast<u8>(blockSize_ >> 8);   // (the whole medium),
+        d[4 + 7] = static_cast<u8>(blockSize_);        // then the block size
+        n += 8;
+        const bool all = page == 0x3F;
+        if (all || page == 0x01) {          // read error recovery
+            d[n++] = 0x01; d[n++] = 10; n += 10;
+        }
+        if (all || page == 0x0D) {          // CD-ROM device parameters
+            d[n++] = 0x0D; d[n++] = 6;
+            d[n + 1] = 5;                   // inactivity timer: 125 ms
+            d[n + 2] = 0; d[n + 3] = 60;    // seconds per minute
+            d[n + 4] = 0; d[n + 5] = 75;    // frames per second
+            n += 6;
+        }
+        if (all || page == 0x2A) {          // CD-ROM capabilities
+            d[n++] = 0x2A; d[n++] = 12;
+            d[n + 0] = 0x00;                // no CD-R/CD-RW reading claimed
+            d[n + 2] = 0x01;                // audio play supported
+            d[n + 6] = 0x02; d[n + 7] = 0x58;   // 600 KB/s
+            n += 12;
+        }
+        if (n == 12 && !all) return check(0x05, 0x24);   // invalid field in CDB
+        d[0] = static_cast<u8>(n - 1);      // mode data length excludes itself
+        emitClamped(out, d, n, allocLen);
+        return good();
     }
 
     void appendSense(std::vector<u8>& out, u8 allocLen) {

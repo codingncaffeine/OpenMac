@@ -595,6 +595,10 @@ int main(int argc, char** argv) {
     // way; guest code is only there once the guest has put it there.
     u32 disasmLiveAt = 0;
     int disasmLiveCount = 0;
+    // --drivers: every driver in the unit table at exit, by name. Whether an
+    // extension installed its driver at all is the first fork in the road for
+    // any "the guest ignores this device" question, and nothing else answers it.
+    bool showDrivers = false;
     // --io-trace FROM TO PCLO PCHI BUDGET: every device access a range of
     // code makes in a frame window. The PC filter is what makes it readable:
     // the ROM's own interrupt traffic drowns a driver's few dozen accesses.
@@ -770,6 +774,7 @@ int main(int argc, char** argv) {
             disasmAt = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             disasmCount = std::atoi(argv[++i]);
         }
+        else if (a == "--drivers") showDrivers = true;
         else if (a == "--disasm-live" && i + 2 < argc) {
             disasmLiveAt = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             disasmLiveCount = std::atoi(argv[++i]);
@@ -1585,6 +1590,55 @@ int main(int argc, char** argv) {
         std::printf("\n-- bus-error sites --\n");
         for (const auto& [pc, n] : busErrSites)
             std::printf("  pc %08X x%d\n", pc, n);
+    }
+
+    if (showDrivers) {
+        // UTableBase $011C, UnitNtryCnt $01D2. Each entry is a handle to a DCE;
+        // dCtlFlags bit 6 says whether dCtlDriver is a handle or a pointer, and
+        // the DRVR's name is a Pascal string 18 bytes into its header.
+        const u32 ramTop = static_cast<u32>(ramMb) * 1024u * 1024u;
+        // A driver lives in RAM or in the ROM; reading anywhere else would be a
+        // device access, and an instrument must not touch the machine.
+        const auto readable = [&](u32 a, u32 len) {
+            return (a && a + len < ramTop) ||
+                   (a >= 0x40800000u && a + len < 0x40900000u);
+        };
+        // A master pointer carries the Memory Manager's locked/purgeable marks
+        // in its high byte, and every DCE in this table is a locked one. Strip
+        // them the way the machine's own guestPtr does -- only when the raw
+        // value is not already a real address, because above 16 MB it can be.
+        const auto deref = [&](u32 p) {
+            if (!p || p + 3 < ramTop) return p;
+            const u32 stripped = p & 0x00FFFFFFu;
+            return stripped + 3 < ramTop ? stripped : p;
+        };
+        const u32 utab = mac.read32(0x011C);
+        const u32 count = mac.read16(0x01D2);
+        std::printf("\n-- drivers (unit table %08X, %u entries) --\n", utab, count);
+        for (u32 i = 0; i < count && readable(utab + i * 4, 4); ++i) {
+            const u32 h = mac.read32(utab + i * 4);
+            if (!h) continue;                       // an empty slot is normal
+            const u32 dce = deref(readable(h, 4) ? mac.read32(h) : 0);
+            const u16 flags = readable(dce, 26) ? mac.read16(dce + 4) : 0;
+            u32 drvr = readable(dce, 26) ? deref(mac.read32(dce + 0)) : 0;
+            // dCtlDriver is a handle when dRAMBased is set and a pointer when
+            // it is not -- and the flag is the only thing that says which.
+            if (drvr && (flags & 0x0040))
+                drvr = deref(readable(drvr, 4) ? mac.read32(drvr) : 0);
+            std::string name = "?";
+            if (readable(drvr, 20)) {
+                const u8 len = mac.read8(drvr + 18);
+                if (len && len <= 31 && readable(drvr + 19, len)) {
+                    name.clear();
+                    for (u8 k = 0; k < len; ++k)
+                        name += char(mac.read8(drvr + 19 + k));
+                }
+            }
+            std::printf("  unit %2u  refNum %5d  h %08X  dce %08X  flags %04X  "
+                        "drvr %08X  %s\n",
+                        i, static_cast<int>(static_cast<s16>(~u16(i))), h, dce,
+                        flags, drvr, name.c_str());
+        }
     }
 
     if (disasmLiveCount > 0) {
