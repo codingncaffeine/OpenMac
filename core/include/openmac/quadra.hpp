@@ -198,6 +198,10 @@ private:
     bool markVolumeClean(u16 drive);
     static bool markVolumeCleanIn(std::vector<u8>& backing, u32 base, u32 volumeSize);
     void completeFloppyEject();
+    int  insertFloppyNow(std::vector<u8> image, bool readOnly);
+    static bool floppyGeometry(std::vector<u8>& image);
+    void seatFloppy(std::vector<u8> image, bool readOnly);
+    void seatPendingFloppy();
     void clearDriveInPlace(u16 drive);
     std::vector<u8> floppyFileImage(const std::vector<u8>& sectors) const;
     u32  ioRead32(u32 off);
@@ -259,6 +263,18 @@ private:
     std::vector<u8> floppy_;
     std::vector<u8> floppyEjected_;
     bool floppyEjectPending_ = false;   // front-end eject, run at a frame edge
+    // A disk handed in while another one is still in the drive waits here until
+    // the drive is empty. There is one slot in a Macintosh and the guest has to
+    // be told the old volume left before the new bytes appear underneath it.
+    std::vector<u8> floppyPending_;
+    bool floppyPendingRO_ = false;
+    bool floppyPendingSet_ = false;
+    int  floppyPendingDelay_ = 0;   // frames of empty drive before it goes in
+public:
+    // Does the front end.s Eject also UNMOUNT, the way Put Away does? A volume
+    // left in the queue as "ejected" is what the guest asks for by name later.
+    bool ejectUnmounts_ = true;
+private:
     // Containers peeled on insertion -- MacBinary around DiskCopy 4.2 around
     // the sectors, either or both -- kept as plain bytes so this header need
     // not know the container formats, and so the medium goes back to the host

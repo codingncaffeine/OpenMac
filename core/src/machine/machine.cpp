@@ -1723,7 +1723,13 @@ void Machine::execute68kTrap(u16 trap) {
     // Place the A-line word in a scratch cell above the sound buffer, point the
     // PC at it, and step until control returns to the following word. The trap
     // dispatcher runs the routine and adjusts the return PC past the A-line.
+    // Put back what was there afterwards: these two bytes belong to the guest,
+    // and an injected trap has no business leaving anything behind in them.
+    // (Here that is the tail of the sound buffer rather than an application's
+    // scratch, so the cost is a click rather than a wild pointer -- but the
+    // Quadra's version of this wrote into ApplScratch and corrupted the Finder.)
     const u32 scratch = (static_cast<u32>(ram_.size()) - 8) & ramMask_;
+    const u8 was0 = ram_[scratch], was1 = ram_[scratch + 1];
     ram_[scratch]     = static_cast<u8>(trap >> 8);
     ram_[scratch + 1] = static_cast<u8>(trap & 0xFF);
     const u32 savedPc = cpu_.pc;
@@ -1747,6 +1753,8 @@ void Machine::execute68kTrap(u16 trap) {
     }
     cpu_.pc = savedPc;
     cpu_.setSR(savedSr);
+    ram_[scratch]     = was0;
+    ram_[scratch + 1] = was1;
 }
 
 

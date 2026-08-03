@@ -1091,11 +1091,10 @@ void QuadraMachine::tickDevices(int cpuCycles) {
     }
     scsi_->tick(cpuCycles);
     scc_->tick(static_cast<s32>(cpuCycles));
-    if (fd_->takeEjectRequest()) {
-        floppy_.clear();
-        fd_->removeDisk();
-        if (onDiag) onDiag("floppy: guest ejected the disk");
-    }
+    // (The eject request is taken at the frame boundary below, where the medium
+    // is KEPT for the write-back. A second consumer here would race that one and
+    // whichever won would decide whether the guest's writes survived -- this one
+    // dropped them on the floor.)
     secondAcc_ += static_cast<u64>(cpuCycles);
     if (secondAcc_ >= kCpuHz) {
         secondAcc_ -= kCpuHz;
@@ -1150,6 +1149,9 @@ void QuadraMachine::tickDevices(int cpuCycles) {
                 floppyEjected_ = std::move(floppy_);
                 floppy_.clear();
             }
+            // A disk the front end handed in while the drive was still full
+            // goes in now that it is empty -- whichever eject emptied it.
+            seatPendingFloppy();
             // DAFB VBL at ~66.67 Hz against the 60.15 Hz tick frame.
             vblAcc_ += 6667;
             dafb_->vblank();
@@ -1434,7 +1436,19 @@ void QuadraMachine::execute68kTrap(u16 trap) {
     // not mapped: the CPU faults, the guard loop spins on the fault, and the
     // machine ends up executing address 10. Low memory is identity-mapped on
     // every Macintosh, because the vector table and the globals live there.
+    //
+    // ⛔ And PUT BACK what was there. Those twelve bytes are reserved for the
+    // running APPLICATION -- the System does not touch them, so an application
+    // is entitled to leave something in them across a Toolbox call. Writing the
+    // trap word here and walking away corrupts the first two bytes of whatever
+    // the Finder was keeping, permanently, on every injected trap: the disk
+    // announce does it up to fifteen times a second while the desktop is up,
+    // and the eject does it again. The Finder reads its own scratch back, gets
+    // half a trap word where a pointer used to be, follows it, and the machine
+    // bus-errors seconds later somewhere that has nothing to do with disks
+    // (measured: A3 = A6A07A0E at 0002BBB6, every front-end eject).
     const u32 scratch = 0x0A78;
+    const u8 was0 = read8(scratch), was1 = read8(scratch + 1);
     write8(scratch, static_cast<u8>(trap >> 8));
     write8(scratch + 1, static_cast<u8>(trap & 0xFF));
     const u32 savedPc = cpu_.pc;
@@ -1446,6 +1460,8 @@ void QuadraMachine::execute68kTrap(u16 trap) {
     }
     cpu_.pc = savedPc;
     cpu_.setSR(savedSr);
+    write8(scratch, was0);
+    write8(scratch + 1, was1);
 }
 
 s32 QuadraMachine::gestaltQuery(u32 selector, u32& response) {
@@ -1830,7 +1846,73 @@ std::vector<u8> QuadraMachine::adbMouseBytesLog() const { return adb_->mouseByte
 void QuadraMachine::adbClearCmdTrace() { adb_->clearCmdTrace(); }
 std::vector<u8> QuadraMachine::adbCmdTrace() const { return adb_->cmdTrace(); }
 
+// A Macintosh has one slot per drive. A disk handed in while another one is
+// still in it used to replace the bytes underneath a mounted volume: everything
+// the guest had written to the outgoing disk went with it (nothing kept it for
+// the write-back), and the System went on believing the volume it had was still
+// there -- reading a catalog that now belongs to a different disk. From the
+// outside that is "the machine keeps asking me for a disk".
+//
+// So take the disk that is in there out first, properly -- flush, unmount,
+// release the medium -- and seat the new one when the drive is actually empty.
+// The eject has to happen at a frame boundary (it runs guest code), so the new
+// disk waits in `floppyPending_` until then.
 int QuadraMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
+    if (fd_->hasDisk() || floppyEjectPending_) {
+        // Check the geometry now, on a copy, so the front end still gets an
+        // immediate yes or no: the peel is destructive and the original has to
+        // survive the wait.
+        std::vector<u8> probe = image;
+        if (!floppyGeometry(probe)) return 0;
+        floppyPending_ = std::move(image);
+        floppyPendingRO_ = readOnly;
+        floppyPendingSet_ = true;
+        floppyPendingDelay_ = 60;   // ~1s of empty drive before the next disk
+        if (onDiag)
+            onDiag("floppy: a disk is still in the drive -- taking it out first");
+        ejectFloppy();
+        return 1;
+    }
+    seatFloppy(std::move(image), readOnly);
+    return floppyPresent() ? 1 : 0;
+}
+
+// Peel the containers and answer whether what is left is floppy media. Shared
+// by the seat path and the "will this be accepted?" check above, so a disk that
+// waits for the drive is judged by exactly the same rule as one that goes
+// straight in.
+bool QuadraMachine::floppyGeometry(std::vector<u8>& image) {
+    if (macbinary::isMacBinary(image)) macbinary::split(image);
+    if (dc42::isDiskCopy(image)) dc42::split(image);
+    const std::size_t n = image.size();
+    return n == 1474560 || n == 819200 || n == 409600;
+}
+
+void QuadraMachine::seatFloppy(std::vector<u8> image, bool readOnly) {
+    insertFloppyNow(std::move(image), readOnly);
+}
+
+// Seat whatever was waiting for the drive to empty. Called at every frame edge,
+// so it also runs the settle the swap needs.
+//
+// ⛔ The new disk must NOT go in on the same frame the old one came out. The
+// driver learns a drive is empty by polling it, and the front end learns the
+// same way -- so a medium that appears in the same instant is never seen to
+// have left: the System goes on believing the drive is empty (measured: drive
+// queue inPlace 0 with a disk in the drive, nothing mounts), and the host never
+// gets its window to write the outgoing disk back to its file. A second of
+// settling is also what taking one disk out and pushing the next one in
+// actually looks like.
+void QuadraMachine::seatPendingFloppy() {
+    if (!floppyPendingSet_ || fd_->hasDisk() || floppyEjectPending_) return;
+    if (floppyPendingDelay_ > 0) { --floppyPendingDelay_; return; }
+    floppyPendingSet_ = false;
+    std::vector<u8> img = std::move(floppyPending_);
+    floppyPending_.clear();
+    seatFloppy(std::move(img), floppyPendingRO_);
+}
+
+int QuadraMachine::insertFloppyNow(std::vector<u8> image, bool readOnly) {
     // Peel the wrappers the archived media wears -- MacBinary around DiskCopy
     // 4.2 around the sectors, either or both -- down to the raw disk data the
     // .Sony Prime hook serves. Most 7.1 install floppies are DiskCopy 4.2: an
@@ -1914,8 +1996,10 @@ void QuadraMachine::completeFloppyEject() {
     const bool fsUp =
         read32(0x0358) != 0 && (read8(0x0360) & 1) == 0 &&
         (((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) != 0xFFFFFFFFu);
-    s16 fl = 0, un = 0;
+    s16 fl = 0, ej = 0, un = 0;
+    bool ejected = false;
     if (fsUp && volumeMountedFor(1)) {
+        ejected = true;
         announceInFlight_ = true;
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
@@ -1932,35 +2016,72 @@ void QuadraMachine::completeFloppyEject() {
                 execute68kTrap(trap);
                 return static_cast<s16>(cpu_.d[0] & 0xFFFF);
             };
+            // Flush what the System is holding, then ASK THE FILE MANAGER TO
+            // EJECT. Do not take the disk away behind its back.
+            //
+            // ⛔ Two ways of doing this are wrong, both measured on this
+            // machine, both ending in the same corrupted pointer:
+            //
+            //  - _UnmountVol frees the VCB while the Finder is still holding a
+            //    pointer to it for the disk's icon. It never asked for the
+            //    unmount, so it never lets go: eleven frames later it walks the
+            //    freed block and the machine bus-errors (BUSERR at 0002BBB6,
+            //    A3 = A6A07A0E).
+            //  - Simply removing the medium is no better. The volume stays ON
+            //    LINE with nothing behind it, every access comes back offLinErr
+            //    forever, and about five seconds later the Finder dies the same
+            //    way. Taking the disk with no trap injected at all does it too,
+            //    so the injection was never the problem -- the missing eject
+            //    was.
+            //
+            // _Eject is what the Finder's own Special > Eject Disk issues. It
+            // flushes the volume, marks it EJECTED -- still in the queue, so
+            // every pointer to it stays good, and the icon dims instead of
+            // dangling -- and commands the drive. The mechanism then runs on
+            // its own clock and the medium comes out through the same path a
+            // guest-commanded eject uses, which keeps it for the write-back.
             fl = call(0xA013);                        // _FlushVol
-            un = call(0xA00E);                        // _UnmountVol
+            ej = call(0xA017);                        // _Eject
+            // ...and then ask to unmount the drive as well.
+            //
+            // On a volume _Eject has already taken off line this answers -35
+            // nsvErr and changes nothing visible -- and yet WITHOUT it the next
+            // disk inserted on this machine gets thrown straight back out
+            // again, and with it the disks mount and stay. That is measured on
+            // the user's own volume, three disks in a row, one variable at a
+            // time; an extra _FlushVol in the same place -- same number of
+            // injected traps, same cycles -- does NOT help, so it is the call
+            // and not the timing.
+            // What the File Manager settles in there is not yet understood.
+            // Kept because the experiment is clean and the call is inert when
+            // there is nothing to unmount; noted here so the next person knows
+            // it is evidence, not reasoning.
+            if (ejectUnmounts_) un = call(0xA00E);    // _UnmountVol
         }
         for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
         announceInFlight_ = false;
     }
     floppyEjectPending_ = false;
-    // Only now take the medium. Leaving it seated after the unmount lets the
-    // driver's next poll find a disk in the drive and announce it again, and
-    // the volume simply comes back (measured). -47 fBsyErr on the unmount
-    // means a file was still open: the disk still comes out, since that is
-    // what this button means, and the flush above means nothing written is
-    // lost -- but the guest will ask for it back.
+    if (ejected) {
+        // The File Manager has it: the driver's eject is running, and
+        // tickEject will hand the medium back at the frame it completes.
+        if (onDiag) {
+            char b[160];
+            std::snprintf(b, sizeof b,
+                          "floppy: front-end eject asked the File Manager "
+                          "(flush %d, eject %d, unmount %d)", fl, ej, un);
+            onDiag(b);
+        }
+        return;
+    }
+    // Nothing was mounted -- before the System is up, or a disk that never
+    // mounted. There is no volume to lose and nobody holding a pointer to one,
+    // so take the medium directly and tell the driver its drive is empty.
     if (!floppy_.empty()) floppyEjected_ = std::move(floppy_);
     floppy_.clear();
     fd_->removeDisk();
-    // And tell the driver its drive is empty. This is the one thing a real
-    // eject does that taking the medium alone does not: .Sony keeps
-    // dsDiskInPlace in its drive-queue entry, and while that still claims a
-    // disk is seated the System goes on polling -- and failing to read -- a
-    // drive with nothing in it.
     clearDriveInPlace(1);
-    if (onDiag) {
-        char b[160];
-        std::snprintf(b, sizeof b,
-                      "floppy: front-end eject (flush %d, unmount %d)%s",
-                      fl, un, un == -47 ? " -- files were still open" : "");
-        onDiag(b);
-    }
+    if (onDiag) onDiag("floppy: front-end eject (no volume was mounted)");
 }
 
 // Mark a drive-queue entry as holding no disk. dsDiskInPlace lives in the
