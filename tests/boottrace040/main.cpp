@@ -433,6 +433,8 @@ int main(int argc, char** argv) {
     const char* romPath = nullptr;
     const char* fdPath = nullptr;
     int fdAfter = -1;               // --floppy-after: insert mid-run at this frame
+    bool wiggle = false;            // --wiggle: real ADB mouse motion after the clicks
+    int wiggleFrom = 0;             // --wiggle-from: the post-frame it starts at
     int jiggleAt = -1;              // --jiggle-at: click+move the mouse mid-boot
     unsigned long watchMemAt = 0;   // --watch-mem: log writes to this address
     unsigned long countPcAt = 0;    // --count-pc: count executions of this pc
@@ -441,6 +443,7 @@ int main(int argc, char** argv) {
     // built somewhere else; this is how that gets settled instead of argued.
     std::vector<u32> watchPcs;
     int watchFrom = 0;               // --watch-from: ignore hits before this frame
+    int watchBudget = 40;            // --watch-budget: lines per address before it goes quiet
     // --click X Y / --dclick X Y, in the order given. Opening a control panel
     // needs a double click, so driving the guest's own UI to a bug needs both.
     // A menu is not a click: the title is pressed, the pointer moves to the
@@ -563,10 +566,13 @@ int main(int argc, char** argv) {
         if (a == "--rom" && i + 1 < argc) romPath = argv[++i];
         else if (a == "--floppy" && i + 1 < argc) fdPath = argv[++i];
         else if (a == "--floppy-after" && i + 2 < argc) { fdPath = argv[++i]; fdAfter = std::atoi(argv[++i]); }
+        else if (a == "--wiggle") wiggle = true;
+        else if (a == "--wiggle-from" && i + 1 < argc) { wiggle = true; wiggleFrom = std::atoi(argv[++i]); }
         else if (a == "--jiggle-at" && i + 1 < argc) jiggleAt = std::atoi(argv[++i]);
         else if (a == "--watch-mem" && i + 1 < argc) watchMemAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--watch-from" && i + 1 < argc) watchFrom = std::atoi(argv[++i]);
+        else if (a == "--watch-budget" && i + 1 < argc) watchBudget = std::atoi(argv[++i]);
         else if (a == "--watch-pc" && i + 1 < argc)
             watchPcs.push_back(static_cast<u32>(std::strtoul(argv[++i], nullptr, 16)));
         else if (a == "--post-frames" && i + 1 < argc) postFrames = std::atoi(argv[++i]);
@@ -954,9 +960,20 @@ int main(int argc, char** argv) {
             // The first fault from RAM code (not the ROM's deliberate sizing
             // probes) gets its recent-PC trail: the jump that landed in the
             // weeds is a few entries back, and the trail names the caller.
-            static bool trailShown = false;
-            if (!trailShown && pc < 0x40000000u && pc >= 0x1000u) {
-                trailShown = true;
+            // A fault inside the ROM counts too, once the startup probes are
+            // past: the ROM faulting on an argument means its CALLER handed it
+            // something impossible, and the ring is the only thing that names
+            // the caller. Before frame 3000 the ROM is still sizing memory and
+            // probing slots, where a fault is the answer, not a failure.
+            // Several trails, not one: a deliberate probe early in the boot
+            // used to spend the only one there was, and the fault that mattered
+            // -- minutes later, in an application -- printed nothing at all.
+            // One trail per SITE, so a probe that faults once a second forever
+            // cannot spend the budget before the interesting fault happens.
+            static int trailsLeft = 3;
+            if (trailsLeft > 0 && busErrSites[pc] == 1 && pc >= 0x1000u &&
+                (pc < 0x40000000u || mac.frameCount() > 3000)) {
+                --trailsLeft;
                 // A wild jump runs on through the weeds before it faults, so a
                 // short trail is all landing site and no caller. The ring holds
                 // 128; print them all and the road in is at the far end.
@@ -1117,7 +1134,7 @@ int main(int argc, char** argv) {
                 // times; the first handful say everything the rest repeat.
                 if (static_cast<int>(mac.frameCount()) < watchFrom) continue;
                 static std::map<u32, int> seen;
-                if (++seen[w] > 40) continue;
+                if (++seen[w] > watchBudget) continue;
                 const M68040& c = mac.cpu();
                 std::printf("WATCH %08X f=%u", pc,
                             static_cast<unsigned>(mac.frameCount()));
@@ -1428,6 +1445,19 @@ int main(int argc, char** argv) {
     // them all costs more than the run itself. What matters is the tail.
     for (int f = 0; f < postFrames; ++f) {
         if (f == trapRingAfter) trapRingOn = trapRingArmed;
+        // --wiggle: keep the mouse MOVING, through the ADB, while the guest
+        // runs. Everything else here places the pointer by writing the mouse
+        // globals, which is precise but skips the transceiver entirely -- so a
+        // fault that only appears when reports are actually being clocked in
+        // and serviced at interrupt time could never show up. A person using
+        // the machine never stops moving the mouse; this is what that looks
+        // like to the hardware.
+        if (wiggle && f >= wiggleFrom) {
+            const int phase = (f - wiggleFrom) & 63;
+            const int dx = phase < 16 ? 4 : phase < 32 ? -4 : phase < 48 ? 3 : -3;
+            const int dy = phase < 16 ? 3 : phase < 32 ? 3 : phase < 48 ? -4 : -4;
+            mac.mouseMove(dx, dy, false);
+        }
         mac.runFrame();
         // Keep collecting audio here too. The machine's buffer is small and
         // drops what is not taken, so a --dump-audio that only drained during
