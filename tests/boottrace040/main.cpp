@@ -475,6 +475,7 @@ int main(int argc, char** argv) {
     bool showDiag = false;          // --diag: print the machine snapshot at exit
     int hdTrace = 0;                // --hd-trace N: log N disk requests in order
     bool doShutdown = false;        // --shutdown: flush+unmount before saving
+    int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
     const char* trapLogPath = nullptr;   // --trap-log: every ringed trap, to a file
     std::ofstream trapLog;
     int shotEvery = 0;              // --shot-every: screen strip during post-frames
@@ -630,6 +631,7 @@ int main(int argc, char** argv) {
         else if (a == "--diag") showDiag = true;
         else if (a == "--hd-trace" && i + 1 < argc) hdTrace = std::atoi(argv[++i]);
         else if (a == "--shutdown") doShutdown = true;
+        else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
         else if (a == "--trap-log" && i + 1 < argc) trapLogPath = argv[++i];
         else if (a == "--shot-every" && i + 1 < argc) shotEvery = std::atoi(argv[++i]);
         else if (a == "--floppy-next" && i + 1 < argc) floppyQueue.push_back(argv[++i]);
@@ -1171,6 +1173,10 @@ int main(int argc, char** argv) {
                 if (++shown >= 24) break;
             }
             continue;
+        }
+        if (ejectAtFrame >= 0 && i == ejectAtFrame) {
+            std::printf("front-end eject requested at frame %d\n", i);
+            mac.ejectFloppy();
         }
         if (fdAfter >= 0 && i == fdAfter && !fdDeferred.empty()) {
             std::printf("floppy (mid-run, frame %d): %s\n", i,

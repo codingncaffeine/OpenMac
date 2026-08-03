@@ -192,7 +192,30 @@ public sealed class QuadraEmulator : IEmulator
     public bool InsertExternalFloppy(string path) => false;
     public void EjectExternalFloppy() { }
     public bool WriteProtectFloppies { get; set; }
-    public bool ConsumeDiskStateChanged() => false;
+
+    // The drive empties without the front end being told: the Eject menu item
+    // is carried out a frame later by the machine, an installer swaps disks by
+    // itself, the Finder obeys a drag to the Trash. Notice it here, or the
+    // menus keep offering to eject a drive with nothing in it.
+    public bool ConsumeDiskStateChanged()
+    {
+        bool present;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            present = Native.omac_q_floppy_present(_h) != 0;
+        }
+        if (present == _lastFloppyPresent) return false;
+        _lastFloppyPresent = present;
+        if (!present && FloppyPath is not null)
+        {
+            Log.Line($"[disk] the machine ejected {Path.GetFileName(FloppyPath)}");
+            FloppyPath = null;
+        }
+        return true;
+    }
+
+    private bool _lastFloppyPresent;
     public bool NetworkingEnabled => false;
     public void SetNetworking(bool enabled) { }
     public string? FolderDiskPath => null;

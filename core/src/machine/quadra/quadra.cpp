@@ -1083,6 +1083,7 @@ void QuadraMachine::tickDevices(int cpuCycles) {
             // medium out so the driver's next status poll finds the drive
             // empty. Without this a guest-commanded eject never finishes and
             // an installer can never ask for the next disk of a set.
+            completeFloppyEject();
             fd_->tickEject(totalCycles_);
             if (fd_->takeEjectRequest()) {
                 if (onDiag) {
@@ -1762,9 +1763,94 @@ int QuadraMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
     return 1;
 }
 
+// The front end's Eject menu item. It cannot pull the disk out here: this runs
+// on the host's UI thread, and telling the guest about it means running guest
+// code, which only the emulation thread may do. So stage it and let the next
+// frame boundary carry it out.
+//
+// It also must not simply yank the medium. The System is holding the volume
+// mounted -- its icon is on the desktop and its blocks are in the cache -- so
+// a medium that vanishes underneath it leaves the disk on screen, the volume
+// in the queue, and the guest asking for it back. That is exactly the reported
+// symptom: the button appeared to do nothing and the OS kept the floppy.
 void QuadraMachine::ejectFloppy() {
-    fd_->removeDisk();
+    if (floppy_.empty() && !fd_->hasDisk()) return;
+    floppyEjectPending_ = true;
+}
+
+// Carry out a staged eject, at a frame boundary with the guest between
+// instructions. Flush first so anything the System was still holding reaches
+// the image the host keeps, then unmount so the volume leaves the desktop,
+// then release the medium.
+void QuadraMachine::completeFloppyEject() {
+    if (!floppyEjectPending_) return;
+    if (inDriver_ || announceInFlight_) return;
+    if ((cpu_.getSR() & 0x0700) != 0) return;         // mid-interrupt
+    // Before the System is up there is no volume to unmount and no File
+    // Manager to ask -- just take the disk.
+    const bool fsUp =
+        read32(0x0358) != 0 && (read8(0x0360) & 1) == 0 &&
+        (((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) != 0xFFFFFFFFu);
+    s16 fl = 0, un = 0;
+    if (fsUp && volumeMountedFor(1)) {
+        announceInFlight_ = true;
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        if (!hdMountPb_) {
+            cpu_.d[0] = 80;
+            execute68kTrap(0xA71E);                   // _NewPtr,Sys,Clear
+            hdMountPb_ = guestPtr(cpu_.a[0]);
+        }
+        if (hdMountPb_) {
+            auto call = [&](u16 trap) -> s16 {
+                for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
+                write16(hdMountPb_ + 22, 1);          // ioVRefNum = drive 1
+                cpu_.a[0] = hdMountPb_;
+                execute68kTrap(trap);
+                return static_cast<s16>(cpu_.d[0] & 0xFFFF);
+            };
+            fl = call(0xA013);                        // _FlushVol
+            un = call(0xA00E);                        // _UnmountVol
+        }
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        announceInFlight_ = false;
+    }
+    floppyEjectPending_ = false;
+    // Only now take the medium. Leaving it seated after the unmount lets the
+    // driver's next poll find a disk in the drive and announce it again, and
+    // the volume simply comes back (measured). -47 fBsyErr on the unmount
+    // means a file was still open: the disk still comes out, since that is
+    // what this button means, and the flush above means nothing written is
+    // lost -- but the guest will ask for it back.
+    if (!floppy_.empty()) floppyEjected_ = std::move(floppy_);
     floppy_.clear();
+    fd_->removeDisk();
+    // And tell the driver its drive is empty. This is the one thing a real
+    // eject does that taking the medium alone does not: .Sony keeps
+    // dsDiskInPlace in its drive-queue entry, and while that still claims a
+    // disk is seated the System goes on polling -- and failing to read -- a
+    // drive with nothing in it.
+    clearDriveInPlace(1);
+    if (onDiag) {
+        char b[160];
+        std::snprintf(b, sizeof b,
+                      "floppy: front-end eject (flush %d, unmount %d)%s",
+                      fl, un, un == -47 ? " -- files were still open" : "");
+        onDiag(b);
+    }
+}
+
+// Mark a drive-queue entry as holding no disk. dsDiskInPlace lives in the
+// DrvSts record three bytes ahead of the queue element; 0 means empty.
+void QuadraMachine::clearDriveInPlace(u16 drive) {
+    u32 e = guestPtr(read32(0x030A));                 // DrvQHdr.qHead
+    for (int n = 0; e && n < 8; ++n) {
+        if (read16(e + 6) == drive && e >= 3) {
+            write8(e - 3, 0);
+            return;
+        }
+        e = guestPtr(read32(e));
+    }
 }
 
 bool QuadraMachine::floppyPresent() const { return fd_->hasDisk(); }

@@ -183,6 +183,8 @@ private:
     void ioWrite8Impl(u32 off, u8 v);
     void traceIo(u32 off, bool write, u8 v);
     bool markVolumeClean(u16 drive);
+    void completeFloppyEject();
+    void clearDriveInPlace(u16 drive);
     u32  ioRead32(u32 off);
     void ioWrite32(u32 off, u32 v);
     void sonicWrite(u32 reg, u16 v);
@@ -241,6 +243,7 @@ private:
     std::unique_ptr<SonyDrive> fd_;
     std::vector<u8> floppy_;
     std::vector<u8> floppyEjected_;
+    bool floppyEjectPending_ = false;   // front-end eject, run at a frame edge
     // VIA1 PA5 = the drive's SEL line. Undriven pins read HIGH (the outA
     // handler models the pull-up with value|~ddr), so the power-on state is
     // high too: at reset the ROM walks the SWIM2 phase lines before touching
