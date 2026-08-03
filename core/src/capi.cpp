@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -520,9 +521,93 @@ OMAC_API const char* omac_version(void) { return "OpenMac core 0.5.0"; }
 struct OMacQ {
     openmac::QuadraMachine mac;
     std::vector<u8> audioBuf;
+    std::vector<std::string> logBuf;   // drained off the hot path by omac_q_poll_log
 
     OMacQ(std::vector<u8> rom, uint32_t ramMB)
-        : mac(std::move(rom), openmac::QuadraMachine::Config{ramMB * 1024u * 1024u}) {}
+        : mac(std::move(rom), openmac::QuadraMachine::Config{ramMB * 1024u * 1024u}) {
+        // The faults behind a bomb box. Without this the front end is deaf to
+        // everything the guest does wrong: a "type 1" system error reached the
+        // user with not one line in the log to say where it came from.
+        // onDiag is deliberately NOT wired here -- this machine's device
+        // channels run at frame rate (the SCC alone writes a thousand lines
+        // across a boot) and would bury exactly the lines worth reading.
+        mac.cpu().onException = [this](int vector, u32 pc) { fault(vector, pc); };
+    }
+
+    void log(const char* s) {
+        if (logBuf.size() < 4000) logBuf.emplace_back(s);
+    }
+
+    // Report a guest exception. Runs INSIDE the CPU's exception dispatch, so it
+    // reads register state only -- a bus read from here can fault again, or pop
+    // a device FIFO, and an instrument must not change what it measures.
+    void fault(int vector, u32 pc) {
+        // The routine ones are the ABI: A-line is every Toolbox call, F-line is
+        // the FPU's unimplemented-instruction hand-off, TRAP #n is a system
+        // call. Only the ones that end a program are worth a line.
+        if (vector == 10 || vector == 11 || (vector >= 32 && vector < 48)) return;
+        // The ROM bus-errors on purpose while it sizes RAM and probes the
+        // slots; that traffic is startup, not a failure. What the System and
+        // an application do is in RAM.
+        if (pc >= 0x40000000u) return;
+        if (faultBudget_ <= 0) return;
+        // A bomb repeats -- the handler re-runs the faulting instruction, and a
+        // wild jump faults over and over -- so each site gets two lines.
+        int& seen = faultSites_[pc & 0xFFFFFFu];
+        if (seen >= 2) return;
+        ++seen;
+        --faultBudget_;
+        const openmac::M68040& c = mac.cpu();
+        static const char* const kName[] = {
+            "reset SP", "reset PC", "access fault", "address error",
+            "illegal instruction", "divide by zero", "CHK", "TRAPcc/TRAPV",
+            "privilege violation", "trace"};
+        // Whose fault it is: CurApName ($0910, a Str31) is the running
+        // application's name -- the same one the System puts in its bomb box,
+        // and empty is exactly when that box says "unknown". Low memory is
+        // identity-mapped and this read goes straight to the RAM array: no
+        // translation to fault in, no device to disturb.
+        char who[32] = "";
+        const u32 nameLen = mac.read8(0x0910u);
+        for (u32 k = 0; k < nameLen && k < 31; ++k) {
+            const u8 ch = mac.read8(0x0911u + k);
+            who[k] = (ch >= 32 && ch < 127) ? static_cast<char>(ch) : '.';
+        }
+        char b[256];
+        std::snprintf(b, sizeof b,
+                      "[guest] %s at pc=%08X addr=%08X sr=%04X app='%s' frame=%llu",
+                      vector < 10 ? kName[vector] : "exception", pc,
+                      c.lastFaultAddr, c.getSR(), who,
+                      static_cast<unsigned long long>(mac.frameCount()));
+        log(b);
+        // The registers name the pointer that was followed, and the ring names
+        // the road in: a wild jump runs on through the weeds before it faults,
+        // so the caller is at the far end of it, not the near one.
+        std::snprintf(b, sizeof b,
+                      "   d0-3 %08X %08X %08X %08X  d4-7 %08X %08X %08X %08X",
+                      c.d[0], c.d[1], c.d[2], c.d[3], c.d[4], c.d[5], c.d[6],
+                      c.d[7]);
+        log(b);
+        std::snprintf(b, sizeof b,
+                      "   a0-3 %08X %08X %08X %08X  a4-7 %08X %08X %08X %08X",
+                      c.a[0], c.a[1], c.a[2], c.a[3], c.a[4], c.a[5], c.a[6],
+                      c.a[7]);
+        log(b);
+        for (int row = 0; row < 4; ++row) {
+            std::string line = "   pc ring";
+            for (int k = 0; k < 12; ++k) {
+                char one[16];
+                std::snprintf(one, sizeof one, " %08X",
+                              c.recentPc(row * 12 + k));
+                line += one;
+            }
+            log(line.c_str());
+        }
+    }
+
+private:
+    int faultBudget_ = 40;             // a log, not a trace
+    std::map<u32, int> faultSites_;
 };
 
 extern "C" {
@@ -603,6 +688,24 @@ OMAC_API size_t omac_q_diagnostics(OMacQ* m, char* out, size_t cap)
     std::copy(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n), out);
     out[n] = '\0';
     return n;
+}
+
+// Hand over as many whole lines as fit and keep the rest: a fault report is
+// several lines long, and half of one in the log is worse than none.
+OMAC_API void omac_q_poll_log(OMacQ* m, char* out, size_t cap)
+{
+    if (!m || !out || cap == 0) return;
+    size_t pos = 0, taken = 0;
+    for (const auto& line : m->logBuf) {
+        if (pos + line.size() + 2 > cap) break;
+        std::memcpy(out + pos, line.data(), line.size());
+        pos += line.size();
+        out[pos++] = '\n';
+        ++taken;
+    }
+    out[pos] = '\0';
+    m->logBuf.erase(m->logBuf.begin(),
+                    m->logBuf.begin() + static_cast<std::ptrdiff_t>(taken));
 }
 
 OMAC_API int omac_q_insert_floppy(OMacQ* m, const uint8_t* img, size_t len, int ro)

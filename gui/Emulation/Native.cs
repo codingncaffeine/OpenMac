@@ -187,6 +187,9 @@ internal static class Native
     public static extern nuint omac_q_diagnostics(IntPtr h, byte[]? outBuf, nuint cap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_q_poll_log(IntPtr h, byte[] outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int omac_q_shutdown_volumes(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

@@ -162,6 +162,7 @@ public sealed class QuadraEmulator : IEmulator
                 ran++;
                 fpsFrames++;
             }
+            if (ran > 0) DrainLog();
             if (acc > FrameSeconds) acc = FrameSeconds;
             if (ran > 0) PublishFrame();
 
@@ -175,6 +176,26 @@ public sealed class QuadraEmulator : IEmulator
 
             Thread.Sleep(1);
         }
+    }
+
+    private readonly byte[] _logPoll = new byte[65536];
+
+    // The machine's own account of itself: media events, and the guest faults
+    // behind a bomb box. Drained on the emulation thread, where the buffer is
+    // filled, so nothing is torn between the two.
+    private void DrainLog()
+    {
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return;
+            Native.omac_q_poll_log(_h, _logPoll, (nuint)_logPoll.Length);
+        }
+        if (_logPoll[0] == 0) return;
+        int len = Array.IndexOf(_logPoll, (byte)0);
+        if (len < 0) len = _logPoll.Length;
+        string s = System.Text.Encoding.ASCII.GetString(_logPoll, 0, len);
+        foreach (string line in s.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            Log.Line("[core] " + line);
     }
 
     private void PublishFrame()

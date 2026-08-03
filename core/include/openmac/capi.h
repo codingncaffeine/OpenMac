@@ -220,6 +220,13 @@ OMAC_API size_t omac_q_harddisk_data(OMacQ*, uint8_t* out, size_t cap);
    state only, so taking it cannot disturb the machine. */
 OMAC_API size_t omac_q_diagnostics(OMacQ*, char* out, size_t cap);
 
+/* Drain the machine's own diagnostics into a NUL-terminated buffer of newline-
+   separated lines, for the front end's log. Always on and low volume: media
+   events, and the guest exceptions behind a bomb box -- an access fault names
+   the instruction, the address it reached for, and the road in. Call it from
+   the frame loop; what does not fit stays queued for the next call. */
+OMAC_API void omac_q_poll_log(OMacQ*, char* out, size_t cap);
+
 /* Flush and unmount the guest's volumes, as Shut Down would. Call this before
    persisting a hard disk image when the host application is closing: without
    it the System's cached blocks never reach the image and the volume stays
