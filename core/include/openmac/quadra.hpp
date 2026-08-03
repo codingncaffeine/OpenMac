@@ -196,6 +196,7 @@ private:
     void ioWrite8Impl(u32 off, u8 v);
     void traceIo(u32 off, bool write, u8 v);
     bool markVolumeClean(u16 drive);
+    static bool markVolumeCleanIn(std::vector<u8>& backing, u32 base, u32 volumeSize);
     void completeFloppyEject();
     void clearDriveInPlace(u16 drive);
     std::vector<u8> floppyFileImage(const std::vector<u8>& sectors) const;

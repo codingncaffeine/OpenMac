@@ -1558,23 +1558,32 @@ void QuadraMachine::announceHardDisks() {
 //
 // Both copies of the MDB are updated, as a real unmount does: block 2 and the
 // alternate in the second-to-last block of the volume.
-bool QuadraMachine::markVolumeClean(u16 drive) {
-    const int unit = drive == 4 ? 0 : 1;
-    std::vector<u8>& backing = unit ? scsiImage2_ : scsiImage_;
-    const u32 base = unit ? hfsImageOffset2_ : hfsImageOffset_;
-    const std::vector<u8>& img = unit ? hd2_ : hd_;
-    if (backing.empty() || img.empty()) return false;
-    if ((unit ? false : hdRO_)) return false;
-    bool any = false;
+// Returns true only when a flag actually had to be changed, so a caller can
+// tell "this volume was left mounted" from "it was already clean".
+bool QuadraMachine::markVolumeCleanIn(std::vector<u8>& backing, u32 base,
+                                      u32 volumeSize) {
+    if (backing.empty() || volumeSize < 2048) return false;
+    bool changed = false;
     // Primary MDB at volume block 2, alternate 1024 bytes from the end.
-    for (u32 off : {1024u, static_cast<u32>(img.size()) - 1024u}) {
+    for (u32 off : {1024u, volumeSize - 1024u}) {
         const u32 at = base + off;
         if (at + 12 > backing.size()) continue;
         if (backing[at] != 0x42 || backing[at + 1] != 0x44) continue;   // 'BD'
+        if (backing[at + 0x0A] & 0x01) continue;                        // clean
         backing[at + 0x0A] = static_cast<u8>(backing[at + 0x0A] | 0x01);
-        any = true;
+        changed = true;
     }
-    return any;
+    return changed;
+}
+
+bool QuadraMachine::markVolumeClean(u16 drive) {
+    const int unit = drive == 4 ? 0 : 1;
+    if ((unit ? false : hdRO_)) return false;
+    const std::vector<u8>& img = unit ? hd2_ : hd_;
+    if (img.empty()) return false;
+    return markVolumeCleanIn(unit ? scsiImage2_ : scsiImage_,
+                             unit ? hfsImageOffset2_ : hfsImageOffset_,
+                             static_cast<u32>(img.size()));
 }
 
 bool QuadraMachine::shutdownVolumes() {
@@ -2010,6 +2019,22 @@ void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hfsImageOffset_ = static_cast<u32>(scsiImage_.size() - hd_.size());
     disk_->attach(&scsiImage_, 0);
     disk_->readOnly = readOnly;
+    // A volume still flagged "in use" is one whose machine stopped without
+    // unmounting it -- a crash, a kill, the host losing power. This ROM
+    // refuses such a volume at boot, and a refused volume never mounts, so it
+    // can never be marked clean again either: one bad exit and the disk is
+    // bricked for good. Clear the flag as it goes in.
+    //
+    // Nothing is being papered over. Every write the guest issued has been in
+    // this image since the moment it was issued -- the driver serves them
+    // straight into it -- so what is on the host is the volume as the guest
+    // last left it. What a crash loses is whatever the System had not written
+    // yet, and no flag can bring that back. A real Macintosh mounts the disk
+    // in exactly this state and lets Disk First Aid look at it afterwards;
+    // refusing to start is the one behaviour that is not authentic.
+    if (!readOnly && markVolumeCleanIn(scsiImage_, hfsImageOffset_,
+                                       static_cast<u32>(hd_.size())) && onDiag)
+        onDiag("hd: volume was left mounted by a previous run -- marked clean");
     hdAnnouncePending_ = true;
     hdAnnounceDelay_ = 0;
 }

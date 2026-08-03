@@ -73,6 +73,11 @@ public sealed class QuadraEmulator : IEmulator
 
     public void LoadRom(string path, int ramMB, bool bootRomDisk)
     {
+        // Settle before persisting, exactly as closing does. Loading a ROM
+        // tears the running machine down -- it is how the monitor is changed --
+        // and writing the disk out while its volume is still mounted saves it
+        // in the "in use" state, which is a disk that will not boot next time.
+        SettleVolumes();
         WriteBackHardDisk();
         byte[] rom = File.ReadAllBytes(path);
         lock (_sync)
@@ -268,6 +273,28 @@ public sealed class QuadraEmulator : IEmulator
     // that file wore. A locked disk never goes back: the guest could not have
     // changed it, and overwriting somebody's master image on the strength of a
     // bug in our own write path is not a risk worth carrying.
+    /// <summary>Flush and unmount the guest's volumes, so the image about to be
+    /// written out is one that will boot. Must run before every write-back:
+    /// closing the window, and loading a ROM, which is how the machine is
+    /// restarted onto a different monitor.</summary>
+    private void SettleVolumes()
+    {
+        try
+        {
+            // Log either way. Reporting only success made a silent no-op read
+            // exactly like a clean shutdown, and that hid the fact that this
+            // had never run once across a whole day of sessions.
+            lock (_sync)
+            {
+                if (_h == IntPtr.Zero) return;
+                Log.Line(Native.omac_q_shutdown_volumes(_h) != 0
+                    ? "hard disk: volumes flushed and marked cleanly unmounted"
+                    : "hard disk: nothing to settle (no volume was mounted)");
+            }
+        }
+        catch (Exception ex) { Log.Line("volume shutdown failed: " + ex.Message); }
+    }
+
     private void WriteBackFloppy()
     {
         string? path = FloppyPath;
@@ -425,12 +452,7 @@ public sealed class QuadraEmulator : IEmulator
         // missing those blocks and carries the "in use" flag that makes the
         // Quadra ROM refuse the disk at the next boot. The emulation thread
         // has already stopped, so the guest CPU is ours to run.
-        try
-        {
-            if (_h != IntPtr.Zero && Native.omac_q_shutdown_volumes(_h) != 0)
-                Log.Line("hard disk: volumes flushed and marked cleanly unmounted");
-        }
-        catch (Exception ex) { Log.Line("volume shutdown failed: " + ex.Message); }
+        SettleVolumes();
         // A disk still in the drive at closing time has never been saved --
         // nothing ejected it -- so save it here, as the hard disk is saved.
         WriteBackFloppy();
