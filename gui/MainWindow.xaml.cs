@@ -148,19 +148,30 @@ public partial class MainWindow : Window
     /// machine supports.</summary>
     private void BuildMonitorMenu()
     {
-        MonitorMenu.Items.Clear();
-        string current = _settings.MonitorQuadra ?? "13-inch RGB";
-        foreach (var (name, w, h) in QuadraEmulator.Displays())
+        // Nothing built from the native core may be allowed to stop the window
+        // from opening. This runs in the constructor, and an older DLL without
+        // the display list took the whole application down with it.
+        try
         {
-            var item = new MenuItem
+            MonitorMenu.Items.Clear();
+            string current = _settings.MonitorQuadra ?? "13-inch RGB";
+            foreach (var (name, w, h) in QuadraEmulator.Displays())
             {
-                Header = $"Apple {name} — {w}×{h}",
-                Tag = name,
-                IsCheckable = true,
-                IsChecked = name == current,
-            };
-            item.Click += Monitor_Click;
-            MonitorMenu.Items.Add(item);
+                var item = new MenuItem
+                {
+                    Header = $"Apple {name} — {w}×{h}",
+                    Tag = name,
+                    IsCheckable = true,
+                    IsChecked = name == current,
+                };
+                item.Click += Monitor_Click;
+                MonitorMenu.Items.Add(item);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Line("monitor list unavailable: " + ex.Message);
+            MonitorMenu.IsEnabled = false;
         }
     }
 

@@ -635,4 +635,23 @@ OMAC_API void omac_q_eject_cd(OMacQ* m) { if (m) m->mac.ejectCd(); }
 
 OMAC_API int omac_q_cd_present(OMacQ* m) { return m && m->mac.cdPresent() ? 1 : 0; }
 
+// The displays the built-in video port drives. Walk index upward until this
+// returns null. Static, so a front end can build its menu before there is a
+// machine to ask.
+OMAC_API const char* omac_q_display_name(int index, int* w, int* h)
+{
+    int n = 0;
+    const openmac::QuadraMachine::DisplayInfo* list =
+        openmac::QuadraMachine::displays(n);
+    if (index < 0 || index >= n) return nullptr;
+    if (w) *w = list[index].width;
+    if (h) *h = list[index].height;
+    return list[index].name;
+}
+
+OMAC_API int omac_q_set_display(OMacQ* m, const char* name)
+{
+    return (m && m->mac.setDisplay(name)) ? 1 : 0;
+}
+
 } // extern "C"
