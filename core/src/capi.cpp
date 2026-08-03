@@ -166,6 +166,11 @@ OMAC_API int omac_harddisk2_booted(OMac* m)
     return m && m->mac.hardDisk2DriverResident() ? 1 : 0;
 }
 
+OMAC_API int omac_unmount_harddisk2(OMac* m)
+{
+    return (m && m->mac.unmountSecondDisk()) ? 1 : 0;
+}
+
 OMAC_API size_t omac_harddisk2_data(OMac* m, uint8_t* out, size_t cap)
 {
     if (!m || !m->mac.hardDisk2Present()) return 0;
@@ -661,6 +666,33 @@ OMAC_API size_t omac_q_harddisk_data(OMacQ* m, uint8_t* out, size_t cap)
     if (cap < img.size()) return 0;
     std::copy(img.begin(), img.end(), out);
     return img.size();
+}
+
+OMAC_API void omac_q_insert_harddisk2(OMacQ* m, const uint8_t* img, size_t len, int ro)
+{
+    if (m && img) m->mac.insertHardDisk2(std::vector<u8>(img, img + len), ro != 0);
+}
+
+OMAC_API void omac_q_detach_harddisk2(OMacQ* m) { if (m) m->mac.detachHardDisk2(); }
+
+OMAC_API size_t omac_q_harddisk2_data(OMacQ* m, uint8_t* out, size_t cap)
+{
+    if (!m || !m->mac.hardDisk2Present()) return 0;
+    const auto& img = m->mac.hardDisk2Image();
+    if (!out) return img.size();
+    if (cap < img.size()) return 0;
+    std::copy(img.begin(), img.end(), out);
+    return img.size();
+}
+
+OMAC_API int omac_q_harddisk2_booted(OMacQ* m)
+{
+    return (m && m->mac.secondDiskDriverResident()) ? 1 : 0;
+}
+
+OMAC_API int omac_q_unmount_harddisk2(OMacQ* m)
+{
+    return (m && m->mac.unmountSecondDisk()) ? 1 : 0;
 }
 
 OMAC_API int omac_q_shutdown_volumes(OMacQ* m)

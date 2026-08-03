@@ -92,7 +92,8 @@ public sealed class NativeEmulator : IEmulator
         HardDiskPath = null;
         CdRomAttached = false;
         CdPath = null;
-        FolderDiskPath = null;
+        Seat.Cancel();
+        Seat.Folder = null;
         TransferDiskLabel = null;
         Log.Line($"[core] created — {ramMB} MB, ROM {Path.GetFileName(path)}");
         // The adapter is per-machine state; re-attach it on the fresh machine.
@@ -148,6 +149,10 @@ public sealed class NativeEmulator : IEmulator
                 fpsFrames++;
             }
             if (acc > FrameSeconds) acc = FrameSeconds;   // bound the backlog
+            // A drop box republish is carried out here, one stage per batch:
+            // the trap injections it needs belong to the thread that owns the
+            // CPU, and only between frames.
+            if (ran > 0) _seat?.Pump();
             if (ran > 0) PublishFrame();
 
             // Health line once a second: fps ~60 with underruns=0 is healthy;
@@ -486,8 +491,26 @@ public sealed class NativeEmulator : IEmulator
                 _nat.OnGuestFrame(f);
     }
 
-    // ---- folder disk ----
-    public string? FolderDiskPath { get; private set; }
+    // ---- folder disk / drop box ----
+    private DropBoxSeat? _seat;
+
+    private DropBoxSeat Seat => _seat ??= new DropBoxSeat(
+        unmount: () =>
+        {
+            lock (_sync)
+                return _h == IntPtr.Zero || Native.omac_unmount_harddisk2(_h) != 0;
+        },
+        readImage: ReadSeatImage,
+        insert: img =>
+        {
+            lock (_sync)
+            {
+                if (_h != IntPtr.Zero)
+                    Native.omac_insert_harddisk2(_h, img, (nuint)img.Length, 0);
+            }
+        });
+
+    public string? FolderDiskPath => _seat?.Folder;
 
     public bool AttachFolderDisk(string folder, out string error)
     {
@@ -501,7 +524,7 @@ public sealed class NativeEmulator : IEmulator
             if (_h == IntPtr.Zero) return false;
             Native.omac_insert_harddisk2(_h, img, (nuint)img.Length, 0);
         }
-        FolderDiskPath = folder;
+        Seat.Folder = folder;
         Log.Line($"[disk] folder disk built from {folder} ({img.Length / (1024 * 1024)} MB volume)");
         return true;
     }
@@ -509,8 +532,27 @@ public sealed class NativeEmulator : IEmulator
     public void DetachFolderDisk()
     {
         SyncFolderDisk();
+        Seat.Cancel();
+        Seat.Folder = null;
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_detach_harddisk2(_h); }
-        FolderDiskPath = null;
+    }
+
+    public bool RepublishFolderDisk(string? addFile, out string error) =>
+        Seat.Request(addFile, out error);
+
+    public bool RepublishPending => _seat?.Pending == true;
+
+    private byte[]? ReadSeatImage()
+    {
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return null;
+            nuint size = Native.omac_harddisk2_data(_h, null, 0);
+            if (size == 0) return null;
+            byte[] img = new byte[size];
+            if (Native.omac_harddisk2_data(_h, img, size) == 0) return null;
+            return img;
+        }
     }
 
     // ---- transfer disk (shares the second-disk seat with the folder disk) ----
@@ -549,23 +591,7 @@ public sealed class NativeEmulator : IEmulator
     }
 
     /// <summary>Write the guest's folder-disk changes back to the host folder.</summary>
-    private void SyncFolderDisk()
-    {
-        if (string.IsNullOrEmpty(FolderDiskPath)) return;
-        byte[]? img = null;
-        lock (_sync)
-        {
-            if (_h == IntPtr.Zero) return;
-            nuint size = Native.omac_harddisk2_data(_h, null, 0);
-            if (size == 0) return;
-            img = new byte[size];
-            if (Native.omac_harddisk2_data(_h, img, size) == 0) return;
-        }
-        var r = FolderDisk.SyncBack(img!, FolderDiskPath!);   // file I/O off the lock
-        Log.Line(r.Error is null
-            ? $"[disk] folder disk synced: {r.Updated} updated, {r.Added} added, {r.Removed} moved to _openmac-removed"
-            : $"[disk] folder disk sync FAILED: {r.Error}");
-    }
+    private void SyncFolderDisk() => _seat?.Sync();
 
     // ---- CD-ROM ----
     public bool CdRomAttached { get; private set; }

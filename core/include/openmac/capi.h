@@ -91,6 +91,12 @@ OMAC_API size_t omac_harddisk2_data(OMac*, uint8_t* out, size_t cap);
    resident, so a mid-session attach mounts live; otherwise offer a restart). */
 OMAC_API int omac_harddisk2_booted(OMac*);
 
+/* Flush and unmount ONLY the second disk's volume, leaving the boot disk alone.
+   The first half of a drop-box republish: the guest's cached blocks land in the
+   image and it forgets its catalog, so the host may rebuild the volume and put
+   it back. Returns non-zero once the volume is off line. */
+OMAC_API int omac_unmount_harddisk2(OMac*);
+
 /* ---- HFS folder-volume builder / reader (host-side, no machine needed) ----
    Builder: begin -> add_dir/add_file (parent 2 = the root) -> build (NULL out
    queries the size; the volume is built once and cached) -> free. Names are
@@ -214,6 +220,21 @@ OMAC_API void   omac_q_mouse(OMacQ*, int dx, int dy, int button);
 OMAC_API void   omac_q_key(OMacQ*, int adb_code, int down);
 OMAC_API void   omac_q_insert_harddisk(OMacQ*, const uint8_t* img, size_t len, int read_only);
 OMAC_API size_t omac_q_harddisk_data(OMacQ*, uint8_t* out, size_t cap);
+
+/* The second SCSI disk (ID 1, drive 5) -- the seat the drop box and the folder
+   disk ride on. Same shape as the Classic's omac_harddisk2_*.
+   _booted reports whether the System has installed that seat's driver: until
+   the startup bus scan has run one, a volume put here cannot mount because
+   there is nothing to read it with.
+   _unmount flushes and unmounts ONLY this volume, leaving the boot disk alone.
+   That is the first half of a republish: the guest's cached blocks land in the
+   image and it forgets its catalog, so the host may rebuild the volume and put
+   it back. Returns non-zero once the volume is off line. */
+OMAC_API void   omac_q_insert_harddisk2(OMacQ*, const uint8_t* img, size_t len, int read_only);
+OMAC_API void   omac_q_detach_harddisk2(OMacQ*);
+OMAC_API size_t omac_q_harddisk2_data(OMacQ*, uint8_t* out, size_t cap);
+OMAC_API int    omac_q_harddisk2_booted(OMacQ*);
+OMAC_API int    omac_q_unmount_harddisk2(OMacQ*);
 
 /* A text snapshot of CPU, low memory and every device, for capturing what a
    wedged guest was doing. Pass out=NULL to learn the size needed. Reads model

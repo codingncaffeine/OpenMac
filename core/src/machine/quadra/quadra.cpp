@@ -1326,7 +1326,7 @@ void QuadraMachine::serveDiskPrime(int unit) {
     const u32 dctlPos = read32(dce + 0x10);
 
     std::vector<u8>& img = unit ? hd2_ : hd_;
-    const bool ro = unit ? false : hdRO_;
+    const bool ro = unit ? hd2RO_ : hdRO_;
     const u32 base = (unit ? hfsImageOffset2_ : hfsImageOffset_);
     std::vector<u8>& backing = unit ? scsiImage2_ : scsiImage_;
 
@@ -1594,7 +1594,7 @@ bool QuadraMachine::markVolumeCleanIn(std::vector<u8>& backing, u32 base,
 
 bool QuadraMachine::markVolumeClean(u16 drive) {
     const int unit = drive == 4 ? 0 : 1;
-    if ((unit ? false : hdRO_)) return false;
+    if (unit ? hd2RO_ : hdRO_) return false;
     const std::vector<u8>& img = unit ? hd2_ : hd_;
     if (img.empty()) return false;
     return markVolumeCleanIn(unit ? scsiImage2_ : scsiImage_,
@@ -1652,6 +1652,62 @@ bool QuadraMachine::shutdownVolumes() {
     for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     announceInFlight_ = false;
     return any;
+}
+
+// The first half of a drop-box republish: get the guest off the second volume
+// so the host may rebuild it. Only drive 5 -- the boot volume is not ours to
+// disturb, and unlike shutdownVolumes this is not a shutdown: the machine goes
+// on running with one fewer disk for the moment it takes to build the next one.
+//
+// The flush is the part that matters. The File Manager writes every cached
+// block of the volume out through our driver, which we serve synchronously, so
+// by the time this returns anything the guest wrote is in the image the caller
+// is about to read. Unmounting then makes the guest forget its cached catalog
+// and bitmap -- which is exactly why a rebuilt volume may be put in its place.
+// Editing the image under a mounted volume instead would leave the guest
+// reading its old catalog against the new disk's blocks.
+//
+// Returns true when the volume is off line afterwards, which includes it never
+// having been mounted -- the caller's next step is the same either way.
+bool QuadraMachine::unmountSecondDisk() {
+    if (hd2_.empty()) return true;
+    if (inDriver_ || announceInFlight_) return false;
+    if (read32(0x0358) == 0) return true;             // System never came up
+    if ((((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) == 0xFFFFFFFFu))
+        return true;                                  // FS queue not built
+    if (read8(0x0360) & 1) return false;              // FSBusy: a file op is running
+    if ((cpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt: not now
+    if (!volumeMountedFor(5)) return true;            // already off line
+    announceInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    if (!hdMountPb_) {
+        cpu_.d[0] = 80;
+        execute68kTrap(0xA71E);                       // _NewPtr,Sys,Clear
+        hdMountPb_ = guestPtr(cpu_.a[0]);
+    }
+    s16 fl = 0, un = 0;
+    if (hdMountPb_) {
+        auto call = [&](u16 trap) -> s16 {
+            for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
+            write16(hdMountPb_ + 22, 5);              // ioVRefNum = drive number
+            cpu_.a[0] = hdMountPb_;
+            execute68kTrap(trap);
+            return static_cast<s16>(cpu_.d[0] & 0xFFFF);
+        };
+        fl = call(0xA013);                            // _FlushVol
+        un = call(0xA00E);                            // _UnmountVol
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    announceInFlight_ = false;
+    const bool off = !volumeMountedFor(5);
+    if (onDiag) {
+        char b[112];
+        std::snprintf(b, sizeof b, "hd2: flush %d, unmount %d -- volume %s", fl, un,
+                      off ? "off line" : "STILL MOUNTED");
+        onDiag(b);
+    }
+    return off;
 }
 
 int QuadraMachine::stepInstruction() {
@@ -2158,6 +2214,7 @@ void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
         onDiag("hd: volume was left mounted by a previous run -- marked clean");
     hdAnnouncePending_ = true;
     hdAnnounceDelay_ = 0;
+    hdMountTries_ = 0;
 }
 
 const std::vector<u8>& QuadraMachine::hardDiskImage() const {
@@ -2170,6 +2227,7 @@ const std::vector<u8>& QuadraMachine::hardDiskImage() const {
 
 void QuadraMachine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     hd2_ = std::move(image);
+    hd2RO_ = readOnly;
     if (hd2_.empty()) {
         disk2_->detach();
         scsiImage2_.clear();
@@ -2181,6 +2239,11 @@ void QuadraMachine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     disk2_->readOnly = readOnly;
     hd2AnnouncePending_ = true;
     hdAnnounceDelay_ = 0;
+    // The try counter is a give-up for one disk's announcement, not a budget
+    // for the machine's lifetime. A drop box republishes this seat over and
+    // over; without this reset the boot's own tries exhaust the cap and every
+    // later volume is dropped without a single _MountVol ever being issued.
+    hdMountTries_ = 0;
 }
 
 void QuadraMachine::detachHardDisk2() {

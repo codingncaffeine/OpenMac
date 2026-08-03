@@ -34,6 +34,20 @@
                 <MenuItem Header="Insert CD Image…" Click="InsertCd_Click" />
                 <MenuItem x:Name="EjectCdItem" Header="Eject CD" Click="EjectCd_Click" />
                 <Separator />
+                <MenuItem Header="Drop Box"
+                          ToolTip="A folder on this PC kept on the Mac's desktop as a real disk. Drop files on the OpenMac window and they appear in it; what the Mac saves there comes back to the folder.">
+                    <MenuItem x:Name="DropBoxEnabledItem" Header="Keep Drop Box on the Desktop"
+                              IsCheckable="True" Click="DropBoxEnabled_Click"
+                              ToolTip="Puts the folder on the SCSI bus for the whole session. Its driver is loaded by the Mac's startup scan, so turning this on wants a restart the first time." />
+                    <MenuItem x:Name="DropBoxFolderItem" Header="Choose Folder…"
+                              Click="DropBoxChooseFolder_Click" />
+                    <MenuItem x:Name="DropBoxOpenItem" Header="Open Folder in Explorer"
+                              Click="DropBoxOpenFolder_Click" />
+                    <Separator />
+                    <MenuItem x:Name="DropBoxRepublishItem" Header="Refresh Now"
+                              Click="DropBoxRepublish_Click"
+                              ToolTip="Rebuild the disk from the folder. Use this after adding files to the folder in Explorer rather than by dropping them on the window." />
+                </MenuItem>
                 <MenuItem Header="Open Host Folder as Disk…" Click="OpenFolderDisk_Click"
                           ToolTip="Builds a real HFS disk from a folder on this PC and puts it on the SCSI bus. Changes the Mac makes come back to the folder when the disk is closed, the machine restarts, or OpenMac quits." />
                 <MenuItem x:Name="CloseFolderDiskItem" Header="Close Folder Disk"

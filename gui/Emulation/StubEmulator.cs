@@ -102,6 +102,15 @@ public sealed class StubEmulator : IEmulator
     }
     public void DetachFolderDisk() => FolderDiskPath = null;
 
+    // No volume exists to republish, so a request is accepted and does nothing:
+    // the preview backend's job is to let the UI be driven, not to emulate.
+    public bool RepublishFolderDisk(string? addFile, out string error)
+    {
+        error = "";
+        return FolderDiskPath is not null;
+    }
+    public bool RepublishPending => false;
+
     public string? TransferDiskLabel { get; private set; }
     public bool TransferDiskResident => true;
     public bool AttachTransferDisk(string filePath, out string error)

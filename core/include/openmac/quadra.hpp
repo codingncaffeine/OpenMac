@@ -85,6 +85,16 @@ public:
     // System's cached blocks are lost and the volume stays flagged unclean,
     // which this ROM refuses at the next boot.
     bool shutdownVolumes();
+    // Flush and unmount ONLY the second disk's volume (drive 5), leaving the
+    // boot volume alone. This is how the drop box republishes: the guest must
+    // let go of the volume -- and write its cached blocks through our driver
+    // into the image -- before the host may rebuild it. Returns true once the
+    // volume is off line, which includes it never having been mounted.
+    bool unmountSecondDisk();
+    // True once the System has installed and we have hooked the second disk's
+    // driver. Until then a volume put on that seat cannot mount, because there
+    // is no driver to read it: the boot scan is what loads one.
+    bool secondDiskDriverResident() const { return diskPrimePc_[1] != 0; }
     u32 adbMouseBytesRead() const; // mouse bytes the guest actually clocked in
     std::vector<u8> adbMouseBytesLog() const;
     void adbClearCmdTrace();
@@ -311,6 +321,7 @@ private:
     mutable std::vector<u8> hd2_;
     std::vector<u8> scsiImage2_;
     u32 hfsImageOffset2_ = 0;
+    bool hd2RO_ = false;
 
     // ADB shift-register bridge (same push model as the Classic).
     bool adbArmed_ = false;

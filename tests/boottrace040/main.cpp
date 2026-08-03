@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -27,6 +28,52 @@ namespace {
 std::vector<u8> loadFile(const char* path) {
     std::ifstream f(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+// ---- drop box ---------------------------------------------------------
+// The front end walks a host folder and hands each file to the volume
+// builder; this is the same walk, so a headless run exercises the code path
+// the GUI takes rather than a convenient approximation of it.
+
+std::pair<u32, u32> inferTypeCreator(const std::string& ext) {
+    std::string e;
+    for (char c : ext) e += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (e == ".txt" || e == ".text" || e == ".md") return {0x54455854u, 0x74747874u};
+    if (e == ".sit") return {0x53495444u, 0x53495421u};
+    if (e == ".sea") return {0x4150504Cu, 0x61757374u};
+    if (e == ".cpt") return {0x50414354u, 0x43504354u};
+    if (e == ".hqx") return {0x54455854u, 0x426E4871u};
+    if (e == ".zip") return {0x5A495020u, 0x5A495020u};
+    if (e == ".lha" || e == ".lzh") return {0x4C484120u, 0x4C415243u};
+    return {0x3F3F3F3Fu, 0x3F3F3F3Fu};
+}
+
+void addFolderTree(hfs::VolumeBuilder& b, u32 parent,
+                   const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name == "_openmac-removed") continue;
+        if (e.is_directory(ec)) {
+            const u32 id = b.addDir(parent, name);
+            if (id) addFolderTree(b, id, e.path());
+        } else if (e.is_regular_file(ec)) {
+            std::vector<u8> data = loadFile(e.path().string().c_str());
+            const auto [type, creator] = inferTypeCreator(e.path().extension().string());
+            b.addFile(parent, name, type, creator, 0, std::move(data), {});
+        }
+    }
+}
+
+std::vector<u8> buildFolderVolume(const std::string& folder, std::string& why) {
+    std::filesystem::path p(folder);
+    std::string vol = p.filename().string();
+    if (vol.empty()) vol = "Drop Box";
+    hfs::VolumeBuilder b(vol);
+    addFolderTree(b, 2, p);
+    std::vector<u8> img = b.build(0);
+    if (img.empty()) why = b.why();
+    return img;
 }
 
 void writeBmp(const char* path, const std::vector<u32>& px, int w, int h) {
@@ -497,6 +544,12 @@ int main(int argc, char** argv) {
     int hdTrace = 0;                // --hd-trace N: log N disk requests in order
     bool doShutdown = false;        // --shutdown: flush+unmount before saving
     int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
+    std::string dropBoxDir;         // --dropbox DIR: serve DIR on the second seat
+    std::string dropBoxAdd;         // --dropbox-add FILE: drop FILE in at republish time
+    int dropBoxRepublishAt = -1;    // --dropbox-republish N: swap the volume at frame N
+    int dropBoxRounds = 1;          // --dropbox-rounds N: republish N times over
+    std::string dropBoxVerify;      // --dropbox-verify FILE: read FILE back out of the
+                                    //   guest's volume and compare it byte for byte
     const char* saveFdPath = nullptr;  // --save-floppy: medium as its file should be
     unsigned long monGnd = 0, monPairs = 0;
     bool monSet = false;            // --monitor GROUNDED PAIRS: which display
@@ -689,6 +742,12 @@ int main(int argc, char** argv) {
         else if (a == "--hd-trace" && i + 1 < argc) hdTrace = std::atoi(argv[++i]);
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
+        else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
+        else if (a == "--dropbox-add" && i + 1 < argc) dropBoxAdd = argv[++i];
+        else if (a == "--dropbox-rounds" && i + 1 < argc) dropBoxRounds = std::atoi(argv[++i]);
+        else if (a == "--dropbox-republish" && i + 1 < argc)
+            dropBoxRepublishAt = std::atoi(argv[++i]);
+        else if (a == "--dropbox-verify" && i + 1 < argc) dropBoxVerify = argv[++i];
         else if (a == "--save-floppy" && i + 1 < argc) saveFdPath = argv[++i];
         else if (a == "--force-mode" && i + 3 < argc) { fmW = std::atoi(argv[++i]); fmH = std::atoi(argv[++i]); fmB = std::atoi(argv[++i]); }
         else if (a == "--monitor" && i + 2 < argc) { monGnd = std::strtoul(argv[++i], nullptr, 0); monPairs = std::strtoul(argv[++i], nullptr, 0); monSet = true; }
@@ -1073,6 +1132,19 @@ int main(int argc, char** argv) {
         mac.insertHardDisk(std::move(hd));
         std::printf("hd: attached\n");
     }
+    // The drop box goes on before the first frame, so the ROM's startup bus
+    // scan loads its driver -- exactly as the front end attaches it during
+    // LoadRom. Without a driver there is nothing to read the volume with.
+    if (!dropBoxDir.empty()) {
+        std::string why;
+        std::vector<u8> vol = buildFolderVolume(dropBoxDir, why);
+        if (vol.empty()) {
+            std::fprintf(stderr, "dropbox: build FAILED: %s\n", why.c_str());
+            return 2;
+        }
+        mac.insertHardDisk2(std::move(vol), false);
+        std::printf("dropbox: %s built and attached\n", dropBoxDir.c_str());
+    }
     std::vector<u8> fdDeferred;
     if (fdPath) {
         auto fd = loadFile(fdPath);
@@ -1309,6 +1381,58 @@ int main(int argc, char** argv) {
         if (ejectAtFrame >= 0 && i == ejectAtFrame) {
             std::printf("front-end eject requested at frame %d\n", i);
             mac.ejectFloppy();
+        }
+        // The republish, driven the way the front end drives it: ask for the
+        // unmount every frame until the guest lets go, then rebuild from the
+        // folder and put the volume back.
+        if (dropBoxRepublishAt >= 0 && i >= dropBoxRepublishAt && !dropBoxDir.empty()) {
+            static int roundsDone = 0;
+            static bool done = false, announced = false;
+            if (!done) {
+                if (!announced) {
+                    std::printf("dropbox: republish %d requested at frame %d\n",
+                                roundsDone + 1, i);
+                    announced = true;
+                }
+                if (mac.unmountSecondDisk()) {
+                    // The dropped file joins the folder only once the guest has
+                    // let go, the way the front end sequences it.
+                    if (!dropBoxAdd.empty()) {
+                        std::error_code ec;
+                        std::filesystem::path dst =
+                            std::filesystem::path(dropBoxDir) /
+                            std::filesystem::path(dropBoxAdd).filename();
+                        std::filesystem::copy_file(
+                            dropBoxAdd, dst,
+                            std::filesystem::copy_options::overwrite_existing, ec);
+                        std::printf("dropbox: added %s%s\n",
+                                    dst.filename().string().c_str(),
+                                    ec ? " (COPY FAILED)" : "");
+                    }
+                    std::string why;
+                    std::vector<u8> vol = buildFolderVolume(dropBoxDir, why);
+                    if (vol.empty())
+                        std::printf("dropbox: rebuild FAILED: %s\n", why.c_str());
+                    else {
+                        std::printf("dropbox: rebuilt %zu bytes at frame %d, reinserting\n",
+                                    vol.size(), i);
+                        mac.insertHardDisk2(std::move(vol), false);
+                    }
+                    // Repeat rounds prove the seat survives being republished
+                    // over and over -- a drop box does this once per dropped
+                    // file, and a give-up counter that is never reset would
+                    // stop mounting silently after the first handful.
+                    if (++roundsDone < dropBoxRounds) {
+                        dropBoxRepublishAt = i + 120;
+                        announced = false;
+                    } else {
+                        done = true;
+                    }
+                } else if (i > dropBoxRepublishAt + 300) {
+                    std::printf("dropbox: the guest never let go of the volume\n");
+                    done = true;
+                }
+            }
         }
         if (fdAfter >= 0 && i == fdAfter && !fdDeferred.empty()) {
             std::printf("floppy (mid-run, frame %d): %s\n", i,
@@ -1872,6 +1996,67 @@ int main(int argc, char** argv) {
         f.write(reinterpret_cast<const char*>(img.data()),
                 static_cast<std::streamsize>(img.size()));
         std::printf("hd saved: %s (%zu bytes)\n", saveHdPath, img.size());
+    }
+
+    if (!dropBoxDir.empty()) {
+        // What the volume looks like from OUTSIDE the guest: the catalog as our
+        // own reader sees it. A file listed here that the Mac cannot open is a
+        // different fault from a file that never made it onto the volume, and
+        // this is what tells the two apart.
+        const std::vector<u8>& vol = mac.hardDisk2Image();
+        std::vector<hfs::Item> items;
+        if (!hfs::listVolume(vol, items)) {
+            std::printf("dropbox: the volume does NOT read back as HFS (%zu bytes)\n",
+                        vol.size());
+        } else {
+            std::printf("dropbox: volume has %zu catalog entries\n", items.size());
+            int shown = 0;
+            for (const auto& it : items) {
+                if (it.id == 2) continue;
+                std::printf("  %-32s %s data=%u rsrc=%u\n", it.name.c_str(),
+                            it.isDir ? "dir " : "file", it.dataLen, it.rsrcLen);
+                if (++shown >= 24) { std::printf("  ...\n"); break; }
+            }
+        }
+        // The round trip that settles whether a file survives the journey: the
+        // host's bytes, against the same file read back out of the volume the
+        // GUEST has been running on. Compared here rather than at the host copy
+        // step, because the host copy proving identical is exactly what the old
+        // parked StuffIt question already knew.
+        if (!dropBoxVerify.empty()) {
+            std::vector<u8> want = loadFile(dropBoxVerify.c_str());
+            std::string base = std::filesystem::path(dropBoxVerify).filename().string();
+            bool found = false;
+            for (const auto& it : items) {
+                if (it.isDir || it.name != base) continue;
+                found = true;
+                std::vector<u8> got;
+                if (!hfs::readFork(vol, it.id, false, got)) {
+                    std::printf("dropbox VERIFY: '%s' is in the catalog but its data "
+                                "fork could not be read\n", base.c_str());
+                    break;
+                }
+                if (got.size() != want.size()) {
+                    std::printf("dropbox VERIFY FAILED: '%s' is %zu bytes on the volume, "
+                                "%zu on the host\n", base.c_str(), got.size(), want.size());
+                    break;
+                }
+                std::size_t diff = 0, firstAt = 0;
+                for (std::size_t k = 0; k < got.size(); ++k)
+                    if (got[k] != want[k]) { if (!diff) firstAt = k; ++diff; }
+                if (diff)
+                    std::printf("dropbox VERIFY FAILED: '%s' matches in length but %zu "
+                                "bytes differ, first at offset %zu\n",
+                                base.c_str(), diff, firstAt);
+                else
+                    std::printf("dropbox VERIFY OK: '%s' %zu bytes, byte-for-byte "
+                                "identical to the host file\n", base.c_str(), got.size());
+                break;
+            }
+            if (!found)
+                std::printf("dropbox VERIFY FAILED: '%s' is not on the volume at all\n",
+                            base.c_str());
+        }
     }
     return 0;
 }

@@ -184,6 +184,25 @@ internal static class Native
     public static extern nuint omac_q_harddisk_data(IntPtr h, byte[]? outBuf, nuint cap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_unmount_harddisk2(IntPtr h);
+
+    // The second SCSI disk (ID 1, drive 5): the drop box / folder disk seat.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_q_insert_harddisk2(IntPtr h, byte[] img, nuint len, int readOnly);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void omac_q_detach_harddisk2(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_q_harddisk2_data(IntPtr h, byte[]? outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_harddisk2_booted(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_unmount_harddisk2(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern nuint omac_q_diagnostics(IntPtr h, byte[]? outBuf, nuint cap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

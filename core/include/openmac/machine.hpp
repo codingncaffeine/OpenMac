@@ -152,6 +152,12 @@ public:
     // attached MID-SESSION mount without a restart. The front end asks this to
     // decide between "it appears in a few seconds" and offering a restart.
     bool hardDisk2DriverResident() const { return bootHadHd2_; }
+    // Flush and unmount ONLY the second disk's volume (drive 5), leaving the
+    // boot volume alone. This is how a drop box republishes: the guest must let
+    // go of the volume -- and write its cached blocks through our driver into
+    // the image -- before the host may rebuild it and put it back. Returns true
+    // once the volume is off line, which includes it never having been mounted.
+    bool unmountSecondDisk();
 
     // CD-ROM: an AppleCD SC-class SCSI drive. The drive is attached to the bus
     // (a device, persisting across discs); a disc image is inserted into it

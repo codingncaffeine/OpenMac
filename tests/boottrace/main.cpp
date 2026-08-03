@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -19,6 +20,54 @@
 using namespace openmac;
 
 namespace {
+
+// ---- drop box ---------------------------------------------------------
+// The front end walks a host folder and hands each file to the volume
+// builder; this is the same walk, so a headless run exercises the code path
+// the GUI takes rather than a convenient approximation of it.
+
+std::pair<u32, u32> inferTypeCreator(const std::string& ext) {
+    std::string e;
+    for (char c : ext) e += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (e == ".txt" || e == ".text" || e == ".md") return {0x54455854u, 0x74747874u};
+    if (e == ".sit") return {0x53495444u, 0x53495421u};
+    if (e == ".sea") return {0x4150504Cu, 0x61757374u};
+    if (e == ".cpt") return {0x50414354u, 0x43504354u};
+    if (e == ".hqx") return {0x54455854u, 0x426E4871u};
+    if (e == ".zip") return {0x5A495020u, 0x5A495020u};
+    if (e == ".lha" || e == ".lzh") return {0x4C484120u, 0x4C415243u};
+    return {0x3F3F3F3Fu, 0x3F3F3F3Fu};
+}
+
+void addFolderTree(hfs::VolumeBuilder& b, u32 parent,
+                   const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name == "_openmac-removed") continue;
+        if (e.is_directory(ec)) {
+            const u32 id = b.addDir(parent, name);
+            if (id) addFolderTree(b, id, e.path());
+        } else if (e.is_regular_file(ec)) {
+            std::ifstream f(e.path(), std::ios::binary);
+            std::vector<u8> data{std::istreambuf_iterator<char>(f),
+                                 std::istreambuf_iterator<char>()};
+            const auto [type, creator] = inferTypeCreator(e.path().extension().string());
+            b.addFile(parent, name, type, creator, 0, std::move(data), {});
+        }
+    }
+}
+
+std::vector<u8> buildFolderVolume(const std::string& folder, std::string& why) {
+    std::filesystem::path p(folder);
+    std::string vol = p.filename().string();
+    if (vol.empty()) vol = "Drop Box";
+    hfs::VolumeBuilder b(vol);
+    addFolderTree(b, 2, p);
+    std::vector<u8> img = b.build(0);
+    if (img.empty()) why = b.why();
+    return img;
+}
 
 // Single-step one frame's worth of cycles, collecting unique PCs, then print
 // them collapsed into ranges: the shape of the active code path.
@@ -1110,6 +1159,9 @@ int main(int argc, char** argv) {
     std::string cdImagePath;   // --cd <path>: attach the CD-ROM drive with this disc in it
     bool cdAttach = false;     // --cd-attach: attach the drive with an empty tray
     std::string hd2ImagePath;  // --harddisk2 <path>: attach a second SCSI disk (ID 1)
+    std::string dropBoxDir;    // --dropbox DIR: serve DIR on the second seat
+    int dropBoxRepublishAt = -1;  // --dropbox-republish N: swap the volume at frame N
+    int dropBoxRounds = 1;        // --dropbox-rounds N: repeat the swap N times
     bool netAttach = false;    // --net: attach the DaynaPORT Ethernet adapter (ID 4)
     u32 hdBlankMB = 0;   // --harddisk-blank N: attach a blank N-MB hard disk
     u32 hdFormatMB = 0;  // --harddisk-format N: attach a formatted N-MB HFS disk
@@ -1156,6 +1208,11 @@ int main(int argc, char** argv) {
         else if (arg == "--cd" && i + 1 < argc) cdImagePath = argv[++i];
         else if (arg == "--cd-attach") cdAttach = true;
         else if (arg == "--harddisk2" && i + 1 < argc) hd2ImagePath = argv[++i];
+        else if (arg == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
+        else if (arg == "--dropbox-republish" && i + 1 < argc)
+            dropBoxRepublishAt = std::atoi(argv[++i]);
+        else if (arg == "--dropbox-rounds" && i + 1 < argc)
+            dropBoxRounds = std::atoi(argv[++i]);
         else if (arg == "--net") netAttach = true;
         else if (arg == "--trace-traps") traceTraps = true;
         else if (arg == "--trace-irq") traceIrq = true;
@@ -1456,6 +1513,19 @@ int main(int argc, char** argv) {
         std::vector<u8> hd{std::istreambuf_iterator<char>(hf), std::istreambuf_iterator<char>()};
         std::printf("HARD DISK 2 %zu bytes loaded from %s\n", hd.size(), hd2ImagePath.c_str());
         mac.insertHardDisk2(std::move(hd), false);
+    }
+    // The drop box goes on before the first frame, so the ROM's startup bus
+    // scan loads its driver -- exactly as the front end attaches it in LoadRom.
+    if (!dropBoxDir.empty()) {
+        std::string why;
+        std::vector<u8> vol = buildFolderVolume(dropBoxDir, why);
+        if (vol.empty()) {
+            std::printf("dropbox: build FAILED: %s\n", why.c_str());
+            return 1;
+        }
+        std::printf("dropbox: %s built (%zu bytes) and attached\n",
+                    dropBoxDir.c_str(), vol.size());
+        mac.insertHardDisk2(std::move(vol), false);
     }
     if (netAttach) mac.attachNet(true);
     if (cdAttach || !cdImagePath.empty()) {
@@ -2464,6 +2534,40 @@ int main(int argc, char** argv) {
             i < insertExternalAt + 240 && (i & 3) == 0)
             mac.mouseMove(((i >> 2) & 1) ? 1 : -1, 0, false);
         if (i == profileAt) profileFrame(mac);
+        // The republish, driven the way the front end drives it: ask for the
+        // unmount every frame until the guest lets go, then rebuild from the
+        // folder and put the volume back.
+        if (dropBoxRepublishAt >= 0 && i >= dropBoxRepublishAt && !dropBoxDir.empty()) {
+            static int roundsDone = 0;
+            static bool done = false, announced = false;
+            if (!done) {
+                if (!announced) {
+                    std::printf("dropbox: republish %d requested at frame %d\n",
+                                roundsDone + 1, i);
+                    announced = true;
+                }
+                if (mac.unmountSecondDisk()) {
+                    std::string why;
+                    std::vector<u8> vol = buildFolderVolume(dropBoxDir, why);
+                    if (vol.empty())
+                        std::printf("dropbox: rebuild FAILED: %s\n", why.c_str());
+                    else {
+                        std::printf("dropbox: rebuilt %zu bytes at frame %d, reinserting\n",
+                                    vol.size(), i);
+                        mac.insertHardDisk2(std::move(vol), false);
+                    }
+                    if (++roundsDone < dropBoxRounds) {
+                        dropBoxRepublishAt = i + 200;
+                        announced = false;
+                    } else {
+                        done = true;
+                    }
+                } else if (i > dropBoxRepublishAt + 400) {
+                    std::printf("dropbox: the guest never let go of the volume\n");
+                    done = true;
+                }
+            }
+        }
         // Re-open the driver's own diagnostics for the interesting stretch. The
         // first forty requests of a boot are the media probe; the ones that
         // matter are whichever the System makes just before it does something

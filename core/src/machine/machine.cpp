@@ -52,6 +52,7 @@ constexpr u16 kTrapInsTime = 0xA058;
 constexpr u16 kTrapPostEvent = 0xA02F;
 constexpr u16 kTrapMountVol = 0xA00F;
 constexpr u16 kTrapUnmountVol = 0xA00E;
+constexpr u16 kTrapFlushVol = 0xA013;
 constexpr u16 kTrapEject = 0xA017;
 constexpr u16 kTrapOpen = 0xA000;
 } // namespace
@@ -886,9 +887,12 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
 
 void Machine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     hd2_ = std::move(image);
-    hd2Installed_ = false;
     hd2Mounted_ = false;
     hd2MountTries_ = 0;
+    // Keep the param block we already own. A drop box republishes this seat
+    // once per dropped file, and re-running the allocation each time leaks 80
+    // bytes of the guest's system heap per drop.
+    if (hd2MountPb_ == 0) hd2Installed_ = false;
     // Same wrapping as the first disk, but this copy of the driver answers for
     // SCSI ID 1, adds drive 5, and installs at unit 33 (the real-world SCSI
     // slot for ID 1), so the two instances never collide.
@@ -905,7 +909,56 @@ void Machine::detachHardDisk2() {
     disk2_->detach();
     hd2_.clear();
     scsiImage2_.clear();
+    hd2Mounted_ = false;
+    hd2MountTries_ = 0;
     if (onDiag) onDiag("hd2: disk detached");
+}
+
+// The first half of a drop-box republish: get the guest off the second volume
+// so the host may rebuild it, leaving the boot volume alone.
+//
+// The flush is the part that matters -- the File Manager writes every cached
+// block of the volume out through our driver, which we serve synchronously, so
+// when this returns anything the guest wrote is in the image the caller is
+// about to read. Unmounting then makes it forget its cached catalog and
+// bitmap, which is what lets a rebuilt volume take its place. Editing the image
+// under a mounted volume instead would leave the guest reading its old catalog
+// against the new disk's blocks.
+//
+// Returns true once the volume is off line, which includes it never having
+// been mounted -- the caller's next step is the same either way.
+bool Machine::unmountSecondDisk() {
+    if (hd2_.empty()) return true;
+    if (!hd2Mounted_) return true;                     // never mounted / already gone
+    if (inSony_) return false;                         // inside our own driver
+    if (hd2MountPb_ == 0) return true;                 // nothing was ever mounted
+    if (read8(0x0360) & 1) return false;               // FSBusy: a file op is running
+    if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
+        return true;                                   // FS queue not built
+    if ((cpu_.getSR() & 0x0700) != 0) return false;    // mid-interrupt: not now
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    auto call = [&](u16 trap) -> s16 {
+        for (u32 i = 0; i < 80; ++i) write8(hd2MountPb_ + i, 0);
+        write16(hd2MountPb_ + ioVRefNum, 5);           // drive 5
+        cpu_.a[0] = hd2MountPb_;
+        execute68kTrap(trap);
+        return static_cast<s16>(cpu_.d[0] & 0xFFFF);
+    };
+    const s16 fl = call(kTrapFlushVol);
+    const s16 un = call(kTrapUnmountVol);
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    // -35 nsvErr means there is no such volume: it is already off line, which
+    // is the state we were asking for.
+    const bool off = (un == 0 || un == -35);
+    if (off) hd2Mounted_ = false;
+    if (onDiag) {
+        char b[112];
+        std::snprintf(b, sizeof b, "hd2: flush %d, unmount %d -- volume %s", fl, un,
+                      off ? "off line" : "STILL MOUNTED");
+        onDiag(b);
+    }
+    return off;
 }
 
 const std::vector<u8>& Machine::hardDisk2Image() const {

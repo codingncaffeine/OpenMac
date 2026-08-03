@@ -50,6 +50,14 @@ public sealed class Settings
     public string? LastCd { get; set; }
     /// <summary>Host folder served to the Mac as a disk (rebuilt each start).</summary>
     public string? LastFolderDisk { get; set; }
+    /// <summary>
+    /// The drop box: keep <see cref="LastFolderDisk"/> in front of the Mac for
+    /// the whole session, so a file dropped on the window arrives in the Finder
+    /// instead of making a disk of its own. Off until asked for — it puts a
+    /// second disk on the SCSI bus, which is a change to the machine, not a
+    /// display preference.
+    /// </summary>
+    public bool DropBox { get; set; }
     /// <summary>DaynaPORT adapter + user-mode NAT.</summary>
     public bool Networking { get; set; }
     /// <summary>

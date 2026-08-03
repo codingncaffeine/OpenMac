@@ -86,6 +86,22 @@ public interface IEmulator : IDisposable
     bool AttachFolderDisk(string folder, out string error);
     void DetachFolderDisk();
 
+    // ---- drop box ----
+    // The folder disk kept permanently in front of the Mac, so files arrive by
+    // being dropped on the window rather than by making a disk for each one.
+    //
+    // Republishing is a SWAP, not an edit: the volume is flushed and unmounted,
+    // rebuilt from the folder, and put back. A mounted HFS volume cannot be
+    // written behind the guest's back — it caches the catalog, the extents and
+    // the bitmap, so a file added underneath it is read against a catalog that
+    // never heard of the thing.
+    //
+    // Returns as soon as the request is accepted; the swap itself takes a few
+    // frames on the emulation thread, and RepublishPending stays true until it
+    // has finished.
+    bool RepublishFolderDisk(string? addFile, out string error);
+    bool RepublishPending { get; }
+
     // ---- transfer disk ----
     // An oversized dropped archive rides the same second-disk seat as the
     // folder disk, read-only, sized to fit. One at a time; it clears when the

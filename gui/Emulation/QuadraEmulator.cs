@@ -78,6 +78,7 @@ public sealed class QuadraEmulator : IEmulator
         // and writing the disk out while its volume is still mounted saves it
         // in the "in use" state, which is a disk that will not boot next time.
         SettleVolumes();
+        SyncFolderDisk();   // the drop box's volume dies with the machine
         WriteBackHardDisk();
         byte[] rom = File.ReadAllBytes(path);
         lock (_sync)
@@ -163,6 +164,10 @@ public sealed class QuadraEmulator : IEmulator
                 fpsFrames++;
             }
             if (ran > 0) DrainLog();
+            // A drop box republish is carried out here, one stage per batch:
+            // the trap injections it needs belong to the thread that owns the
+            // CPU, and only between frames.
+            if (ran > 0) _seat?.Pump();
             if (acc > FrameSeconds) acc = FrameSeconds;
             if (ran > 0) PublishFrame();
 
@@ -337,19 +342,123 @@ public sealed class QuadraEmulator : IEmulator
     }
     public bool NetworkingEnabled => false;
     public void SetNetworking(bool enabled) { }
-    public string? FolderDiskPath => null;
+
+    // ---- folder disk / drop box (second SCSI seat, ID 1 / drive 5) ----
+    //
+    // A host folder served as a real HFS volume. Attaching builds the volume
+    // from the folder; the guest's changes come back to the folder whenever the
+    // machine settles. The drop box is the same volume kept permanently in
+    // place: a file dropped on the window lands in the folder, and the volume
+    // is REPUBLISHED so the Mac sees it.
+    //
+    // Republishing is a swap, not an edit. The guest caches a mounted volume's
+    // catalog, extents and bitmap, so writing a new file into the image behind
+    // its back leaves it reading yesterday's catalog against today's blocks.
+    // Instead the volume is flushed and unmounted, rebuilt on the host, and put
+    // back -- the same thing that happens when a removable cartridge is
+    // swapped, which is a sequence this System handles natively.
+    private DropBoxSeat? _seat;
+
+    private DropBoxSeat Seat => _seat ??= new DropBoxSeat(
+        unmount: () =>
+        {
+            lock (_sync)
+                return _h == IntPtr.Zero || Native.omac_q_unmount_harddisk2(_h) != 0;
+        },
+        readImage: ReadSeatImage,
+        insert: img =>
+        {
+            lock (_sync)
+            {
+                if (_h != IntPtr.Zero)
+                    Native.omac_q_insert_harddisk2(_h, img, (nuint)img.Length, 0);
+            }
+        });
+
+    public string? FolderDiskPath => _seat?.Folder;
+
     public bool AttachFolderDisk(string folder, out string error)
     {
-        error = "Folder disks are not on the Quadra 650 yet.";
-        return false;
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        SyncFolderDisk();   // a previously attached folder gets its changes first
+        byte[]? img = FolderDisk.Build(folder, out error);
+        if (img is null) return false;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            Native.omac_q_insert_harddisk2(_h, img, (nuint)img.Length, 0);
+        }
+        Seat.Folder = folder;
+        TransferDiskLabel = null;
+        Log.Line($"[disk] folder disk built from {folder} "
+                 + $"({img.Length / (1024 * 1024)} MB volume)");
+        return true;
     }
-    public void DetachFolderDisk() { }
-    public string? TransferDiskLabel => null;
-    public bool TransferDiskResident => false;
+
+    public void DetachFolderDisk()
+    {
+        SyncFolderDisk();
+        Seat.Cancel();
+        Seat.Folder = null;
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_detach_harddisk2(_h); }
+    }
+
+    public bool RepublishFolderDisk(string? addFile, out string error) =>
+        Seat.Request(addFile, out error);
+
+    public bool RepublishPending => _seat?.Pending == true;
+
+    // ---- transfer disk (shares the seat with the folder disk) ----
+    public string? TransferDiskLabel { get; private set; }
+
+    public bool TransferDiskResident
+    {
+        get
+        {
+            lock (_sync)
+                return _h != IntPtr.Zero && Native.omac_q_harddisk2_booted(_h) != 0;
+        }
+    }
+
     public bool AttachTransferDisk(string filePath, out string error)
     {
-        error = "Transfer disks are not on the Quadra 650 yet.";
-        return false;
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        byte[]? img = FolderDisk.BuildTransferVolume(filePath, 0, out error);
+        if (img is null) return false;
+        // Software-locked in both MDB copies (drAtrb bit 15), so the System
+        // mounts it read-only and never tries to write. An unlocked volume that
+        // silently drops writes leaves the guest's cached view diverging from
+        // the disk.
+        img[1024 + 10] |= 0x80;
+        int altMdb = img.Length - 2 * 512;
+        if (altMdb > 0) img[altMdb + 10] |= 0x80;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            Native.omac_q_insert_harddisk2(_h, img, (nuint)img.Length, 1);   // read-only
+        }
+        TransferDiskLabel = Path.GetFileName(filePath);
+        Log.Line($"[disk] transfer disk built for {TransferDiskLabel} "
+                 + $"({img.Length / (1024 * 1024)} MB volume, read-only)");
+        return true;
+    }
+
+    /// <summary>Write the guest's folder-disk changes back to the host folder.</summary>
+    private void SyncFolderDisk() => _seat?.Sync();
+
+    private byte[]? ReadSeatImage()
+    {
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return null;
+            nuint size = Native.omac_q_harddisk2_data(_h, null, 0);
+            if (size == 0) return null;
+            byte[] img = new byte[size];
+            if (Native.omac_q_harddisk2_data(_h, img, size) == 0) return null;
+            return img;
+        }
     }
 
     // ---- CD-ROM (AppleCD-class target on the SCSI bus) ----
@@ -474,6 +583,9 @@ public sealed class QuadraEmulator : IEmulator
         // Quadra ROM refuse the disk at the next boot. The emulation thread
         // has already stopped, so the guest CPU is ours to run.
         SettleVolumes();
+        // Whatever the guest saved into the drop box only exists in the volume
+        // image until this runs -- and the image dies with the machine.
+        SyncFolderDisk();
         // A disk still in the drive at closing time has never been saved --
         // nothing ejected it -- so save it here, as the hard disk is saved.
         WriteBackFloppy();

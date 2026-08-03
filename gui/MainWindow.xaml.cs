@@ -438,14 +438,33 @@ public partial class MainWindow : Window
                     Log.Line($"cd refused: {_settings.LastCd} -- {_emulator.CdMediumNote()}");
                     _settings.LastCd = null;
                 }
-                if (!string.IsNullOrEmpty(_settings.LastFolderDisk) &&
-                    Directory.Exists(_settings.LastFolderDisk) &&
-                    !_emulator.AttachFolderDisk(_settings.LastFolderDisk!, out string fdErr))
+                if (_settings.Networking) _emulator.SetNetworking(true);
+            }
+            // The folder goes on the seat before the machine runs a frame, so
+            // its driver is there for the ROM's startup bus scan to load --
+            // which is the difference between the volume appearing on its own
+            // and needing a restart. Both models have the seat.
+            //
+            // Two ways to want it: the drop box is on (use the chosen folder,
+            // or make the default one), or a folder disk was simply left open
+            // last session (restore exactly that, and create nothing).
+            string? seatFolder = _settings.DropBox ? DropBoxFolder() : ChosenFolder();
+            if (seatFolder is not null &&
+                !_emulator.AttachFolderDisk(seatFolder, out string dbErr))
+            {
+                Log.Line($"folder disk refused: {seatFolder} -- {dbErr}");
+                if (_settings.DropBox)
                 {
-                    Log.Line($"folder disk refused: {_settings.LastFolderDisk} -- {fdErr}");
+                    MessageBox.Show(this,
+                        "The drop box folder did not become a disk, so it is off for now."
+                        + "\n\n" + dbErr,
+                        "Drop Box", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    _settings.DropBox = false;
+                }
+                else
+                {
                     _settings.LastFolderDisk = null;
                 }
-                if (_settings.Networking) _emulator.SetNetworking(true);
             }
         }
         catch (Exception ex)
@@ -790,6 +809,134 @@ public partial class MainWindow : Window
         UpdateUi();
     }
 
+    // ---- drop box ----
+    //
+    // The drop box IS the folder disk, kept in place for the session instead of
+    // being opened and closed around a task. There is one second-disk seat, so
+    // this shares it with "Open Host Folder as Disk" and the transfer disk; the
+    // occupant is named rather than clobbered.
+
+    /// <summary>The folder the user has chosen, or null. No side effects: a
+    /// folder is not created for somebody who never asked for one.</summary>
+    private string? ChosenFolder() =>
+        !string.IsNullOrEmpty(_settings.LastFolderDisk) &&
+        Directory.Exists(_settings.LastFolderDisk) ? _settings.LastFolderDisk : null;
+
+    /// <summary>The folder the drop box uses: the one chosen last, else a
+    /// plainly named folder under Documents, made on demand.</summary>
+    private string? DropBoxFolder() => ChosenFolder() ?? DropBoxSeat.EnsureDefaultFolder();
+
+    private void DropBoxEnabled_Click(object sender, RoutedEventArgs e)
+    {
+        bool want = DropBoxEnabledItem.IsChecked;
+        if (!want)
+        {
+            _emulator.DetachFolderDisk();
+            _settings.DropBox = false;
+            _settings.Save();
+            UpdateUi();
+            return;
+        }
+        // Remember the choice even with no machine yet; it takes effect on load.
+        if (!_emulator.IsRomLoaded)
+        {
+            _settings.DropBox = true;
+            _settings.Save();
+            UpdateUi();
+            return;
+        }
+        if (_emulator.TransferDiskLabel is { } tdl)
+        {
+            MessageBox.Show(this,
+                $"The transfer disk “{tdl}” is using the second SCSI seat. Restart the " +
+                "machine to release it, then turn the drop box on.",
+                "Drop Box", MessageBoxButton.OK, MessageBoxImage.Information);
+            DropBoxEnabledItem.IsChecked = false;
+            return;
+        }
+        string? folder = DropBoxFolder();
+        if (folder is null)
+        {
+            MessageBox.Show(this,
+                "The drop box folder could not be created. Choose one with " +
+                "File ▸ Drop Box ▸ Choose Folder…",
+                "Drop Box", MessageBoxButton.OK, MessageBoxImage.Warning);
+            DropBoxEnabledItem.IsChecked = false;
+            return;
+        }
+        AttachDropBox(folder, offerRestart: true);
+    }
+
+    /// <summary>Put the folder on the seat and remember it. When the seat's
+    /// driver was not loaded by this Mac's startup scan there is nothing to read
+    /// the disk with, so offer the restart that loads one.</summary>
+    private void AttachDropBox(string folder, bool offerRestart)
+    {
+        if (!_emulator.AttachFolderDisk(folder, out string error))
+        {
+            Log.Line($"drop box refused: {folder} -- {error}");
+            MessageBox.Show(this, "The drop box folder did not become a disk.\n\n" + error,
+                            "Drop Box", MessageBoxButton.OK, MessageBoxImage.Warning);
+            DropBoxEnabledItem.IsChecked = false;
+            return;
+        }
+        _settings.DropBox = true;
+        _settings.LastFolderDisk = folder;
+        _settings.Save();
+        UpdateUi();
+        if (offerRestart && !_emulator.TransferDiskResident &&
+            _emulator.RomPath is { } rom)
+        {
+            var r = MessageBox.Show(this,
+                "The drop box is on the bus, but its driver is loaded by the Mac's " +
+                "startup scan — and this Mac started without one.\n\nRestart now so it " +
+                "appears on the desktop?",
+                "Drop Box", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (r == MessageBoxResult.Yes) LoadRom(rom);
+        }
+    }
+
+    private void DropBoxChooseFolder_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "Choose the Drop Box Folder",
+        };
+        string? current = DropBoxFolder();
+        if (current is not null && Directory.Exists(current)) dlg.InitialDirectory = current;
+        if (dlg.ShowDialog(this) != true) return;
+
+        _settings.LastFolderDisk = dlg.FolderName;
+        _settings.Save();
+        if (!_emulator.IsRomLoaded || !_settings.DropBox) { UpdateUi(); return; }
+        // Already running: swap the drop box over to the new folder. The old one
+        // gets its changes back first -- AttachFolderDisk syncs the outgoing
+        // folder before it builds the incoming one -- and the republish is what
+        // makes the Mac let go of the old volume and pick up the new.
+        AttachDropBox(dlg.FolderName, offerRestart: false);
+        _emulator.RepublishFolderDisk(null, out _);
+    }
+
+    private void DropBoxOpenFolder_Click(object sender, RoutedEventArgs e)
+    {
+        string? folder = DropBoxFolder();
+        if (folder is null) return;
+        try
+        {
+            System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo(folder) { UseShellExecute = true });
+        }
+        catch (Exception ex) { Log.Line("could not open the drop box folder: " + ex.Message); }
+    }
+
+    private void DropBoxRepublish_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_emulator.RepublishFolderDisk(null, out string error))
+            MessageBox.Show(this, "Nothing to refresh.\n\n" + error,
+                            "Drop Box", MessageBoxButton.OK, MessageBoxImage.Information);
+        UpdateUi();
+    }
+
     // ---- folder disk ----
     private void OpenFolderDisk_Click(object sender, RoutedEventArgs e)
     {
@@ -904,8 +1051,10 @@ public partial class MainWindow : Window
         long size;
         try { size = new FileInfo(path).Length; } catch { return; }
 
-        // Archives and encodings go INTO the guest on a transfer floppy, not
-        // into a drive as media.
+        // With a drop box on the desktop, a loose Mac file simply goes in it --
+        // no disk of its own, nothing to throw in the Trash afterwards. Without
+        // one, archives and encodings ride in on a transfer floppy instead.
+        if (TransferExtensions.Contains(ext) && DropBoxDrop(path)) return;
         if (TransferExtensions.Contains(ext)) { TransferDrop(path, requireMacBinary: false); return; }
 
         // Floppy-sized files: let the core's judge look first. The internal
@@ -950,12 +1099,37 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Nothing recognised it as media. With a drop box open that is not a
+        // failure -- it is a file, and a file is what the drop box is for.
+        if (DropBoxDrop(path)) return;
+
         string why = triedFloppy ? _emulator.MediumNote(0)
                                  : "not floppy media, a CD image, or a hard-disk image";
         Log.Line($"drop refused: {path} -- {why}");
         MessageBox.Show(this,
-            Path.GetFileName(path) + " did not go in any drive.\n\n" + why,
+            Path.GetFileName(path) + " did not go in any drive.\n\n" + why +
+            "\n\nTo copy it into the Mac as a file, turn on File ▸ Drop Box ▸ " +
+            "Keep Drop Box on the Desktop and drop it again.",
             "OpenMac", MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
+
+    /// <summary>Put a loose file in the drop box and republish, so it turns up
+    /// on the Mac's desktop. False when no drop box is attached, which leaves
+    /// the caller to try the older routes.</summary>
+    private bool DropBoxDrop(string path)
+    {
+        if (_emulator.FolderDiskPath is null) return false;
+        if (!_emulator.RepublishFolderDisk(path, out string error))
+        {
+            Log.Line($"drop box refused {path}: {error}");
+            MessageBox.Show(this,
+                Path.GetFileName(path) + " did not go in the drop box.\n\n" + error,
+                "Drop Box", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return true;      // handled: told the user what happened
+        }
+        Log.Line($"drop: {Path.GetFileName(path)} -> drop box");
+        UpdateUi();
+        return true;
     }
 
     /// <summary>Put one loose Mac file into the guest on a write-protected
@@ -1335,5 +1509,16 @@ public partial class MainWindow : Window
             ? $"Eject “{Path.GetFileNameWithoutExtension(cdPath)}”" : "Eject CD";
         CloseFolderDiskItem.IsEnabled = _emulator.FolderDiskPath is not null;
         NetworkingItem.IsChecked = _emulator.NetworkingEnabled;
+
+        DropBoxEnabledItem.IsChecked = _settings.DropBox;
+        // Name the folder in the menu: a drop box whose folder you cannot see
+        // is one you have to go looking for.
+        string? dbFolder = ChosenFolder() ?? (_settings.DropBox ? DropBoxSeat.DefaultFolder : null);
+        DropBoxFolderItem.Header = dbFolder is null
+            ? "Choose Folder…"
+            : $"Choose Folder…   ({Path.GetFileName(dbFolder.TrimEnd('\\', '/'))})";
+        DropBoxOpenItem.IsEnabled = dbFolder is not null;
+        DropBoxRepublishItem.IsEnabled =
+            _emulator.FolderDiskPath is not null && !_emulator.RepublishPending;
     }
 }
