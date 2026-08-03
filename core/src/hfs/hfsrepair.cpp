@@ -19,7 +19,6 @@
 
 #include "openmac/hfs.hpp"
 
-#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 
@@ -168,16 +167,19 @@ bool shrinkExtentsTree(std::vector<u8>& img, u32 base, u32 volumeBytes,
     wr32(hdr + 40, bthFree - (oldNodes - newNodes));// bthFree: only free ones left
     for (u32 ab = firstFreed; ab < xtStart + xtBlks; ++ab) clearBit(vbm, ab);
 
-    wr32(mdb + 0x82, newBytes);                     // drXTFlSize
-    wr16(mdb + 0x88, u16(newBlks));                 // drXTExtRec[0].count
-    if (rd32(mdb + 0x4A) > newBytes) wr32(mdb + 0x4A, newBytes);   // drXTClpSiz
     const u32 freeBks = rd16(mdb + 0x22) + freedBlks;
-    wr16(mdb + 0x22, u16(freeBks < 0x10000u ? freeBks : 0xFFFFu));
-
     // The alternate MDB in the second-to-last block is what a repair tool reads
-    // when the primary is unreadable, so it moves with it.
-    if (volumeBytes >= 1024)
-        std::copy(mdb, mdb + kBlockSize, vol + volumeBytes - 1024);
+    // when the primary is unreadable, so the same four fields move there too --
+    // and only those four. Copying the whole block over it would be easier and
+    // would throw away whatever else that copy legitimately held.
+    u8* alt = vol + volumeBytes - 1024;
+    for (u8* m : {mdb, alt}) {
+        if (m == alt && rd16(alt) != kSigWord) continue;   // no usable backup
+        wr32(m + 0x82, newBytes);                    // drXTFlSize
+        wr16(m + 0x88, u16(newBlks));                // drXTExtRec[0].count
+        if (rd32(m + 0x4A) > newBytes) wr32(m + 0x4A, newBytes);   // drXTClpSiz
+        wr16(m + 0x22, u16(freeBks < 0x10000u ? freeBks : 0xFFFFu));  // drFreeBks
+    }
 
     say(why, "the extents tree was %u bytes, past the %u the ROM's own repair "
              "can walk; cut to %u (%u unused nodes returned to the volume)",

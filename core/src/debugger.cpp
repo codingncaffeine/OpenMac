@@ -328,22 +328,24 @@ std::string extended(Cursor& c, const char* base) {
     const bool pcRel = base[0] == 'P';
     const u32 pcBase = c.p;
     const u16 ext = c.word();
-    char b[96];
-    char idx[24];
-    std::snprintf(idx, sizeof idx, "%c%d%s%s", (ext & 0x8000) ? 'A' : 'D',
-                  (ext >> 12) & 7, (ext & 0x0800) ? ".l" : ".w",
-                  ((ext >> 9) & 3) ? (((ext >> 9) & 3) == 1 ? "*2"
-                                      : ((ext >> 9) & 3) == 2 ? "*4" : "*8")
-                                   : "");
+    // Assembled as a string rather than into a fixed buffer: an operand that
+    // silently loses its tail is a listing that reads plausibly and names the
+    // wrong address, and the widths here depend on four independent fields.
+    char nb[16];
+    std::snprintf(nb, sizeof nb, "%c%d%s", (ext & 0x8000) ? 'A' : 'D',
+                  (ext >> 12) & 7, (ext & 0x0800) ? ".l" : ".w");
+    std::string idx = nb;
+    switch ((ext >> 9) & 3) {
+        case 1: idx += "*2"; break;
+        case 2: idx += "*4"; break;
+        case 3: idx += "*8"; break;
+        default: break;
+    }
     if (!(ext & 0x0100)) {                       // brief format, one word
         const s32 d8 = static_cast<int8_t>(ext & 0xFF);
         if (pcRel)
-            std::snprintf(b, sizeof b, "%s(PC,%s)",
-                          hexAddr(pcBase + static_cast<u32>(d8)).c_str(), idx);
-        else
-            std::snprintf(b, sizeof b, "%s(%s,%s)",
-                          disp16(static_cast<u16>(d8)).c_str(), base, idx);
-        return b;
+            return hexAddr(pcBase + static_cast<u32>(d8)) + "(PC," + idx + ")";
+        return disp16(static_cast<u16>(d8)) + "(" + base + "," + idx + ")";
     }
     // Full format. The extension words that follow are a base displacement of
     // 0/1/2 words (bits 5-4) and then an outer displacement of 0/1/2 (bits
@@ -361,29 +363,22 @@ std::string extended(Cursor& c, const char* base) {
         if (odSize == 2) od = static_cast<int16_t>(c.word());
         else if (odSize == 3) od = static_cast<s32>(c.lng());
     }
-    char inner[80];
     // Postindexed puts the index outside the indirection; preindexed inside.
     const bool post = !indexSup && (iis & 4) != 0;
+    const bool innerIdx = !indexSup && !post;
+    std::string inner;
     if (pcRel && !baseSup)
-        std::snprintf(inner, sizeof inner, "%s(PC)%s%s",
-                      hexAddr(pcBase + static_cast<u32>(bd)).c_str(),
-                      (indexSup || post) ? "" : ",", (indexSup || post) ? "" : idx);
-    else
-        std::snprintf(inner, sizeof inner, "%s%s%s%s%s",
-                      bd ? disp16(static_cast<u16>(bd)).c_str() : "",
-                      (bd && !baseSup) ? "," : "",
-                      baseSup ? "" : base,
-                      (indexSup || post) ? "" : ",",
-                      (indexSup || post) ? "" : idx);
-    if (!memIndirect)
-        std::snprintf(b, sizeof b, "(%s)", inner);
-    else if (post)
-        std::snprintf(b, sizeof b, "([%s],%s%s%s)", inner, idx,
-                      od ? "," : "", od ? disp16(static_cast<u16>(od)).c_str() : "");
-    else
-        std::snprintf(b, sizeof b, "([%s]%s%s)", inner, od ? "," : "",
-                      od ? disp16(static_cast<u16>(od)).c_str() : "");
-    return b;
+        inner = hexAddr(pcBase + static_cast<u32>(bd)) + "(PC)";
+    else {
+        if (bd) inner += disp16(static_cast<u16>(bd));
+        if (bd && !baseSup) inner += ",";
+        if (!baseSup) inner += base;
+    }
+    if (innerIdx) inner += "," + idx;
+    const std::string odText = od ? "," + disp16(static_cast<u16>(od)) : std::string();
+    if (!memIndirect) return "(" + inner + ")";
+    if (post) return "([" + inner + "]," + idx + odText + ")";
+    return "([" + inner + "]" + odText + ")";
 }
 
 // Decode an effective address, appending text and consuming extension words.
