@@ -452,7 +452,7 @@ TEST_CASE("040 FMOVEM.X saves and restores registers through memory") {
     f.cpu.fp[0] = 1.5;
     f.cpu.fp[7] = -2.25;
     f.cpu.a[7] = 0x0F000;
-    // FMOVEM.X FP0/FP7,-(A7): predec list bit for FP0 = 0x01? (bit0=FP7...bit7=FP0)
+    // FMOVEM.X FP0/FP7,-(A7): predec list bit for FP0 = 0x01, FP7 = 0x80.
     f.run({0xF227, 0xE081});   // static predec, list 0x81 = FP0 and FP7
     const u32 sp = f.cpu.a[7];
     CHECK(sp == 0x0F000 - 24);
@@ -464,6 +464,60 @@ TEST_CASE("040 FMOVEM.X saves and restores registers through memory") {
     CHECK(f.cpu.fp[0] == doctest::Approx(1.5));
     CHECK(f.cpu.fp[7] == doctest::Approx(-2.25));
     CHECK(f.cpu.a[7] == 0x0F000);
+}
+
+TEST_CASE("040 FMOVEM.X predecrement list runs the other way round") {
+    // The predecrement mask is the postincrement mask reversed: bit 0 is FP0
+    // going down, bit 7 is FP0 coming back up. A save/restore pair is the only
+    // way most code touches this, and a palindrome list (FP0 with FP7, $81)
+    // round-trips whichever way the bits are read -- so the pair proves
+    // nothing on its own. These name ONE register, and an asymmetric pair.
+    Cpu040Fix f;
+    for (int i = 0; i < 8; ++i) f.cpu.fp[i] = 0.0;
+    f.cpu.fp[0] = 1.17;
+    f.cpu.a[7] = 0x0F000;
+
+    f.run({0xF227, 0xE001});          // FMOVEM.X FP0,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 12);
+    // 1.17 as a 96-bit extended: exponent $3FFF, explicit integer bit set.
+    // Reading the mask the other way would push FP7 -- a zero mantissa under
+    // a live exponent, which is what sent the ROM's normalize loop spinning.
+    CHECK(f.bus.read32(0x0F000 - 12) == 0x3FFF0000u);
+    CHECK((f.bus.read32(0x0F000 - 8) & 0x80000000u) != 0u);
+    CHECK(f.bus.read32(0x0F000 - 8) != 0u);
+
+    f.cpu.fp[0] = 0.0;
+    f.run({0xF21F, 0xD080});          // FMOVEM.X (A7)+,FP0   (postinc bit 7)
+    CHECK(f.cpu.fp[0] == doctest::Approx(1.17));
+    CHECK(f.cpu.a[7] == 0x0F000);
+
+    // The ROM's other pair: push FP2/FP3 with $0C, pop them with $30. Same two
+    // registers, and they must come back in the same registers.
+    f.cpu.fp[2] = 7.5;
+    f.cpu.fp[3] = -9.25;
+    f.run({0xF227, 0xE00C});          // FMOVEM.X FP2/FP3,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 24);
+    f.cpu.fp[2] = f.cpu.fp[3] = 0.0;
+    f.run({0xF21F, 0xD030});          // FMOVEM.X (A7)+,FP2/FP3
+    CHECK(f.cpu.fp[2] == doctest::Approx(7.5));
+    CHECK(f.cpu.fp[3] == doctest::Approx(-9.25));
+    CHECK(f.cpu.a[7] == 0x0F000);
+
+    // Ascending memory holds FP0..FP7 whichever end wrote it. Powers of two
+    // make that readable: FPi keeps exponent $3FFF+i, so the slot a register
+    // landed in is visible in the stored bytes, not merely inferred from a
+    // round trip that would survive any consistent scrambling.
+    for (int i = 0; i < 8; ++i) f.cpu.fp[i] = std::ldexp(1.0, i);
+    f.run({0xF227, 0xE0FF});          // FMOVEM.X FP0-FP7,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 96);
+    for (int i = 0; i < 8; ++i) {
+        const u32 se = f.bus.read32(0x0F000 - 96 + 12 * static_cast<u32>(i));
+        CHECK(se == (0x3FFFu + static_cast<u32>(i)) << 16);
+    }
+    for (int i = 0; i < 8; ++i) f.cpu.fp[i] = 0.0;
+    f.run({0xF21F, 0xD0FF});          // FMOVEM.X (A7)+,FP0-FP7
+    for (int i = 0; i < 8; ++i)
+        CHECK(f.cpu.fp[i] == doctest::Approx(std::ldexp(1.0, i)));
 }
 
 TEST_CASE("040 FMOVEM control list moves the address register by the whole list") {

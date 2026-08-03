@@ -529,14 +529,26 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
         for (u32 b = 0; b < 8; ++b) n += (list >> b) & 1;
 
         if (!toRegs && mode == 4) {
-            // Predecrement: FP7 first in the list's bit 0..? Predec list bit 0
-            // = FP7 ... bit 7 = FP0, stored descending.
+            // Predecrement carries the REVERSED mask -- list bit 0 is FP0 and
+            // bit 7 is FP7, against bit 7 = FP0 for control and postincrement.
+            // The reversal is what makes a save and its restore name the same
+            // registers: this ROM pushes with $01/$0C and pops with $80/$30,
+            // and those are the same two masks read from opposite ends.
+            // Reading the predecrement mask the postincrement way pushed FP7
+            // where FP0 was asked for -- and the ROM's SANE normalize loop,
+            // handed a zero mantissa with a live exponent, shifts it left
+            // forever (a hang with the cursor still tracking, because the
+            // cursor runs off an interrupt and everything else waits on the
+            // task that never returns).
+            //
+            // Registers still store DESCENDING, so that ascending memory holds
+            // FP0..FP7 exactly as the postincrement load will read it back.
             u32 addr = c.a[reg];
-            for (int i = 0; i < 8; ++i) {
+            for (int i = 7; i >= 0; --i) {
                 if (!((list >> i) & 1)) continue;
                 addr -= 12;
                 u32 se; u64 mant;
-                doubleToExtended(c.fp[7 - i], se, mant);
+                doubleToExtended(c.fp[i], se, mant);
                 c.wr32(addr, se);
                 c.wr32(addr + 4, static_cast<u32>(mant >> 32));
                 c.wr32(addr + 8, static_cast<u32>(mant));

@@ -536,6 +536,8 @@ int main(int argc, char** argv) {
     int ioBudget = 400;
     u32 trailPc = 0;                // --trail <pc> <n>, gated by --watch-from
     int trailCount = 0;
+    u32 fpTrailPc = 0;              // --fp-trail <pc> <n>: FP ops before a PC
+    int fpTrailCount = 40;
     unsigned long breakPc = 0;
     int breakSkip = 0;
     unsigned long traceFrom = 0;
@@ -659,6 +661,10 @@ int main(int argc, char** argv) {
         else if (a == "--trail" && i + 2 < argc) {
             trailPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             trailCount = std::atoi(argv[++i]);
+        }
+        else if (a == "--fp-trail" && i + 2 < argc) {
+            fpTrailPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            fpTrailCount = std::atoi(argv[++i]);
         }
         else if (a == "--io-trace" && i + 5 < argc) {
             ioTrace = true;
@@ -1211,6 +1217,64 @@ int main(int argc, char** argv) {
                         "sp=%08X sr=%04X\n",
                         pc, c.d[0], c.d[1], c.a[0], c.a[1], c.a[2], c.a[7],
                         c.getSR());
+        };
+    } else if (fpTrailPc) {
+        // --fp-trail <pc> <n>: the last n FLOATING-POINT instructions before
+        // execution reaches an address, each with the register file it left
+        // behind. A plain instruction trail cannot answer "which operation
+        // produced this value" -- the arithmetic is thousands of instructions
+        // back, buried in integer glue, and the recent-PC ring holds only the
+        // spin. Recording FP instructions ALONE keeps the whole computation in
+        // a few dozen entries.
+        struct FpStep { u32 pc; u16 op, ext; double fp0; u32 fpsr; };
+        auto ring = std::make_shared<std::vector<FpStep>>();
+        ring->reserve(static_cast<std::size_t>(fpTrailCount) + 1);
+        auto pending = std::make_shared<FpStep>();
+        auto havePending = std::make_shared<bool>(false);
+        auto fired = std::make_shared<bool>(false);
+        auto hits = std::make_shared<u64>(0);
+        mac.cpu().onStep = [&, ring, pending, havePending, fired, hits](u32 pc) {
+            const M68040& c = mac.cpu();
+            // Close out the previous FP instruction: its result is visible
+            // only once the NEXT one starts.
+            if (*havePending) {
+                pending->fp0 = c.fp[0];
+                pending->fpsr = c.fpsr;
+                if (ring->size() >= static_cast<std::size_t>(fpTrailCount))
+                    ring->erase(ring->begin());
+                ring->push_back(*pending);
+                *havePending = false;
+            }
+            // Fire only once the trigger address has been reached far more
+            // times than any real loop there could run: a routine that is
+            // merely BUSY passes through, a routine that is STUCK trips it.
+            // Firing on the first arrival would report a healthy call.
+            if (pc == fpTrailPc && !*fired && ++*hits >= 100000) {
+                *fired = true;
+                std::printf("-- fp trail: %zu FP instructions before %08X "
+                            "(frame %u) --\n",
+                            ring->size(), pc,
+                            static_cast<unsigned>(mac.frameCount()));
+                for (const auto& s : *ring)
+                    std::printf("F %08X op=%04X ext=%04X -> fp0=%.17g fpsr=%08X\n",
+                                s.pc, s.op, s.ext, s.fp0, s.fpsr);
+                std::printf("   fp regs:");
+                for (int k = 0; k < 8; ++k) std::printf(" fp%d=%.17g", k, c.fp[k]);
+                std::printf("\n   fpcr=%08X fpsr=%08X fpiar=%08X\n",
+                            c.fpcr, c.fpsr, c.fpiar);
+                return;
+            }
+            if (static_cast<int>(mac.frameCount()) < watchFrom) return;
+            // Only fetch from somewhere a fetch is safe: a read of a device
+            // window would change the device, and a read of nothing at all
+            // faults out through the hook.
+            const bool readable = (pc + 3 < ramTop_) ||
+                                  (pc >= 0x40800000u && pc < 0x40900000u);
+            if (!readable) return;
+            const u16 op = static_cast<u16>(mac.read16(pc));
+            if ((op & 0xFE00) != 0xF200) return;   // coprocessor id 1: the FPU
+            *pending = {pc, op, static_cast<u16>(mac.read16(pc + 2)), 0.0, 0};
+            *havePending = true;
         };
     } else if (!watchPcs.empty()) {
         installWatch();
