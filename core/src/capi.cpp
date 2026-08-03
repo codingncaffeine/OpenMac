@@ -765,6 +765,16 @@ OMAC_API size_t omac_q_floppy_data(OMacQ* m, uint8_t* out, size_t cap)
     return img.size();
 }
 
+// The drive is a device on the bus; a disc is media in it. Nothing mounts until
+// the drive is there, and this front end never had a way to put it there --
+// which is why a disc chosen in the GUI did nothing at all.
+OMAC_API void omac_q_attach_cd(OMacQ* m, int attached, int busId)
+{
+    if (m) m->mac.attachCdRom(attached != 0, busId);
+}
+
+OMAC_API int omac_q_cd_attached(OMacQ* m) { return m && m->mac.cdRomAttached() ? 1 : 0; }
+
 OMAC_API int omac_q_insert_cd(OMacQ* m, const uint8_t* img, size_t len)
 {
     if (!m || !img) return 0;

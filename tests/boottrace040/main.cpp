@@ -545,6 +545,7 @@ int main(int argc, char** argv) {
     int hdTrace = 0;                // --hd-trace N: log N disk requests in order
     bool doShutdown = false;        // --shutdown: flush+unmount before saving
     int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
+    int ejectCdAtFrame = -1;        // --eject-cd-at N: the same for the disc
     bool noVolumeRepair = false;        // --no-volume-repair: reproduce the dirty-volume refusal
     const char* hd2Path = nullptr;  // --harddisk2 FILE: an existing image on seat 2
     std::string dropBoxDir;         // --dropbox DIR: serve DIR on the second seat
@@ -789,6 +790,7 @@ int main(int argc, char** argv) {
         else if (a == "--hd-trace" && i + 1 < argc) hdTrace = std::atoi(argv[++i]);
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
+        else if (a == "--eject-cd-at" && i + 1 < argc) ejectCdAtFrame = std::atoi(argv[++i]);
         else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
         else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
         else if (a == "--no-volume-repair") noVolumeRepair = true;
@@ -1506,6 +1508,10 @@ int main(int argc, char** argv) {
         if (ejectAtFrame >= 0 && i == ejectAtFrame) {
             std::printf("front-end eject requested at frame %d\n", i);
             mac.ejectFloppy();
+        }
+        if (ejectCdAtFrame >= 0 && i == ejectCdAtFrame) {
+            std::printf("front-end CD eject requested at frame %d\n", i);
+            mac.ejectCd();
         }
         // The republish, driven the way the front end drives it: ask for the
         // unmount every frame until the guest lets go, then rebuild from the

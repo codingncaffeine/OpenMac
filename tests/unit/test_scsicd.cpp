@@ -3,6 +3,8 @@
 #include "../../core/src/machine/cdmedia.hpp"
 #include "../../core/src/machine/scsicd.hpp"
 
+#include <openmac/quadra.hpp>
+
 #include <cstring>
 #include <string>
 #include <vector>
@@ -264,4 +266,38 @@ TEST_CASE("MODE SENSE serves the page it was asked for, and refuses the rest") {
     REQUIRE(sense.data.size() >= 13);
     CHECK((sense.data[2] & 0x0F) == 0x05);   // ILLEGAL REQUEST
     CHECK(sense.data[12] == 0x24);           // invalid field in CDB
+}
+
+// A Mac CD master puts an Apple partition map at the front and the volume
+// inside an "Apple_HFS" partition -- and the map's entries are addressed in
+// 512-byte blocks even when the disc's sectors are 2048, which is the detail
+// that decides whether the driver reads a volume or reads the map again.
+TEST_CASE("the HFS partition is found where an Apple CD master puts it") {
+    // A bare HFS master starts at zero: MDB two blocks in, nothing in front.
+    std::vector<u8> bare(64 * 1024, 0);
+    bare[1024] = 'B'; bare[1025] = 'D';
+    CHECK(QuadraMachine::findHfsPartition(bare) == 0);
+
+    // A partitioned master: DDR at block 0, map entries from block 1, and the
+    // Apple_HFS entry naming a start in 512-byte blocks.
+    std::vector<u8> apm(256 * 1024, 0);
+    apm[0] = 'E'; apm[1] = 'R';
+    auto entry = [&](std::size_t blk, const char* type, u32 start) {
+        u8* p = apm.data() + blk * 512;
+        p[0] = 'P'; p[1] = 'M';
+        p[8] = u8(start >> 24); p[9] = u8(start >> 16);
+        p[10] = u8(start >> 8); p[11] = u8(start);
+        std::memcpy(p + 48, type, std::strlen(type) + 1);
+    };
+    entry(1, "Apple_partition_map", 1);
+    entry(2, "Apple_Driver", 64);
+    entry(3, "Apple_HFS", 128);
+    CHECK(QuadraMachine::findHfsPartition(apm) == 128u * 512u);
+
+    // A disc with a map but no HFS in it reads as "starts at zero", which is
+    // what an ISO 9660 disc is: the mount then fails, rather than reading the
+    // partition map as if it were a volume.
+    std::vector<u8> isoOnly(256 * 1024, 0);
+    isoOnly[0] = 'E'; isoOnly[1] = 'R';
+    CHECK(QuadraMachine::findHfsPartition(isoOnly) == 0);
 }

@@ -149,6 +149,11 @@ public:
     bool cdRomAttached() const;
     // Returns 1 when the drive took the disc, 0 when the file was refused.
     int insertCd(std::vector<u8> image);
+    // Where a disc's HFS volume starts inside its flat image: the Apple
+    // partition map's Apple_HFS entry, or 0 for a bare HFS master. Pure data
+    // structure, so it is testable on its own -- and the block size the map is
+    // addressed in (512, whatever the disc's sectors are) is the whole trick.
+    static u32 findHfsPartition(const std::vector<u8>& disc);
     void ejectCd();
     bool cdPresent() const;
     void attachNet(bool attached, int busId = 4);
@@ -277,10 +282,35 @@ private:
     void serveDiskPrime(int unit);
     void serveDiskCtlStatus(int unit, bool status);
     void findDiskDriverPrime();
+    // The CD needs a driver that does not exist. The ROM carries one for
+    // floppies and the hard disk brings its own on its partition map, but a
+    // CD-ROM's driver comes from Apple's CD-ROM extension -- and that extension
+    // never claims this drive, so no drive ever reaches the queue and no disc of
+    // any format can mount. So install one: a DRVR named ".AppleCD" whose entry
+    // points are addresses this machine watches, exactly as it watches the hard
+    // disk's Prime and the ROM's .Sony Prime. See BasiliskII/src/cdrom.cpp,
+    // which reaches the same conclusion from the other direction.
+    void installCdDriver();
+    void mountCdVolume();
+    void completeCdEject();
+    void serveCdPrime();
+    void serveCdCtlStatus(bool status);
     bool volumeMountedFor(u16 drive);
     bool inDriver_ = false;      // serving a driver request: no nested traps
     u32 diskPrimePc_[2] = {0, 0};   // unit 1 (drive 4) and unit 33 (drive 5)
     u32 diskCtlPc_[2] = {0, 0}, diskStatusPc_[2] = {0, 0};
+    // The installed .AppleCD driver: where its stubs live, and the drive it
+    // owns. cdDrive_ is 0 until AddDrive has taken.
+    u32 cdDrvr_ = 0, cdPrimePc_ = 0, cdCtlPc_ = 0, cdStatusPc_ = 0;
+    u32 cdStatus_ = 0;              // the DrvSts the drive queue points into
+    s16 cdRefNum_ = 0;
+    u16 cdDrive_ = 0;
+    u32 cdHfsOffset_ = 0;           // the disc's HFS partition, in bytes
+    bool cdMountPending_ = false;
+    int cdMountTries_ = 0;
+    int cdInstallTries_ = 0;
+    bool cdEjectPending_ = false;   // front-end eject, run at a frame edge
+    int cdEjectTries_ = 0;
 
     std::unique_ptr<SonyDrive> fd_;
     std::vector<u8> floppy_;

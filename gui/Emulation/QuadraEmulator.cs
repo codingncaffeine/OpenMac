@@ -487,8 +487,13 @@ public sealed class QuadraEmulator : IEmulator
     // ---- CD-ROM (AppleCD-class target on the SCSI bus) ----
     public bool CdRomAttached { get; private set; }
     public string? CdPath { get; private set; }
+    // The drive has to be ON THE BUS before a disc in it means anything: with no
+    // drive there is no target to select, no driver to install, and nothing
+    // mounts however good the image is. This used to set a flag and tell the
+    // machine nothing at all.
     public void SetCdRomAttached(bool attached)
     {
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_attach_cd(_h, attached ? 1 : 0, 3); }
         CdRomAttached = attached;
         if (!attached) EjectCd();
     }
@@ -496,13 +501,28 @@ public sealed class QuadraEmulator : IEmulator
     public bool InsertCd(string path)
     {
         if (_h == IntPtr.Zero) return false;
+        // A .cue is a text sheet naming the real data file; load that one.
+        string mediaPath = path;
+        if (Path.GetExtension(path).Equals(".cue", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(
+                    File.ReadAllText(path), "FILE\\s+\"([^\"]+)\"",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (m.Success)
+                    mediaPath = Path.Combine(Path.GetDirectoryName(path) ?? "", m.Groups[1].Value);
+            }
+            catch { return false; }
+        }
         byte[] img;
-        try { img = File.ReadAllBytes(path); }
+        try { img = File.ReadAllBytes(mediaPath); }
         catch { return false; }
         int ok;
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return false;
+            if (Native.omac_q_cd_attached(_h) == 0) Native.omac_q_attach_cd(_h, 1, 3);
             ok = Native.omac_q_insert_cd(_h, img, (nuint)img.Length);
         }
         if (ok == 0) return false;

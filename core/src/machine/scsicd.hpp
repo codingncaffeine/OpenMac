@@ -43,6 +43,11 @@ public:
     }
     void eject() { media_.clear(); unitAttention_ = true; }
     bool discPresent() const { return !media_.empty(); }
+    // The flat byte run the drive serves. A driver installed by the machine
+    // reads the disc from here rather than through the bus, the way the hard
+    // disk's Prime hook reads its image -- the guest's driver, DCE and
+    // completion path stay its own; only the transfer is the machine's.
+    const std::vector<u8>& media() const { return media_; }
     // One-shot: the guest ejected the disc (START STOP UNIT + LoEj).
     bool takeEjectRequest() {
         const bool r = ejectRequest_;

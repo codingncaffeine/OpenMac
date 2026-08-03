@@ -1114,6 +1114,11 @@ void QuadraMachine::tickDevices(int cpuCycles) {
         via1_->setCA2(true);
         ca2PulseSlices_ = 2;
         announceHardDisks();
+        // The CD's driver goes in on the same clock and for the same reason:
+        // there is no unit table to install into until the System has built one.
+        if (cdrom_->attachedState() && !cdDrvr_) installCdDriver();
+        if (cdEjectPending_) completeCdEject();
+        else if (cdMountPending_) mountCdVolume();
     }
     // The whole machine cadence rides device time so that frame-driven and
     // single-stepped execution behave identically: audio samples per slice,
@@ -1396,6 +1401,278 @@ void QuadraMachine::serveDiskPrime(int unit) {
     }
     write32(pb + 0x28, done);                          // ioActCount
     write32(dce + 0x10, pos + done);                   // dCtlPosition
+    write16(pb + 0x10, static_cast<u16>(result));      // ioResult
+    cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+    const u32 target = read32(0x08FC);                 // jIODone
+    cpu_.a[0] = target;
+    cpu_.pc = target;
+}
+
+// Where the disc's HFS volume begins. Apple's own CD masters put an Apple
+// partition map at the front and the volume inside an "Apple_HFS" partition;
+// a plain HFS master has its MDB two blocks in and starts at zero. The map's
+// entries are addressed in 512-byte blocks even on a disc whose sectors are
+// 2048, which is why this walks blocks rather than sectors.
+//
+// Reference: Inside Macintosh: Devices, "The SCSI Manager" (partition map), and
+// the same walk in BasiliskII/src/cdrom.cpp.
+u32 QuadraMachine::findHfsPartition(const std::vector<u8>& disc) {
+    for (std::size_t blk = 0; blk < 64; ++blk) {
+        const std::size_t at = blk * 512;
+        if (at + 512 > disc.size()) break;
+        const u8* m = disc.data() + at;
+        if (m[0] != 0x50 || m[1] != 0x4D) continue;            // 'PM'
+        // pmPartName at +16, pmParType at +48, both C strings in 32 bytes.
+        const char* type = reinterpret_cast<const char*>(m + 48);
+        if (std::strncmp(type, "Apple_HFS", 32) != 0) continue;
+        const u32 start = (u32(m[8]) << 24) | (u32(m[9]) << 16) |
+                          (u32(m[10]) << 8) | m[11];           // pmPyPartStart
+        return start * 512u;
+    }
+    return 0;   // a bare HFS master, or a disc with no HFS on it at all
+}
+
+// Build the .AppleCD driver in the System heap and hand it to the Device
+// Manager. Its Open/Prime/Control/Status entry points are four addresses this
+// machine watches; when the guest's Device Manager jumps to one, stepInstruction
+// serves the request in C++ and returns through jIODone -- the same shape as the
+// hard disk's Prime hook, so the guest's DCE, queue and completion path stay its
+// own and only the transfer is ours.
+//
+// This runs once the System is up, for the same reason the hard disk's mount
+// does: a driver installed during the ROM's boot scan is installed into a
+// machine that has not built its unit table yet.
+void QuadraMachine::installCdDriver() {
+    if (cdDrvr_ || inDriver_ || announceInFlight_) return;
+    if (read32(0x0358) == 0) return;                  // System never came up
+    if ((((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) == 0xFFFFFFFFu))
+        return;                                       // FS queue not built
+    if (read8(0x0360) & 1) return;                    // FSBusy: a file op is running
+    if ((cpu_.getSR() & 0x0700) != 0) return;         // mid-interrupt: not now
+    if (++cdInstallTries_ > 30) return;
+
+    // Find the slot BEFORE allocating anything: the unit table is not built
+    // until the System is well under way, and an attempt that gives up after
+    // the allocation leaks a block of the System heap every time it retries.
+    const u32 uTable = guestPtr(read32(0x011C));
+    const u32 units = read16(0x01D2);                 // UnitNtryCnt
+    u32 unit = 0;
+    for (u32 i = 32; i < units && i < 128; ++i) {     // 0-31 are Apple's
+        if (uTable + i * 4u + 3 >= ram_.size()) break;
+        if (read32(uTable + i * 4u) == 0) { unit = i; break; }
+    }
+    if (!uTable || !unit) return;                     // not yet; try again later
+
+    announceInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+
+    // DRVR header: flags, delay, event mask, menu, then the five entry-point
+    // offsets, then the name as a Pascal string. Our entry points are stubs the
+    // guest never actually executes, but they have to BE somewhere.
+    const u32 kHeader = 0x1C;                         // header + ".AppleCD" + pad
+    cpu_.d[0] = kHeader + 0x20;
+    execute68kTrap(0xA71E);                           // _NewPtr,Sys,Clear
+    const u32 drvr = guestPtr(cpu_.a[0]);
+    if (!drvr) {
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        announceInFlight_ = false;
+        return;
+    }
+    // dReadEnable | dWritEnable | dCtlEnable | dStatEnable | dNeedLock.
+    write16(drvr + 0x00, 0x4F00);                     // drvrFlags
+    write16(drvr + 0x02, 0);                          // drvrDelay
+    write16(drvr + 0x04, 0);                          // drvrEMask
+    write16(drvr + 0x06, 0);                          // drvrMenu
+    write16(drvr + 0x08, u16(kHeader + 0x00));        // drvrOpen
+    write16(drvr + 0x0A, u16(kHeader + 0x08));        // drvrPrime
+    write16(drvr + 0x0C, u16(kHeader + 0x10));        // drvrCtl
+    write16(drvr + 0x0E, u16(kHeader + 0x18));        // drvrStatus
+    write16(drvr + 0x10, u16(kHeader + 0x00));        // drvrClose -> the Open stub
+    const char* name = "\010.AppleCD";
+    for (int i = 0; i < 9; ++i) write8(drvr + 0x12 + u32(i), u8(name[i]));
+    // Each stub is MOVEQ #0,D0 / JMP ([jIODone]) -- a correct driver on its own,
+    // so nothing is stranded if the hook ever misses.
+    for (u32 off : {0x00u, 0x08u, 0x10u, 0x18u}) {
+        const u32 at = drvr + kHeader + off;
+        write16(at + 0, 0x7000);                      // MOVEQ #0,D0
+        write16(at + 2, 0x2078); write16(at + 4, 0x08FC);   // MOVEA.L $08FC.W,A0
+        write16(at + 6, 0x4ED0);                      // JMP (A0)
+    }
+    cdDrvr_ = drvr;
+    cdPrimePc_ = drvr + kHeader + 0x08;
+    cdCtlPc_ = drvr + kHeader + 0x10;
+    cdStatusPc_ = drvr + kHeader + 0x18;
+
+    // Into the unit table by hand rather than through _DrvrInstall. That trap
+    // takes a refNum the caller has to have picked already, and picking one by
+    // trying them in turn means writing over whatever is there when the guess
+    // is wrong -- which is exactly what it did: low memory came back as
+    // $6DB6DB6D and the machine was gone. Finding an empty slot first is the
+    // same work without the guessing.
+    const s16 refNum = static_cast<s16>(~unit);
+    cdRefNum_ = refNum;
+    // The unit table holds HANDLES to device control entries, so the DCE is a
+    // relocatable block -- and it must not move under the Device Manager, hence
+    // the lock.
+    cpu_.d[0] = 50;                                   // AuxDCE
+    execute68kTrap(0xA722);                           // _NewHandle,Sys,Clear
+    const u32 dceH = cpu_.a[0];
+    if (dceH) { cpu_.a[0] = dceH; execute68kTrap(0xA029); }   // _HLock
+    const u32 dce = dceH ? guestPtr(read32(guestPtr(dceH))) : 0;
+    if (!dce) {
+        cdDrvr_ = cdPrimePc_ = cdCtlPc_ = cdStatusPc_ = 0;
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        announceInFlight_ = false;
+        if (onDiag) onDiag("cd: no memory for the driver's control entry");
+        return;
+    }
+    write32(dce + 0x00, drvr);                        // dCtlDriver (a pointer)
+    write16(dce + 0x04, u16(0x4F00 | 0x0020));        // dCtlFlags | dOpened
+    write16(dce + 0x18, static_cast<u16>(refNum));    // dCtlRefNum
+    write32(uTable + unit * 4u, dceH);
+
+    // The drive itself: a DrvSts the drive queue links through, then AddDrive.
+    cpu_.d[0] = 22;                                   // SIZEOF DrvSts
+    execute68kTrap(0xA71E);                           // _NewPtr,Sys,Clear
+    cdStatus_ = guestPtr(cpu_.a[0]);
+    if (cdStatus_) {
+        write8(cdStatus_ + 2, 0x80);                  // dsWriteProt: locked
+        write8(cdStatus_ + 3, cdrom_->discPresent() ? 1 : 0);   // dsDiskInPlace
+        write8(cdStatus_ + 4, 1);                     // dsInstalled
+        write8(cdStatus_ + 5, 1);                     // dsSides
+        cdDrive_ = 6;                                 // past the two SCSI seats
+        cpu_.d[0] = (u32(cdDrive_) << 16) | u16(refNum);
+        cpu_.a[0] = cdStatus_ + 6;                    // the DrvQEl itself
+        execute68kTrap(0xA04E);                       // _AddDrive
+        cdMountPending_ = cdrom_->discPresent();
+        cdMountTries_ = 0;
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    announceInFlight_ = false;
+    if (onDiag) {
+        char b[144];
+        std::snprintf(b, sizeof b,
+                      "cd: .AppleCD installed at unit %u (refNum %d), drive %u, "
+                      "Prime at %08X", unit, refNum, cdDrive_, cdPrimePc_);
+        onDiag(b);
+    }
+}
+
+// Ask the File Manager to mount the disc, the same way the hard disks are
+// mounted: _MountVol on the drive, gated on the System being settled. A
+// disk-inserted event would be the other way, and the hard disk's history says
+// that event makes 7.5's startup re-run a mount it has already failed.
+void QuadraMachine::mountCdVolume() {
+    if (!cdMountPending_ || !cdDrive_) return;
+    if (inDriver_ || announceInFlight_) return;
+    if (read32(0x0358) == 0) return;                  // System never came up
+    if (read8(0x0360) & 1) return;                    // FSBusy
+    if ((cpu_.getSR() & 0x0700) != 0) return;         // mid-interrupt
+    if (volumeMountedFor(cdDrive_)) { cdMountPending_ = false; return; }
+    if (++cdMountTries_ > 15) { cdMountPending_ = false; return; }
+    announceInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    if (!hdMountPb_) {
+        cpu_.d[0] = 80;
+        execute68kTrap(0xA71E);                       // _NewPtr,Sys,Clear
+        hdMountPb_ = guestPtr(cpu_.a[0]);
+    }
+    s16 res = -108;
+    if (hdMountPb_) {
+        for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
+        write16(hdMountPb_ + 22, cdDrive_);           // ioVRefNum = the drive
+        cpu_.a[0] = hdMountPb_;
+        execute68kTrap(0xA00F);                       // _MountVol
+        res = static_cast<s16>(cpu_.d[0] & 0xFFFF);
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    announceInFlight_ = false;
+    if (res == 0 || res == -55) cdMountPending_ = false;   // mounted, or already
+    if (onDiag) {
+        char b[80];
+        std::snprintf(b, sizeof b, "cd: mount drive %u -> %d", cdDrive_, res);
+        onDiag(b);
+    }
+}
+
+// The CD driver's Prime: read-only, served straight out of the disc image at
+// the HFS partition's offset. A CD is addressed by the File Manager in 512-byte
+// logical blocks whatever the drive's own sector size is, and the image is a
+// flat byte run, so the translation is one addition.
+void QuadraMachine::serveCdPrime() {
+    const u32 pb = guestPtr(cpu_.a[0]);
+    const u32 dce = guestPtr(cpu_.a[1]);
+    const u16 trap = read16(pb + 0x06);
+    const u32 buf = guestPtr(read32(pb + 0x20));
+    const u32 req = read32(pb + 0x24);
+    const u16 posMode = read16(pb + 0x2C);
+    const u32 posOff = read32(pb + 0x2E);
+    const u32 dctlPos = read32(dce + 0x10);
+    const std::vector<u8>& disc = cdrom_->media();
+    const u32 volSize = disc.size() > cdHfsOffset_
+                            ? static_cast<u32>(disc.size()) - cdHfsOffset_ : 0;
+
+    u32 pos = dctlPos;
+    switch (posMode & 3) {
+    case 1: pos = posOff; break;                                   // fsFromStart
+    case 2: pos = volSize + posOff; break;                         // fsFromLEOF
+    case 3: pos = dctlPos + posOff; break;                         // fsFromMark
+    default: break;                                                // fsAtMark
+    }
+    s16 result = 0;
+    u32 done = 0;
+    if (!cdrom_->discPresent() || volSize == 0) {
+        result = -65;                                  // offLinErr
+    } else if (trap & 1) {
+        result = -44;                                  // wPrErr: it is a CD
+    } else if (pos >= volSize) {
+        result = -39;                                  // eofErr
+    } else {
+        u32 n = req;
+        if (pos + n > volSize) { n = volSize - pos; result = -39; }
+        const u32 at = cdHfsOffset_ + pos;
+        for (u32 i = 0; i < n; ++i) write8(buf + i, disc[at + i]);
+        done = n;
+    }
+    write32(pb + 0x28, done);                          // ioActCount
+    write32(dce + 0x10, pos + done);                   // dCtlPosition
+    write16(pb + 0x10, static_cast<u16>(result));      // ioResult
+    cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+    const u32 target = read32(0x08FC);                 // jIODone
+    cpu_.a[0] = target;
+    cpu_.pc = target;
+}
+
+// Control and Status for the CD. The one that matters is csCode 7, Eject: the
+// Finder's drag-to-Trash and Special > Eject Disk both come through here, and a
+// drive that answers "done" without letting go leaves an icon on a disc the
+// host has already taken back.
+void QuadraMachine::serveCdCtlStatus(bool status) {
+    const u32 pb = guestPtr(cpu_.a[0]);
+    const u16 csCode = read16(pb + 0x1A);
+    s16 result = 0;
+    if (!status) {
+        switch (csCode) {
+        case 7:                                        // Eject
+            cdrom_->eject();
+            cdHfsOffset_ = 0;
+            if (cdStatus_) write8(cdStatus_ + 3, 0);   // dsDiskInPlace
+            if (onDiag) onDiag("cd: the guest ejected the disc");
+            break;
+        case 21: case 22:                              // icon / drive info
+            result = -17;                              // controlErr: not ours
+            break;
+        case 5: case 6: case 8: case 9: case 23: case 24:
+            break;                                     // verify, format, tag: fine
+        default:
+            break;
+        }
+    } else if (csCode == 8) {                          // DriveStatus
+        if (cdStatus_)
+            for (u32 i = 0; i < 22; ++i) write8(pb + 0x1C + i, read8(cdStatus_ + i));
+    }
     write16(pb + 0x10, static_cast<u16>(result));      // ioResult
     cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
     const u32 target = read32(0x08FC);                 // jIODone
@@ -1836,6 +2113,35 @@ int QuadraMachine::stepInstruction() {
                               static_cast<unsigned>(frameCounter_));
                 onDiag(b);
             }
+            cpu_.d[0] = static_cast<u32>(-36);
+            cpu_.pc = read32(0x08FC);
+            cpu_.a[0] = cpu_.pc;
+        }
+        inDriver_ = false;
+        tickDevices(40);
+        return 40;
+    }
+    if (cdPrimePc_ && cpu_.pc == cdPrimePc_) {
+        inDriver_ = true;
+        try { serveCdPrime(); } catch (const BusFault& f) {
+            if (onDiag) {
+                char b[112];
+                std::snprintf(b, sizeof b, "cd prime FAULT pb=%08X addr=%08X (f %u)",
+                              cpu_.a[0], f.addr, static_cast<unsigned>(frameCounter_));
+                onDiag(b);
+            }
+            cpu_.d[0] = static_cast<u32>(-36);
+            cpu_.pc = read32(0x08FC);
+            cpu_.a[0] = cpu_.pc;
+        }
+        inDriver_ = false;
+        tickDevices(40);
+        return 40;
+    }
+    if ((cdCtlPc_ && cpu_.pc == cdCtlPc_) || (cdStatusPc_ && cpu_.pc == cdStatusPc_)) {
+        const bool isStatus = cdStatusPc_ && cpu_.pc == cdStatusPc_;
+        inDriver_ = true;
+        try { serveCdCtlStatus(isStatus); } catch (const BusFault&) {
             cpu_.d[0] = static_cast<u32>(-36);
             cpu_.pc = read32(0x08FC);
             cpu_.a[0] = cpu_.pc;
@@ -2409,9 +2715,71 @@ int QuadraMachine::insertCd(std::vector<u8> image) {
     }
     if (!m.ok) return 0;
     cdrom_->insert(std::move(m.data));
+    // Where the volume starts on this disc, and the drive's own view of it.
+    cdHfsOffset_ = findHfsPartition(cdrom_->media());
+    if (onDiag && cdHfsOffset_) {
+        char b[96];
+        std::snprintf(b, sizeof b, "cd: Apple_HFS partition at byte %u",
+                      cdHfsOffset_);
+        onDiag(b);
+    }
+    if (cdStatus_) write8(cdStatus_ + 3, 1);          // dsDiskInPlace
+    cdMountPending_ = true;
+    cdMountTries_ = 0;
     return 1;
 }
-void QuadraMachine::ejectCd() { cdrom_->eject(); }
+// The front end's Eject only STAGES: the disc has a volume mounted on it, and
+// taking the medium out from under one leaves the guest holding a volume with
+// nothing behind it -- offLinErr forever, which is exactly what the floppy path
+// had to learn. completeCdEject unmounts first, at a frame edge, on the
+// emulation thread.
+void QuadraMachine::ejectCd() {
+    if (!cdrom_->discPresent()) return;
+    cdEjectPending_ = true;
+}
+
+void QuadraMachine::completeCdEject() {
+    if (!cdEjectPending_) return;
+    if (inDriver_ || announceInFlight_) return;
+    if (cdDrive_ && read32(0x0358) != 0 && !(read8(0x0360) & 1) &&
+        (cpu_.getSR() & 0x0700) == 0 && volumeMountedFor(cdDrive_)) {
+        announceInFlight_ = true;
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        if (!hdMountPb_) {
+            cpu_.d[0] = 80;
+            execute68kTrap(0xA71E);                   // _NewPtr,Sys,Clear
+            hdMountPb_ = guestPtr(cpu_.a[0]);
+        }
+        s16 un = -1;
+        if (hdMountPb_) {
+            for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
+            write16(hdMountPb_ + 22, cdDrive_);       // ioVRefNum
+            cpu_.a[0] = hdMountPb_;
+            execute68kTrap(0xA00E);                   // _UnmountVol
+            un = static_cast<s16>(cpu_.d[0] & 0xFFFF);
+        }
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        announceInFlight_ = false;
+        if (un != 0) {
+            // The guest is still using it (an open file, an application running
+            // off the disc). A real drive refuses too; try again next tick.
+            if (onDiag && cdEjectTries_ == 0) {
+                char b[80];
+                std::snprintf(b, sizeof b, "cd: the guest is still using the disc (%d)", un);
+                onDiag(b);
+            }
+            if (++cdEjectTries_ < 20) return;
+        }
+    }
+    cdEjectPending_ = false;
+    cdEjectTries_ = 0;
+    cdrom_->eject();
+    cdHfsOffset_ = 0;
+    cdMountPending_ = false;
+    if (cdStatus_) write8(cdStatus_ + 3, 0);          // dsDiskInPlace
+    if (onDiag) onDiag("cd: disc taken out by the host");
+}
 bool QuadraMachine::cdPresent() const { return cdrom_->discPresent(); }
 
 void QuadraMachine::attachNet(bool attached, int busId) {
