@@ -540,6 +540,9 @@ public sealed class NativeEmulator : IEmulator
     public bool RepublishFolderDisk(string? addFile, out string error) =>
         Seat.Request(addFile, out error);
 
+    public bool RetargetFolderDisk(string folder, out string error) =>
+        Seat.Request(null, folder, out error);
+
     public bool RepublishPending => _seat?.Pending == true;
 
     private byte[]? ReadSeatImage()

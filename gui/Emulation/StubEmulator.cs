@@ -109,6 +109,12 @@ public sealed class StubEmulator : IEmulator
         error = "";
         return FolderDiskPath is not null;
     }
+    public bool RetargetFolderDisk(string folder, out string error)
+    {
+        error = "";
+        FolderDiskPath = folder;
+        return true;
+    }
     public bool RepublishPending => false;
 
     public string? TransferDiskLabel { get; private set; }

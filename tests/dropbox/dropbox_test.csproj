@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The drop box's republish sequence, driven through the SHIPPED DropBoxSeat
+    and FolderDisk with stand-in native delegates.
+
+    This exists because the C++ trace tools cannot reach it. They attach a
+    volume to the second SCSI seat and swap it, but the sync-back that folds the
+    guest's volume back into the host folder is C#, so those tools were
+    exercising a sequence the application does not run. A dropped file went
+    missing in exactly that gap. Run this after touching FolderDisk or DropBox,
+    from this directory:
+
+        dotnet run -c Release
+
+    Not wired into ctest: that suite is native and has no dotnet dependency.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>OpenMac.Gui</RootNamespace>
+    <AssemblyName>dropbox_test</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <!--
+    Compiled in, not referenced: the types under test are internal, so this has
+    to be the same assembly to see them.
+  -->
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\gui\Log.cs" />
+    <Compile Include="..\..\gui\Emulation\FolderDisk.cs" />
+    <Compile Include="..\..\gui\Emulation\DropBox.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\gui\native\openmac_c.dll" Condition="Exists('..\..\gui\native\openmac_c.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>openmac_c.dll</Link>
+    </None>
+  </ItemGroup>
+
+</Project>

@@ -23,7 +23,20 @@ internal static class FolderDisk
     {
         "Desktop", "Desktop DB", "Desktop DF", "Desktop Folder", "Trash",
         "Temporary Items", "Network Trash Folder", "TheVolumeSettingsFolder",
+        "Move&Rename", "AutoRecover",
     };
+
+    /// <summary>
+    /// Is this a root-level item the guest made for its own use, rather than
+    /// something the user put there? Extensions name their scratch folders after
+    /// themselves — SpaceSaver writes "SpaceSaver Temporary Items" — so the
+    /// suffix has to count, not just the exact names. Getting this wrong is
+    /// visible: the folder is created on the host, and then it is the only thing
+    /// the next rebuild has to work from.
+    /// </summary>
+    private static bool IsGuestNoise(string name) =>
+        Array.Exists(GuestNoise, n => n.Equals(name, StringComparison.OrdinalIgnoreCase)) ||
+        name.EndsWith("Temporary Items", StringComparison.OrdinalIgnoreCase);
 
     private static readonly string[] HostNoise = { "thumbs.db", "desktop.ini" };
 
@@ -127,6 +140,10 @@ internal static class FolderDisk
         foreach (var sub in dir.EnumerateDirectories())
         {
             if (sub.Name.Equals(RemovedDir, StringComparison.OrdinalIgnoreCase)) continue;
+            // Guest scratch that an earlier sync left on the host: do not build
+            // it back into the volume. The guest makes its own when it wants
+            // one, and a stale copy is just clutter on the Mac's desktop.
+            if (parent == 2 && IsGuestNoise(sub.Name)) continue;
             uint id = omac_hfsb_add_dir(b, parent, sub.Name,
                 ToHfsDate(sub.CreationTime), ToHfsDate(sub.LastWriteTime));
             if (id != 0) AddTree(b, id, sub);
@@ -270,6 +287,13 @@ internal static class FolderDisk
                 foreach (var it in items)
                 {
                     if (it.isDir == 0 || pathOf.ContainsKey(it.id)) continue;
+                    // A root-level noise directory never gets a path, so nothing
+                    // underneath it can resolve one either and the whole subtree
+                    // stays out of the host folder. That matters most for Trash:
+                    // giving it a path would copy a file the user just threw away
+                    // back to the host as "Trash\thing", while the original was
+                    // shelved for having moved.
+                    if (it.parent == 2 && IsGuestNoise(NameOf(it))) continue;
                     if (pathOf.TryGetValue(it.parent, out string? pp))
                     {
                         pathOf[it.id] = Path.Combine(pp, HostName(it));
@@ -286,10 +310,7 @@ internal static class FolderDisk
                 if (it.id == 2) continue;
                 if (!pathOf.TryGetValue(it.parent, out string? parentPath)) continue;
                 string name = HostName(it);
-                if (parentPath.Length == 0 &&
-                    Array.Exists(GuestNoise,
-                        n => n.Equals(NameOf(it), StringComparison.OrdinalIgnoreCase)))
-                    continue;
+                if (parentPath.Length == 0 && IsGuestNoise(NameOf(it))) continue;
                 if (it.isDir != 0)
                 {
                     string dir = Path.Combine(folder, parentPath, name);

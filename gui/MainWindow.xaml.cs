@@ -909,12 +909,24 @@ public partial class MainWindow : Window
         _settings.LastFolderDisk = dlg.FolderName;
         _settings.Save();
         if (!_emulator.IsRomLoaded || !_settings.DropBox) { UpdateUi(); return; }
-        // Already running: swap the drop box over to the new folder. The old one
-        // gets its changes back first -- AttachFolderDisk syncs the outgoing
-        // folder before it builds the incoming one -- and the republish is what
-        // makes the Mac let go of the old volume and pick up the new.
-        AttachDropBox(dlg.FolderName, offerRestart: false);
-        _emulator.RepublishFolderDisk(null, out _);
+        if (_emulator.FolderDiskPath is null)
+        {
+            // Nothing on the seat yet: a plain attach is safe.
+            AttachDropBox(dlg.FolderName, offerRestart: true);
+            return;
+        }
+        // A volume is already mounted from the old folder, so the move has to go
+        // through the swap. Putting the new folder's bytes on the seat while the
+        // Mac still holds the old volume would leave it reading the old catalog
+        // against the new disk's blocks -- and the outgoing folder would never
+        // get back what the guest saved into it.
+        if (!_emulator.RetargetFolderDisk(dlg.FolderName, out string error))
+        {
+            Log.Line($"drop box move refused: {dlg.FolderName} -- {error}");
+            MessageBox.Show(this, "The drop box did not move.\n\n" + error,
+                            "Drop Box", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        UpdateUi();
     }
 
     private void DropBoxOpenFolder_Click(object sender, RoutedEventArgs e)

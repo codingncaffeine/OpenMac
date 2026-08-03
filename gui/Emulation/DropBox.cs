@@ -38,6 +38,8 @@ internal sealed class DropBoxSeat
     private volatile Stage _stage = Stage.Idle;
     private int _tries;
     private byte[]? _rebuilt;
+    private string? _pendingAdd;      // the dropped file, copied in after sync-back
+    private string? _pendingFolder;   // a folder to move to, taken after sync-back
     private readonly object _rebuiltLock = new();
 
     // ~5 s at 60 Hz. The core refuses an unmount while a file operation is in
@@ -62,21 +64,55 @@ internal sealed class DropBoxSeat
     public void Cancel() => _stage = Stage.Idle;
 
     /// <summary>
-    /// Copy <paramref name="addFile"/> into the folder (when given) and start a
-    /// republish. Returns false only when there is no folder or the copy failed
-    /// — the guest-side swap itself happens over the next few frames.
+    /// Republish, with <paramref name="addFile"/> joining the folder on the way
+    /// through. Returns false only when there is no folder — the swap itself
+    /// happens over the next few frames.
     /// </summary>
-    public bool Request(string? addFile, out string error)
+    /// <remarks>
+    /// ⛔ The file is NOT copied here. It is copied inside <see cref="Rebuild"/>,
+    /// AFTER the sync-back, and the order is the whole point: sync-back's job
+    /// includes shelving host files the guest deleted, and it decides that by
+    /// asking which host files are absent from the volume. A file copied in
+    /// before it runs is absent from the volume for the innocent reason that it
+    /// arrived after the volume was built — and gets shelved as a deletion, so
+    /// the dropped file never reaches the Mac. Copying after sync-back means the
+    /// question is never asked about it.
+    /// </remarks>
+    public bool Request(string? addFile, out string error) =>
+        Request(addFile, null, out error);
+
+    /// <summary>
+    /// As above, and with <paramref name="newFolder"/> the drop box moves to a
+    /// different folder on the way through: the outgoing folder still receives
+    /// what the guest wrote, and the incoming one becomes the volume.
+    /// </summary>
+    /// <remarks>
+    /// Retargeting has to go through here rather than through a fresh attach.
+    /// Putting different bytes on the seat while the guest still has the old
+    /// volume mounted is the stale-catalog hazard the whole swap exists to
+    /// avoid — the Mac would be reading the folder it used to have against the
+    /// blocks of the one it has now.
+    /// </remarks>
+    public bool Request(string? addFile, string? newFolder, out string error)
     {
         error = "";
         string? folder = Folder;
-        if (string.IsNullOrEmpty(folder)) { error = "no drop box is attached"; return false; }
-        if (!string.IsNullOrEmpty(addFile))
+        if (string.IsNullOrEmpty(folder) && string.IsNullOrEmpty(newFolder))
         {
-            try { CopyIn(folder!, addFile!); }
-            catch (Exception ex) { error = ex.Message; return false; }
+            error = "no drop box is attached";
+            return false;
         }
-        lock (_rebuiltLock) _rebuilt = null;
+        if (!string.IsNullOrEmpty(addFile) && !File.Exists(addFile))
+        {
+            error = "that file is not there any more";
+            return false;
+        }
+        lock (_rebuiltLock)
+        {
+            _rebuilt = null;
+            _pendingAdd = addFile;
+            _pendingFolder = newFolder;
+        }
         _tries = 0;
         _stage = Stage.WantUnmount;
         return true;
@@ -173,20 +209,49 @@ internal sealed class DropBoxSeat
     private void Rebuild(byte[]? current, string? folder)
     {
         byte[]? next = null;
+        string? add, moveTo;
+        lock (_rebuiltLock)
+        {
+            add = _pendingAdd; _pendingAdd = null;
+            moveTo = _pendingFolder; _pendingFolder = null;
+        }
         try
         {
-            if (string.IsNullOrEmpty(folder)) return;
-            // Sync BEFORE rebuilding: whatever the guest wrote to the volume is
-            // only in the image, and the rebuild reads the folder. Skipping this
-            // would throw away everything saved to the drop box since it was
-            // last published.
-            if (current is not null)
+            // 1. Sync BEFORE rebuilding: whatever the guest wrote to the volume
+            //    is only in the image, and the rebuild reads the folder.
+            //    Skipping this would throw away everything saved to the drop box
+            //    since it was last published. This goes to the OUTGOING folder,
+            //    which is the one the volume was built from.
+            if (current is not null && !string.IsNullOrEmpty(folder))
             {
                 var s = FolderDisk.SyncBack(current, folder!);
                 if (s.Error is not null)
                     Log.Line($"[dropbox] sync back failed: {s.Error} — "
                              + "rebuilding from the folder as it stands");
             }
+            // 1b. Only now does a move take effect: the old folder has its
+            //     contents back, and everything below is about the new one.
+            if (!string.IsNullOrEmpty(moveTo))
+            {
+                Folder = moveTo;
+                folder = moveTo;
+                Log.Line($"[dropbox] moved to {moveTo}");
+            }
+            if (string.IsNullOrEmpty(folder)) return;
+            // 2. THEN the dropped file joins the folder. Before the sync-back it
+            //    would look like a file the guest had deleted -- absent from the
+            //    volume -- and be shelved into _openmac-removed instead of
+            //    reaching the Mac.
+            if (!string.IsNullOrEmpty(add))
+            {
+                try { CopyIn(folder!, add!); }
+                catch (Exception ex)
+                {
+                    Log.Line($"[dropbox] could not copy {Path.GetFileName(add!)} "
+                             + "into the folder: " + ex.Message);
+                }
+            }
+            // 3. And only now is the folder what the volume should be.
             next = FolderDisk.Build(folder!, out string buildError);
             if (next is null)
                 Log.Line($"[dropbox] rebuild failed: {buildError} — "

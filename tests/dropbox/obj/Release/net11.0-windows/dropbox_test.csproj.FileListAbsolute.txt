@@ -1,0 +1,16 @@
+I:\Visual Studio Projects\OpenMac\tests\dropbox\bin\Release\net11.0-windows\openmac_c.dll
+I:\Visual Studio Projects\OpenMac\tests\dropbox\bin\Release\net11.0-windows\dropbox_test.exe
+I:\Visual Studio Projects\OpenMac\tests\dropbox\bin\Release\net11.0-windows\dropbox_test.deps.json
+I:\Visual Studio Projects\OpenMac\tests\dropbox\bin\Release\net11.0-windows\dropbox_test.runtimeconfig.json
+I:\Visual Studio Projects\OpenMac\tests\dropbox\bin\Release\net11.0-windows\dropbox_test.dll
+I:\Visual Studio Projects\OpenMac\tests\dropbox\bin\Release\net11.0-windows\dropbox_test.pdb
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\dropbox_test.GeneratedMSBuildEditorConfig.editorconfig
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\dropbox_test.AssemblyInfoInputs.cache
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\dropbox_test.AssemblyInfo.cs
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\dropbox_test.csproj.CoreCompileInputs.cache
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\dropbox_test.sourcelink.json
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\dropbox_test.dll
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\refint\dropbox_test.dll
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\dropbox_test.pdb
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\dropbox_test.genruntimeconfig.cache
+I:\Visual Studio Projects\OpenMac\tests\dropbox\obj\Release\net11.0-windows\ref\dropbox_test.dll

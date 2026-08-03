@@ -100,6 +100,16 @@ public interface IEmulator : IDisposable
     // frames on the emulation thread, and RepublishPending stays true until it
     // has finished.
     bool RepublishFolderDisk(string? addFile, out string error);
+
+    /// <summary>
+    /// Republish onto a different folder. The outgoing folder still receives
+    /// what the guest wrote before the move takes effect. Retargeting must go
+    /// through here rather than through a fresh attach: putting different bytes
+    /// on the seat while the old volume is still mounted is exactly the
+    /// stale-catalog hazard the swap exists to avoid.
+    /// </summary>
+    bool RetargetFolderDisk(string folder, out string error);
+
     bool RepublishPending { get; }
 
     // ---- transfer disk ----
