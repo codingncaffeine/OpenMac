@@ -504,6 +504,45 @@ TEST_CASE("040 FMOVEM control list moves the address register by the whole list"
     CHECK(f.bus.read32(0x0F000 - 4) == 0x00001234);
 }
 
+TEST_CASE("040 FMOVE to and from memory steps the pointer by the operand's size") {
+    Cpu040Fix f;
+    // The same rule as the control list, for a single operand: an extended is
+    // twelve bytes and a double is eight, so -(A7) has to step back over all of
+    // it before the write. Stepping by four leaves the tail lying across the
+    // caller's saved register -- which is how the ROM's SANE glue came back
+    // with a null A0 and its caller then pushed A0-10 as a pointer.
+    f.cpu.a[7] = 0x0F000;
+    f.bus.write32(0x0F000, 0xCAFEF00D);   // the caller's slot, just above SP
+    f.cpu.d[0] = 4;
+    f.run({0xF200, 0x4000});              // FMOVE.L D0,FP0   (FP0 = 4.0)
+    f.run({0xF227, 0x6800});              // FMOVE.X FP0,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 12);
+    CHECK(f.bus.read32(0x0F000) == 0xCAFEF00D);            // caller's slot intact
+    CHECK((f.bus.read32(0x0F000 - 12) >> 16) == 0x4001);   // sign+exponent of 4.0
+    CHECK(f.bus.read32(0x0F000 - 8) == 0x80000000u);       // explicit integer bit
+    CHECK(f.bus.read32(0x0F000 - 4) == 0);
+
+    // ...and back off the stack, leaving it exactly where it started.
+    f.cpu.d[0] = 0;
+    f.run({0xF200, 0x4000});              // FP0 = 0
+    f.run({0xF21F, 0x4800});              // FMOVE.X (A7)+,FP0
+    CHECK(f.cpu.a[7] == 0x0F000);
+    f.run({0xF200, 0x6000});              // FMOVE.L FP0,D0
+    CHECK(f.cpu.d[0] == 4);
+
+    // A double is eight, a single four, a word two.
+    f.run({0xF227, 0x7400});              // FMOVE.D FP0,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 8);
+    CHECK(f.bus.read32(0x0F000) == 0xCAFEF00D);
+    f.run({0xF21F, 0x5400});              // FMOVE.D (A7)+,FP0
+    CHECK(f.cpu.a[7] == 0x0F000);
+    f.run({0xF227, 0x6400});              // FMOVE.S FP0,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 4);
+    f.cpu.a[7] = 0x0F000;
+    f.run({0xF227, 0x7000});              // FMOVE.W FP0,-(A7)
+    CHECK(f.cpu.a[7] == 0x0F000 - 2);
+}
+
 TEST_CASE("040 FSAVE produces NULL before use and IDLE after; FRESTORE resets") {
     Cpu040Fix f;
     f.cpu.a[0] = 0xC000;

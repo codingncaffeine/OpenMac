@@ -213,6 +213,37 @@ u32 fpFormatBytes(int fmt) {
     }
 }
 
+// The effective address for an FPU operand of this format.
+//
+// Postincrement and predecrement step the address register by the size of the
+// OPERAND, and an FPU operand is up to 12 bytes: extended and packed are 12,
+// double is 8. The integer EA calculator only knows byte/word/long, so asking
+// it for the address moves the register by at most 4 -- and the transfer then
+// reads or writes the remaining 8 bytes past the pointer, over whatever is
+// there. On the stack that is the caller's saved registers and its return
+// address: `FMOVE.X FP0,-(A7)` inside the ROM's SANE glue wrote the result
+// across the A0 it had saved four bytes earlier, so the routine returned a
+// garbage pointer and its caller followed it. (Same defect the FMOVEM control
+// list had; this is its single-register sibling.)
+//
+// The stack-pointer byte rule holds here too: -(A7)/(A7)+ with a byte operand
+// moves A7 by 2, keeping it even.
+u32 fpuOperandEA(M68040& c, int mode, int reg, int fmt) {
+    const u32 bytes = fpFormatBytes(fmt);
+    const u32 step = (bytes == 1 && reg == 7) ? 2u : bytes;
+    if (mode == 3) {              // (An)+
+        const u32 addr = c.a[reg];
+        c.a[reg] += step;
+        return addr;
+    }
+    if (mode == 4) {              // -(An)
+        c.a[reg] -= step;
+        return c.a[reg];
+    }
+    // Every other mode ignores the size; pass a code it understands.
+    return CpuOps040::calcEA(c, mode, reg, bytes == 1 ? 0 : bytes == 2 ? 1 : 2);
+}
+
 } // namespace
 
 // General FPU instruction: F200-F23F with the coprocessor extension word.
@@ -265,7 +296,7 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
                     else src = static_cast<double>(static_cast<s8>(raw & 0xFF));
                 }
             } else {
-                const u32 addr = calcEA(c, mode, reg, fpFormatBytes(fmt) == 2 ? 1 : 2);
+                const u32 addr = fpuOperandEA(c, mode, reg, fmt);
                 if (fmt == 2 || fmt == 3) {
                     const u32 w0 = c.rd32(addr);
                     const u32 w1 = c.rd32(addr + 4), w2 = c.rd32(addr + 8);
@@ -412,7 +443,7 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
             else writeSized(c.d[reg], static_cast<u32>(static_cast<s32>(v)) & 0xFF, 0);
             return 4;
         }
-        const u32 addr = calcEA(c, mode, reg, fpFormatBytes(fmt) == 2 ? 1 : 2);
+        const u32 addr = fpuOperandEA(c, mode, reg, fmt);
         switch (fmt) {
         case 0: c.wr32(addr, static_cast<u32>(static_cast<s32>(v))); break;
         case 1: c.wr32(addr, doubleToSingle(v)); break;
