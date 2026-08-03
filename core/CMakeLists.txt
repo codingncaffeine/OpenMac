@@ -23,6 +23,7 @@ add_library(openmac_core STATIC
     src/hfs/hfsformat.cpp
     src/hfs/hfsbuild.cpp
     src/hfs/hfsread.cpp
+    src/hfs/hfsrepair.cpp
     src/debugger.cpp
 )
 

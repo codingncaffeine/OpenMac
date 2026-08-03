@@ -23,7 +23,9 @@
 #include "scsi.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 namespace openmac {
@@ -53,7 +55,36 @@ public:
     bool present() const override { return attached_; }
     int  id() const override { return id_; }
 
+    // Every command the drive is asked, with what it answered. A CD that will
+    // not mount is a conversation between the Apple CD-ROM driver and this
+    // drive, and until it is written down the failure is a silence.
+    std::function<void(const char*)> onDiag;
+    int diagBudget = 400;
+
     u8 execute(const u8* cdb, std::vector<u8>& out, u32& writeBytes) override {
+        const u8 status = executeImpl(cdb, out, writeBytes);
+        if (onDiag && diagBudget > 0) {
+            --diagBudget;
+            char b[160];
+            const int n = cdbLen(cdb[0]);
+            int p = std::snprintf(b, sizeof b, "cd: cdb");
+            for (int i = 0; i < n && p < 60; ++i)
+                p += std::snprintf(b + p, sizeof b - std::size_t(p), " %02X", cdb[0 + i]);
+            std::snprintf(b + p, sizeof b - std::size_t(p),
+                          " -> %s%s, %zu bytes in%s",
+                          status == 0 ? "GOOD" : "CHECK",
+                          status == 0 ? "" : status == 0x02 ? "" : " ?",
+                          out.size(),
+                          status == 0 ? "" : (senseKey_ == 0x05 && asc_ == 0x20)
+                                                 ? "  <-- COMMAND NOT IMPLEMENTED"
+                                                 : "");
+            onDiag(b);
+        }
+        return status;
+    }
+
+private:
+    u8 executeImpl(const u8* cdb, std::vector<u8>& out, u32& writeBytes) {
         out.clear();
         writeBytes = 0;
         const u8 op = cdb[0];
@@ -130,6 +161,7 @@ public:
         }
     }
 
+public:
     void acceptWrite(const std::vector<u8>& data) override {
         if (!modeSelectPending_) return;
         modeSelectPending_ = false;

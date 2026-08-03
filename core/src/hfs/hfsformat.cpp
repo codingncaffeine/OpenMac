@@ -224,6 +224,27 @@ std::vector<u8> formatVolume(u32 sizeBytes, const std::string& volumeName) {
     u32 clumpAllocBlks = clump / alBlkSiz;
     if (clumpAllocBlks * nodesPerAB > kMaxMapNodes)
         clumpAllocBlks = kMaxMapNodes / nodesPerAB;
+    // And keep both files inside the ROM's own repair budget. When a volume was
+    // not unmounted cleanly the ROM rebuilds it, and it bounds each B*-tree walk
+    // by ceil(fileBytes / recordBytes) -- 12 bytes for an extents record, 70 for
+    // a catalog one -- computed with a **16-bit DIVU** at $4080F456. A quotient
+    // that will not fit in 16 bits leaves the divide's destination untouched
+    // (M68000PRM: overflow, destination unaffected) and the surrounding ceil
+    // then answers 1, so the rebuild tolerates a tree holding zero records and
+    // gives up on the first one it finds. That is a volume the ROM cannot
+    // repair -- the blinking question mark after any exit that is not Shut Down.
+    // Every Apple-formatted volume of the era sits far inside this (an Apple
+    // 1.44 MB System disk gives the extents file 11,264 bytes, a 10 MB volume
+    // 81,920); a 2048-node file on 8 KB allocation blocks is 1,048,576, and
+    // 1048576/12 = 87381 does not fit. Halve the limit so the file may still
+    // double as the File Manager grows it before the ROM loses its reach.
+    const u32 repairableBlks = kRepairableExtentsBytes / alBlkSiz;
+    if (repairableBlks && clumpAllocBlks > repairableBlks)
+        clumpAllocBlks = repairableBlks;
+    if (clumpAllocBlks == 0) clumpAllocBlks = 1;
+    // The growth increment follows the file, so the first extension lands
+    // inside the budget too rather than adding the old multi-megabyte clump.
+    clump = clumpAllocBlks * alBlkSiz;
 
     const u32 extAllocBlks = clumpAllocBlks;
     const u32 catAllocBlks = clumpAllocBlks;

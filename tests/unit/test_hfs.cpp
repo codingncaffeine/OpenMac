@@ -175,3 +175,108 @@ TEST_CASE("formatVolume name handling: clamp to 27 chars and default empty") {
     std::vector<u8> b = hfs::formatVolume(4u * 1024 * 1024, "");
     CHECK(readVolumeName(b) == "Untitled");
 }
+
+// The Quadra's ROM rebuilds a volume that was not unmounted cleanly, and it
+// bounds its walk of the extents-overflow B*-tree by ceil(fileBytes / 12),
+// computed with a SIXTEEN-BIT divide ($4080F456). A quotient that does not fit
+// leaves the divide's destination untouched, the ceil answers 1, and the ROM
+// refuses any volume whose extents tree holds a single record -- which is
+// "the disk went corrupt and won't boot". The catalog's divisor is 70 and has
+// far more room, but it is the same arithmetic, so both are checked.
+TEST_CASE("formatVolume keeps the B*-trees inside the ROM's repair budget") {
+    for (u32 mb : {4u, 20u, 64u, 100u, 250u, 500u, 1000u, 2000u}) {
+        const u32 sizeBytes = mb * 1024u * 1024u;
+        std::vector<u8> img = hfs::formatVolume(sizeBytes, "Budget");
+        REQUIRE(img.size() == sizeBytes);
+        INFO("volume size = " << mb << " MB");
+        const u32 alBlkSiz = rd32(img, kMdbOff + 0x14);
+        const u32 xtFlSize = rd32(img, kMdbOff + 0x82);
+        const u32 ctFlSize = rd32(img, kMdbOff + 0x92);
+        const u32 xtClpSiz = rd32(img, kMdbOff + 0x4A);
+        INFO("alBlkSiz=" << alBlkSiz << " xtFlSize=" << xtFlSize
+                         << " ctFlSize=" << ctFlSize);
+        CHECK(xtFlSize > 0);
+        CHECK(ctFlSize > 0);
+        // The budget divides are DIVU.W: the quotient has to fit in 16 bits.
+        CHECK(xtFlSize / 12u < 65536u);
+        CHECK(ctFlSize / 70u < 65536u);
+        // A growth step must not put the tree straight back out of reach.
+        CHECK(xtClpSiz <= xtFlSize);
+        // Still whole allocation blocks, which is what makes the file mountable.
+        CHECK(xtFlSize % alBlkSiz == 0);
+        CHECK(ctFlSize % alBlkSiz == 0);
+    }
+}
+
+TEST_CASE("shrinkExtentsTree cuts an over-large extents tree, and only free nodes") {
+    // Build a volume the way the formatter used to: the extents file capped at
+    // the header node's map capacity, 2048 nodes, which on 8 KB allocation
+    // blocks is 1 MB and past what the ROM can walk.
+    const u32 sizeBytes = 500u * 1024u * 1024u;
+    std::vector<u8> img = hfs::formatVolume(sizeBytes, "Legacy");
+    const u32 alBlkSiz = rd32(img, kMdbOff + 0x14);
+    const u32 lpa = alBlkSiz / 512u;
+    const u32 oldBlks = (2048u / lpa);
+    const u32 oldBytes = oldBlks * alBlkSiz;
+    REQUIRE(oldBytes > hfs::kRepairableExtentsBytes);
+
+    // Widen the extents file back out by hand: size, extent, node count, free
+    // count, and the bitmap bits it would own.
+    const u32 xtStart = rd16(img, kMdbOff + 0x86);
+    const u32 alBlSt = rd16(img, kMdbOff + 0x1C);
+    const u32 newBlksWas = rd16(img, kMdbOff + 0x88);
+    const u32 freeWas = rd16(img, kMdbOff + 0x22);
+    auto put32 = [&](std::size_t off, u32 v) {
+        img[off] = u8(v >> 24); img[off + 1] = u8(v >> 16);
+        img[off + 2] = u8(v >> 8); img[off + 3] = u8(v);
+    };
+    auto put16 = [&](std::size_t off, u16 v) {
+        img[off] = u8(v >> 8); img[off + 1] = u8(v);
+    };
+    put32(kMdbOff + 0x82, oldBytes);
+    put16(kMdbOff + 0x88, u16(oldBlks));
+    put16(kMdbOff + 0x22, u16(freeWas - (oldBlks - newBlksWas)));
+    const std::size_t hdr = std::size_t(alBlSt) * 512u + std::size_t(xtStart) * alBlkSiz;
+    const u32 freeWasNodes = rd32(img, hdr + 40);
+    put32(hdr + 36, 2048u);
+    put32(hdr + 40, freeWasNodes + (2048u - newBlksWas * lpa));
+    for (u32 ab = xtStart + newBlksWas; ab < xtStart + oldBlks; ++ab)
+        img[3u * 512u + (ab >> 3)] |= u8(0x80u >> (ab & 7u));
+
+    // Now repair it.
+    std::string why;
+    std::vector<u8> before = img;
+    CHECK(hfs::shrinkExtentsTree(img, 0, sizeBytes, hfs::kRepairableExtentsBytes, why));
+    INFO(why);
+    const u32 xtNow = rd32(img, kMdbOff + 0x82);
+    CHECK(xtNow <= hfs::kRepairableExtentsBytes);
+    CHECK(xtNow / 12u < 65536u);
+    CHECK(xtNow == u32(rd16(img, kMdbOff + 0x88)) * alBlkSiz);
+    CHECK(rd32(img, hdr + 36) == xtNow / 512u);          // bthNNodes
+    CHECK(rd32(img, hdr + 36) > rd32(img, hdr + 40));    // some node still in use
+    CHECK(rd16(img, kMdbOff + 0x22) == freeWas);         // the blocks came back
+    // The freed allocation blocks are free in the bitmap again.
+    const u32 nowBlks = rd16(img, kMdbOff + 0x88);
+    for (u32 ab = xtStart + nowBlks; ab < xtStart + oldBlks; ++ab)
+        CHECK((img[3u * 512u + (ab >> 3)] & (0x80u >> (ab & 7u))) == 0);
+    // The alternate MDB moved with the primary.
+    CHECK(rd32(img, sizeBytes - 1024 + 0x82) == xtNow);
+
+    // Idempotent: a second pass has nothing to do and says nothing.
+    std::string again;
+    CHECK_FALSE(hfs::shrinkExtentsTree(img, 0, sizeBytes,
+                                       hfs::kRepairableExtentsBytes, again));
+    CHECK(again.empty());
+
+    // And it refuses when a node above the cut is in use, leaving the image
+    // byte-identical -- the whole reason it looks at the map at all.
+    std::vector<u8> live = before;
+    const u32 liveNode = 2000;
+    live[hdr + 248 + (liveNode >> 3)] |= u8(0x80u >> (liveNode & 7u));
+    std::vector<u8> untouched = live;
+    std::string refusal;
+    CHECK_FALSE(hfs::shrinkExtentsTree(live, 0, sizeBytes,
+                                       hfs::kRepairableExtentsBytes, refusal));
+    CHECK(refusal.find("left alone") != std::string::npos);
+    CHECK(live == untouched);
+}

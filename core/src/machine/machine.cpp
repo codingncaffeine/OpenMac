@@ -79,6 +79,7 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     scsi_->addTarget(cdrom_.get());   // detached until the front end attaches it
     scsi_->addTarget(netdev_.get());  // likewise
     netdev_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
+    cdrom_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     drive0_->installed = true;
     drive0_->image = &floppy_;
     drive1_->installed = false;

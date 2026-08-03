@@ -103,4 +103,33 @@ bool listVolume(const std::vector<u8>& img, std::vector<Item>& items);
 // cannot be resolved.
 bool readFork(const std::vector<u8>& img, u32 fileId, bool rsrc, std::vector<u8>& out);
 
+// ---- making an old volume repairable again -----------------------------
+//
+// When a volume was not unmounted cleanly the Quadra's ROM rebuilds it before
+// mounting, and it bounds its walk of the extents-overflow B*-tree by
+// ceil(fileBytes / 12) -- computed with a SIXTEEN-BIT divide. Past 12 * 65535
+// bytes that quotient does not fit, the divide leaves its destination
+// untouched, and the budget collapses to 1: the ROM then refuses any volume
+// whose extents tree holds even a single record. Volumes this formatter made
+// before 2026-08-03 have a 2048-node (1 MB) extents file and are over that
+// line, which is what "the disk went corrupt and won't boot" always was.
+//
+// shrinkExtentsTree cuts the extents file back to `maxBytes` IN PLACE, and only
+// ever gives back nodes the tree is not using: it refuses unless every node the
+// header node's allocation map marks in use lies below the new end. Everything
+// it touches -- drXTFlSize, drXTClpSiz, drXTExtRec, bthNNodes/bthFree in the
+// header node, the volume bitmap, drFreeBks, both MDBs -- moves together.
+//
+// `base` is where the volume starts inside `img` (0 for a bare volume, the
+// partition's offset inside a wrapped SCSI image). Returns true only when the
+// image was changed; `why` always says what happened, in words meant for a log
+// the user may read.
+bool shrinkExtentsTree(std::vector<u8>& img, u32 base, u32 volumeBytes,
+                       u32 maxBytes, std::string& why);
+
+// The largest extents-overflow file the ROM's rebuild can still walk, halved so
+// a volume may grow once more before it is out of reach. The formatter and the
+// repair share it, so there is one number and not two that can drift.
+constexpr u32 kRepairableExtentsBytes = 12u * 32768u;
+
 } // namespace openmac::hfs

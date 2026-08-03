@@ -7,9 +7,15 @@
 #include "openmac/machine.hpp"
 
 #include <cstdio>
+#include <functional>
 #include <string>
 
 namespace openmac::dbg {
+
+// Where a disassembly reads its words from. A machine's bus is one source; a
+// ROM image on the host is another, and so is a second machine that this
+// header knows nothing about.
+using ReadWord = std::function<u16(u32)>;
 
 // Name of an A-line trap ($Axxx), or nullptr if unknown.
 const char* trapName(u16 opcode);
@@ -40,6 +46,11 @@ void dumpLowMem(Machine& mac, std::FILE* out);
 // Disassemble one instruction at `pc`. Appends the text to `out` and returns
 // the instruction length in bytes (>= 2). Reads through the machine bus.
 int disasm(Machine& mac, u32 pc, std::string& out);
+
+// The same, reading words from anywhere -- another machine's bus, or a ROM
+// image sitting in host memory. Addresses print at their natural width, so a
+// ROM mapped at $40800000 reads as itself.
+int disasm(const ReadWord& readWord, u32 pc, std::string& out);
 
 // Hex + ASCII dump of `len` bytes at `addr`.
 void dumpMem(Machine& mac, u32 addr, u32 len, std::FILE* out);

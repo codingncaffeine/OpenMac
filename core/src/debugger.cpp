@@ -286,11 +286,21 @@ void dumpLowMem(Machine& mac, std::FILE* out) {
 namespace {
 
 struct Cursor {
-    Machine& mac;
+    const ReadWord& rd;
     u32 p;
-    u16 word() { const u16 v = mac.read16(p); p += 2; return v; }
-    u32 lng()  { const u32 v = (u32(mac.read16(p)) << 16) | mac.read16(p + 2); p += 4; return v; }
+    u16 word() { const u16 v = rd(p); p += 2; return v; }
+    u32 lng()  { const u32 v = (u32(rd(p)) << 16) | rd(p + 2); p += 4; return v; }
 };
+
+// An address as a listing writes it. The 68000-era machines live below 16 MB
+// and read best in six digits; a Quadra's ROM sits at $40800000, and masking
+// that to 24 bits turns every branch target into a different address. So the
+// width follows the value instead of the era.
+std::string hexAddr(u32 a) {
+    char b[16];
+    std::snprintf(b, sizeof b, a <= 0xFFFFFFu ? "$%06X" : "$%08X", a);
+    return b;
+}
 
 const char* kSizes[] = {".b", ".w", ".l"};
 const char* kCond[] = {"T","F","HI","LS","CC","CS","NE","EQ",
@@ -301,6 +311,77 @@ std::string disp16(u16 v) {
     char b[16];
     const int d = static_cast<int16_t>(v);
     std::snprintf(b, sizeof b, "%s$%04X", d < 0 ? "-" : "", d < 0 ? -d : d);
+    return b;
+}
+
+// An indexed operand: (d8,An,Xn) in the 68000's brief form, or the 68020's
+// full format, which the Mac's own system software uses freely (a driver
+// dispatching through `JSR ([$0174,A5])` is one word longer than the brief
+// form). Getting the LENGTH wrong is worse than getting the text wrong: the
+// listing silently loses alignment and every instruction after it is fiction.
+//
+// Reference: M68000PRM 2.2, "Effective Address Encoding Summary".
+std::string extended(Cursor& c, const char* base) {
+    // For a PC-relative operand the displacement is counted from the extension
+    // word itself, and resolving it here is what makes a ROM listing readable:
+    // an address you have to add by hand is a branch you will misread.
+    const bool pcRel = base[0] == 'P';
+    const u32 pcBase = c.p;
+    const u16 ext = c.word();
+    char b[96];
+    char idx[24];
+    std::snprintf(idx, sizeof idx, "%c%d%s%s", (ext & 0x8000) ? 'A' : 'D',
+                  (ext >> 12) & 7, (ext & 0x0800) ? ".l" : ".w",
+                  ((ext >> 9) & 3) ? (((ext >> 9) & 3) == 1 ? "*2"
+                                      : ((ext >> 9) & 3) == 2 ? "*4" : "*8")
+                                   : "");
+    if (!(ext & 0x0100)) {                       // brief format, one word
+        const s32 d8 = static_cast<int8_t>(ext & 0xFF);
+        if (pcRel)
+            std::snprintf(b, sizeof b, "%s(PC,%s)",
+                          hexAddr(pcBase + static_cast<u32>(d8)).c_str(), idx);
+        else
+            std::snprintf(b, sizeof b, "%s(%s,%s)",
+                          disp16(static_cast<u16>(d8)).c_str(), base, idx);
+        return b;
+    }
+    // Full format. The extension words that follow are a base displacement of
+    // 0/1/2 words (bits 5-4) and then an outer displacement of 0/1/2 (bits
+    // 2-0), and both have to be consumed whether or not they are printed.
+    const int bdSize = (ext >> 4) & 3;
+    const int iis = ext & 7;
+    const bool baseSup = (ext & 0x0080) != 0, indexSup = (ext & 0x0040) != 0;
+    s32 bd = 0;
+    if (bdSize == 2) bd = static_cast<int16_t>(c.word());
+    else if (bdSize == 3) bd = static_cast<s32>(c.lng());
+    s32 od = 0;
+    const int odSize = indexSup ? iis & 3 : (iis & 3);
+    const bool memIndirect = (iis & 7) != 0;
+    if (memIndirect) {
+        if (odSize == 2) od = static_cast<int16_t>(c.word());
+        else if (odSize == 3) od = static_cast<s32>(c.lng());
+    }
+    char inner[80];
+    // Postindexed puts the index outside the indirection; preindexed inside.
+    const bool post = !indexSup && (iis & 4) != 0;
+    if (pcRel && !baseSup)
+        std::snprintf(inner, sizeof inner, "%s(PC)%s%s",
+                      hexAddr(pcBase + static_cast<u32>(bd)).c_str(),
+                      (indexSup || post) ? "" : ",", (indexSup || post) ? "" : idx);
+    else
+        std::snprintf(inner, sizeof inner, "%s%s%s%s",
+                      bd ? disp16(static_cast<u16>(bd)).c_str() : "",
+                      baseSup ? "" : base,
+                      (indexSup || post) ? "" : ",",
+                      (indexSup || post) ? "" : idx);
+    if (!memIndirect)
+        std::snprintf(b, sizeof b, "(%s)", inner);
+    else if (post)
+        std::snprintf(b, sizeof b, "([%s],%s%s%s)", inner, idx,
+                      od ? "," : "", od ? disp16(static_cast<u16>(od)).c_str() : "");
+    else
+        std::snprintf(b, sizeof b, "([%s]%s%s)", inner, od ? "," : "",
+                      od ? disp16(static_cast<u16>(od)).c_str() : "");
     return b;
 }
 
@@ -320,28 +401,22 @@ std::string ea(Cursor& c, int mode, int reg, int size) {
         case 4: std::snprintf(b, sizeof b, "-(A%d)", reg); break;
         case 5: { const std::string d = disp16(c.word());
                   std::snprintf(b, sizeof b, "%s(A%d)", d.c_str(), reg); break; }
-        case 6: { const u16 ext = c.word();
-                  std::snprintf(b, sizeof b, "$%02X(A%d,%c%d%s)",
-                                static_cast<unsigned>(ext & 0xFF), reg,
-                                (ext & 0x8000) ? 'A' : 'D', (ext >> 12) & 7,
-                                (ext & 0x0800) ? ".l" : ".w"); break; }
+        case 6: { char an[8];
+                  std::snprintf(an, sizeof an, "A%d", reg);
+                  return extended(c, an); }
         case 7:
             switch (reg) {
-                case 0: std::snprintf(b, sizeof b, "$%06X",
-                                      static_cast<u32>(static_cast<int16_t>(c.word())) & 0xFFFFFFu);
+                // Absolute short sign-extends: $8000..$FFFF names the top of
+                // the address space, which is where low memory's mirrors and
+                // the I/O page live on these machines.
+                case 0: std::snprintf(b, sizeof b, "%s.W",
+                                      hexAddr(static_cast<u32>(static_cast<int16_t>(c.word()))).c_str());
                         break;
-                case 1: std::snprintf(b, sizeof b, "$%06X", c.lng() & 0xFFFFFFu); break;
+                case 1: std::snprintf(b, sizeof b, "%s", hexAddr(c.lng()).c_str()); break;
                 case 2: { const u32 base = c.p;
-                          const u32 t = (base + static_cast<u32>(static_cast<int16_t>(c.word())))
-                                        & 0xFFFFFFu;
-                          std::snprintf(b, sizeof b, "$%06X(PC)", t); break; }
-                case 3: { const u32 base = c.p;
-                          const u16 ext = c.word();
-                          const u32 t = (base + static_cast<u32>(static_cast<int8_t>(ext & 0xFF)))
-                                        & 0xFFFFFFu;
-                          std::snprintf(b, sizeof b, "$%06X(PC,%c%d%s)", t,
-                                        (ext & 0x8000) ? 'A' : 'D', (ext >> 12) & 7,
-                                        (ext & 0x0800) ? ".l" : ".w"); break; }
+                          const u32 t = base + static_cast<u32>(static_cast<int16_t>(c.word()));
+                          std::snprintf(b, sizeof b, "%s(PC)", hexAddr(t).c_str()); break; }
+                case 3: return extended(c, "PC");
                 case 4:
                     if (size == 2) std::snprintf(b, sizeof b, "#$%08X", c.lng());
                     else if (size == 0) std::snprintf(b, sizeof b, "#$%02X", c.word() & 0xFF);
@@ -386,7 +461,12 @@ std::string regList(u16 mask, bool predec) {
 // is a line of the routine under investigation that has to be decoded by hand,
 // and every one of those is a chance to misread a branch.
 int disasm(Machine& mac, u32 pc, std::string& out) {
-    Cursor c{mac, pc};
+    const ReadWord rd = [&mac](u32 a) { return mac.read16(a); };
+    return disasm(rd, pc, out);
+}
+
+int disasm(const ReadWord& rd, u32 pc, std::string& out) {
+    Cursor c{rd, pc};
     const u16 op = c.word();
     char buf[128];
     const int mode = (op >> 3) & 7, reg = op & 7;
@@ -519,8 +599,9 @@ int disasm(Machine& mac, u32 pc, std::string& out) {
             const int cond = (op >> 8) & 15;
             if (mode == 1) {                        // DBcc
                 const u32 base = c.p;
-                const u32 t = (base + static_cast<u32>(static_cast<int16_t>(c.word()))) & 0xFFFFFFu;
-                std::snprintf(buf, sizeof buf, "DB%-6s D%d,$%06X", kCond[cond], reg, t);
+                const u32 t = base + static_cast<u32>(static_cast<int16_t>(c.word()));
+                std::snprintf(buf, sizeof buf, "DB%-6s D%d,%s", kCond[cond], reg,
+                              hexAddr(t).c_str());
                 emit(buf);
             } else {
                 char nm[12];
@@ -542,8 +623,9 @@ int disasm(Machine& mac, u32 pc, std::string& out) {
         int d = static_cast<int8_t>(op & 0xFF);
         const u32 base = c.p;
         if ((op & 0xFF) == 0x00) d = static_cast<int16_t>(c.word());
-        std::snprintf(buf, sizeof buf, "%-8s $%06X", bcc[(op >> 8) & 0xF],
-                      (base + static_cast<u32>(d)) & 0xFFFFFFu);
+        else if ((op & 0xFF) == 0xFF) d = static_cast<int32_t>(c.lng());   // 68020+ long form
+        std::snprintf(buf, sizeof buf, "%-8s %s", bcc[(op >> 8) & 0xF],
+                      hexAddr(base + static_cast<u32>(d)).c_str());
         emit(buf);
         break;
     }

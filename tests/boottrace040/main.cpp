@@ -3,6 +3,7 @@
 // access log, and a BMP of the framebuffer. The terminal debugger that
 // carries the board bring-up, as boottrace carried the Classic's.
 
+#include <openmac/debugger.hpp>
 #include <openmac/hfs.hpp>
 #include <openmac/quadra.hpp>
 
@@ -544,7 +545,7 @@ int main(int argc, char** argv) {
     int hdTrace = 0;                // --hd-trace N: log N disk requests in order
     bool doShutdown = false;        // --shutdown: flush+unmount before saving
     int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
-    bool noCleanFix = false;        // --no-clean-fix: reproduce the dirty-volume refusal
+    bool noVolumeRepair = false;        // --no-volume-repair: reproduce the dirty-volume refusal
     const char* hd2Path = nullptr;  // --harddisk2 FILE: an existing image on seat 2
     std::string dropBoxDir;         // --dropbox DIR: serve DIR on the second seat
     std::string dropBoxAdd;         // --dropbox-add FILE: drop FILE in at republish time
@@ -584,6 +585,16 @@ int main(int argc, char** argv) {
     // or a hand disassembly of a whole routine.
     struct DumpRange { u32 lo, hi; const char* path; };
     std::vector<DumpRange> dumpRanges;
+    // --disasm ADDR N: N instructions at ADDR, off the power-on bus, then
+    // exit. Reading this ROM by hand out of a hex dump is how three sessions
+    // in a row mis-decoded a branch; a listing is not a luxury here.
+    u32 disasmAt = 0;
+    int disasmCount = 0;
+    // --disasm-live ADDR N: the same listing, taken at the END of a run, so a
+    // driver the System loaded into RAM can be read. The ROM is the same either
+    // way; guest code is only there once the guest has put it there.
+    u32 disasmLiveAt = 0;
+    int disasmLiveCount = 0;
     // --io-trace FROM TO PCLO PCHI BUDGET: every device access a range of
     // code makes in a frame window. The PC filter is what makes it readable:
     // the ROM's own interrupt traffic drowns a driver's few dozen accesses.
@@ -594,6 +605,17 @@ int main(int argc, char** argv) {
     int trailCount = 0;
     u32 fpTrailPc = 0;              // --fp-trail <pc> <n>: FP ops before a PC
     int fpTrailCount = 40;
+    // --fault-trail N: the last N instructions BEFORE an access fault, with
+    // registers. --trail runs forward from an address you already suspect;
+    // when a register is wrong by the time it faults, the question is where it
+    // turned over, and that is behind the fault, not in front of it.
+    int faultTrail = 0;
+    int faultTrailSites = 1;        // --fault-trail N SITES
+    // --back-trail PC N [SITES]: the same ring, dumped when execution reaches
+    // an address instead of when it faults. "Which of the six branches into
+    // this error exit was taken" is a question only the road in can answer.
+    u32 backTrailPc = 0;
+    int backTrailSites = 1;
     unsigned long breakPc = 0;
     int breakSkip = 0;
     unsigned long traceFrom = 0;
@@ -722,6 +744,15 @@ int main(int argc, char** argv) {
             fpTrailPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             fpTrailCount = std::atoi(argv[++i]);
         }
+        else if (a == "--fault-trail" && i + 1 < argc) {
+            faultTrail = std::atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') faultTrailSites = std::atoi(argv[++i]);
+        }
+        else if (a == "--back-trail" && i + 2 < argc) {
+            backTrailPc = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            faultTrail = std::atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') backTrailSites = std::atoi(argv[++i]);
+        }
         else if (a == "--io-trace" && i + 5 < argc) {
             ioTrace = true;
             ioFrom = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
@@ -735,6 +766,14 @@ int main(int argc, char** argv) {
             const u32 hi = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             dumpRanges.push_back({lo, hi, argv[++i]});
         }
+        else if (a == "--disasm" && i + 2 < argc) {
+            disasmAt = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            disasmCount = std::atoi(argv[++i]);
+        }
+        else if (a == "--disasm-live" && i + 2 < argc) {
+            disasmLiveAt = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            disasmLiveCount = std::atoi(argv[++i]);
+        }
         else if (a == "--trace-traps" && i + 2 < argc) {
             trapsAfterCdbs = std::atoi(argv[++i]);
             traceTraps = std::atoi(argv[++i]);
@@ -747,7 +786,7 @@ int main(int argc, char** argv) {
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
         else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
         else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
-        else if (a == "--no-clean-fix") noCleanFix = true;
+        else if (a == "--no-volume-repair") noVolumeRepair = true;
         else if (a == "--dropbox-add" && i + 1 < argc) dropBoxAdd = argv[++i];
         else if (a == "--dropbox-rounds" && i + 1 < argc) dropBoxRounds = std::atoi(argv[++i]);
         else if (a == "--dropbox-republish" && i + 1 < argc)
@@ -861,6 +900,24 @@ int main(int argc, char** argv) {
     QuadraMachine::Config cfg;
     cfg.ramSize = static_cast<u32>(ramMb) * 1024u * 1024u;
     QuadraMachine mac(std::move(rom), cfg);
+    auto listing = [&mac](u32 at, int count) {
+        const dbg::ReadWord rd = [&mac](u32 a) { return mac.read16(a); };
+        u32 pc = at;
+        for (int n = 0; n < count; ++n) {
+            std::string text;
+            const int len = dbg::disasm(rd, pc, text);
+            std::printf("%08X  ", pc);
+            for (int w = 0; w < 5; ++w)
+                if (w * 2 < len) std::printf("%04X ", mac.read16(pc + u32(w) * 2));
+                else std::printf("     ");
+            std::printf(" %s\n", text.c_str());
+            pc += static_cast<u32>(len);
+        }
+    };
+    if (disasmCount > 0) {
+        listing(disasmAt, disasmCount);
+        return 0;
+    }
     int cdbCount = 0;
     int flushCount = 0;
     mac.onDiag = [&](const char* m) {
@@ -895,6 +952,27 @@ int main(int argc, char** argv) {
         if (vramBudget > 0) {
             --vramBudget;
             std::printf("VRAM W off=%06X pc=%08X\n", off, pc);
+        }
+    };
+    // --fault-trail: every instruction goes into a ring, and the ring prints
+    // when the access fault happens. The ROM probes memory it knows may be bad
+    // and catches the fault itself, so a fault is not automatically a failure
+    // -- what the ring answers is where the register the faulting instruction
+    // indexes off last held a sane value.
+    struct FaultStep { u32 pc, d0, d1, a0, a1, a2, a6, sp; u16 sr; };
+    auto faultRing = std::make_shared<std::vector<FaultStep>>();
+    auto faultRingPos = std::make_shared<std::size_t>(0);
+    int faultTrailsLeft = faultTrailSites;
+    auto dumpFaultRing = [&](const char* what, u32 pc, u32 addr) {
+        std::printf("-- %s: %zu instructions into %08X (addr %08X, frame %u), "
+                    "oldest first --\n", what, faultRing->size(), pc, addr,
+                    static_cast<unsigned>(mac.frameCount()));
+        for (std::size_t k = 0; k < faultRing->size(); ++k) {
+            const FaultStep& s = (*faultRing)[(*faultRingPos + k) % faultRing->size()];
+            if (!s.pc) continue;      // ring not full yet
+            std::printf("X %08X d0=%08X d1=%08X a0=%08X a1=%08X a2=%08X "
+                        "a6=%08X sp=%08X sr=%04X\n",
+                        s.pc, s.d0, s.d1, s.a0, s.a1, s.a2, s.a6, s.sp, s.sr);
         }
     };
     std::map<u32, int> busErrSites;
@@ -1070,6 +1148,11 @@ int main(int argc, char** argv) {
                 std::printf("BUSERR pc=%08X addr=%08X f=%u\n", pc,
                             mac.cpu().lastFaultAddr,
                             static_cast<unsigned>(mac.frameCount()));
+            if (faultTrail > 0 && !backTrailPc && faultTrailsLeft > 0 &&
+                static_cast<int>(mac.frameCount()) >= watchFrom) {
+                --faultTrailsLeft;
+                dumpFaultRing("fault trail", pc, mac.cpu().lastFaultAddr);
+            }
             // The first fault from RAM code (not the ROM's deliberate sizing
             // probes) gets its recent-PC trail: the jump that landed in the
             // weeds is a few entries back, and the trail names the caller.
@@ -1134,7 +1217,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cannot read disk: %s\n", hdPath);
             return 2;
         }
-        mac.suppressCleanFix = noCleanFix;
+        mac.suppressVolumeRepair = noVolumeRepair;
         mac.suppressHdAnnounce = noAnnounce;
         mac.insertHardDisk(std::move(hd));
         std::printf("hd: attached\n");
@@ -1184,8 +1267,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         mac.attachCdRom(true, 3);
-        mac.insertCd(std::move(cd));
-        std::printf("cd: attached (id 3)\n");
+        if (!mac.insertCd(std::move(cd))) {
+            std::fprintf(stderr, "cd: the drive refused that file\n");
+            return 2;
+        }
     }
 
     if (traceFrom) {
@@ -1291,7 +1376,20 @@ int main(int argc, char** argv) {
     // an address in the frame window. A watch says a routine was entered
     // with these registers; this says where it went -- which is the question
     // when a call does not come back.
-    if (trailPc) {
+    if (faultTrail > 0) {
+        faultRing->resize(static_cast<std::size_t>(faultTrail));
+        mac.cpu().onStep = [&, faultRing, faultRingPos](u32 pc) {
+            const M68040& c = mac.cpu();
+            (*faultRing)[*faultRingPos] = {pc, c.d[0], c.d[1], c.a[0], c.a[1],
+                                           c.a[2], c.a[6], c.a[7], c.getSR()};
+            *faultRingPos = (*faultRingPos + 1) % faultRing->size();
+            if (pc == backTrailPc && backTrailSites > 0 &&
+                static_cast<int>(mac.frameCount()) >= watchFrom) {
+                --backTrailSites;
+                dumpFaultRing("back trail", pc, 0);
+            }
+        };
+    } else if (trailPc) {
         int left = trailCount;
         bool armed = false;
         mac.cpu().onStep = [&, left, armed](u32 pc) mutable {
@@ -1487,6 +1585,11 @@ int main(int argc, char** argv) {
         std::printf("\n-- bus-error sites --\n");
         for (const auto& [pc, n] : busErrSites)
             std::printf("  pc %08X x%d\n", pc, n);
+    }
+
+    if (disasmLiveCount > 0) {
+        std::printf("\n-- listing at %08X --\n", disasmLiveAt);
+        listing(disasmLiveAt, disasmLiveCount);
     }
 
     const M68040& c = mac.cpu();

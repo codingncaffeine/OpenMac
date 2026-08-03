@@ -1,10 +1,13 @@
 #include "openmac/quadra.hpp"
 
+#include "openmac/hfs.hpp"
+
 #include "../adb.hpp"
 #include "../dc42.hpp"
 #include "../macbinary.hpp"
 #include "../rtc.hpp"
 #include "../scsi.hpp"
+#include "../cdmedia.hpp"
 #include "../scsicd.hpp"
 #include "../scsiimage.hpp"
 #include "../scsinet.hpp"
@@ -224,6 +227,15 @@ void QuadraMachine::wireDevices() {
     };
 
     netdev_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
+    // With the PC: whether a command came from the ROM's boot scan or from a
+    // driver in RAM is the first question about a disc that will not mount,
+    // and the target itself cannot know.
+    cdrom_->onDiag = [this](const char* m) {
+        if (!onDiag) return;
+        char b[220];
+        std::snprintf(b, sizeof b, "%s (pc %08X)", m, cpu_.pc);
+        onDiag(b);
+    };
 
     cpu_.onResetInstruction = [this] {
         via1_->reset();
@@ -1554,10 +1566,12 @@ void QuadraMachine::announceHardDisks() {
 // Closing the host application is, to the guest, having its power cut. The
 // System marks a volume "in use" on its disk the moment it mounts it for
 // writing and only clears that mark on unmount, so a machine that is simply
-// switched off leaves every volume flagged unclean -- and this ROM refuses
-// such a volume at boot (it tests vcbAtrb bit 8 at $4080F814 and diverts,
-// which is the blinking question mark). Worse, blocks the System is still
-// holding in its cache never reach the image at all.
+// switched off leaves every volume flagged unclean, and blocks the System is
+// still holding in its cache never reach the image at all.
+//
+// The flag itself is not a problem -- this ROM rebuilds an unclean volume and
+// mounts it, the way a real Macintosh does (see hfs::shrinkExtentsTree for the
+// one thing that used to stop it). The lost cache blocks are.
 //
 // So do what Special > Shut Down does, on the way out: flush each mounted
 // volume and unmount it. The guest's own File Manager writes its cached
@@ -2291,23 +2305,28 @@ void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hfsImageOffset_ = static_cast<u32>(scsiImage_.size() - hd_.size());
     disk_->attach(&scsiImage_, 0);
     disk_->readOnly = readOnly;
-    // A volume still flagged "in use" is one whose machine stopped without
-    // unmounting it -- a crash, a kill, the host losing power. This ROM
-    // refuses such a volume at boot, and a refused volume never mounts, so it
-    // can never be marked clean again either: one bad exit and the disk is
-    // bricked for good. Clear the flag as it goes in.
+    // A volume left flagged "in use" is one whose machine stopped without
+    // unmounting it -- a crash, a kill, the host losing power. That is not a
+    // damaged volume and a real Macintosh mounts it: this ROM rebuilds it first
+    // (recounting the catalog and remaking the bitmap), then puts up System
+    // 7.5's "may not have been shut down properly" notice.
     //
-    // Nothing is being papered over. Every write the guest issued has been in
-    // this image since the moment it was issued -- the driver serves them
-    // straight into it -- so what is on the host is the volume as the guest
-    // last left it. What a crash loses is whatever the System had not written
-    // yet, and no flag can bring that back. A real Macintosh mounts the disk
-    // in exactly this state and lets Disk First Aid look at it afterwards;
-    // refusing to start is the one behaviour that is not authentic.
-    if (!readOnly && !suppressCleanFix &&
-        markVolumeCleanIn(scsiImage_, hfsImageOffset_,
-                          static_cast<u32>(hd_.size())) && onDiag)
-        onDiag("hd: volume was left mounted by a previous run -- marked clean");
+    // What it cannot do is rebuild a volume whose extents-overflow B*-tree is
+    // bigger than its own budget arithmetic can measure -- see
+    // hfs::shrinkExtentsTree. Volumes this formatter made before 2026-08-03 are
+    // all over that line, which is why one bad exit used to leave a disk that
+    // would never boot again. Put them back inside it, once, in place, giving
+    // back only nodes the tree is not using.
+    if (!readOnly && !suppressVolumeRepair) {
+        std::string why;
+        const bool changed =
+            hfs::shrinkExtentsTree(scsiImage_, hfsImageOffset_,
+                                   static_cast<u32>(hd_.size()),
+                                   hfs::kRepairableExtentsBytes, why);
+        if (onDiag && !why.empty())
+            onDiag((std::string("hd: ") + why).c_str());
+        (void)changed;
+    }
     hdAnnouncePending_ = true;
     hdAnnounceDelay_ = 0;
     hdMountTries_ = 0;
@@ -2333,6 +2352,16 @@ void QuadraMachine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     hfsImageOffset2_ = static_cast<u32>(scsiImage2_.size() - hd2_.size());
     disk2_->attach(&scsiImage2_, 1);
     disk2_->readOnly = readOnly;
+    // The same repair the boot disk gets: a volume put on this seat may be an
+    // old image of the user's too, and it will be mounted by the same ROM.
+    if (!readOnly && !suppressVolumeRepair) {
+        std::string why;
+        hfs::shrinkExtentsTree(scsiImage2_, hfsImageOffset2_,
+                               static_cast<u32>(hd2_.size()),
+                               hfs::kRepairableExtentsBytes, why);
+        if (onDiag && !why.empty())
+            onDiag((std::string("hd2: ") + why).c_str());
+    }
     hd2AnnouncePending_ = true;
     hdAnnounceDelay_ = 0;
     // The try counter is a give-up for one disk's announcement, not a budget
@@ -2358,10 +2387,28 @@ const std::vector<u8>& QuadraMachine::hardDisk2Image() const {
 
 void QuadraMachine::attachCdRom(bool attached, int busId) {
     cdrom_->setAttached(attached, busId);
+    if (onDiag) {
+        char b[64];
+        std::snprintf(b, sizeof b, "cd: drive %s (SCSI ID %d)",
+                      attached ? "attached" : "detached", busId & 7);
+        onDiag(b);
+    }
 }
 bool QuadraMachine::cdRomAttached() const { return cdrom_->attachedState(); }
+// The Classic has peeled CD containers since its drive was built; this seat
+// never did, so a raw-sector .bin went in with its 2352-byte framing still on
+// it, and a file the drive cannot serve was accepted in silence. Same code and
+// same words on both machines now.
 int QuadraMachine::insertCd(std::vector<u8> image) {
-    cdrom_->insert(std::move(image));
+    cd::Medium m = cd::normalize(std::move(image));
+    if (onDiag) {
+        char b[240];
+        std::snprintf(b, sizeof b, "cd: %s%s", m.ok ? "inserted -- " : "refused: ",
+                      m.desc);
+        onDiag(b);
+    }
+    if (!m.ok) return 0;
+    cdrom_->insert(std::move(m.data));
     return 1;
 }
 void QuadraMachine::ejectCd() { cdrom_->eject(); }

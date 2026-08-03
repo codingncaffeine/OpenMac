@@ -185,11 +185,11 @@ public:
     // Diagnosis switch: skip the injected mount/announce of hard disks, to
     // separate "our injection perturbs the boot" from everything else.
     bool suppressHdAnnounce = false;
-    // Diagnosis switch: do NOT clear a volume's "left mounted" flag as it goes
-    // in. That clearing is a workaround for this ROM refusing a volume a real
-    // Macintosh mounts (it scavenges and warns instead), and the workaround is
-    // what makes the refusal impossible to study. Set this to reproduce it.
-    bool suppressCleanFix = false;
+    // Diagnosis switch: attach a volume exactly as the file holds it, with no
+    // repair pass. Set this to reproduce what an old, over-large extents tree
+    // does to the ROM's rebuild -- the refusal is invisible once the volume has
+    // been put back inside the ROM's reach.
+    bool suppressVolumeRepair = false;
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }
     std::function<void(const char* msg)> onDiag;
