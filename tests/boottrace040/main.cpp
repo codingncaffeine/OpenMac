@@ -544,6 +544,7 @@ int main(int argc, char** argv) {
     int hdTrace = 0;                // --hd-trace N: log N disk requests in order
     bool doShutdown = false;        // --shutdown: flush+unmount before saving
     int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
+    bool noCleanFix = false;        // --no-clean-fix: reproduce the dirty-volume refusal
     const char* hd2Path = nullptr;  // --harddisk2 FILE: an existing image on seat 2
     std::string dropBoxDir;         // --dropbox DIR: serve DIR on the second seat
     std::string dropBoxAdd;         // --dropbox-add FILE: drop FILE in at republish time
@@ -746,6 +747,7 @@ int main(int argc, char** argv) {
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
         else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
         else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
+        else if (a == "--no-clean-fix") noCleanFix = true;
         else if (a == "--dropbox-add" && i + 1 < argc) dropBoxAdd = argv[++i];
         else if (a == "--dropbox-rounds" && i + 1 < argc) dropBoxRounds = std::atoi(argv[++i]);
         else if (a == "--dropbox-republish" && i + 1 < argc)
@@ -1132,6 +1134,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cannot read disk: %s\n", hdPath);
             return 2;
         }
+        mac.suppressCleanFix = noCleanFix;
         mac.suppressHdAnnounce = noAnnounce;
         mac.insertHardDisk(std::move(hd));
         std::printf("hd: attached\n");
@@ -1301,10 +1304,13 @@ int main(int argc, char** argv) {
             }
             if (left-- <= 0) return;
             const M68040& c = mac.cpu();
+            // A6 is in here because a garbage frame pointer is a whole class of
+            // fault on its own, and a trail that omits the register the faulting
+            // instruction indexes off cannot show you the moment it went bad.
             std::printf("T %08X d0=%08X d1=%08X a0=%08X a1=%08X a2=%08X "
-                        "sp=%08X sr=%04X\n",
-                        pc, c.d[0], c.d[1], c.a[0], c.a[1], c.a[2], c.a[7],
-                        c.getSR());
+                        "a6=%08X sp=%08X sr=%04X\n",
+                        pc, c.d[0], c.d[1], c.a[0], c.a[1], c.a[2], c.a[6],
+                        c.a[7], c.getSR());
         };
     } else if (fpTrailPc) {
         // --fp-trail <pc> <n>: the last n FLOATING-POINT instructions before

@@ -2304,8 +2304,9 @@ void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     // yet, and no flag can bring that back. A real Macintosh mounts the disk
     // in exactly this state and lets Disk First Aid look at it afterwards;
     // refusing to start is the one behaviour that is not authentic.
-    if (!readOnly && markVolumeCleanIn(scsiImage_, hfsImageOffset_,
-                                       static_cast<u32>(hd_.size())) && onDiag)
+    if (!readOnly && !suppressCleanFix &&
+        markVolumeCleanIn(scsiImage_, hfsImageOffset_,
+                          static_cast<u32>(hd_.size())) && onDiag)
         onDiag("hd: volume was left mounted by a previous run -- marked clean");
     hdAnnouncePending_ = true;
     hdAnnounceDelay_ = 0;
