@@ -270,6 +270,8 @@ public:
     }
     bool vblIntEnabled() const { return vblEnabled_; }
     u32 swatchReg(int i) const { return swatch_[i & 63]; }
+    u32 ctlReg(int i) const { return regs_[i & 63]; }
+    u64 clockStream() const { return clockShift_; }
     std::function<void(bool level)> onIrq;
     std::function<void(const char* msg)> onDiag;
 

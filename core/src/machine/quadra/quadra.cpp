@@ -344,8 +344,16 @@ std::string QuadraMachine::diagnosticReport() const {
     {
         // The swatch's horizontal and vertical timing: what the ROM programmed
         // from the monitor it sensed, and where the geometry above comes from.
-        std::string t = "   swatch";
+        std::string t = "   dafbreg";
+        (void)0;
         char one[32];
+        for (u32 r : {0x00u, 0x04u, 0x08u, 0x0Cu, 0x10u, 0x14u, 0x18u, 0x24u, 0x28u}) {
+            std::snprintf(one, sizeof one, " %02X=%X", r, dafb_->ctlReg(static_cast<int>(r >> 2)));
+            t += one;
+        }
+        s += t;
+        s += '\n';
+        t = "   swatch";
         for (u32 r : {0x40u, 0x44u, 0x48u, 0x4Cu, 0x54u, 0x58u, 0x5Cu, 0x60u}) {
             std::snprintf(one, sizeof one, " %02X=%03X", r,
                           dafb_->swatchReg(static_cast<int>(r >> 2)));
