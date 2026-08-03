@@ -1308,6 +1308,17 @@ void QuadraMachine::serveDiskPrime(int unit) {
         }
     }
     if (trap & 1) ++hdWriteCount_; else ++hdReadCount_;
+    // Every request the volume's own driver makes, in order. Two boots of the
+    // same disk that diverge are best compared here: this is what the guest
+    // asked the medium for, before any interpretation.
+    if (onDiag && hdTraceBudget_ > 0) {
+        --hdTraceBudget_;
+        char b[128];
+        std::snprintf(b, sizeof b, "HDIO %s pos=%u(blk %u) req=%u -> %u err=%d",
+                      (trap & 1) ? "write" : "read ", pos, pos / 512, req, done,
+                      result);
+        onDiag(b);
+    }
     if (result != 0 && onDiag && hdErrBudget_ > 0) {
         --hdErrBudget_;
         char b[128];
@@ -1470,6 +1481,100 @@ void QuadraMachine::announceHardDisks() {
     if (hdMountTries_ >= 15) { hdAnnouncePending_ = hd2AnnouncePending_ = false; }
     for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     announceInFlight_ = false;
+}
+
+// Closing the host application is, to the guest, having its power cut. The
+// System marks a volume "in use" on its disk the moment it mounts it for
+// writing and only clears that mark on unmount, so a machine that is simply
+// switched off leaves every volume flagged unclean -- and this ROM refuses
+// such a volume at boot (it tests vcbAtrb bit 8 at $4080F814 and diverts,
+// which is the blinking question mark). Worse, blocks the System is still
+// holding in its cache never reach the image at all.
+//
+// So do what Special > Shut Down does, on the way out: flush each mounted
+// volume and unmount it. The guest's own File Manager writes its cached
+// blocks through our driver -- which we serve synchronously, so everything
+// has landed in the image by the time this returns -- and sets the clean
+// mark itself. Nothing is faked: the flag is set by the code that owns it.
+// Record in the image that a volume is consistent on disk. drAtrb bit 8 says
+// "this volume was unmounted cleanly", which is the File Manager's way of
+// promising that nothing it was holding is missing from the medium. After a
+// _FlushVol that returned noErr, and with the machine about to be destroyed,
+// that promise is simply true -- the flush is what makes it true, and this
+// only writes it down. The startup volume cannot be unmounted (its System
+// file is open), so there is no other way for the guest to state it.
+//
+// Both copies of the MDB are updated, as a real unmount does: block 2 and the
+// alternate in the second-to-last block of the volume.
+bool QuadraMachine::markVolumeClean(u16 drive) {
+    const int unit = drive == 4 ? 0 : 1;
+    std::vector<u8>& backing = unit ? scsiImage2_ : scsiImage_;
+    const u32 base = unit ? hfsImageOffset2_ : hfsImageOffset_;
+    const std::vector<u8>& img = unit ? hd2_ : hd_;
+    if (backing.empty() || img.empty()) return false;
+    if ((unit ? false : hdRO_)) return false;
+    bool any = false;
+    // Primary MDB at volume block 2, alternate 1024 bytes from the end.
+    for (u32 off : {1024u, static_cast<u32>(img.size()) - 1024u}) {
+        const u32 at = base + off;
+        if (at + 12 > backing.size()) continue;
+        if (backing[at] != 0x42 || backing[at + 1] != 0x44) continue;   // 'BD'
+        backing[at + 0x0A] = static_cast<u8>(backing[at + 0x0A] | 0x01);
+        any = true;
+    }
+    return any;
+}
+
+bool QuadraMachine::shutdownVolumes() {
+    if (hd_.empty() && hd2_.empty()) return false;
+    if (inDriver_ || announceInFlight_) return false;
+    if (read32(0x0358) == 0) return false;            // System never came up
+    if ((((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) == 0xFFFFFFFFu))
+        return false;                                 // FS queue not built
+    announceInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    if (!hdMountPb_) {
+        cpu_.d[0] = 80;
+        execute68kTrap(0xA71E);                       // _NewPtr,Sys,Clear
+        hdMountPb_ = guestPtr(cpu_.a[0]);
+    }
+    bool any = false;
+    if (hdMountPb_) {
+        for (u16 drive : {u16(4), u16(5)}) {
+            if (!volumeMountedFor(drive)) continue;
+            auto call = [&](u16 trap) -> s16 {
+                for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
+                write16(hdMountPb_ + 22, drive);      // ioVRefNum
+                cpu_.a[0] = hdMountPb_;
+                execute68kTrap(trap);
+                return static_cast<s16>(cpu_.d[0] & 0xFFFF);
+            };
+            // Flush first: the File Manager writes every cached block of this
+            // volume through our driver, which we serve synchronously, so
+            // when this returns the image on the host holds everything the
+            // guest ever wrote.
+            const s16 fl = call(0xA013);              // _FlushVol
+            // Then try the real unmount. It succeeds for a data volume, and
+            // fails -47 (fBsyErr) for the startup volume because the System
+            // file is open on it -- a real Shut Down cannot unmount that one
+            // either.
+            const s16 un = call(0xA00E);              // _UnmountVol
+            bool marked = false;
+            if (fl == 0 && un != 0) marked = markVolumeClean(drive);
+            any = any || un == 0 || marked;
+            if (onDiag) {
+                char b[112];
+                std::snprintf(b, sizeof b,
+                              "hd: drive %u flush %d, unmount %d%s", drive, fl,
+                              un, marked ? ", marked cleanly unmounted" : "");
+                onDiag(b);
+            }
+        }
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    announceInFlight_ = false;
+    return any;
 }
 
 int QuadraMachine::stepInstruction() {

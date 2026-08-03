@@ -473,6 +473,8 @@ int main(int argc, char** argv) {
     std::size_t trapRingPos = 0;
     bool askGestalt = false;        // --gestalt: query the guest at exit
     bool showDiag = false;          // --diag: print the machine snapshot at exit
+    int hdTrace = 0;                // --hd-trace N: log N disk requests in order
+    bool doShutdown = false;        // --shutdown: flush+unmount before saving
     const char* trapLogPath = nullptr;   // --trap-log: every ringed trap, to a file
     std::ofstream trapLog;
     int shotEvery = 0;              // --shot-every: screen strip during post-frames
@@ -626,6 +628,8 @@ int main(int argc, char** argv) {
         else if (a == "--find" && i + 1 < argc) findHex = argv[++i];
         else if (a == "--gestalt") askGestalt = true;
         else if (a == "--diag") showDiag = true;
+        else if (a == "--hd-trace" && i + 1 < argc) hdTrace = std::atoi(argv[++i]);
+        else if (a == "--shutdown") doShutdown = true;
         else if (a == "--trap-log" && i + 1 < argc) trapLogPath = argv[++i];
         else if (a == "--shot-every" && i + 1 < argc) shotEvery = std::atoi(argv[++i]);
         else if (a == "--floppy-next" && i + 1 < argc) floppyQueue.push_back(argv[++i]);
@@ -754,6 +758,7 @@ int main(int argc, char** argv) {
     // The write watch serves any investigation, not just the input test.
     if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), 4, 60);
     if (ioTrace) mac.traceIoWindow(ioFrom, ioTo, ioPcLo, ioPcHi, ioBudget);
+    if (hdTrace) mac.traceHdRequests(hdTrace);
     if (countPcAt) mac.countPc(static_cast<u32>(countPcAt));
     int vramBudget = 10;
     mac.onVramWrite = [&](u32 off, u32 pc) {
@@ -1600,6 +1605,10 @@ int main(int argc, char** argv) {
         std::printf("screen dumped: %s\n", shotPath);
     }
     if (showDiag) std::printf("\n%s\n", mac.diagnosticReport().c_str());
+
+    if (doShutdown)
+        std::printf("shutdown volumes: %s\n",
+                    mac.shutdownVolumes() ? "unmounted" : "nothing to do");
 
     if (saveHdPath) {
         // Everything the guest wrote, so the result of an install can be

@@ -80,6 +80,11 @@ public:
     // when the guest stops responding. Reads model state only, so taking it
     // cannot perturb the machine.
     std::string diagnosticReport() const;
+    // Flush and unmount every mounted volume, as Shut Down would. Call before
+    // persisting an image when the host application is closing: without it the
+    // System's cached blocks are lost and the volume stays flagged unclean,
+    // which this ROM refuses at the next boot.
+    bool shutdownVolumes();
     u32 adbMouseBytesRead() const; // mouse bytes the guest actually clocked in
     std::vector<u8> adbMouseBytesLog() const;
     void adbClearCmdTrace();
@@ -89,6 +94,7 @@ public:
         watchAddr_ = addr; watchLen_ = len; watchBudget_ = budget;
     }
     void armDataInTrace(int n) { dataInPcBudget_ = n; }
+    void traceHdRequests(int n) { hdTraceBudget_ = n; }
     // Log every device access made between two frames by code inside a PC
     // range: which registers a routine actually touches, and what they
     // answered. Answers "what is this driver waiting on" directly.
@@ -176,6 +182,7 @@ private:
     u8   ioRead8Impl(u32 off);
     void ioWrite8Impl(u32 off, u8 v);
     void traceIo(u32 off, bool write, u8 v);
+    bool markVolumeClean(u16 drive);
     u32  ioRead32(u32 off);
     void ioWrite32(u32 off, u32 v);
     void sonicWrite(u32 reg, u16 v);
@@ -317,6 +324,7 @@ private:
     int  hdMountTries_ = 0;
     u32  hdReadCount_ = 0, hdWriteCount_ = 0;
     u32  fdReadCount_ = 0, fdWriteCount_ = 0;
+    int  hdTraceBudget_ = 0;    // traceHdRequests: log every disk request
     int  hdErrBudget_ = 20;     // report the first failed disk requests
     int scsiDiagBudget_ = 60;   // trace the first 53C96 register accesses
     int iplDiagBudget_ = 12;    // trace the first level-2 interrupt assertions

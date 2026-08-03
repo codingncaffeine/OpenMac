@@ -325,6 +325,18 @@ public sealed class QuadraEmulator : IEmulator
     {
         _stop = true;
         _worker.Join();
+        // Closing the window is, to the guest, having its power cut. Settle
+        // the volumes first -- flush what the System is still holding and
+        // mark them cleanly unmounted -- or the image we persist below is
+        // missing those blocks and carries the "in use" flag that makes the
+        // Quadra ROM refuse the disk at the next boot. The emulation thread
+        // has already stopped, so the guest CPU is ours to run.
+        try
+        {
+            if (_h != IntPtr.Zero && Native.omac_q_shutdown_volumes(_h) != 0)
+                Log.Line("hard disk: volumes flushed and marked cleanly unmounted");
+        }
+        catch (Exception ex) { Log.Line("volume shutdown failed: " + ex.Message); }
         WriteBackHardDisk();
         Destroy();
         _audio.Dispose();

@@ -219,6 +219,13 @@ OMAC_API size_t omac_q_harddisk_data(OMacQ*, uint8_t* out, size_t cap);
    wedged guest was doing. Pass out=NULL to learn the size needed. Reads model
    state only, so taking it cannot disturb the machine. */
 OMAC_API size_t omac_q_diagnostics(OMacQ*, char* out, size_t cap);
+
+/* Flush and unmount the guest's volumes, as Shut Down would. Call this before
+   persisting a hard disk image when the host application is closing: without
+   it the System's cached blocks never reach the image and the volume stays
+   flagged unclean, which the Quadra ROM refuses at the next boot. Returns
+   non-zero if a volume was settled. */
+OMAC_API int omac_q_shutdown_volumes(OMacQ*);
 /* Floppy in the internal SuperDrive. Raw 400K/800K/1.44MB dumps and DiskCopy
    4.2 / MacBinary wrappers all mount; returns 1 if the drive took the disk,
    0 if the file is not floppy media. omac_q_floppy_data copies the medium out
