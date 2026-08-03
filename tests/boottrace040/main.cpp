@@ -433,6 +433,14 @@ int main(int argc, char** argv) {
     const char* romPath = nullptr;
     const char* fdPath = nullptr;
     int fdAfter = -1;               // --floppy-after: insert mid-run at this frame
+    // Disk sequencing during the post-click run: put named disks in at named
+    // frames, take them out with the front end's Eject, and watch what the
+    // System believes between the two. An insert/eject cycle is the whole
+    // subject here, so it has to be scriptable rather than one disk at boot.
+    std::vector<std::pair<int, std::string>> floppyAt;   // --floppy-at IMG N
+    std::vector<int> ejectPost;                          // --eject-post N
+    int diskLogEvery = 0;                                // --disk-log N
+    bool ejectNoUnmount = false;    // --eject-no-unmount: front-end eject leaves the volume
     bool wiggle = false;            // --wiggle: real ADB mouse motion after the clicks
     int wiggleFrom = 0;             // --wiggle-from: the post-frame it starts at
     int jiggleAt = -1;              // --jiggle-at: click+move the mouse mid-boot
@@ -450,7 +458,17 @@ int main(int argc, char** argv) {
     // item with the button still down, and the release selects. --drag models
     // that, and its screenshot is taken while the button is still held, which
     // is the only moment an open menu is on screen to read item positions from.
-    struct Click { int x, y; bool dbl; bool drag; int x2, y2, x3, y3; };
+    // Media belongs in the same ordered list as the clicks. A disk sequence is
+    // insert, use the guest's own menu, eject, insert the next one -- and with
+    // the disks scheduled separately from the pointer there is no way to put a
+    // menu selection BETWEEN two inserts, which is exactly where the fault the
+    // user reports lives.
+    // act: 0 = mouse (x/y/dbl/drag as below), 1 = insert `arg`, 2 = front-end
+    // eject, 3 = run `n` frames, 4 = report what the System believes.
+    struct Click {
+        int x, y; bool dbl; bool drag; int x2, y2, x3, y3;
+        int act = 0; std::string arg; int n = 0;
+    };
     std::vector<Click> clicks;
     int postFrames = 0;             // --post-frames: run on after the clicks
     bool trapRingOn = false, trapRingArmed = false;   // --trap-ring
@@ -566,6 +584,29 @@ int main(int argc, char** argv) {
         if (a == "--rom" && i + 1 < argc) romPath = argv[++i];
         else if (a == "--floppy" && i + 1 < argc) fdPath = argv[++i];
         else if (a == "--floppy-after" && i + 2 < argc) { fdPath = argv[++i]; fdAfter = std::atoi(argv[++i]); }
+        else if (a == "--insert" && i + 1 < argc)
+            clicks.push_back({0, 0, false, false, 0, 0, -1, -1, 1, argv[++i], 0});
+        else if (a == "--eject-now")
+            clicks.push_back({0, 0, false, false, 0, 0, -1, -1, 2, "", 0});
+        // Put back the disk that just came out, exactly as the guest last had
+        // it. Re-inserting the host FILE is not the same act: everything the
+        // System wrote to the medium while it was mounted is missing from it,
+        // so what goes back in is a restored copy rather than the same disk --
+        // and when the guest is asking for that disk by name, the difference
+        // is the whole question.
+        else if (a == "--reinsert")
+            clicks.push_back({0, 0, false, false, 0, 0, -1, -1, 5, "", 0});
+        else if (a == "--wait" && i + 1 < argc)
+            clicks.push_back({0, 0, false, false, 0, 0, -1, -1, 3, "", std::atoi(argv[++i])});
+        else if (a == "--disks")
+            clicks.push_back({0, 0, false, false, 0, 0, -1, -1, 4, "", 0});
+        else if (a == "--floppy-at" && i + 2 < argc) {
+            const std::string img = argv[++i];
+            floppyAt.emplace_back(std::atoi(argv[++i]), img);
+        }
+        else if (a == "--eject-post" && i + 1 < argc) ejectPost.push_back(std::atoi(argv[++i]));
+        else if (a == "--disk-log" && i + 1 < argc) diskLogEvery = std::atoi(argv[++i]);
+        else if (a == "--eject-no-unmount") ejectNoUnmount = true;
         else if (a == "--wiggle") wiggle = true;
         else if (a == "--wiggle-from" && i + 1 < argc) { wiggle = true; wiggleFrom = std::atoi(argv[++i]); }
         else if (a == "--jiggle-at" && i + 1 < argc) jiggleAt = std::atoi(argv[++i]);
@@ -586,17 +627,17 @@ int main(int argc, char** argv) {
         else if (a == "--save-hd" && i + 1 < argc) saveHdPath = argv[++i];
         else if (a == "--click" && i + 2 < argc) {
             const int cx = std::atoi(argv[++i]);
-            clicks.push_back({cx, std::atoi(argv[++i]), false, false, 0, 0, -1, -1});
+            clicks.push_back({cx, std::atoi(argv[++i]), false, false, 0, 0, -1, -1, 0, "", 0});
         }
         else if (a == "--dclick" && i + 2 < argc) {
             const int cx = std::atoi(argv[++i]);
-            clicks.push_back({cx, std::atoi(argv[++i]), true, false, 0, 0, -1, -1});
+            clicks.push_back({cx, std::atoi(argv[++i]), true, false, 0, 0, -1, -1, 0, "", 0});
         }
         else if (a == "--drag" && i + 4 < argc) {
             const int cx = std::atoi(argv[++i]);
             const int cy = std::atoi(argv[++i]);
             const int dx = std::atoi(argv[++i]);
-            clicks.push_back({cx, cy, false, true, dx, std::atoi(argv[++i]), -1, -1});
+            clicks.push_back({cx, cy, false, true, dx, std::atoi(argv[++i]), -1, -1, 0, "", 0});
         }
         else if (a == "--drag3" && i + 6 < argc) {
             const int cx = std::atoi(argv[++i]);
@@ -604,7 +645,7 @@ int main(int argc, char** argv) {
             const int dx = std::atoi(argv[++i]);
             const int dy = std::atoi(argv[++i]);
             const int ex = std::atoi(argv[++i]);
-            clicks.push_back({cx, cy, false, true, dx, dy, ex, std::atoi(argv[++i])});
+            clicks.push_back({cx, cy, false, true, dx, dy, ex, std::atoi(argv[++i]), 0, "", 0});
         }
         else if (a == "--harddisk" && i + 1 < argc) hdPath = argv[++i];
         else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
@@ -774,6 +815,7 @@ int main(int argc, char** argv) {
     if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), 4, 60);
     if (ioTrace) mac.traceIoWindow(ioFrom, ioTo, ioPcLo, ioPcHi, ioBudget);
     if (hdTrace) mac.traceHdRequests(hdTrace);
+    mac.ejectUnmounts_ = !ejectNoUnmount;
     if (monSet) mac.setMonitorSense(static_cast<u32>(monGnd), static_cast<u32>(monPairs));
     if (fmW) mac.forceVideoMode(fmW, fmH, fmB);
     if (countPcAt) mac.countPc(static_cast<u32>(countPcAt));
@@ -1382,6 +1424,43 @@ int main(int argc, char** argv) {
         mac.drainAudio(chunk);
         audio.insert(audio.end(), chunk.begin(), chunk.end());
     };
+    // What the System believes it has: every volume on line by name and drive,
+    // and every drive it knows about with the disk-in-place byte the .Sony
+    // driver keeps three bytes ahead of its queue element. A volume left on
+    // line with no disk behind it is what makes the guest ask for a floppy
+    // back by name, so this has to be readable AT each step of an insert /
+    // eject sequence -- reading it only at the end says nothing about which
+    // step left it that way.
+    auto diskState = [&](const char* tag) {
+        std::printf("DISKSTATE %-14s volumes:", tag);
+        u32 vcb = mac.read32(0x0358) & 0x00FFFFFFu;
+        if (!vcb) std::printf(" (none)");
+        for (int n = 0; vcb && n < 8; ++n) {
+            char nm[32] = {0};
+            const int len = mac.read8(vcb + 44);
+            for (int k = 0; k < len && k < 27; ++k)
+                nm[k] = static_cast<char>(mac.read8(vcb + 45 + static_cast<u32>(k)));
+            // vcbDrvNum +72 goes to 0 when a volume goes OFF LINE and the drive
+            // number moves into vcbDRefNum +74; vcbVRefNum +78 is the number
+            // every File Manager call names the volume by, which is what turns
+            // a "vref=-2" in a trap log into a volume with a name.
+            std::printf(" [%s drv %d dref %d vref %d]", nm,
+                        static_cast<s16>(mac.read16(vcb + 72)),
+                        static_cast<s16>(mac.read16(vcb + 74)),
+                        static_cast<s16>(mac.read16(vcb + 78)));
+            vcb = mac.read32(vcb) & 0x00FFFFFFu;
+        }
+        u32 e = mac.read32(0x030A) & 0x00FFFFFFu;
+        std::printf("  drives:");
+        if (!e) std::printf(" (none)");
+        for (int n = 0; e && n < 8; ++n) {
+            std::printf(" [drv %u ref %d inPlace %d]", mac.read16(e + 6),
+                        static_cast<s16>(mac.read16(e + 8)),
+                        static_cast<s8>(mac.read8(e - 3)));
+            e = mac.read32(e) & 0x00FFFFFFu;
+        }
+        std::printf("  medium:%s\n", mac.floppyPresent() ? "in" : "out");
+    };
     auto moveTo = [&](int tx, int ty) {
         const u16 x = static_cast<u16>(tx), y = static_cast<u16>(ty);
         mac.write16(0x0828, y); mac.write16(0x082A, x);   // MTemp
@@ -1418,7 +1497,41 @@ int main(int argc, char** argv) {
         mac.renderScreen(px.data());
         writeBmp(p, px, w, h);
     };
+    int stepNo = 0;
     for (const auto& pt : clicks) {
+        ++stepNo;
+        if (pt.act) {
+            char tag[24];
+            std::snprintf(tag, sizeof tag, "step%d", stepNo);
+            if (pt.act == 1) {
+                auto img = loadFile(pt.arg.c_str());
+                std::printf("step %d insert %s -> %s\n", stepNo, pt.arg.c_str(),
+                            img.empty() ? "UNREADABLE"
+                            : mac.insertFloppy(std::move(img)) ? "inserted" : "REFUSED");
+            } else if (pt.act == 2) {
+                std::printf("step %d front-end eject\n", stepNo);
+                mac.ejectFloppy();
+            } else if (pt.act == 3) {
+                for (int f = 0; f < pt.n; ++f) stepFrame();
+                std::printf("step %d waited %d frames\n", stepNo, pt.n);
+                shot();
+            } else if (pt.act == 5) {
+                auto img = mac.floppyForWriteBack();
+                // Size read BEFORE the insert: the call moves the vector out,
+                // and the order arguments are evaluated in is the compiler's
+                // business -- printed the other way round this reported every
+                // medium as zero bytes.
+                const std::size_t bytes = img.size();
+                const char* how = img.empty() ? "NOTHING TO PUT BACK"
+                                  : mac.insertFloppy(std::move(img)) ? "inserted"
+                                                                     : "REFUSED";
+                std::printf("step %d re-insert the ejected medium (%zu bytes) -> %s\n",
+                            stepNo, bytes, how);
+            } else {
+                diskState(tag);
+            }
+            continue;
+        }
         if (!pt.drag) {
             clickAt(pt.x, pt.y, pt.dbl);
             shot();
@@ -1497,6 +1610,31 @@ int main(int argc, char** argv) {
             std::vector<u32> px(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
             mac.renderScreen(px.data());
             writeBmp(p, px, w, h);
+        }
+        // Scripted media: a disk goes in, a disk comes out, and the System's
+        // idea of both is printed either side of the event.
+        for (const auto& [at, path] : floppyAt) {
+            if (f != at) continue;
+            auto img = loadFile(path.c_str());
+            char tag[24];
+            std::snprintf(tag, sizeof tag, "f%d-before-in", f);
+            diskState(tag);
+            std::printf("floppy-at %d: %s -> %s\n", f, path.c_str(),
+                        img.empty() ? "UNREADABLE"
+                        : mac.insertFloppy(std::move(img)) ? "inserted" : "REFUSED");
+        }
+        for (int at : ejectPost) {
+            if (f != at) continue;
+            char tag[24];
+            std::snprintf(tag, sizeof tag, "f%d-before-out", f);
+            diskState(tag);
+            std::printf("eject-post %d: front-end eject requested\n", f);
+            mac.ejectFloppy();
+        }
+        if (diskLogEvery > 0 && f > 0 && f % diskLogEvery == 0) {
+            char tag[24];
+            std::snprintf(tag, sizeof tag, "f%d", f);
+            diskState(tag);
         }
         if (mac.cpu().halted) { std::printf("HALTED post-click frame %d\n", f); break; }
     }
