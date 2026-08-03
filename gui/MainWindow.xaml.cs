@@ -214,7 +214,11 @@ public partial class MainWindow : Window
         if (_emulator.TryGetFrame(_bgra))
             _bitmap.WritePixels(new Int32Rect(0, 0, w, h), _bgra, w * 4, 0);
         // The machine ejects disks on its own; keep the menus and status honest.
-        if (_emulator.ConsumeDiskStateChanged()) UpdateUi();
+        if (_emulator.ConsumeDiskStateChanged())
+        {
+            SeatWaitingFloppy();   // the drive is empty and the old disk is saved
+            UpdateUi();
+        }
     }
 
     [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
@@ -533,17 +537,48 @@ public partial class MainWindow : Window
         return false;
     }
 
+    // A disk waiting for the drive to empty. Picking a new disk while one is
+    // already in there has to take the old one OUT first -- the guest is holding
+    // that volume mounted, and swapping the bytes underneath it loses everything
+    // it wrote and leaves it reading a catalog that now belongs to another disk.
+    // The eject is carried out by the machine a frame later, so the new disk
+    // waits here until the drive reports empty (which is also when the outgoing
+    // disk is written back to its file).
+    private string? _floppyWaiting;
+
     private void InsertFloppy_Click(object sender, RoutedEventArgs e)
     {
         if (FilePicker.Open(this, _settings, FilePicker.Floppy, "Insert Floppy",
                             DiskImageFilter, _settings.LastFloppy) is { } path)
         {
+            if (_emulator.FloppyPath is not null)
+            {
+                _floppyWaiting = path;
+                _emulator.EjectFloppy();
+                Log.Line($"[disk] taking out {Path.GetFileName(_emulator.FloppyPath)} "
+                         + $"before {Path.GetFileName(path)} goes in");
+                UpdateUi();
+                return;
+            }
             if (TryInsert(path, _emulator.InsertFloppy, 0))
             {
                 _settings.LastFloppy = path;
                 _settings.Save();
             }
             UpdateUi();
+        }
+    }
+
+    // Called from the frame tick once the drive state has changed. The outgoing
+    // disk has been saved by then, so the one that was waiting can go in.
+    private void SeatWaitingFloppy()
+    {
+        if (_floppyWaiting is not { } path || _emulator.FloppyPath is not null) return;
+        _floppyWaiting = null;
+        if (TryInsert(path, _emulator.InsertFloppy, 0))
+        {
+            _settings.LastFloppy = path;
+            _settings.Save();
         }
     }
 
