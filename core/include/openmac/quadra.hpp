@@ -111,6 +111,12 @@ public:
     // itself on the connector's sense lines and the ROM picks the timing from
     // that, so this is how the machine is told to run at another resolution.
     void setMonitorSense(u32 grounded, u32 pairs);
+    // The displays this video port can drive. Naming the monitor IS choosing
+    // the resolution: an Apple fixed-frequency display runs exactly one.
+    struct DisplayInfo { const char* name; int width, height, grounded, pairs; };
+    static const DisplayInfo* displays(int& count);
+    bool setDisplay(const char* name);
+    void forceVideoMode(int w, int h, int bpp);
 
     // SCSI media, mirroring the Classic's surface. Images are wrapped in an
     // Apple partition map with a driver the ROM's boot scan can load.

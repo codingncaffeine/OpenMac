@@ -479,6 +479,7 @@ int main(int argc, char** argv) {
     const char* saveFdPath = nullptr;  // --save-floppy: medium as its file should be
     unsigned long monGnd = 0, monPairs = 0;
     bool monSet = false;            // --monitor GROUNDED PAIRS: which display
+    int fmW = 0, fmH = 0, fmB = 0;  // --force-mode W H BPP: render at this
     const char* trapLogPath = nullptr;   // --trap-log: every ringed trap, to a file
     std::ofstream trapLog;
     int shotEvery = 0;              // --shot-every: screen strip during post-frames
@@ -636,6 +637,7 @@ int main(int argc, char** argv) {
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
         else if (a == "--save-floppy" && i + 1 < argc) saveFdPath = argv[++i];
+        else if (a == "--force-mode" && i + 3 < argc) { fmW = std::atoi(argv[++i]); fmH = std::atoi(argv[++i]); fmB = std::atoi(argv[++i]); }
         else if (a == "--monitor" && i + 2 < argc) { monGnd = std::strtoul(argv[++i], nullptr, 0); monPairs = std::strtoul(argv[++i], nullptr, 0); monSet = true; }
         else if (a == "--trap-log" && i + 1 < argc) trapLogPath = argv[++i];
         else if (a == "--shot-every" && i + 1 < argc) shotEvery = std::atoi(argv[++i]);
@@ -767,6 +769,7 @@ int main(int argc, char** argv) {
     if (ioTrace) mac.traceIoWindow(ioFrom, ioTo, ioPcLo, ioPcHi, ioBudget);
     if (hdTrace) mac.traceHdRequests(hdTrace);
     if (monSet) mac.setMonitorSense(static_cast<u32>(monGnd), static_cast<u32>(monPairs));
+    if (fmW) mac.forceVideoMode(fmW, fmH, fmB);
     if (countPcAt) mac.countPc(static_cast<u32>(countPcAt));
     int vramBudget = 10;
     mac.onVramWrite = [&](u32 off, u32 pc) {

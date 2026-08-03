@@ -185,7 +185,14 @@ public:
 
     // ---- scanout ----
     // Depth from the Antelope control register bits [4:2].
+    //
+    // Do NOT try to derive this from the row length instead: rows are padded,
+    // and by more than a factor of two. The 21-inch display sits at 1 bit with
+    // 1152 pixels in a 576-byte row -- 144 bytes of picture in four times the
+    // space -- so "the largest depth that fits the row" reads it as 4 bits and
+    // renders a quarter of the screen stretched across all of it.
     int bpp() const {
+        if (forceBpp_) return forceBpp_;
         switch (depthCtl_ & 0x1C) {
         case 0x00: return 1;
         case 0x08: return 2;
@@ -199,21 +206,12 @@ public:
     }
     u32 strideBytes() const { return (regs_[2] & 0xFFFu) * 4; }
 
-    // Visible geometry from the swatch, as the ROM programs it (verified
-    // against the 13" 640x480 values it writes: HAL $98, HFP $318, active
-    // start $52 half-lines, active end $412 of $41A total -- Apple's 525-line
-    // timing). Falls back to 640x480 until the swatch is programmed.
-    int width() const {
-        const int px = static_cast<int>(swatch_[0x44 >> 2]) -
-                       static_cast<int>(swatch_[0x40 >> 2]);
-        return px > 0 && px <= 2048 ? px : 640;
-    }
-    int height() const {
-        const int hl = static_cast<int>(swatch_[0x60 >> 2]) -
-                       static_cast<int>(swatch_[0x5C >> 2]);
-        const int lines = hl / 2;
-        return lines > 0 && lines <= 1024 ? lines : 480;
-    }
+    // Visible geometry: the raster of the display that is plugged in. See
+    // MonitorWiring -- an Apple fixed-frequency monitor runs one resolution,
+    // and the swatch counters cannot be read as pixels across modes because
+    // they count in a video clock that changes with the display.
+    int width() const { return forceW_ ? forceW_ : monitor_.width; }
+    int height() const { return forceH_ ? forceH_ : monitor_.height; }
 
     // Expand the framebuffer to ARGB8888. `out` holds width()*height().
     void render(u32* out) const {
@@ -271,6 +269,10 @@ public:
     bool vblIntEnabled() const { return vblEnabled_; }
     u32 swatchReg(int i) const { return swatch_[i & 63]; }
     u32 ctlReg(int i) const { return regs_[i & 63]; }
+    u32 depthCtlRaw() const { return depthCtl_; }
+    // Diagnosis override: render at a stated geometry regardless of what the
+    // registers decode to, to settle what the guest is actually drawing.
+    void forceMode(int w, int h, int bpp) { forceW_ = w; forceH_ = h; forceBpp_ = bpp; }
     u64 clockStream() const { return clockShift_; }
     std::function<void(bool level)> onIrq;
     std::function<void(const char* msg)> onDiag;
@@ -291,6 +293,14 @@ public:
     struct MonitorWiring {
         u8 grounded = 0;    // bit n: sense line n tied to ground
         u8 pairs = 0;       // bit0: 0-1 tied, bit1: 1-2 tied, bit2: 0-2 tied
+        // The raster this display runs. An Apple fixed-frequency monitor has
+        // exactly one, which is why naming the monitor and choosing the
+        // resolution are the same act. Taking the raster from here rather than
+        // from the swatch counters is also the only reading that survives every
+        // mode: the counters are in units of the video clock, and that clock
+        // changes with the display, so the same arithmetic reads 640x480 right
+        // and 1152x870 four times narrow.
+        int width = 640, height = 480;
     };
     void setMonitor(const MonitorWiring& m) { monitor_ = m; }
     MonitorWiring monitor() const { return monitor_; }
@@ -327,6 +337,7 @@ private:
     }
     MonitorWiring monitor_{};
     mutable int senseDiag_ = 60;
+    int forceW_ = 0, forceH_ = 0, forceBpp_ = 0;
 
     std::vector<u8> vram_;
     u32 regs_[64]{};

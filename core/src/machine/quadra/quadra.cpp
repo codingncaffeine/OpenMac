@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <map>
 
 // Machine wiring and address decode per the Quadra 650 hardware dossier:
@@ -338,9 +339,18 @@ std::string QuadraMachine::diagnosticReport() const {
         via1_->irqAsserted() ? 1 : 0);
     add("   VIA2  ifr=%02X ier=%02X irq=%d", via2_->peekIfr(), via2_->peekIer(),
         via2_->irqAsserted() ? 1 : 0);
+    // What the GUEST believes its screen is. When our decode of the video
+    // registers disagrees with what is on screen, this is the arbiter:
+    // ScreenRow is the main screen's rowBytes and CrsrPin its bounding box,
+    // both written by the System from the display it configured.
+    add("   screen ScreenRow=%d ScrnBase=%08X CrsrPin=%d,%d,%d,%d",
+        static_cast<s16>(peek16(0x0106)), peek32(0x0824),
+        static_cast<s16>(peek16(0x0834)), static_cast<s16>(peek16(0x0836)),
+        static_cast<s16>(peek16(0x0838)), static_cast<s16>(peek16(0x083A)));
     add("   DAFB  %dx%d %dbpp base=%05X stride=%u sense=%X",
         dafb_->width(), dafb_->height(), dafb_->bpp(), dafb_->fbBase(),
         dafb_->strideBytes(), dafb_->read(0x1C));
+    add("   depthCtl=%02X", dafb_->depthCtlRaw());
     {
         // The swatch's horizontal and vertical timing: what the ROM programmed
         // from the monitor it sensed, and where the geometry above comes from.
@@ -1740,10 +1750,56 @@ u32 QuadraMachine::adbKbdPolls() const { return adb_->kbdPolls(); }
 u32 QuadraMachine::adbMouseReports() const { return adb_->mouseReports(); }
 bool QuadraMachine::dafbVblEnabled() const { return dafb_->vblIntEnabled(); }
 u32 QuadraMachine::dafbSwatchReg(int i) const { return dafb_->swatchReg(i); }
+void QuadraMachine::forceVideoMode(int w, int h, int bpp) { dafb_->forceMode(w, h, bpp); }
+
+// The displays this video port can drive, as the developer note's table of
+// maximum pixel depths lists them, each with the sense wiring it presents --
+// measured from the ROM by setting the wiring and reading back the screen the
+// System configured (CrsrPin), not assumed.
+const QuadraMachine::DisplayInfo* QuadraMachine::displays(int& count) {
+    static const DisplayInfo kList[] = {
+        {"12-inch RGB",       512,  384, 0x3, 0},
+        {"13-inch RGB",       640,  480, 0x1, 0},
+        {"15-inch Portrait",  640,  870, 0x2, 0},
+        {"19-inch Color",    1024,  768, 0x0, 0},
+        {"21-inch Color",    1152,  870, 0x4, 0},
+    };
+    count = static_cast<int>(sizeof kList / sizeof kList[0]);
+    return kList;
+}
+
+bool QuadraMachine::setDisplay(const char* name) {
+    int n = 0;
+    const DisplayInfo* list = displays(n);
+    for (int i = 0; i < n; ++i) {
+        if (!name || std::strcmp(list[i].name, name) != 0) continue;
+        Dafb::MonitorWiring m;
+        m.grounded = static_cast<u8>(list[i].grounded);
+        m.pairs = static_cast<u8>(list[i].pairs);
+        m.width = list[i].width;
+        m.height = list[i].height;
+        dafb_->setMonitor(m);
+        return true;
+    }
+    return false;
+}
+
 void QuadraMachine::setMonitorSense(u32 grounded, u32 pairs) {
     Dafb::MonitorWiring m;
     m.grounded = static_cast<u8>(grounded & 7u);
     m.pairs = static_cast<u8>(pairs & 7u);
+    // Adopt the raster of whichever listed display presents this wiring, so
+    // a sense set by hand still renders at the right size.
+    int n = 0;
+    const DisplayInfo* list = displays(n);
+    for (int i = 0; i < n; ++i) {
+        if (list[i].grounded != static_cast<int>(m.grounded) ||
+            list[i].pairs != static_cast<int>(m.pairs))
+            continue;
+        m.width = list[i].width;
+        m.height = list[i].height;
+        break;
+    }
     dafb_->setMonitor(m);
 }
 u32 QuadraMachine::adbMouseBytesRead() const { return adb_->mouseBytesRead(); }
