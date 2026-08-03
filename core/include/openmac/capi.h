@@ -226,6 +226,13 @@ OMAC_API size_t omac_q_diagnostics(OMacQ*, char* out, size_t cap);
    flagged unclean, which the Quadra ROM refuses at the next boot. Returns
    non-zero if a volume was settled. */
 OMAC_API int omac_q_shutdown_volumes(OMacQ*);
+
+/* The floppy medium as its host file should hold it: the guest's sectors with
+   the containers the file arrived in reassembled around them. Returns the disk
+   still in the drive, or the one last ejected, so a front end can save it both
+   when the user asks and when the machine hands a disk back. Pass out=NULL for
+   the size; 0 means there is nothing to save. */
+OMAC_API size_t omac_q_floppy_writeback(OMacQ*, uint8_t* out, size_t cap);
 /* Floppy in the internal SuperDrive. Raw 400K/800K/1.44MB dumps and DiskCopy
    4.2 / MacBinary wrappers all mount; returns 1 if the drive took the disk,
    0 if the file is not floppy media. omac_q_floppy_data copies the medium out

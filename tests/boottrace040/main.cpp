@@ -476,6 +476,7 @@ int main(int argc, char** argv) {
     int hdTrace = 0;                // --hd-trace N: log N disk requests in order
     bool doShutdown = false;        // --shutdown: flush+unmount before saving
     int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
+    const char* saveFdPath = nullptr;  // --save-floppy: medium as its file should be
     const char* trapLogPath = nullptr;   // --trap-log: every ringed trap, to a file
     std::ofstream trapLog;
     int shotEvery = 0;              // --shot-every: screen strip during post-frames
@@ -632,6 +633,7 @@ int main(int argc, char** argv) {
         else if (a == "--hd-trace" && i + 1 < argc) hdTrace = std::atoi(argv[++i]);
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
+        else if (a == "--save-floppy" && i + 1 < argc) saveFdPath = argv[++i];
         else if (a == "--trap-log" && i + 1 < argc) trapLogPath = argv[++i];
         else if (a == "--shot-every" && i + 1 < argc) shotEvery = std::atoi(argv[++i]);
         else if (a == "--floppy-next" && i + 1 < argc) floppyQueue.push_back(argv[++i]);
@@ -1615,6 +1617,13 @@ int main(int argc, char** argv) {
     if (doShutdown)
         std::printf("shutdown volumes: %s\n",
                     mac.shutdownVolumes() ? "unmounted" : "nothing to do");
+
+    if (saveFdPath) {
+        const std::vector<u8> img = mac.floppyForWriteBack();
+        std::ofstream f(saveFdPath, std::ios::binary);
+        if (!img.empty()) f.write(reinterpret_cast<const char*>(img.data()), static_cast<std::streamsize>(img.size()));
+        std::printf("floppy write-back: %zu bytes -> %s\n", img.size(), saveFdPath);
+    }
 
     if (saveHdPath) {
         // Everything the guest wrote, so the result of an install can be

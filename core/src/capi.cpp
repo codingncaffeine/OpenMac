@@ -583,6 +583,17 @@ OMAC_API int omac_q_shutdown_volumes(OMacQ* m)
     return (m && m->mac.shutdownVolumes()) ? 1 : 0;
 }
 
+OMAC_API size_t omac_q_floppy_writeback(OMacQ* m, uint8_t* out, size_t cap)
+{
+    if (!m) return 0;
+    const std::vector<u8> img = m->mac.floppyForWriteBack();
+    if (img.empty()) return 0;
+    if (!out) return img.size();
+    if (cap < img.size()) return 0;
+    std::copy(img.begin(), img.end(), out);
+    return img.size();
+}
+
 OMAC_API size_t omac_q_diagnostics(OMacQ* m, char* out, size_t cap)
 {
     if (!m) return 0;

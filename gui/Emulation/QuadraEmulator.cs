@@ -178,8 +178,11 @@ public sealed class QuadraEmulator : IEmulator
 
     public void EjectFloppy()
     {
+        // The machine carries the eject out a frame later, on its own thread.
+        // ConsumeDiskStateChanged notices the drive emptying and saves the
+        // medium then -- but only while it still knows which file to save it
+        // to, so the path stays put until it has.
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_eject_floppy(_h); }
-        FloppyPath = null;
     }
 
     public string MediumNote(int drive) =>
@@ -209,6 +212,10 @@ public sealed class QuadraEmulator : IEmulator
         _lastFloppyPresent = present;
         if (!present && FloppyPath is not null)
         {
+            // Save first, then forget the path. Whatever the guest wrote to
+            // this disk only exists in the core until now, and the core drops
+            // it when the next disk goes in.
+            WriteBackFloppy();
             Log.Line($"[disk] the machine ejected {Path.GetFileName(FloppyPath)}");
             FloppyPath = null;
         }
@@ -216,6 +223,30 @@ public sealed class QuadraEmulator : IEmulator
     }
 
     private bool _lastFloppyPresent;
+
+    // Put the medium back in the file it came from, wearing whatever container
+    // that file wore. A locked disk never goes back: the guest could not have
+    // changed it, and overwriting somebody's master image on the strength of a
+    // bug in our own write path is not a risk worth carrying.
+    private void WriteBackFloppy()
+    {
+        string? path = FloppyPath;
+        if (string.IsNullOrEmpty(path) || WriteProtectFloppies) return;
+        byte[]? buf = null;
+        try
+        {
+            lock (_sync)
+            {
+                if (_h == IntPtr.Zero) return;
+                nuint size = Native.omac_q_floppy_writeback(_h, null, 0);
+                if (size == 0) return;
+                buf = new byte[size];
+                if (Native.omac_q_floppy_writeback(_h, buf, size) == 0) return;
+            }
+            File.WriteAllBytes(path!, buf!);   // outside the lock: don't stall the worker
+        }
+        catch (Exception ex) { Log.Line("floppy write-back failed: " + ex.Message); }
+    }
     public bool NetworkingEnabled => false;
     public void SetNetworking(bool enabled) { }
     public string? FolderDiskPath => null;
@@ -360,6 +391,9 @@ public sealed class QuadraEmulator : IEmulator
                 Log.Line("hard disk: volumes flushed and marked cleanly unmounted");
         }
         catch (Exception ex) { Log.Line("volume shutdown failed: " + ex.Message); }
+        // A disk still in the drive at closing time has never been saved --
+        // nothing ejected it -- so save it here, as the hard disk is saved.
+        WriteBackFloppy();
         WriteBackHardDisk();
         Destroy();
         _audio.Dispose();

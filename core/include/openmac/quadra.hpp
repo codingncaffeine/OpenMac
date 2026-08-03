@@ -139,6 +139,9 @@ public:
     // The medium a guest-commanded eject pushed out, with every byte the
     // guest wrote still in it; empty when nothing has been ejected.
     std::vector<u8> takeEjectedFloppy() { return std::move(floppyEjected_); }
+    // The medium wearing the containers its file arrived in, ready to write
+    // back: the disk in the drive, or the one last ejected.
+    std::vector<u8> floppyForWriteBack() const;
 
     // Diagnostics.
     struct ScsiDiag {
@@ -185,6 +188,7 @@ private:
     bool markVolumeClean(u16 drive);
     void completeFloppyEject();
     void clearDriveInPlace(u16 drive);
+    std::vector<u8> floppyFileImage(const std::vector<u8>& sectors) const;
     u32  ioRead32(u32 off);
     void ioWrite32(u32 off, u32 v);
     void sonicWrite(u32 reg, u16 v);
@@ -244,6 +248,12 @@ private:
     std::vector<u8> floppy_;
     std::vector<u8> floppyEjected_;
     bool floppyEjectPending_ = false;   // front-end eject, run at a frame edge
+    // Containers peeled on insertion -- MacBinary around DiskCopy 4.2 around
+    // the sectors, either or both -- kept as plain bytes so this header need
+    // not know the container formats, and so the medium goes back to the host
+    // in the file format it arrived in, reassembled around the guest's writes.
+    std::vector<u8> fdMbHeader_, fdMbResource_;
+    std::vector<u8> fdDcHeader_, fdDcTags_;
     // VIA1 PA5 = the drive's SEL line. Undriven pins read HIGH (the outA
     // handler models the pull-up with value|~ddr), so the power-on state is
     // high too: at reset the ROM walks the SWIM2 phase lines before touching

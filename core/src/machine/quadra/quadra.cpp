@@ -1724,13 +1724,23 @@ int QuadraMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
     // 84-byte header in front of the sectors, so a 1.44 MB disk is 1,474,644
     // bytes on disk rather than 1,474,560, and read raw every sector lands 84
     // bytes out of place and nothing mounts.
+    // Keep the containers rather than dropping them. The guest writes sectors,
+    // but the file this disk came from wears a DiskCopy or MacBinary header
+    // and has to go back to the host looking like the file it was -- writing
+    // bare sectors over it would destroy the header its next reader needs.
     const char* container = "raw image";
+    fdMbHeader_.clear(); fdMbResource_.clear();
+    fdDcHeader_.clear(); fdDcTags_.clear();
     if (macbinary::isMacBinary(image)) {
-        macbinary::split(image);
+        macbinary::Parts p = macbinary::split(image);
+        fdMbHeader_ = std::move(p.header);
+        fdMbResource_ = std::move(p.resource);
         container = "MacBinary";
     }
     if (dc42::isDiskCopy(image)) {
-        dc42::split(image);
+        dc42::Parts p = dc42::split(image);
+        fdDcHeader_ = std::move(p.header);
+        fdDcTags_ = std::move(p.tags);
         container = "DiskCopy 4.2";
     }
 
@@ -1854,6 +1864,35 @@ void QuadraMachine::clearDriveInPlace(u16 drive) {
 }
 
 bool QuadraMachine::floppyPresent() const { return fd_->hasDisk(); }
+
+// The medium as the host's file should hold it: the guest's sectors with the
+// containers the file arrived in put back around them, innermost first. An
+// untouched disk reassembles to the identical file.
+std::vector<u8> QuadraMachine::floppyFileImage(const std::vector<u8>& sectors) const {
+    std::vector<u8> out = sectors;
+    if (out.empty()) return out;
+    if (fdDcHeader_.size() == dc42::kHeaderSize) {
+        dc42::Parts p;
+        p.header = fdDcHeader_;
+        p.tags = fdDcTags_;
+        out = dc42::rewrap(p, out);
+    }
+    if (fdMbHeader_.size() == macbinary::kHeaderSize) {
+        macbinary::Parts p;
+        p.header = fdMbHeader_;
+        p.resource = fdMbResource_;
+        out = macbinary::rewrap(p, out);
+    }
+    return out;
+}
+
+// What the guest wrote, ready to go back to the file it came from. Returns the
+// disk still in the drive, or the one last ejected -- so a front end can save
+// it either when the user asks or when the machine hands the disk back.
+std::vector<u8> QuadraMachine::floppyForWriteBack() const {
+    if (!floppy_.empty()) return floppyFileImage(floppy_);
+    return floppyFileImage(floppyEjected_);
+}
 
 void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
     hd_ = std::move(image);
