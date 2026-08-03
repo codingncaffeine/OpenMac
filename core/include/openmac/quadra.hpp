@@ -91,6 +91,14 @@ public:
     // into the image -- before the host may rebuild it. Returns true once the
     // volume is off line, which includes it never having been mounted.
     bool unmountSecondDisk();
+    // Read a file off the second disk's volume THROUGH THE GUEST: its own File
+    // Manager, _Open / _Read / _Close, served by our driver hook exactly as an
+    // application's read is. Reading the image with our own HFS reader answers
+    // a different question -- it says the bytes are on the volume, not that the
+    // guest can get at them, and an archiver calling a file corrupt is a claim
+    // about the second thing. Diagnostic only; never on a shipping path.
+    bool readFileThroughGuest(const std::string& name, std::vector<u8>& out,
+                              std::string& why);
     // True once the System has installed and we have hooked the second disk's
     // driver. Until then a volume put on that seat cannot mount, because there
     // is no driver to read it: the boot scan is what loads one.

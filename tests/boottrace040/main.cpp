@@ -548,6 +548,7 @@ int main(int argc, char** argv) {
     std::string dropBoxAdd;         // --dropbox-add FILE: drop FILE in at republish time
     int dropBoxRepublishAt = -1;    // --dropbox-republish N: swap the volume at frame N
     int dropBoxRounds = 1;          // --dropbox-rounds N: republish N times over
+    std::string dropBoxGuestRead;   // --dropbox-guest-read FILE: read it via the GUEST
     std::string dropBoxVerify;      // --dropbox-verify FILE: read FILE back out of the
                                     //   guest's volume and compare it byte for byte
     const char* saveFdPath = nullptr;  // --save-floppy: medium as its file should be
@@ -748,6 +749,7 @@ int main(int argc, char** argv) {
         else if (a == "--dropbox-republish" && i + 1 < argc)
             dropBoxRepublishAt = std::atoi(argv[++i]);
         else if (a == "--dropbox-verify" && i + 1 < argc) dropBoxVerify = argv[++i];
+        else if (a == "--dropbox-guest-read" && i + 1 < argc) dropBoxGuestRead = argv[++i];
         else if (a == "--save-floppy" && i + 1 < argc) saveFdPath = argv[++i];
         else if (a == "--force-mode" && i + 3 < argc) { fmW = std::atoi(argv[++i]); fmH = std::atoi(argv[++i]); fmB = std::atoi(argv[++i]); }
         else if (a == "--monitor" && i + 2 < argc) { monGnd = std::strtoul(argv[++i], nullptr, 0); monPairs = std::strtoul(argv[++i], nullptr, 0); monSet = true; }
@@ -2056,6 +2058,34 @@ int main(int argc, char** argv) {
             if (!found)
                 std::printf("dropbox VERIFY FAILED: '%s' is not on the volume at all\n",
                             base.c_str());
+        }
+        // The same comparison, but with the GUEST doing the reading. This is
+        // what answers an archiver calling a file corrupt: the bytes being on
+        // the volume and the guest being able to fetch them are two different
+        // claims, and only this one tests the second.
+        if (!dropBoxGuestRead.empty()) {
+            std::vector<u8> want = loadFile(dropBoxGuestRead.c_str());
+            std::string base = std::filesystem::path(dropBoxGuestRead).filename().string();
+            std::vector<u8> got;
+            std::string why;
+            if (!mac.readFileThroughGuest(base, got, why)) {
+                std::printf("GUEST READ FAILED: '%s' -- %s\n", base.c_str(), why.c_str());
+            } else if (got.size() != want.size()) {
+                std::printf("GUEST READ MISMATCH: '%s' is %zu bytes to the guest, "
+                            "%zu on the host\n", base.c_str(), got.size(), want.size());
+            } else {
+                std::size_t diff = 0, firstAt = 0;
+                for (std::size_t k = 0; k < got.size(); ++k)
+                    if (got[k] != want[k]) { if (!diff) firstAt = k; ++diff; }
+                if (diff)
+                    std::printf("GUEST READ MISMATCH: '%s' same length but %zu bytes "
+                                "differ, first at offset %zu (block %zu)\n",
+                                base.c_str(), diff, firstAt, firstAt / 512);
+                else
+                    std::printf("GUEST READ OK: '%s' %zu bytes, byte-for-byte identical "
+                                "read through the guest's own File Manager\n",
+                                base.c_str(), got.size());
+            }
         }
     }
     return 0;

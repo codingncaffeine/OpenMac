@@ -1710,6 +1710,101 @@ bool QuadraMachine::unmountSecondDisk() {
     return off;
 }
 
+// Read a file the way an application does: the guest's File Manager walks the
+// catalog, resolves the extents and calls the driver, and we serve the driver.
+// Everything an archiver depends on is therefore in the loop -- which is the
+// point. Our own reader can say the bytes are on the volume; only this can say
+// the guest is able to fetch them.
+bool QuadraMachine::readFileThroughGuest(const std::string& name,
+                                         std::vector<u8>& out, std::string& why) {
+    out.clear();
+    why.clear();
+    if (hd2_.empty()) { why = "no volume on the second seat"; return false; }
+    if (inDriver_ || announceInFlight_) { why = "busy"; return false; }
+    if (read32(0x0358) == 0) { why = "the System is not up"; return false; }
+    if ((((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) == 0xFFFFFFFFu)) {
+        why = "the File Manager queue is not built";
+        return false;
+    }
+    if (read8(0x0360) & 1) { why = "the File Manager is busy"; return false; }
+    if (name.empty() || name.size() > 31) { why = "bad name"; return false; }
+
+    constexpr u32 kChunk = 32768;
+    announceInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+
+    auto newPtr = [&](u32 bytes) -> u32 {
+        cpu_.d[0] = bytes;
+        execute68kTrap(0xA71E);                       // _NewPtr,Sys,Clear
+        return guestPtr(cpu_.a[0]);
+    };
+    const u32 pb = newPtr(80);
+    const u32 nameBuf = newPtr(64);
+    const u32 dataBuf = newPtr(kChunk);
+    bool ok = false;
+    if (!pb || !nameBuf || !dataBuf) {
+        why = "the guest heap would not give us working space";
+    } else {
+        // A Pascal string: length byte, then the characters.
+        write8(nameBuf, static_cast<u8>(name.size()));
+        for (std::size_t i = 0; i < name.size(); ++i)
+            write8(nameBuf + 1 + static_cast<u32>(i), static_cast<u8>(name[i]));
+
+        auto call = [&](u16 trap) -> s16 {
+            cpu_.a[0] = pb;
+            execute68kTrap(trap);
+            return static_cast<s16>(cpu_.d[0] & 0xFFFF);
+        };
+        auto clearPb = [&]() { for (u32 i = 0; i < 80; ++i) write8(pb + i, 0); };
+
+        clearPb();
+        write32(pb + 18, nameBuf);                    // ioNamePtr
+        write16(pb + 22, 5);                          // ioVRefNum = drive number
+        write8(pb + 27, 1);                           // ioPermssn = fsRdPerm
+        const s16 openErr = call(0xA000);             // _Open
+        if (openErr != 0) {
+            char b[96];
+            std::snprintf(b, sizeof b, "the guest could not open it (_Open %d)", openErr);
+            why = b;
+        } else {
+            const u16 refNum = read16(pb + 24);
+            s16 readErr = 0;
+            for (;;) {
+                clearPb();
+                write16(pb + 24, refNum);             // ioRefNum
+                write32(pb + 32, dataBuf);            // ioBuffer
+                write32(pb + 36, kChunk);             // ioReqCount
+                write16(pb + 44, 0);                  // ioPosMode = fsAtMark
+                readErr = call(0xA002);               // _Read
+                const u32 got = read32(pb + 40);      // ioActCount
+                for (u32 i = 0; i < got; ++i) out.push_back(read8(dataBuf + i));
+                // -39 eofErr with a short count is the normal end of a file.
+                if (readErr != 0 || got == 0) break;
+            }
+            clearPb();
+            write16(pb + 24, refNum);
+            call(0xA001);                             // _Close
+            if (readErr != 0 && readErr != -39) {
+                char b[96];
+                std::snprintf(b, sizeof b, "the guest's read failed (_Read %d) after %zu bytes",
+                              readErr, out.size());
+                why = b;
+            } else {
+                ok = true;
+            }
+        }
+    }
+    for (u32 p : {pb, nameBuf, dataBuf}) {
+        if (!p) continue;
+        cpu_.a[0] = p;
+        execute68kTrap(0xA01F);                       // _DisposPtr
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    announceInFlight_ = false;
+    return ok;
+}
+
 int QuadraMachine::stepInstruction() {
     if (countPc_ && (cpu_.pc | 0x40000000u) == (countPc_ | 0x40000000u)) ++countPcHits_;
     // The ROM's .Sony driver runs through both its 32-bit face and the 24-bit

@@ -156,13 +156,21 @@ internal static class FolderDisk
             byte[] bytes;
             try { bytes = File.ReadAllBytes(f.FullName); } catch { continue; }
             uint cr = ToHfsDate(f.CreationTime), md = ToHfsDate(f.LastWriteTime);
-            if (f.Extension.Equals(".bin", StringComparison.OrdinalIgnoreCase) &&
-                MacBinary.TryDecode(bytes, out var mb))
+            // MacBinary is sniffed whatever the file is called, as the transfer
+            // volume already does. A Macintosh application lives in its
+            // RESOURCE fork, which a plain copy off the web does not carry, so
+            // a wrapper that does is the only way most software arrives intact
+            // -- and period downloads wear one under every extension there is,
+            // or none. Refusing to look unless the name ends in .bin means an
+            // application arrives as an empty icon that will not open.
+            if (MacBinary.TryDecode(bytes, out var mb))
             {
-                // The HOST name (minus .bin) is the guest name, so the
-                // sync-back mapping stays bijective regardless of what the
-                // MacBinary header called the file.
-                omac_hfsb_add_file(b, parent, Path.GetFileNameWithoutExtension(f.Name),
+                // The HOST name is the guest name, minus a .bin if it wore one,
+                // so the sync-back mapping stays bijective regardless of what
+                // the MacBinary header called the file.
+                string guestName = f.Extension.Equals(".bin", StringComparison.OrdinalIgnoreCase)
+                    ? Path.GetFileNameWithoutExtension(f.Name) : f.Name;
+                omac_hfsb_add_file(b, parent, guestName,
                     mb.Type, mb.Creator, mb.Flags, mb.Data, (nuint)mb.Data.Length,
                     mb.Rsrc, (nuint)mb.Rsrc.Length, cr, md);
             }
@@ -323,7 +331,17 @@ internal static class FolderDisk
                 byte[] rsrc = it.rsrcLen != 0 ? ReadFork(r, it.id, true, it.rsrcLen)
                                               : Array.Empty<byte>();
                 bool asMacBinary = rsrc.Length != 0;
-                string rel = Path.Combine(parentPath, asMacBinary ? name + ".bin" : name);
+                // A forked file goes back as MacBinary. Which host name it goes
+                // back UNDER has to be the one it came in under, or the pairing
+                // stops being one-to-one: a wrapper called "App.sea" would come
+                // back as "App.sea.bin" beside it, and the next build would add
+                // BOTH to the volume under the same guest name. So if the host
+                // already holds this file as a wrapper under its own name, write
+                // there; only mint a .bin when there is nothing to write back to.
+                string plainRel = Path.Combine(parentPath, name);
+                string rel = !asMacBinary || IsMacBinaryFile(Path.Combine(folder, plainRel))
+                    ? plainRel
+                    : Path.Combine(parentPath, name + ".bin");
                 guestPaths.Add(rel);
                 string full = Path.Combine(folder, rel);
                 byte[] outBytes = asMacBinary
@@ -379,6 +397,34 @@ internal static class FolderDisk
         {
             omac_hfsr_free(r);
         }
+    }
+
+    /// <summary>Does this host file already carry a MacBinary wrapper? Only the
+    /// header is read: this runs per file during a sync and the answer is in the
+    /// first 128 bytes.</summary>
+    private static bool IsMacBinaryFile(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            if (!fi.Exists || fi.Length < 128) return false;
+            byte[] head = new byte[128];
+            using (var fs = File.OpenRead(path))
+                if (fs.Read(head, 0, 128) != 128) return false;
+            // Same shape MacBinary.TryDecode insists on, minus the fork lengths
+            // it cannot check without the whole file.
+            if (head[0] != 0 || head[74] != 0) return false;
+            int nameLen = head[1];
+            if (nameLen < 1 || nameLen > 63) return false;
+            uint dataLen = ((uint)head[83] << 24) | ((uint)head[84] << 16) |
+                           ((uint)head[85] << 8) | head[86];
+            uint rsrcLen = ((uint)head[87] << 24) | ((uint)head[88] << 16) |
+                           ((uint)head[89] << 8) | head[90];
+            if (dataLen > 0x00FFFFFF || rsrcLen > 0x00FFFFFF) return false;
+            long need = 128 + ((dataLen + 127) & ~127u) + ((rsrcLen + 127) & ~127u);
+            return fi.Length >= need;
+        }
+        catch { return false; }
     }
 
     private static byte[] ReadFork(IntPtr r, uint id, bool rsrc, uint len)

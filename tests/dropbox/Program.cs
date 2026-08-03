@@ -54,7 +54,11 @@ static class FolderDiskProbe
         return outp;
     }
 
-    public static byte[]? Fork(byte[] img, string name)
+    public static byte[]? Rsrc(byte[] img, string name) => Fork(img, name, true);
+
+    public static byte[]? Fork(byte[] img, string name) => Fork(img, name, false);
+
+    private static byte[]? Fork(byte[] img, string name, bool rsrc)
     {
         IntPtr r = omac_hfsr_open(img, (nuint)img.Length);
         if (r == IntPtr.Zero) return null;
@@ -65,8 +69,8 @@ static class FolderDiskProbe
             {
                 if (omac_hfsr_item(r, i, out var it) == 0) continue;
                 if (it.isDir != 0 || NameOf(it) != name) continue;
-                byte[] buf = new byte[it.dataLen];
-                nuint n = omac_hfsr_fork(r, it.id, 0, buf, (nuint)buf.Length);
+                byte[] buf = new byte[rsrc ? it.rsrcLen : it.dataLen];
+                nuint n = omac_hfsr_fork(r, it.id, rsrc ? 1 : 0, buf, (nuint)buf.Length);
                 if (n != (nuint)buf.Length) Array.Resize(ref buf, (int)n);
                 return buf;
             }
@@ -235,6 +239,51 @@ static class Program
         Check(File.Exists(Path.Combine(folder, "MadeOnTheMac")),
               "what the Mac saved reached the OUTGOING folder before the move");
         Check(seat.Folder == second, "the seat now points at the new folder");
+
+        // A Macintosh application lives in its RESOURCE fork, which a plain copy
+        // off the web does not carry. MacBinary is how one arrives intact, and
+        // period downloads wear it under every extension there is -- so it has
+        // to be sniffed by content, not by the name ending in .bin. Getting this
+        // wrong means an application shows up as an empty icon that will not
+        // open, which is hard to tell from a corrupt download.
+        Console.WriteLine("== a forked application arrives whole ==");
+        string appBox = NewDir("appbox");
+        byte[] appData = new byte[3000];
+        byte[] appRsrc = new byte[7000];
+        for (int i = 0; i < appData.Length; i++) appData[i] = (byte)(i % 251);
+        for (int i = 0; i < appRsrc.Length; i++) appRsrc[i] = (byte)(255 - i % 253);
+        // Wrapped, but named the way the download was -- not ".bin".
+        byte[] wrapped = MacBinary.Encode("Expander", 0x4150504Cu /*APPL*/, 0x61757374u,
+                                          0, appData, appRsrc, 0, 0);
+        File.WriteAllBytes(Path.Combine(appBox, "Expander.sea"), wrapped);
+
+        byte[]? appVol = FolderDisk.Build(appBox, out string abe);
+        Check(appVol is not null, "the folder builds" + (abe.Length > 0 ? " -- " + abe : ""));
+        if (appVol is not null)
+        {
+            var items = FolderDiskProbe.List(appVol);
+            var app = items.Find(t => t.Name == "Expander.sea");
+            Check(app.Name is not null, "the application is on the volume");
+            Check(app.DataLen == (uint)appData.Length,
+                  $"its data fork is the payload, not the wrapper ({app.DataLen} vs {appData.Length})");
+            byte[]? rsrc = FolderDiskProbe.Rsrc(appVol, "Expander.sea");
+            Check(rsrc is not null && rsrc.Length == appRsrc.Length &&
+                  rsrc.AsSpan().SequenceEqual(appRsrc),
+                  $"IT KEPT ITS RESOURCE FORK ({rsrc?.Length ?? -1} of {appRsrc.Length})");
+
+            // And back out again: the wrapper must return to the name it came in
+            // under, or the next build adds it twice under one guest name.
+            var sr = FolderDisk.SyncBack(appVol, appBox);
+            Check(sr.Error is null, "it syncs back" + (sr.Error is not null ? " -- " + sr.Error : ""));
+            Check(File.Exists(Path.Combine(appBox, "Expander.sea")),
+                  "it went back to the name it came in under");
+            Check(!File.Exists(Path.Combine(appBox, "Expander.sea.bin")),
+                  "no second copy was minted beside it");
+            byte[]? rebuilt = FolderDisk.Build(appBox, out _);
+            Check(rebuilt is not null &&
+                  FolderDiskProbe.List(rebuilt).FindAll(t => t.Name.StartsWith("Expander")).Count == 1,
+                  "a second build still sees exactly one of it");
+        }
 
         Console.WriteLine(failures == 0 ? "\nALL PASS" : $"\n{failures} FAILED");
         return failures == 0 ? 0 : 1;
