@@ -80,6 +80,9 @@ public sealed class QuadraEmulator : IEmulator
         SettleVolumes();
         SyncFolderDisk();   // the drop box's volume dies with the machine
         WriteBackHardDisk();
+        // And the PRAM, for the same reason: this is how the machine restarts
+        // onto another monitor or RAM size, and the chip goes with it.
+        SavePram();
         byte[] rom = File.ReadAllBytes(path);
         lock (_sync)
         {
@@ -87,6 +90,14 @@ public sealed class QuadraEmulator : IEmulator
             _h = Native.omac_q_create(rom, (nuint)rom.Length, (uint)ramMB);
             if (_h == IntPtr.Zero)
                 throw new InvalidOperationException("Quadra core failed to initialize (bad ROM or size?)");
+            // Put the battery back before the machine runs a single frame. The
+            // ROM reads parameter RAM during startup and hands what it finds to
+            // the System; blank PRAM means the ROM writes defaults over it and
+            // every setting the user made last session is gone -- which is how
+            // a machine with 136 MB fitted kept booting in 24-bit mode.
+            byte[]? pram = PramStore.Load("quadra", out uint pramAge);
+            if (pram is not null && Native.omac_q_pram_load(_h, pram, (nuint)pram.Length, pramAge) != 0)
+                Log.Line($"[core] parameter RAM restored ({pramAge}s since it was saved)");
             // Plug the monitor in before the machine runs a single frame: the
             // ROM senses the video port during startup and never looks again.
             if (!string.IsNullOrEmpty(Monitor) &&
@@ -637,6 +648,25 @@ public sealed class QuadraEmulator : IEmulator
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_key(_h, adbCode, down ? 1 : 0); }
     }
 
+    /// <summary>
+    /// Take the PRAM out of the chip and put it on disk. Called on the way out
+    /// and again whenever the machine is about to be replaced -- LoadRom builds
+    /// a new one, and the settings the user just made live only in the old one.
+    /// </summary>
+    private void SavePram()
+    {
+        byte[] blob;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return;
+            nuint size = Native.omac_q_pram_save(_h, null, 0);
+            if (size == 0) return;
+            blob = new byte[size];
+            if (Native.omac_q_pram_save(_h, blob, size) == 0) return;
+        }
+        PramStore.Save("quadra", blob);
+    }
+
     public void Dispose()
     {
         _stop = true;
@@ -655,6 +685,7 @@ public sealed class QuadraEmulator : IEmulator
         // nothing ejected it -- so save it here, as the hard disk is saved.
         WriteBackFloppy();
         WriteBackHardDisk();
+        SavePram();
         Destroy();
         _audio.Dispose();
     }

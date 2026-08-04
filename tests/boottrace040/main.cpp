@@ -600,6 +600,11 @@ int main(int argc, char** argv) {
     // extension installed its driver at all is the first fork in the road for
     // any "the guest ignores this device" question, and nothing else answers it.
     bool showDrivers = false;
+    // --pram FILE / --save-pram FILE: the battery. Load one before the machine
+    // runs a frame, write one out at the end. Two runs of the pair are what
+    // proves a setting made in a control panel is still there next time.
+    const char* pramInPath = nullptr;
+    const char* pramOutPath = nullptr;
     // --io-trace FROM TO PCLO PCHI BUDGET: every device access a range of
     // code makes in a frame window. The PC filter is what makes it readable:
     // the ROM's own interrupt traffic drowns a driver's few dozen accesses.
@@ -776,6 +781,8 @@ int main(int argc, char** argv) {
             disasmCount = std::atoi(argv[++i]);
         }
         else if (a == "--drivers") showDrivers = true;
+        else if (a == "--pram" && i + 1 < argc) pramInPath = argv[++i];
+        else if (a == "--save-pram" && i + 1 < argc) pramOutPath = argv[++i];
         else if (a == "--disasm-live" && i + 2 < argc) {
             disasmLiveAt = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             disasmLiveCount = std::atoi(argv[++i]);
@@ -924,6 +931,14 @@ int main(int argc, char** argv) {
     if (disasmCount > 0) {
         listing(disasmAt, disasmCount);
         return 0;
+    }
+    // Before the machine runs a frame: the ROM reads parameter RAM during
+    // startup and hands what it finds to the System, and never asks again.
+    if (pramInPath) {
+        const std::vector<u8> blob = loadFile(pramInPath);
+        std::printf("pram: %s -> %s\n", pramInPath,
+                    mac.loadPram(blob.data(), static_cast<u32>(blob.size()), 0)
+                        ? "restored" : "REFUSED (not a pram file)");
     }
     int cdbCount = 0;
     int flushCount = 0;
@@ -1598,6 +1613,21 @@ int main(int argc, char** argv) {
             std::printf("  pc %08X x%d\n", pc, n);
     }
 
+    if (pramOutPath) {
+        std::vector<u8> blob(QuadraMachine::kPramBlobBytes);
+        const u32 n = mac.savePram(blob.data(), static_cast<u32>(blob.size()));
+        std::ofstream f(pramOutPath, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(blob.data()), n);
+        // How much of it the guest actually wrote: a battery holding nothing
+        // is the same as no battery, and that is worth seeing at a glance.
+        u32 nonZero = 0;
+        for (u32 i = 8; i < 8 + 256; ++i) if (blob[i]) ++nonZero;
+        std::printf("pram: wrote %u bytes to %s (%u/256 XPRAM bytes set, clock %u)\n",
+                    n, pramOutPath, nonZero,
+                    (u32(blob[264]) << 24) | (u32(blob[265]) << 16) |
+                        (u32(blob[266]) << 8) | blob[267]);
+    }
+
     if (showDrivers) {
         // UTableBase $011C, UnitNtryCnt $01D2. Each entry is a handle to a DCE;
         // dCtlFlags bit 6 says whether dCtlDriver is a handle or a pointer, and
@@ -2078,6 +2108,10 @@ int main(int argc, char** argv) {
                         resp, resp);
         };
         ask("mach"); ask("sysv"); ask("proc"); ask("fpu "); ask("mmu ");
+        // How much memory the guest believes it has, and whether it is in
+        // 32-bit addressing at all -- 24-bit mode caps a machine at 8 MB
+        // however much is fitted, and nothing else in a boot says so out loud.
+        ask("ram "); ask("lram"); ask("addr"); ask("vm  ");
     }
 
     if (findHex) {

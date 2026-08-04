@@ -236,6 +236,18 @@ internal static class Native
     public static extern nuint omac_q_floppy_data(IntPtr h, byte[]? outBuf, nuint cap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_pram_save(IntPtr h, byte[]? outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_pram_load(IntPtr h, byte[] data, nuint len, uint addSeconds);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint omac_q_pram_save(IntPtr h, byte[]? outBuf, nuint cap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_pram_load(IntPtr h, byte[] data, nuint len, uint addSeconds);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_q_attach_cd(IntPtr h, int attached, int busId);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

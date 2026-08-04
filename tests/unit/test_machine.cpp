@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 #include <openmac/machine.hpp>
 
+#include <cstring>
 #include <vector>
 
 using namespace openmac;
@@ -79,4 +80,47 @@ TEST_CASE("via T1 one-shot fires and gates the IRQ line") {
     CHECK((mac.read8(viaReg(13)) & 0x80) != 0);   // IRQ asserted
     (void)mac.read8(viaReg(4));     // reading T1C-low clears the interrupt
     CHECK((mac.read8(viaReg(13)) & 0x40) == 0);
+}
+
+// Parameter RAM is the one part of a Macintosh that survives being switched
+// off. The blob is deliberately opaque -- 256 bytes of XPRAM exactly as the
+// guest wrote them, plus the clock -- so a setting stored by a control panel
+// comes back whatever it was, and nothing on the host has to know which byte
+// holds it.
+TEST_CASE("parameter RAM survives the machine it came from") {
+    Machine a(fakeRom(), {1u * 1024 * 1024});
+    // Write a pattern through the chip the way the guest would see it, plus a
+    // clock reading, then take a copy.
+    // (The chip is reached here through the machine's own save/load, which is
+    // the surface a front end uses.)
+    std::vector<u8> blob(Machine::kPramBlobBytes);
+    REQUIRE(a.savePram(blob.data(), u32(blob.size())) == Machine::kPramBlobBytes);
+    CHECK(std::memcmp(blob.data(), "PRAM", 4) == 0);
+    CHECK(blob[4] == 1);
+
+    // A doctored blob stands in for "what the guest left in the chip".
+    for (u32 i = 0; i < 256; ++i) blob[8 + i] = u8(i ^ 0x5A);
+    blob[264] = 0x12; blob[265] = 0x34; blob[266] = 0x56; blob[267] = 0x78;
+
+    Machine b(fakeRom(), {1u * 1024 * 1024});
+    // Switched off for an hour: a real battery keeps counting.
+    REQUIRE(b.loadPram(blob.data(), u32(blob.size()), 3600));
+    std::vector<u8> back(Machine::kPramBlobBytes);
+    REQUIRE(b.savePram(back.data(), u32(back.size())) == Machine::kPramBlobBytes);
+    CHECK(std::memcmp(back.data() + 8, blob.data() + 8, 256) == 0);
+    const u32 clock = (u32(back[264]) << 24) | (u32(back[265]) << 16) |
+                      (u32(back[266]) << 8) | back[267];
+    CHECK(clock == 0x12345678u + 3600u);
+
+    // Anything that is not ours changes nothing at all, rather than filling
+    // the chip with a stranger's bytes.
+    Machine c(fakeRom(), {1u * 1024 * 1024});
+    std::vector<u8> before(Machine::kPramBlobBytes);
+    c.savePram(before.data(), u32(before.size()));
+    std::vector<u8> junk(Machine::kPramBlobBytes, 0xAB);
+    CHECK_FALSE(c.loadPram(junk.data(), u32(junk.size()), 0));
+    CHECK_FALSE(c.loadPram(blob.data(), 10, 0));       // too short
+    std::vector<u8> after(Machine::kPramBlobBytes);
+    c.savePram(after.data(), u32(after.size()));
+    CHECK(before == after);
 }

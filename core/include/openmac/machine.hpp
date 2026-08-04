@@ -178,6 +178,16 @@ public:
     bool cdPresent() const;
     const char* cdMediumText() const { return cdMediumText_; }
 
+    // Parameter RAM: the one part of a Macintosh that survives being switched
+    // off. Held only in memory it comes back blank every launch and the machine
+    // forgets every setting a user made. The blob is opaque -- 256 bytes of
+    // XPRAM as the guest wrote them, plus the clock -- so whatever a control
+    // panel stores is what comes back. `addSeconds` is how long the machine was
+    // off; a real one keeps counting on its battery.
+    static constexpr u32 kPramBlobBytes = 268;
+    u32 savePram(u8* out, u32 cap) const;
+    bool loadPram(const u8* data, u32 len, u32 addSeconds);
+
     // Networking: a DaynaPORT SCSI/Link Ethernet adapter (SCSI ID 4). The
     // device moves raw Ethernet frames; the front end owns the backend (its
     // user-mode NAT). Inject queues a host frame for the guest; drain hands

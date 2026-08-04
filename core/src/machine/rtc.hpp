@@ -25,7 +25,9 @@ public:
     void tickSecond() { ++seconds_; }
 
     u32 seconds() const { return seconds_; }
+    void setSeconds(u32 s) { seconds_ = s; }
     std::array<u8, 256>& xpram() { return xpram_; }
+    const std::array<u8, 256>& xpram() const { return xpram_; }
 
     // Diagnostic: observe completed command/data bytes on the wire.
     std::function<void(const char* what, u8 value)> onByte;

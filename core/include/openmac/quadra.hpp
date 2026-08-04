@@ -187,6 +187,26 @@ public:
     // CPU. Headless diagnosis only: the answer is whatever the System's own
     // table holds. Returns the OSErr; the response lands in `response`.
     s32 gestaltQuery(u32 selector, u32& response);
+    // ---- parameter RAM -------------------------------------------------
+    //
+    // The clock/PRAM chip is the one part of a Macintosh that survives being
+    // switched off, and everything a user sets that is not a file lives in it:
+    // 32-bit addressing, the startup disk, the alert volume, the date. Held
+    // only in memory, it comes back blank every launch, the ROM resets it to
+    // defaults, and the machine forgets every choice -- which is how a machine
+    // with 136 MB fitted kept booting in 24-bit mode with 8 MB usable.
+    //
+    // The blob is opaque on purpose: 256 bytes of XPRAM as the guest wrote
+    // them, plus the clock. Nothing here interprets a single byte of it, so
+    // whatever a control panel stores is what comes back.
+    //
+    // `addSeconds` is how long the machine was switched off. A real one keeps
+    // counting on its battery; pass the elapsed wall time and this one does
+    // too. Returns false (and changes nothing) if the blob is not ours.
+    static constexpr u32 kPramBlobBytes = 268;
+    u32 savePram(u8* out, u32 cap) const;
+    bool loadPram(const u8* data, u32 len, u32 addSeconds);
+
     // Diagnosis switch: skip the injected mount/announce of hard disks, to
     // separate "our injection perturbs the boot" from everything else.
     bool suppressHdAnnounce = false;

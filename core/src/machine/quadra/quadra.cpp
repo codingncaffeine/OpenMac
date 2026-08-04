@@ -340,8 +340,22 @@ std::string QuadraMachine::diagnosticReport() const {
     add("   Ticks $016A = %u", peek32(0x016A));
     add("   MemErr $0220 = %d   FSBusy $0360 = %04X",
         static_cast<s16>(peek16(0x0220)), peek16(0x0360));
-    add("   VCBQHdr $0358 = %08X   DrvQHdr $0308 = %08X",
-        peek32(0x0358), peek32(0x0308));
+    // The queue HEADS, not the flags word in front of them: DrvQHdr's head is
+    // at $030A, and reading the long at $0308 answers the flags plus the top
+    // half of a low-memory pointer -- which is zero on a healthy machine and
+    // reads exactly like an empty queue.
+    add("   VCBQHdr $0358 = %08X   DrvQHdr $030A = %08X",
+        peek32(0x0358), peek32(0x030A));
+    // What the guest believes it has. An application's world sitting far below
+    // the fitted RAM is how "not enough memory" reaches a user on a machine
+    // with plenty -- and nothing else in this snapshot would show it.
+    add("   MemTop $0108 = %08X   BufPtr $010C = %08X   HeapEnd $0114 = %08X",
+        peek32(0x0108), peek32(0x010C), peek32(0x0114));
+    add("   ApplZone $02AA = %08X  ApplLimit $0130 = %08X  CurStackBase $0908 = %08X",
+        peek32(0x02AA), peek32(0x0130), peek32(0x0908));
+    add("   CurApName $0910 = '%.*s'   CurrentA5 $0904 = %08X",
+        peek16(0x0910) >> 8 > 31 ? 31 : peek16(0x0910) >> 8,
+        reinterpret_cast<const char*>(ram_.data() + 0x0911), peek32(0x0904));
     add("   Mouse $0830 = %d,%d   SCCRd $01D8 = %08X",
         static_cast<s16>(peek16(0x0832)), static_cast<s16>(peek16(0x0830)),
         peek32(0x01D8));
@@ -2689,6 +2703,33 @@ const std::vector<u8>& QuadraMachine::hardDisk2Image() const {
         hd2_.assign(scsiImage2_.begin() + hfsImageOffset2_,
                     scsiImage2_.begin() + hfsImageOffset2_ + hd2_.size());
     return hd2_;
+}
+
+// 'PRAM', a version, the 256 bytes of XPRAM, then the clock. Written and read
+// as bytes in a fixed order so a file survives a rebuild, and never
+// interpreted -- see the header for why that matters.
+u32 QuadraMachine::savePram(u8* out, u32 cap) const {
+    if (!out || cap < kPramBlobBytes) return kPramBlobBytes;
+    const std::array<u8, 256>& p = rtc_->xpram();
+    std::memcpy(out, "PRAM", 4);
+    out[4] = 1;                                       // version
+    out[5] = out[6] = out[7] = 0;
+    std::copy(p.begin(), p.end(), out + 8);
+    const u32 s = rtc_->seconds();
+    out[264] = u8(s >> 24); out[265] = u8(s >> 16);
+    out[266] = u8(s >> 8);  out[267] = u8(s);
+    return kPramBlobBytes;
+}
+
+bool QuadraMachine::loadPram(const u8* data, u32 len, u32 addSeconds) {
+    if (!data || len < kPramBlobBytes) return false;
+    if (std::memcmp(data, "PRAM", 4) != 0 || data[4] != 1) return false;
+    std::array<u8, 256>& p = rtc_->xpram();
+    std::copy(data + 8, data + 8 + 256, p.begin());
+    const u32 s = (u32(data[264]) << 24) | (u32(data[265]) << 16) |
+                  (u32(data[266]) << 8) | data[267];
+    rtc_->setSeconds(s + addSeconds);
+    return true;
 }
 
 void QuadraMachine::attachCdRom(bool attached, int busId) {

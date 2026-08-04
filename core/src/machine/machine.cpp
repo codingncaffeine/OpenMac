@@ -1040,6 +1040,33 @@ void Machine::ejectCd() {
 
 bool Machine::cdPresent() const { return cdrom_->discPresent(); }
 
+// 'PRAM', a version, the 256 bytes of XPRAM, then the clock -- bytes in a fixed
+// order so a file survives a rebuild, and never interpreted. Same format and
+// same shape as the Quadra's, because it is the same chip.
+u32 Machine::savePram(u8* out, u32 cap) const {
+    if (!out || cap < kPramBlobBytes) return kPramBlobBytes;
+    const std::array<u8, 256>& p = rtc_->xpram();
+    std::memcpy(out, "PRAM", 4);
+    out[4] = 1;
+    out[5] = out[6] = out[7] = 0;
+    std::copy(p.begin(), p.end(), out + 8);
+    const u32 s = rtc_->seconds();
+    out[264] = u8(s >> 24); out[265] = u8(s >> 16);
+    out[266] = u8(s >> 8);  out[267] = u8(s);
+    return kPramBlobBytes;
+}
+
+bool Machine::loadPram(const u8* data, u32 len, u32 addSeconds) {
+    if (!data || len < kPramBlobBytes) return false;
+    if (std::memcmp(data, "PRAM", 4) != 0 || data[4] != 1) return false;
+    std::array<u8, 256>& p = rtc_->xpram();
+    std::copy(data + 8, data + 8 + 256, p.begin());
+    const u32 s = (u32(data[264]) << 24) | (u32(data[265]) << 16) |
+                  (u32(data[266]) << 8) | data[267];
+    rtc_->setSeconds(s + addSeconds);
+    return true;
+}
+
 void Machine::attachNet(bool attached, int busId) {
     netdev_->setAttached(attached, busId);
     if (onDiag) {

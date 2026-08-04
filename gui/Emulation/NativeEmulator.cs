@@ -68,6 +68,9 @@ public sealed class NativeEmulator : IEmulator
         WriteBackExternalFloppy();
         WriteBackHardDisk();   // persist guest writes on every medium before teardown
         SyncFolderDisk();
+        // And the PRAM: this tears the running machine down, and the chip that
+        // remembers the user's settings goes down with it.
+        SavePram();
         byte[] rom = File.ReadAllBytes(path);
         lock (_sync)
         {
@@ -75,6 +78,12 @@ public sealed class NativeEmulator : IEmulator
             _h = Native.omac_create(rom, (nuint)rom.Length, (uint)ramMB);
             if (_h == IntPtr.Zero)
                 throw new InvalidOperationException("core failed to initialize (bad ROM or size?)");
+            // Put the battery back before the machine runs a frame: the ROM
+            // reads parameter RAM during startup and never asks again.
+            byte[]? pram = PramStore.Load("classic", out uint pramAge);
+            if (pram is not null &&
+                Native.omac_pram_load(_h, pram, (nuint)pram.Length, pramAge) != 0)
+                Log.Line($"[core] parameter RAM restored ({pramAge}s since it was saved)");
             // Boot the built-in ROM disk (System 6.0.3 from ROM) instead of an inserted
             // disk -- the emulated equivalent of holding Cmd-Opt-X-O at power-on.
             if (bootRomDisk) Native.omac_set_force_rom_disk(_h, 1);
@@ -742,6 +751,24 @@ public sealed class NativeEmulator : IEmulator
         }
     }
 
+    /// <summary>
+    /// Take the PRAM out of the chip and put it on disk, so the next launch
+    /// starts with a battery in it instead of a blank one.
+    /// </summary>
+    private void SavePram()
+    {
+        byte[] blob;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return;
+            nuint size = Native.omac_pram_save(_h, null, 0);
+            if (size == 0) return;
+            blob = new byte[size];
+            if (Native.omac_pram_save(_h, blob, size) == 0) return;
+        }
+        PramStore.Save("classic", blob);
+    }
+
     public void Dispose()
     {
         _stop = true;
@@ -750,6 +777,7 @@ public sealed class NativeEmulator : IEmulator
         WriteBackExternalFloppy();
         WriteBackHardDisk();
         SyncFolderDisk();
+        SavePram();
         Destroy();
         _nat?.Dispose();
         _audio.Dispose();

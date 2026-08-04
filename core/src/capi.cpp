@@ -365,6 +365,21 @@ OMAC_API size_t omac_net_drain(OMac* m, uint8_t* out, size_t cap)
 OMAC_API void omac_cd_eject(OMac* m) { if (m) m->mac.ejectCd(); }
 OMAC_API int omac_cd_present(OMac* m) { return m && m->mac.cdPresent() ? 1 : 0; }
 
+// Parameter RAM. Call with out = null for the size. `addSeconds` on load is how
+// long the machine was switched off, so the clock carries on the way a battery
+// would rather than restarting where it stopped.
+OMAC_API size_t omac_pram_save(OMac* m, uint8_t* out, size_t cap)
+{
+    if (!m) return 0;
+    return m->mac.savePram(out, static_cast<uint32_t>(cap));
+}
+
+OMAC_API int omac_pram_load(OMac* m, const uint8_t* data, size_t len,
+                            uint32_t addSeconds)
+{
+    return m && m->mac.loadPram(data, static_cast<uint32_t>(len), addSeconds) ? 1 : 0;
+}
+
 OMAC_API size_t omac_cd_medium(OMac* m, char* out, size_t cap)
 {
     if (!m) return 0;
@@ -714,6 +729,21 @@ OMAC_API size_t omac_q_floppy_writeback(OMacQ* m, uint8_t* out, size_t cap)
     if (cap < img.size()) return 0;
     std::copy(img.begin(), img.end(), out);
     return img.size();
+}
+
+// Parameter RAM. Call with out = null for the size. `addSeconds` on load is how
+// long the machine was switched off, so the clock carries on the way a battery
+// would rather than restarting where it stopped.
+OMAC_API size_t omac_q_pram_save(OMacQ* m, uint8_t* out, size_t cap)
+{
+    if (!m) return 0;
+    return m->mac.savePram(out, static_cast<uint32_t>(cap));
+}
+
+OMAC_API int omac_q_pram_load(OMacQ* m, const uint8_t* data, size_t len,
+                              uint32_t addSeconds)
+{
+    return m && m->mac.loadPram(data, static_cast<uint32_t>(len), addSeconds) ? 1 : 0;
 }
 
 OMAC_API size_t omac_q_diagnostics(OMacQ* m, char* out, size_t cap)
