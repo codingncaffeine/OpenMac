@@ -118,8 +118,13 @@ public:
     void adbClearCmdTrace();
     std::vector<u8> adbCmdTrace() const;   // CPU-issued ADB commands since the clear
     void armAdbSrTrace(int n) { adbSrTraceBudget_ = n; }   // log VIA1 SR reads w/ PCs
-    void watchMem(u32 addr, u32 len, int budget) {         // log RAM writes w/ PCs
+    // Log RAM writes to a range, with the PC that made them. `fromFrame` is not
+    // a convenience: the ROM's memory test writes its walking pattern over every
+    // byte of RAM during startup, so a watch armed from frame zero spends its
+    // whole budget on that and never sees what happens later.
+    void watchMem(u32 addr, u32 len, int budget, u32 fromFrame = 0) {
         watchAddr_ = addr; watchLen_ = len; watchBudget_ = budget;
+        watchFromFrame_ = fromFrame;
     }
     void armDataInTrace(int n) { dataInPcBudget_ = n; }
     void traceHdRequests(int n) { hdTraceBudget_ = n; }
@@ -423,6 +428,7 @@ private:
     int adbSrTraceBudget_ = 0;  // armed by the input test: log SR reads with PCs
     int dataInPcBudget_ = 0;    // log which routine drains SCSI data-in bytes
     u32 watchAddr_ = 0, watchLen_ = 0;   // RAM write-watch window
+    u32 watchFromFrame_ = 0;             // ignore the ROM.s memory test
     int watchBudget_ = 0;
 
     // Device-access trace, gated by frame window and by the PC that issued

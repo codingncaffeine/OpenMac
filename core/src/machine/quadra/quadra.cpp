@@ -474,7 +474,8 @@ u8 QuadraMachine::read8(u32 addr) {
 
 void QuadraMachine::write8(u32 addr, u8 value) {
     if (addr < 0x40000000u) {
-        if (watchLen_ && addr - watchAddr_ < watchLen_ && watchBudget_ > 0 && onDiag) {
+        if (watchLen_ && addr - watchAddr_ < watchLen_ && watchBudget_ > 0 &&
+            frameCounter_ >= watchFromFrame_ && onDiag) {
             --watchBudget_;
             char b[64];
             std::snprintf(b, sizeof b, "WATCH w8 %08X=%02X pc=%08X", addr, value, cpu_.pc);
@@ -567,7 +568,8 @@ u16 QuadraMachine::read16(u32 addr) {
 
 void QuadraMachine::write16(u32 addr, u16 value) {
     if (addr < 0x40000000u) {
-        if (watchLen_ && addr - watchAddr_ < watchLen_ + 1 && watchBudget_ > 0 && onDiag) {
+        if (watchLen_ && addr - watchAddr_ < watchLen_ + 1 && watchBudget_ > 0 &&
+            frameCounter_ >= watchFromFrame_ && onDiag) {
             --watchBudget_;
             char b[64];
             std::snprintf(b, sizeof b, "WATCH w16 %08X=%04X pc=%08X", addr, value, cpu_.pc);
@@ -657,7 +659,8 @@ u32 QuadraMachine::read32(u32 addr) {
 
 void QuadraMachine::write32(u32 addr, u32 value) {
     if (addr < 0x40000000u) {
-        if (watchLen_ && addr - watchAddr_ < watchLen_ + 3 && watchBudget_ > 0 && onDiag) {
+        if (watchLen_ && addr - watchAddr_ < watchLen_ + 3 && watchBudget_ > 0 &&
+            frameCounter_ >= watchFromFrame_ && onDiag) {
             --watchBudget_;
             char b[72];
             std::snprintf(b, sizeof b, "WATCH w32 %08X=%08X pc=%08X", addr, value, cpu_.pc);
@@ -2734,21 +2737,52 @@ std::string QuadraMachine::trapTableHealth() const {
     char b[160];
     for (const Table& t : kTables) {
         if (t.base + t.count * 4 > ram_.size()) continue;
-        u32 zero = 0, firstAt = 0;
+        u32 zero = 0, firstAt = 0, lastAt = 0, runs = 0;
+        bool inRun = false;
         for (u32 i = 0; i < t.count; ++i) {
             const u8* p = ram_.data() + t.base + i * 4;
-            if (p[0] || p[1] || p[2] || p[3]) continue;
-            if (!zero++) firstAt = i;
+            const bool isZero = !(p[0] || p[1] || p[2] || p[3]);
+            if (isZero) {
+                if (!zero++) firstAt = i;
+                lastAt = i;
+                if (!inRun) { ++runs; inRun = true; }
+            } else {
+                inRun = false;
+            }
         }
         if (zero == 0) {
             std::snprintf(b, sizeof b, "   %s trap table: %u entries, all filled\n",
                           t.name, t.count);
-        } else {
-            std::snprintf(b, sizeof b,
-                          "   %s trap table: %u of %u entries DISPATCH TO ZERO, "
-                          "first is trap $%04X\n",
-                          t.name, zero, t.count, t.firstTrap + firstAt);
+            s += b;
+            continue;
         }
+        // The SHAPE is the evidence. One contiguous run of zeros is a block
+        // write that landed on the table -- a length and a destination, and both
+        // are readable from the range. Scattered zeros are something choosing
+        // entries one at a time, which is a different culprit entirely.
+        std::snprintf(b, sizeof b,
+                      "   %s trap table: %u of %u entries DISPATCH TO ZERO\n",
+                      t.name, zero, t.count);
+        s += b;
+        std::snprintf(b, sizeof b,
+                      "      traps $%04X..$%04X, addresses $%04X..$%04X, "
+                      "%u byte%s in %u run%s%s\n",
+                      t.firstTrap + firstAt, t.firstTrap + lastAt,
+                      t.base + firstAt * 4, t.base + lastAt * 4 + 3,
+                      (lastAt - firstAt + 1) * 4, (lastAt - firstAt) ? "s" : "",
+                      runs, runs == 1 ? "" : "s",
+                      runs == 1 ? " (one contiguous block)" : "");
+        s += b;
+        // What sits either side of the hole: a block write leaves the entries
+        // just outside it untouched, and those are the ROM addresses that say
+        // where the table was healthy.
+        const auto entry = [&](u32 i) -> u32 {
+            const u8* p = ram_.data() + t.base + i * 4;
+            return (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | p[3];
+        };
+        std::snprintf(b, sizeof b, "      before $%04X, after $%04X\n",
+                      firstAt ? entry(firstAt - 1) : 0,
+                      lastAt + 1 < t.count ? entry(lastAt + 1) : 0);
         s += b;
     }
     return s;

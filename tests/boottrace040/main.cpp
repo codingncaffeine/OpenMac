@@ -492,7 +492,8 @@ int main(int argc, char** argv) {
     bool wiggle = false;            // --wiggle: real ADB mouse motion after the clicks
     int wiggleFrom = 0;             // --wiggle-from: the post-frame it starts at
     int jiggleAt = -1;              // --jiggle-at: click+move the mouse mid-boot
-    unsigned long watchMemAt = 0;   // --watch-mem: log writes to this address
+    unsigned long watchMemAt = 0;   // --watch-mem ADDR [LEN] [BUDGET]: log writes
+    unsigned long watchMemLen = 4, watchMemBudget = 60;
     unsigned long countPcAt = 0;    // --count-pc: count executions of this pc
     // --watch-pc (repeatable): report the registers each time execution reaches
     // an address. A pointer that is already wrong when a routine is entered was
@@ -691,6 +692,9 @@ int main(int argc, char** argv) {
             clicks.push_back({0, 0, false, false, 0, 0, -1, -1, 3, "", std::atoi(argv[++i])});
         else if (a == "--disks")
             clicks.push_back({0, 0, false, false, 0, 0, -1, -1, 4, "", 0});
+        else if (a == "--cmd-key" && i + 1 < argc)
+            clicks.push_back({0, 0, false, false, 0, 0, -1, -1, 6, "",
+                              static_cast<int>(std::strtoul(argv[++i], nullptr, 16))});
         else if (a == "--floppy-at" && i + 2 < argc) {
             const std::string img = argv[++i];
             floppyAt.emplace_back(std::atoi(argv[++i]), img);
@@ -701,7 +705,11 @@ int main(int argc, char** argv) {
         else if (a == "--wiggle") wiggle = true;
         else if (a == "--wiggle-from" && i + 1 < argc) { wiggle = true; wiggleFrom = std::atoi(argv[++i]); }
         else if (a == "--jiggle-at" && i + 1 < argc) jiggleAt = std::atoi(argv[++i]);
-        else if (a == "--watch-mem" && i + 1 < argc) watchMemAt = std::strtoul(argv[++i], nullptr, 16);
+        else if (a == "--watch-mem" && i + 1 < argc) {
+            watchMemAt = std::strtoul(argv[++i], nullptr, 16);
+            if (i + 1 < argc && argv[i + 1][0] != 45) watchMemLen = std::strtoul(argv[++i], nullptr, 16);
+            if (i + 1 < argc && argv[i + 1][0] != 45) watchMemBudget = std::strtoul(argv[++i], nullptr, 10);
+        }
         else if (a == "--count-pc" && i + 1 < argc) countPcAt = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--watch-from" && i + 1 < argc) watchFrom = std::atoi(argv[++i]);
         else if (a == "--watch-budget" && i + 1 < argc) watchBudget = std::atoi(argv[++i]);
@@ -968,7 +976,7 @@ int main(int argc, char** argv) {
         std::printf("f=%u %s\n", static_cast<unsigned>(mac.frameCount()), m);
     };
     // The write watch serves any investigation, not just the input test.
-    if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), 4, 60);
+    if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), static_cast<u32>(watchMemLen), static_cast<int>(watchMemBudget), static_cast<u32>(watchFrom));
     if (ioTrace) mac.traceIoWindow(ioFrom, ioTo, ioPcLo, ioPcHi, ioBudget);
     if (hdTrace) mac.traceHdRequests(hdTrace);
     mac.ejectUnmounts_ = !ejectNoUnmount;
@@ -1170,6 +1178,17 @@ int main(int argc, char** argv) {
             }
         }
         if (vector == 10 || vector == 11 || (vector >= 32 && vector < 48)) return;
+        // A guest in the first 4K is running in the exception vectors, which it
+        // did not branch to: the A-line dispatcher RTSed into a trap table entry
+        // without checking it. Say which trap while the table still says so.
+        if (pc < 0x1000u) {
+            static int lowBudget = 4;
+            if (lowBudget-- > 0) {
+                std::printf("GUEST LOST vector %d pc=%08X f=%u\n", vector, pc,
+                            static_cast<unsigned>(mac.frameCount()));
+                std::printf("%s", mac.trapTableHealth().c_str());
+            }
+        }
         if (vector == 2) {
             ++busErrSites[pc];
             if (busErrSites[pc] <= 2)
@@ -1745,7 +1764,7 @@ int main(int argc, char** argv) {
         const u16 msV0 = mac.read16(0x0830), msH0 = mac.read16(0x0832);
         mac.adbClearCmdTrace();
         mac.armAdbSrTrace(30);
-        if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), 16, 60);
+        if (watchMemAt) mac.watchMem(static_cast<u32>(watchMemAt), static_cast<u32>(watchMemLen), static_cast<int>(watchMemBudget), static_cast<u32>(watchFrom));
         if (countPcAt) mac.countPc(static_cast<u32>(countPcAt));
         std::printf("VBL plumbing: dafb vblEnabled=%d  via2 IFR=%02X IER=%02X\n",
                     mac.dafbVblEnabled() ? 1 : 0,
@@ -1927,6 +1946,25 @@ int main(int argc, char** argv) {
             } else if (pt.act == 3) {
                 for (int f = 0; f < pt.n; ++f) stepFrame();
                 std::printf("step %d waited %d frames\n", stepNo, pt.n);
+                shot();
+            } else if (pt.act == 6) {
+                // A Command chord. The Finder opens the selection on Cmd-O,
+                // which is worth having because a synthetic double-click on an
+                // icon selects it and does not open it -- the Finder wants two
+                // mouse-downs it recognises as a pair, and a scripted pointer
+                // rarely lands inside DoubleTime with the cadence it expects.
+                // Selecting and then using the keyboard is the same act to the
+                // Finder and it is deterministic.
+                const u8 key = static_cast<u8>(pt.n);
+                mac.keyEvent(0x37, true);                  // Command down
+                for (int f = 0; f < 6; ++f) stepFrame();
+                mac.keyEvent(key, true);
+                for (int f = 0; f < 6; ++f) stepFrame();
+                mac.keyEvent(key, false);
+                for (int f = 0; f < 6; ++f) stepFrame();
+                mac.keyEvent(0x37, false);
+                for (int f = 0; f < 30; ++f) stepFrame();
+                std::printf("step %d command-key $%02X\n", stepNo, key);
                 shot();
             } else if (pt.act == 5) {
                 auto img = mac.floppyForWriteBack();
