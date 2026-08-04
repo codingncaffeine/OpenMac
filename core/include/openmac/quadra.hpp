@@ -80,6 +80,16 @@ public:
     // when the guest stops responding. Reads model state only, so taking it
     // cannot perturb the machine.
     std::string diagnosticReport() const;
+    // The two trap dispatch tables, checked for entries that dispatch nowhere.
+    // The A-line dispatcher at $408099B0 does not validate: for a Toolbox trap
+    // it writes the table entry over its own return address and RTSes into it,
+    // so a zero entry sends the guest to address 0 and it runs forward through
+    // the exception vectors until something is illegal. That is a crash whose
+    // report says only "illegal instruction at $12", and the one fact that
+    // would explain it -- which trap had no handler -- is gone by then.
+    // Reads the RAM array directly and takes no locks, so it is safe to call
+    // from inside the CPU's exception dispatch.
+    std::string trapTableHealth() const;
     // Flush and unmount every mounted volume, as Shut Down would. Call before
     // persisting an image when the host application is closing: without it the
     // System's cached blocks are lost and the volume stays flagged unclean,

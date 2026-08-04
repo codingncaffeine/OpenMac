@@ -594,8 +594,8 @@ int main(int argc, char** argv) {
     // --disasm-live ADDR N: the same listing, taken at the END of a run, so a
     // driver the System loaded into RAM can be read. The ROM is the same either
     // way; guest code is only there once the guest has put it there.
-    u32 disasmLiveAt = 0;
-    int disasmLiveCount = 0;
+    struct LiveList { u32 at; int n; };
+    std::vector<LiveList> disasmLive;
     // --drivers: every driver in the unit table at exit, by name. Whether an
     // extension installed its driver at all is the first fork in the road for
     // any "the guest ignores this device" question, and nothing else answers it.
@@ -790,8 +790,8 @@ int main(int argc, char** argv) {
         else if (a == "--pram" && i + 1 < argc) pramInPath = argv[++i];
         else if (a == "--save-pram" && i + 1 < argc) pramOutPath = argv[++i];
         else if (a == "--disasm-live" && i + 2 < argc) {
-            disasmLiveAt = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
-            disasmLiveCount = std::atoi(argv[++i]);
+            const u32 at = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            disasmLive.push_back({at, std::atoi(argv[++i])});
         }
         else if (a == "--trace-traps" && i + 2 < argc) {
             trapsAfterCdbs = std::atoi(argv[++i]);
@@ -1687,9 +1687,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (disasmLiveCount > 0) {
-        std::printf("\n-- listing at %08X --\n", disasmLiveAt);
-        listing(disasmLiveAt, disasmLiveCount);
+    for (const auto& L : disasmLive) {
+        std::printf("\n-- listing at %08X --\n", L.at);
+        listing(L.at, L.n);
     }
 
     const M68040& c = mac.cpu();

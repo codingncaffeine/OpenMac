@@ -2721,6 +2721,39 @@ const std::vector<u8>& QuadraMachine::hardDisk2Image() const {
 // 'PRAM', a version, the 256 bytes of XPRAM, then the clock. Written and read
 // as bytes in a fixed order so a file survives a rebuild, and never
 // interpreted -- see the header for why that matters.
+// Decoded from the ROM's own dispatcher, not assumed: $408099B0 reads
+// ($0E00,D2.w*4) for a Toolbox trap and JSRs ([$0400,D2.w*4]) for an OS one, so
+// the tables are 1024 entries at $0E00 and 256 at $0400. A healthy System has no
+// zero entry in either -- every unimplemented slot points at the ROM's
+// unimplemented-trap handler.
+std::string QuadraMachine::trapTableHealth() const {
+    struct Table { const char* name; u32 base, count; u32 firstTrap; };
+    static const Table kTables[2] = {{"OS", 0x0400, 256, 0xA000},
+                                     {"Toolbox", 0x0E00, 1024, 0xA800}};
+    std::string s;
+    char b[160];
+    for (const Table& t : kTables) {
+        if (t.base + t.count * 4 > ram_.size()) continue;
+        u32 zero = 0, firstAt = 0;
+        for (u32 i = 0; i < t.count; ++i) {
+            const u8* p = ram_.data() + t.base + i * 4;
+            if (p[0] || p[1] || p[2] || p[3]) continue;
+            if (!zero++) firstAt = i;
+        }
+        if (zero == 0) {
+            std::snprintf(b, sizeof b, "   %s trap table: %u entries, all filled\n",
+                          t.name, t.count);
+        } else {
+            std::snprintf(b, sizeof b,
+                          "   %s trap table: %u of %u entries DISPATCH TO ZERO, "
+                          "first is trap $%04X\n",
+                          t.name, zero, t.count, t.firstTrap + firstAt);
+        }
+        s += b;
+    }
+    return s;
+}
+
 u32 QuadraMachine::savePram(u8* out, u32 cap) const {
     if (!out || cap < kPramBlobBytes) return kPramBlobBytes;
     const std::array<u8, 256>& p = rtc_->xpram();

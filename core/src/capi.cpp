@@ -628,6 +628,23 @@ struct OMacQ {
             }
             log(line.c_str());
         }
+        // A guest running in the exception vectors did not get there by
+        // branching. The A-line dispatcher writes a trap table entry over its
+        // own return address and RTSes into it without checking, so a zero
+        // entry lands the guest at address 0 -- and by the time it faults, the
+        // one fact that explains it is which trap had no handler. Ask while
+        // the evidence is still there; it costs a scan of two tables, and only
+        // when the PC says something already went badly wrong.
+        if (pc < 0x1000u) {
+            const std::string health = mac.trapTableHealth();
+            std::size_t at = 0;
+            while (at < health.size()) {
+                const std::size_t nl = health.find('\n', at);
+                const std::size_t end = nl == std::string::npos ? health.size() : nl;
+                log(health.substr(at, end - at).c_str());
+                at = end + 1;
+            }
+        }
     }
 
 private:
