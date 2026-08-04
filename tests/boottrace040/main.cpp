@@ -600,6 +600,7 @@ int main(int argc, char** argv) {
     // extension installed its driver at all is the first fork in the road for
     // any "the guest ignores this device" question, and nothing else answers it.
     bool showDrivers = false;
+    bool cdDriveOnly = false;   // --cd-drive: the drive attached, no disc in it
     // --pram FILE / --save-pram FILE: the battery. Load one before the machine
     // runs a frame, write one out at the end. Two runs of the pair are what
     // proves a setting made in a control panel is still there next time.
@@ -781,6 +782,11 @@ int main(int argc, char** argv) {
             disasmCount = std::atoi(argv[++i]);
         }
         else if (a == "--drivers") showDrivers = true;
+        // The drive on the bus with nothing in it -- which is what a front end
+        // leaves behind when the user attaches a CD-ROM and takes the disc out,
+        // and a different path from --cd: the driver installs, the drive joins
+        // the queue empty, and the System polls it forever.
+        else if (a == "--cd-drive") cdDriveOnly = true;
         else if (a == "--pram" && i + 1 < argc) pramInPath = argv[++i];
         else if (a == "--save-pram" && i + 1 < argc) pramOutPath = argv[++i];
         else if (a == "--disasm-live" && i + 2 < argc) {
@@ -1281,6 +1287,10 @@ int main(int argc, char** argv) {
         } else {
             std::printf("floppy: %s\n", mac.insertFloppy(std::move(fd)) ? "inserted" : "REFUSED");
         }
+    }
+    if (cdDriveOnly) {
+        mac.attachCdRom(true, 3);
+        std::printf("cd: drive attached with no disc\n");
     }
     if (cdPath) {
         auto cd = loadFile(cdPath);

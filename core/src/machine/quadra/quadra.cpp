@@ -1505,13 +1505,26 @@ void QuadraMachine::installCdDriver() {
     write16(drvr + 0x10, u16(kHeader + 0x00));        // drvrClose -> the Open stub
     const char* name = "\010.AppleCD";
     for (int i = 0; i < 9; ++i) write8(drvr + 0x12 + u32(i), u8(name[i]));
-    // Each stub is MOVEQ #0,D0 / JMP ([jIODone]) -- a correct driver on its own,
-    // so nothing is stranded if the hook ever misses.
-    for (u32 off : {0x00u, 0x08u, 0x10u, 0x18u}) {
+    // Prime, Control and Status are QUEUED calls: they finish through IODone,
+    // so a stub that jumps there is a correct driver on its own and nothing is
+    // stranded if the hook ever misses.
+    for (u32 off : {0x08u, 0x10u, 0x18u}) {
         const u32 at = drvr + kHeader + off;
         write16(at + 0, 0x7000);                      // MOVEQ #0,D0
         write16(at + 2, 0x2078); write16(at + 4, 0x08FC);   // MOVEA.L $08FC.W,A0
         write16(at + 6, 0x4ED0);                      // JMP (A0)
+    }
+    // ⛔ Open and Close are NOT. They are immediate calls and must RTS with the
+    // result in D0. Sending them through IODone asks the Device Manager to
+    // complete a request nobody queued -- it dequeues from a DCE queue that is
+    // empty and takes a completion routine out of a parameter block that is not
+    // one. Nothing faults there; the damage lands later, in a trap table that
+    // dispatches to zero and a System heap full of a repeating fill.
+    {
+        const u32 at = drvr + kHeader + 0x00;
+        write16(at + 0, 0x7000);                      // MOVEQ #0,D0
+        write16(at + 2, 0x4E75);                      // RTS
+        write16(at + 4, 0x4E71); write16(at + 6, 0x4E71);   // NOP NOP (padding)
     }
     cdDrvr_ = drvr;
     cdPrimePc_ = drvr + kHeader + 0x08;
