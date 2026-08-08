@@ -7,6 +7,10 @@ cmake-build-*/
 .vscode/
 *.user
 
+# Packaged release trees and their archives
+dist/
+*.zip
+
 # Dev-shell local state
 imgui.ini
 CMakeUserPresets.json

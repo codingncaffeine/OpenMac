@@ -13,12 +13,17 @@
     <Product>OpenMac</Product>
     <AssemblyTitle>OpenMac</AssemblyTitle>
     <UseWindowsForms>false</UseWindowsForms>
+    <Version>0.6.0</Version>
   </PropertyGroup>
 
-  <!-- Ship the native core DLL (built by CMake into gui/native) beside the app. -->
+  <!-- Ship the native core DLL (built by CMake into gui/native) beside the app.
+       CopyToOutputDirectory covers a local build; publish is a separate copy
+       step, and without CopyToPublishDirectory a published tree is an app with
+       no emulator in it. -->
   <ItemGroup>
     <None Include="native\openmac_c.dll" Condition="Exists('native\openmac_c.dll')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <Link>openmac_c.dll</Link>
     </None>
   </ItemGroup>
