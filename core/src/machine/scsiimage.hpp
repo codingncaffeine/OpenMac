@@ -80,7 +80,7 @@ inline std::vector<u8> buildScsiDriver(u8 scsiId = 0, u16 driveNum = 4, u8 unit 
     // handle body in A4 across the _NewPtr calls. A5 is CurrentA5 -- never touched.
     return {
         // ---- installer (offset 0): manual DCE install + _AddDrive ----
-        0x45, 0xFA, 0x00, 0x5A,             // LEA drvr(PC),A2        A2 = &DRVR (drvr @ +0x5C)
+        0x45, 0xFA, 0x00, 0x52,             // LEA drvr(PC),A2        A2 = &DRVR (drvr @ +0x54)
         0x26, 0x28, 0x00, 0x08,             // MOVE.L 8(A0),D3        D3 = pmPyPartStart (before A0 clobbered)
         0x20, 0x3C, 0x00, 0x00, 0x00, 0x30, // MOVE.L #$30,D0
         0xA7, 0x1E,                         // _NewPtr,Sys,Clear      A0 = DCE
@@ -89,9 +89,19 @@ inline std::vector<u8> buildScsiDriver(u8 scsiId = 0, u16 driveNum = 4, u8 unit 
         0x70, 0x04,                         // MOVEQ #4,D0
         0xA7, 0x1E,                         // _NewPtr,Sys,Clear      A0 = master ptr (handle body)
         0x28, 0x48,                         // MOVEA.L A0,A4          A4 = handle
-        0x20, 0x0B,                         // MOVE.L A3,D0           D0 = DCE ptr
-        0x00, 0x80, 0x80, 0x00, 0x00, 0x00, // ORI.L #$80000000,D0    set locked-master-ptr flag
-        0x28, 0x80,                         // MOVE.L D0,(A4)         *handle = flagged DCE ptr
+        // The master pointer goes in CLEAN. A unit-table entry is a locked
+        // Handle, and in 24-bit mode the Memory Manager keeps that lock in the
+        // pointer's own high byte -- so this used to ORI.L #$80000000 to look
+        // like the real article. That costs nothing while the machine folds
+        // high bytes away, and kills it the moment it stops: with 32-bit
+        // addressing switched on the ROM maps $80000000-$FFFFFFFF transparently
+        // (dtt1 = $807FC040), so the very first IODone -- which fetches this
+        // pointer back out of the unit table and does BTST D4,$0004(A1) on it --
+        // drives $8000DDE4 onto the bus, where nothing answers. Bus error, Sad
+        // Mac, before a single block of the System is read. A 32-bit master
+        // pointer carries no flag bits at all and nothing consults this one in
+        // 24-bit mode either, so unflagged is right in both modes.
+        0x28, 0x8B,                         // MOVE.L A3,(A4)         *handle = DCE ptr
         0x22, 0x78, 0x01, 0x1C,             // MOVEA.L ($011C).W,A1   A1 = UTableBase
         0x23, 0x4C,                         // MOVE.L A4,d16(A1)      UTableBase[unit] = handle
         static_cast<u8>((unit * 4u) >> 8), static_cast<u8>(unit * 4u),
@@ -108,7 +118,7 @@ inline std::vector<u8> buildScsiDriver(u8 scsiId = 0, u16 driveNum = 4, u8 unit 
         0x41, 0xE9, 0x00, 0x06,             // LEA 6(A1),A0          &dsQLink
         0xA0, 0x4E,                         // _AddDrive
         0x4E, 0x75,                         // RTS
-        // ---- DRVR (offset 0x5C) ----
+        // ---- DRVR (offset 0x54) ----
         0x4F, 0x00,                         // drvrFlags: NeedLock|dReadEnable|dWritEnable|dCtlEnable|dStatEnable
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // delay/emask/menu
         0x00, 0x1A,                         // drvrOpen   = 0x1A
@@ -266,7 +276,7 @@ inline std::vector<u8> buildScsiDriverPortable(u8 scsiId = 0, u16 driveNum = 4,
     const u8 refHi = static_cast<u8>(refNum >> 8), refLo = static_cast<u8>(refNum);
     return {
         // ---- installer (offset 0): identical to buildScsiDriver ----
-        0x45, 0xFA, 0x00, 0x5A,             // LEA drvr(PC),A2
+        0x45, 0xFA, 0x00, 0x52,             // LEA drvr(PC),A2        (drvr @ +0x54)
         0x26, 0x28, 0x00, 0x08,             // MOVE.L 8(A0),D3
         0x20, 0x3C, 0x00, 0x00, 0x00, 0x30, // MOVE.L #$30,D0
         0xA7, 0x1E,                         // _NewPtr,Sys,Clear
@@ -275,9 +285,7 @@ inline std::vector<u8> buildScsiDriverPortable(u8 scsiId = 0, u16 driveNum = 4,
         0x70, 0x04,                         // MOVEQ #4,D0
         0xA7, 0x1E,                         // _NewPtr,Sys,Clear
         0x28, 0x48,                         // MOVEA.L A0,A4
-        0x20, 0x0B,                         // MOVE.L A3,D0
-        0x00, 0x80, 0x80, 0x00, 0x00, 0x00, // ORI.L #$80000000,D0
-        0x28, 0x80,                         // MOVE.L D0,(A4)
+        0x28, 0x8B,                         // MOVE.L A3,(A4)  unflagged -- see buildScsiDriver
         0x22, 0x78, 0x01, 0x1C,             // MOVEA.L ($011C).W,A1
         0x23, 0x4C,                         // MOVE.L A4,d16(A1)
         static_cast<u8>((unit * 4u) >> 8), static_cast<u8>(unit * 4u),
@@ -294,7 +302,7 @@ inline std::vector<u8> buildScsiDriverPortable(u8 scsiId = 0, u16 driveNum = 4,
         0x41, 0xE9, 0x00, 0x06,             // LEA 6(A1),A0
         0xA0, 0x4E,                         // _AddDrive
         0x4E, 0x75,                         // RTS
-        // ---- DRVR (offset 0x5C) ----
+        // ---- DRVR (offset 0x54) ----
         0x4F, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x1A,                         // drvrOpen   = 0x1A
