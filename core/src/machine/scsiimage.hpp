@@ -399,45 +399,49 @@ inline std::vector<u8> buildScsiDriverPortable(u8 scsiId = 0, u16 driveNum = 4,
         0x10, 0xC2,                         // q+22
         0x42, 0x18,                         // q+24
         0xC8, 0xC2,                         // q+26  MULU D2,D4
-        0x9E, 0xFC, 0x00, 0x14,             // q+28  SUBA.W #$14,A7
-        0x2C, 0x0F,                         // q+32  MOVE.L A7,D6
-        0x55, 0x8F,                         // q+34  SUBQ.L #2,A7
-        0x3F, 0x3C, 0x00, 0x01,             // q+36  SCSIGet
-        0xA8, 0x15,                         // q+40
-        0x3E, 0x17,                         // q+42
-        0x66, 0x4C,                         // q+44  BNE.S .err (q+122)
-        0x3F, 0x05,                         // q+46
-        0x3F, 0x3C, 0x00, 0x02,             // q+48  SCSISelect
-        0xA8, 0x15,                         // q+52
-        0x3E, 0x17,                         // q+54
-        0x66, 0x40,                         // q+56  BNE.S .err
-        0x48, 0x78, 0x09, 0xFA,             // q+58  PEA $09FA
-        0x3F, 0x3C, 0x00, 0x06,             // q+62  CDB length 6
-        0x3F, 0x3C, 0x00, 0x03,             // q+66  SCSICmd
-        0xA8, 0x15,                         // q+70
-        0x3E, 0x17,                         // q+72
-        0x66, 0x16,                         // q+74  BNE.S .compl (q+98)
-        0x20, 0x46,                         // q+76  MOVE.L D6,A0
-        0x30, 0xFC, 0x00, 0x01,             // q+78  MOVE.W #1,(A0)+  scInc
-        0x20, 0xCA,                         // q+82
-        0x20, 0xC4,                         // q+84
-        0x30, 0xBC, 0x00, 0x07,             // q+86  MOVE.W #7,(A0)   scStop
-        0x2F, 0x06,                         // q+90  MOVE.L D6,-(A7)  TIB
-        0x3F, 0x00,                         // q+92  MOVE.W D0,-(A7)  selector
-        0xA8, 0x15,                         // q+94
-        0x3E, 0x17,                         // q+96
-        // .compl (q+98)
-        0x48, 0x78, 0x09, 0xFA,             // q+98
-        0x48, 0x78, 0x09, 0xFC,             // q+102
-        0x2F, 0x3C, 0x00, 0x00, 0x00, 0x00, // q+106
-        0x3F, 0x3C, 0x00, 0x04,             // q+112 SCSIComplete
-        0xA8, 0x15,                         // q+116
-        0x3E, 0x38, 0x09, 0xFA,             // q+118
-        // .err (q+122)
-        0xDE, 0xFC, 0x00, 0x16,             // q+122 ADDA.W #$16,A7
-        0x30, 0x07,                         // q+126 MOVE.W D7,D0
-        0x2E, 0x1F,                         // q+128
-        0x4E, 0x75,                         // q+130 RTS
+        // D0 is volatile across _SCSIDispatch. D3 is no longer needed after
+        // the CDB has been assembled and is preserved by the ROM dispatcher,
+        // so keep the caller's read/write selector there until the data phase.
+        0x36, 0x00,                         // q+28  MOVE.W D0,D3
+        0x9E, 0xFC, 0x00, 0x14,             // q+30  SUBA.W #$14,A7
+        0x2C, 0x0F,                         // q+34  MOVE.L A7,D6
+        0x55, 0x8F,                         // q+36  SUBQ.L #2,A7
+        0x3F, 0x3C, 0x00, 0x01,             // q+38  SCSIGet
+        0xA8, 0x15,                         // q+42
+        0x3E, 0x17,                         // q+44
+        0x66, 0x4C,                         // q+46  BNE.S .err (q+124)
+        0x3F, 0x05,                         // q+48
+        0x3F, 0x3C, 0x00, 0x02,             // q+50  SCSISelect
+        0xA8, 0x15,                         // q+54
+        0x3E, 0x17,                         // q+56
+        0x66, 0x40,                         // q+58  BNE.S .err
+        0x48, 0x78, 0x09, 0xFA,             // q+60  PEA $09FA
+        0x3F, 0x3C, 0x00, 0x06,             // q+64  CDB length 6
+        0x3F, 0x3C, 0x00, 0x03,             // q+68  SCSICmd
+        0xA8, 0x15,                         // q+72
+        0x3E, 0x17,                         // q+74
+        0x66, 0x16,                         // q+76  BNE.S .compl (q+100)
+        0x20, 0x46,                         // q+78  MOVE.L D6,A0
+        0x30, 0xFC, 0x00, 0x01,             // q+80  MOVE.W #1,(A0)+  scInc
+        0x20, 0xCA,                         // q+84
+        0x20, 0xC4,                         // q+86
+        0x30, 0xBC, 0x00, 0x07,             // q+88  MOVE.W #7,(A0)   scStop
+        0x2F, 0x06,                         // q+92  MOVE.L D6,-(A7)  TIB
+        0x3F, 0x03,                         // q+94  MOVE.W D3,-(A7)  saved selector
+        0xA8, 0x15,                         // q+96
+        0x3E, 0x17,                         // q+98
+        // .compl (q+100)
+        0x48, 0x78, 0x09, 0xFA,             // q+100
+        0x48, 0x78, 0x09, 0xFC,             // q+104
+        0x2F, 0x3C, 0x00, 0x00, 0x00, 0x00, // q+108
+        0x3F, 0x3C, 0x00, 0x04,             // q+114 SCSIComplete
+        0xA8, 0x15,                         // q+118
+        0x3E, 0x38, 0x09, 0xFA,             // q+120
+        // .err (q+124)
+        0xDE, 0xFC, 0x00, 0x16,             // q+124 ADDA.W #$16,A7
+        0x30, 0x07,                         // q+128 MOVE.W D7,D0
+        0x2E, 0x1F,                         // q+130
+        0x4E, 0x75,                         // q+132 RTS
     };
 }
 

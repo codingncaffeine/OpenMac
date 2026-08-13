@@ -18,7 +18,7 @@ namespace OpenMac.Gui.Emulation;
 /// exactly as the guest wrote them plus the clock, and nothing on this side
 /// interprets a byte of it. Whatever a control panel stores is what comes back.
 ///
-/// One file per machine model, because the two machines have different PRAM
+/// One file per machine model, because the machines have different PRAM
 /// contents and writing one over the other would be worse than forgetting.
 /// </remarks>
 public static class PramStore
@@ -55,20 +55,37 @@ public static class PramStore
             }
             return blob;
         }
-        catch { return null; }
+        catch (Exception ex)
+        {
+            Log.Line($"{model} PRAM load failed: {ex.Message}");
+            return null;
+        }
     }
 
-    /// <summary>Write the contents back, with the moment they were written.</summary>
-    public static void Save(string model, byte[] blob)
+    /// <summary>
+    /// Write the contents back, with the moment they were written. A false
+    /// result is logged so a persistence failure is never mistaken for a guest
+    /// that simply did not change parameter RAM.
+    /// </summary>
+    public static bool Save(string model, byte[] blob)
     {
-        if (blob.Length == 0) return;
+        if (blob.Length == 0)
+        {
+            Log.Line($"{model} PRAM save rejected an empty blob");
+            return false;
+        }
         try
         {
             Directory.CreateDirectory(Dir);
             File.WriteAllBytes(PathFor(model), blob);
             File.WriteAllText(StampFor(model),
                               DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString());
+            return true;
         }
-        catch { /* a machine that cannot save its PRAM still runs */ }
+        catch (Exception ex)
+        {
+            Log.Line($"{model} PRAM save failed: {ex.Message}");
+            return false;
+        }
     }
 }

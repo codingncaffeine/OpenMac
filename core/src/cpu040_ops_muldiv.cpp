@@ -26,6 +26,7 @@ int CpuOps040::opMul(M68040& c, u16 op) {
     c.d[dreg] = r;
     setNZ(c, r, 2);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
+    if (c.is68030()) return 28 + eaFetchTime030(eaIndex(mode, reg), 1);
     return (isSigned ? 16 : 14) + eaTime(eaIndex(mode, reg));
 }
 
@@ -35,7 +36,8 @@ int CpuOps040::opDiv(M68040& c, u16 op) {
     const int dreg = (op >> 9) & 7;
     const u16 s = static_cast<u16>(readEA(c, mode, reg, 1));
     const u32 t = c.d[dreg];
-    const int eaT = eaTime(eaIndex(mode, reg));
+    const int eaT = c.is68030() ? eaFetchTime030(eaIndex(mode, reg), 1)
+                                : eaTime(eaIndex(mode, reg));
 
     if (s == 0) {
         c.sr_ = static_cast<u16>(c.sr_ & ~(kN040 | kZ040 | kV040 | kC040));
@@ -47,12 +49,12 @@ int CpuOps040::opDiv(M68040& c, u16 op) {
         if (q > 0xFFFF) {
             setFlag(c, kV040, true);
             setFlag(c, kC040, false);
-            return 27 + eaT;
+            return (c.is68030() ? 44 : 27) + eaT;
         }
         c.d[dreg] = ((t % s) << 16) | (q & 0xFFFF);
         setNZ(c, q, 1);
         c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
-        return 27 + eaT;
+        return (c.is68030() ? 44 : 27) + eaT;
     }
 
     const s32 st = static_cast<s32>(t);
@@ -61,14 +63,14 @@ int CpuOps040::opDiv(M68040& c, u16 op) {
     if (q64 > 32767 || q64 < -32768) {
         setFlag(c, kV040, true);
         setFlag(c, kC040, false);
-        return 27 + eaT;
+        return (c.is68030() ? 56 : 27) + eaT;
     }
     const s32 q = static_cast<s32>(q64);
     const s32 rem = st % ss;
     c.d[dreg] = (static_cast<u32>(rem & 0xFFFF) << 16) | static_cast<u32>(q & 0xFFFF);
     setNZ(c, static_cast<u32>(q), 1);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
-    return 27 + eaT;
+    return (c.is68030() ? 56 : 27) + eaT;
 }
 
 // MULU.L/MULS.L and DIVU.L/DIVS.L/DIVUL.L/DIVSL.L, selected by the opcode's
@@ -83,7 +85,9 @@ int CpuOps040::opMulDivL(M68040& c, u16 op) {
     const bool isSigned = (ext & 0x0800) != 0;
     const bool is64 = (ext & 0x0400) != 0;
     const u32 s = readEA(c, mode, reg, 2);
-    const int eaT = eaTime(eaIndex(mode, reg));
+    const int eaT = c.is68030()
+        ? eaFetchImmediateTime030(c, eaIndex(mode, reg), 1)
+        : eaTime(eaIndex(mode, reg));
 
     if (!isDiv) {
         if (isSigned) {
@@ -118,7 +122,7 @@ int CpuOps040::opMulDivL(M68040& c, u16 op) {
                 setFlag(c, kC040, false);
             }
         }
-        return 20 + eaT;
+        return (c.is68030() ? 44 : 20) + eaT;
     }
 
     // Divide. rl = Dq (dividend low / quotient), rh = Dr (remainder; also
@@ -138,13 +142,13 @@ int CpuOps040::opMulDivL(M68040& c, u16 op) {
         if (q > 0x7FFFFFFFll || q < -0x80000000ll) {
             setFlag(c, kV040, true);
             setFlag(c, kC040, false);
-            return 44 + eaT;
+            return (c.is68030() ? 90 : 44) + eaT;
         }
         if (rh != rl) c.d[rh] = static_cast<u32>(static_cast<u64>(rem));
         c.d[rl] = static_cast<u32>(static_cast<u64>(q));
         setNZ(c, c.d[rl], 2);
         c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
-        return 44 + eaT;
+        return (c.is68030() ? 90 : 44) + eaT;
     }
 
     const u64 dividend = is64 ? ((static_cast<u64>(c.d[rh]) << 32) | c.d[rl])
@@ -154,13 +158,13 @@ int CpuOps040::opMulDivL(M68040& c, u16 op) {
     if (q > 0xFFFFFFFFull) {
         setFlag(c, kV040, true);
         setFlag(c, kC040, false);
-        return 44 + eaT;
+        return (c.is68030() ? 78 : 44) + eaT;
     }
     if (rh != rl) c.d[rh] = static_cast<u32>(rem);
     c.d[rl] = static_cast<u32>(q);
     setNZ(c, c.d[rl], 2);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
-    return 44 + eaT;
+    return (c.is68030() ? 78 : 44) + eaT;
 }
 
 namespace {
@@ -210,14 +214,14 @@ int CpuOps040::opAbcdSbcd(M68040& c, u16 op) {
         const u8 t = static_cast<u8>(c.d[rx] & 0xFF);
         const u8 r = isAbcd ? abcdByte040(c, s, t) : sbcdByte040(c, s, t);
         writeSized(c.d[rx], r, 0);
-        return 3;
+        return c.is68030() ? 4 : 3;
     }
 
     const u8 s = c.rd8(calcEA(c, 4, ry, 0));
     const u8 t0 = c.rd8(calcEA(c, 4, rx, 0));
     const u8 r = isAbcd ? abcdByte040(c, s, t0) : sbcdByte040(c, s, t0);
     c.wr8(c.a[rx], r);
-    return 4;
+    return c.is68030() ? 13 : 4;
 }
 
 int CpuOps040::opNbcd(M68040& c, u16 op) {
@@ -225,11 +229,12 @@ int CpuOps040::opNbcd(M68040& c, u16 op) {
     if (mode == 0) {
         const u8 r = sbcdByte040(c, static_cast<u8>(c.d[reg] & 0xFF), 0);
         writeSized(c.d[reg], r, 0);
-        return 2;
+        return c.is68030() ? 6 : 2;
     }
     const u32 addr = calcEA(c, mode, reg, 0);
     const u8 r = sbcdByte040(c, c.rd8(addr), 0);
     c.wr8(addr, r);
+    if (c.is68030()) return 6 + eaFetchTime030(eaIndex(mode, reg), 0);
     return 3 + eaTime(eaIndex(mode, reg));
 }
 
@@ -258,6 +263,7 @@ int CpuOps040::opPackUnpk(M68040& c, u16 op) {
         if (memForm) c.wr16(calcEA(c, 4, ry, 1), unpacked);
         else         writeSized(c.d[ry], unpacked, 1);
     }
+    if (c.is68030()) return memForm ? 11 : (isPack ? 6 : 8);
     return memForm ? (isPack ? 5 : 6) : (isPack ? 3 : 4);   // UM 10.5
 }
 
@@ -268,13 +274,14 @@ int CpuOps040::opTas(M68040& c, u16 op) {
         setNZ(c, v, 0);
         c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
         c.d[reg] |= 0x80;
-        return 2;
+        return c.is68030() ? 4 : 2;
     }
     const u32 addr = calcEA(c, mode, reg, 0);
     const u32 v = c.rd8(addr);
     setNZ(c, v, 0);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
     c.wr8(addr, static_cast<u8>(v | 0x80));
+    if (c.is68030()) return 12 + eaCalcTime030(c, eaIndex(mode, reg));
     return 24 + eaTime(eaIndex(mode, reg));
 }
 

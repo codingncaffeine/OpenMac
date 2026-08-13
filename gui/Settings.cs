@@ -9,10 +9,16 @@ public sealed class Settings
     public int RamMB { get; set; } = 4;
     public bool BootRomDisk { get; set; }
 
-    /// <summary>Which machine the GUI runs: "classic" or "quadra650". Each model
-    /// remembers its own ROM and hard disk — they are not interchangeable.</summary>
+    /// <summary>Which machine the GUI runs: "classic", "iifx" or "quadra650". Each model
+    /// remembers its own ROM, floppy and hard disk — they are not interchangeable.</summary>
     public string Model { get; set; } = "classic";
+    public string? LastRomIifx { get; set; }
+    public string? LastFloppyIifx { get; set; }
+    public string? LastHardDiskIifx { get; set; }
+    public string? VideoRomIifx { get; set; }
+    public int RamMBIifx { get; set; } = 8;
     public string? LastRomQuadra { get; set; }
+    public string? LastFloppyQuadra { get; set; }
     public string? LastHardDiskQuadra { get; set; }
     public int RamMBQuadra { get; set; } = 8;
 
@@ -24,19 +30,42 @@ public sealed class Settings
     [System.Text.Json.Serialization.JsonIgnore]
     public bool IsQuadra => Model == "quadra650";
     [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsIifx => Model == "iifx";
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? ModelLastRom
     {
-        get => IsQuadra ? LastRomQuadra : LastRom;
-        set { if (IsQuadra) LastRomQuadra = value; else LastRom = value; }
+        get => IsIifx ? LastRomIifx : IsQuadra ? LastRomQuadra : LastRom;
+        set
+        {
+            if (IsIifx) LastRomIifx = value;
+            else if (IsQuadra) LastRomQuadra = value;
+            else LastRom = value;
+        }
     }
     [System.Text.Json.Serialization.JsonIgnore]
     public string? ModelLastHardDisk
     {
-        get => IsQuadra ? LastHardDiskQuadra : LastHardDisk;
-        set { if (IsQuadra) LastHardDiskQuadra = value; else LastHardDisk = value; }
+        get => IsIifx ? LastHardDiskIifx : IsQuadra ? LastHardDiskQuadra : LastHardDisk;
+        set
+        {
+            if (IsIifx) LastHardDiskIifx = value;
+            else if (IsQuadra) LastHardDiskQuadra = value;
+            else LastHardDisk = value;
+        }
     }
     [System.Text.Json.Serialization.JsonIgnore]
-    public int ModelRamMB => IsQuadra ? RamMBQuadra : RamMB;
+    public string? ModelLastFloppy
+    {
+        get => IsIifx ? LastFloppyIifx : IsQuadra ? LastFloppyQuadra : LastFloppy;
+        set
+        {
+            if (IsIifx) LastFloppyIifx = value;
+            else if (IsQuadra) LastFloppyQuadra = value;
+            else LastFloppy = value;
+        }
+    }
+    [System.Text.Json.Serialization.JsonIgnore]
+    public int ModelRamMB => IsIifx ? RamMBIifx : IsQuadra ? RamMBQuadra : RamMB;
 
     public int Scale { get; set; } = 2;              // 0 = fit, else fixed multiplier
     public string? LastRom { get; set; }
@@ -102,7 +131,14 @@ public sealed class Settings
         try
         {
             if (File.Exists(FilePath))
-                return JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new Settings();
+            {
+                Settings settings =
+                    JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new Settings();
+                int[] legalIifxRam = { 4, 8, 16, 20, 32, 64, 68, 80, 128 };
+                if (Array.IndexOf(legalIifxRam, settings.RamMBIifx) < 0)
+                    settings.RamMBIifx = 8;
+                return settings;
+            }
         }
         catch { /* fall through to defaults */ }
         return new Settings();
@@ -123,6 +159,6 @@ public sealed class Settings
         RecentRoms.RemoveAll(p => string.Equals(p, path, StringComparison.OrdinalIgnoreCase));
         RecentRoms.Insert(0, path);
         if (RecentRoms.Count > 8) RecentRoms.RemoveRange(8, RecentRoms.Count - 8);
-        LastRom = path;
+        ModelLastRom = path;
     }
 }

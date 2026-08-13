@@ -10,6 +10,8 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 class Via6522 {
 public:
     void reset();
@@ -73,6 +75,8 @@ public:
     }
 
 private:
+    friend class IifxStateCodec;
+
     void setIFR(u8 bit);
     void clearIFR(u8 bit);
     void portAWritten();

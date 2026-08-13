@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -34,8 +35,19 @@ public partial class MainWindow : Window
     private EventHandler? _renderHandler;
 
     private bool _mouseLocked;
+    // The click which captures the host pointer is not a Macintosh click. Keep
+    // the guest button as an explicit state instead of deriving it from WPF's
+    // physical LeftButton flag during motion: the latter remains pressed while
+    // the capture click is being released and used to leave the Mac button
+    // stuck down after that release was intentionally ignored.
+    private bool _guestMouseDown;
+    private bool _captureMotionLogged;
+    private HwndSource? _windowSource;
+    private bool _rawMouseRegistered;
+    private long _pendingMouseDx, _pendingMouseDy;
+    private ulong _capturedMotionPackets;
+    private long _capturedMouseDx, _capturedMouseDy;
     private KeyboardHook? _keyHook;        // swallows host combos while input is captured
-    private bool _ignoreUpAfterLock;
     private int _lockCx, _lockCy;          // window-center reference, physical screen px
     private string _baseTitle = "OpenMac";
     private bool _fullscreen;
@@ -60,6 +72,11 @@ public partial class MainWindow : Window
         CompositionTarget.Rendering += _renderHandler;
 
         WireInput();
+        // WPF coalesces legacy WM_MOUSEMOVE messages around SetCursorPos. That
+        // can reduce a captured mouse to one synthetic pixel of motion. Raw
+        // Input is attached once the HWND exists and supplies the HID's actual
+        // relative deltas; the WPF button events remain enabled.
+        SourceInitialized += (_, _) => InitializeRawMouse();
         // The captured-input keyboard hook lives for the window's lifetime and
         // does nothing until capture switches it on. It reads _emulator through
         // this, so a backend swap never leaves it pointing at a dead machine.
@@ -82,6 +99,8 @@ public partial class MainWindow : Window
         };
         Closing += (_, _) =>
         {
+            UnlockMouse();
+            ShutdownRawMouse();
             if (_renderHandler != null) CompositionTarget.Rendering -= _renderHandler;
             timeEndPeriod(1);
             _keyHook?.Dispose();
@@ -97,6 +116,11 @@ public partial class MainWindow : Window
         try
         {
             Native.omac_version();   // probes the native DLL; throws if it's missing
+            if (settings.IsIifx)
+            {
+                Log.Line("backend: native core (openmac_c.dll), Macintosh IIfx");
+                return new IifxEmulator { VideoRomPath = settings.VideoRomIifx };
+            }
             if (settings.IsQuadra)
             {
                 Log.Line("backend: native core (openmac_c.dll), Quadra 650");
@@ -141,6 +165,7 @@ public partial class MainWindow : Window
     }
 
     private void ModelClassic_Click(object sender, RoutedEventArgs e) => SwitchModel("classic");
+    private void ModelIifx_Click(object sender, RoutedEventArgs e) => SwitchModel("iifx");
     private void ModelQuadra_Click(object sender, RoutedEventArgs e) => SwitchModel("quadra650");
 
     /// <summary>Fill the Monitor menu from the displays the machine can drive.
@@ -198,6 +223,10 @@ public partial class MainWindow : Window
 
     private void Tick()
     {
+        // Coalesce high-poll-rate host mice to the display cadence. This keeps
+        // WM_INPUT non-blocking while still delivering every relative count to
+        // the emulated ADB mouse before the next displayed guest frame.
+        FlushMouseMotion();
         // Display only. The emulator produces frames (and audio) on its own thread;
         // copy the most recent one and blit it. TryGetFrame returns false when
         // nothing new has been produced since the previous refresh.
@@ -236,30 +265,49 @@ public partial class MainWindow : Window
         // without hitting a screen edge. Middle-click (or losing focus) releases
         // it. This bypasses mapping the absolute cursor through the Viewbox scale,
         // which shrank motion and truncated sub-pixel movement away in the int cast.
-        ScreenImage.MouseMove += (_, e) =>
+        ScreenImage.MouseMove += (_, _) =>
         {
+            // Raw Input does not include SetCursorPos's synthetic movement and
+            // is the normal path. Retain the old calculation only as a fallback
+            // for a Windows configuration that refuses device registration.
+            if (_rawMouseRegistered) return;
             if (!_mouseLocked || !_emulator.IsRomLoaded) return;
             if (!GetCursorPos(out POINT pt)) return;
             int dx = pt.X - _lockCx, dy = pt.Y - _lockCy;
             if (dx == 0 && dy == 0) return;                   // the warp-back itself
-            bool down = e.LeftButton == MouseButtonState.Pressed;
-            _emulator.MouseMove(dx, dy, down);
+            QueueMouseMotion(dx, dy, "legacy");
             SetCursorPos(_lockCx, _lockCy);                   // warp back to centre
         };
-        ScreenImage.MouseLeftButtonDown += (_, _) =>
+        ScreenImage.MouseLeftButtonDown += (_, e) =>
         {
             ScreenImage.Focus();
-            if (!_mouseLocked) { LockMouse(); _ignoreUpAfterLock = true; return; }
+            if (!_mouseLocked) { LockMouse(); e.Handled = true; return; }
+            if (_guestMouseDown) return;
+            FlushMouseMotion();
+            _guestMouseDown = true;
             _emulator.MouseButton(true);
         };
-        ScreenImage.MouseLeftButtonUp += (_, _) =>
+        ScreenImage.MouseLeftButtonUp += (_, e) =>
         {
-            if (_ignoreUpAfterLock) { _ignoreUpAfterLock = false; return; }
+            // A release belonging to the capture gesture has no matching guest
+            // press. A real guest click is forwarded exactly once.
+            if (!_guestMouseDown) { e.Handled = true; return; }
+            FlushMouseMotion();
+            _guestMouseDown = false;
             _emulator.MouseButton(false);
         };
         ScreenImage.MouseDown += (_, e) =>
         {
-            if (e.ChangedButton == MouseButton.Middle) UnlockMouse();
+            if (e.ChangedButton == MouseButton.Middle)
+            {
+                UnlockMouse();
+                e.Handled = true;
+            }
+        };
+        ScreenImage.LostMouseCapture += (_, _) =>
+        {
+            if (_mouseLocked && !ReferenceEquals(Mouse.Captured, ScreenImage))
+                UnlockMouse();
         };
 
         KeyDown += (_, e) =>
@@ -311,26 +359,155 @@ public partial class MainWindow : Window
     }
 
     // ---- relative mouse capture ----
+    private void InitializeRawMouse()
+    {
+        IntPtr hwnd = new WindowInteropHelper(this).Handle;
+        _windowSource = HwndSource.FromHwnd(hwnd);
+        _windowSource?.AddHook(WindowProc);
+
+        var devices = new[]
+        {
+            new RAWINPUTDEVICE
+            {
+                UsagePage = 0x01,             // HID generic desktop controls
+                Usage = 0x02,                 // mouse
+                Flags = 0,                    // foreground only; keep legacy buttons
+                Target = hwnd,
+            },
+        };
+        _rawMouseRegistered = RegisterRawInputDevices(
+            devices, (uint)devices.Length, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
+        if (_rawMouseRegistered)
+            Log.Line($"input: raw relative mouse registered (packet={Marshal.SizeOf<RAWINPUT>()} bytes)");
+        else
+            Log.Line($"input: raw mouse registration failed ({Marshal.GetLastWin32Error()}); using legacy motion");
+    }
+
+    private void ShutdownRawMouse()
+    {
+        if (_rawMouseRegistered)
+        {
+            var devices = new[]
+            {
+                new RAWINPUTDEVICE
+                {
+                    UsagePage = 0x01,
+                    Usage = 0x02,
+                    Flags = RIDEV_REMOVE,
+                    Target = IntPtr.Zero,
+                },
+            };
+            RegisterRawInputDevices(
+                devices, (uint)devices.Length, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
+            _rawMouseRegistered = false;
+        }
+        _windowSource?.RemoveHook(WindowProc);
+        _windowSource = null;
+    }
+
+    private IntPtr WindowProc(IntPtr hwnd, int message, IntPtr wParam,
+                              IntPtr lParam, ref bool handled)
+    {
+        if (message != WM_INPUT || !_mouseLocked || !_emulator.IsRomLoaded)
+            return IntPtr.Zero;
+
+        uint size = (uint)Marshal.SizeOf<RAWINPUT>();
+        RAWINPUT input = default;
+        uint read = GetRawInputData(lParam, RID_INPUT, ref input, ref size,
+                                    (uint)Marshal.SizeOf<RAWINPUTHEADER>());
+        if (read == uint.MaxValue || input.Header.Type != RIM_TYPEMOUSE)
+            return IntPtr.Zero;
+
+        int dx = input.Mouse.LastX;
+        int dy = input.Mouse.LastY;
+        if ((input.Mouse.Flags & MOUSE_MOVE_ABSOLUTE) != 0)
+        {
+            // Absolute pointing devices report a normalized position instead
+            // of counts. The Windows cursor has already resolved that position,
+            // so turn it back into a relative delta from our lock point.
+            if (!GetCursorPos(out POINT point)) return IntPtr.Zero;
+            dx = point.X - _lockCx;
+            dy = point.Y - _lockCy;
+        }
+        if (dx == 0 && dy == 0) return IntPtr.Zero;
+
+        QueueMouseMotion(dx, dy, "raw");
+        // Warping the legacy pointer does not manufacture Raw Input packets.
+        // Keeping it centred prevents an invisible host cursor reaching another
+        // monitor while the raw HID deltas continue without an artificial edge.
+        SetCursorPos(_lockCx, _lockCy);
+        return IntPtr.Zero;                  // WPF must still perform WM_INPUT cleanup
+    }
+
+    private void QueueMouseMotion(int dx, int dy, string source)
+    {
+        _pendingMouseDx += dx;
+        _pendingMouseDy += dy;
+        _capturedMouseDx += dx;
+        _capturedMouseDy += dy;
+        ++_capturedMotionPackets;
+        if (_captureMotionLogged) return;
+        _captureMotionLogged = true;
+        Log.Line($"input: first {source} motion dx={dx} dy={dy} backend={_emulator.BackendName}");
+    }
+
+    private void FlushMouseMotion()
+    {
+        long dx = _pendingMouseDx;
+        long dy = _pendingMouseDy;
+        _pendingMouseDx = _pendingMouseDy = 0;
+        if (!_mouseLocked || !_emulator.IsRomLoaded || (dx == 0 && dy == 0)) return;
+
+        // A physically impossible multi-billion-count packet is the only way
+        // these casts can split; retaining the remainder makes even that lossless.
+        while (dx != 0 || dy != 0)
+        {
+            int partX = (int)Math.Clamp(dx, int.MinValue, int.MaxValue);
+            int partY = (int)Math.Clamp(dy, int.MinValue, int.MaxValue);
+            _emulator.MouseMove(partX, partY, _guestMouseDown);
+            dx -= partX;
+            dy -= partY;
+        }
+    }
+
     private void LockMouse()
     {
         if (_mouseLocked) return;
+        if (!Mouse.Capture(ScreenImage, CaptureMode.Element))
+        {
+            Log.Line("input: pointer capture refused by WPF");
+            return;
+        }
         _mouseLocked = true;
-        Mouse.Capture(ScreenImage);
+        _guestMouseDown = false;
+        _captureMotionLogged = false;
+        _pendingMouseDx = _pendingMouseDy = 0;
+        _capturedMotionPackets = 0;
+        _capturedMouseDx = _capturedMouseDy = 0;
         ScreenImage.Cursor = Cursors.None;
         RecenterCursor();
         if (_keyHook != null) _keyHook.Enabled = true;   // Cmd(Win)+Q, Alt+Tab etc. now reach the Mac
         Title = _baseTitle + "   —   input captured: keys go to the Mac (middle-click to release)";
+        Log.Line($"input: pointer captured backend={_emulator.BackendName}");
     }
 
     private void UnlockMouse()
     {
         if (!_mouseLocked) return;
+        // Losing focus or middle-clicking while dragging must never strand the
+        // Macintosh button in its active-low pressed state.
+        FlushMouseMotion();
+        if (_guestMouseDown && _emulator.IsRomLoaded)
+            _emulator.MouseButton(false);
+        _guestMouseDown = false;
         _mouseLocked = false;
-        _ignoreUpAfterLock = false;
         if (_keyHook != null) { _keyHook.Enabled = false; _keyHook.ReleaseAll(); }
         if (ScreenImage.IsMouseCaptured) ScreenImage.ReleaseMouseCapture();
         ScreenImage.Cursor = null;
         Title = _baseTitle;
+        Log.Line($"input: pointer released packets={_capturedMotionPackets} "
+                 + $"delta={_capturedMouseDx}/{_capturedMouseDy} "
+                 + $"source={(_rawMouseRegistered ? "raw" : "legacy")}");
     }
 
     // Park the OS cursor at the window's physical centre and remember that point;
@@ -348,6 +525,50 @@ public partial class MainWindow : Window
 
     [StructLayout(LayoutKind.Sequential)] private struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTDEVICE
+    {
+        public ushort UsagePage;
+        public ushort Usage;
+        public uint Flags;
+        public IntPtr Target;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTHEADER
+    {
+        public uint Type;
+        public uint Size;
+        public IntPtr Device;
+        public IntPtr WParam;
+    }
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    private struct RAWMOUSE
+    {
+        [FieldOffset(0)] public ushort Flags;
+        [FieldOffset(4)] public uint Buttons;
+        [FieldOffset(8)] public uint RawButtons;
+        [FieldOffset(12)] public int LastX;
+        [FieldOffset(16)] public int LastY;
+        [FieldOffset(20)] public uint ExtraInformation;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUT
+    {
+        public RAWINPUTHEADER Header;
+        public RAWMOUSE Mouse;
+    }
+    private const int WM_INPUT = 0x00FF;
+    private const uint RID_INPUT = 0x10000003;
+    private const uint RIM_TYPEMOUSE = 0;
+    private const ushort MOUSE_MOVE_ABSOLUTE = 0x0001;
+    private const uint RIDEV_REMOVE = 0x00000001;
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RegisterRawInputDevices(
+        [In] RAWINPUTDEVICE[] devices, uint count, uint size);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputData(
+        IntPtr rawInput, uint command, ref RAWINPUT data, ref uint size, uint headerSize);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
@@ -355,18 +576,34 @@ public partial class MainWindow : Window
     // ---- machine lifecycle ----
     private void LoadRom(string path)
     {
-        // The two machines take different ROMs (Classic: 512 KB, Quadra
+        // The machines take distinct ROMs (Classic and IIfx: 512 KB, Quadra
         // family: 1 MB). Feeding the wrong one wedges the CPU into a white
         // screen with no diagnostics -- refuse it with directions instead.
         long romLen = new FileInfo(path).Length;
         bool looksQuadra = romLen >= 1024 * 1024;
-        if (looksQuadra != _settings.IsQuadra)
+        uint header = 0;
+        if (romLen >= 4)
         {
-            string msg = looksQuadra
-                ? "This is a 1 MB Quadra-family ROM, but the current model is the Macintosh " +
-                  "Classic.\n\nSwitch Machine > Model > Macintosh Quadra 650, then open this ROM there."
-                : "This is a Classic-sized ROM, but the current model is the Quadra 650.\n\n" +
-                  "Switch Machine > Model > Macintosh Classic, then open this ROM there.";
+            using FileStream stream = File.OpenRead(path);
+            Span<byte> bytes = stackalloc byte[4];
+            if (stream.Read(bytes) == 4)
+                header = ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16)
+                         | ((uint)bytes[2] << 8) | bytes[3];
+        }
+        bool looksIifx = romLen == 512 * 1024 && header == 0x4147DD77u;
+        bool rightModel = _settings.IsQuadra ? looksQuadra
+                        : _settings.IsIifx ? looksIifx
+                        : !looksQuadra && !looksIifx;
+        if (!rightModel)
+        {
+            string detected = looksQuadra ? "a Quadra-family ROM"
+                            : looksIifx ? "the Macintosh IIfx ROM (checksum 4147DD77)"
+                            : "a Classic-family 512 KB ROM";
+            string wanted = _settings.IsQuadra ? "Macintosh Quadra 650"
+                          : _settings.IsIifx ? "Macintosh IIfx"
+                          : "Macintosh Classic";
+            string msg = $"This file looks like {detected}, but the current model is the {wanted}.\n\n"
+                       + "Choose the matching machine under Machine > Model, then open its ROM there.";
             Log.Line($"ROM refused (wrong model): {path} ({romLen} bytes, model={_settings.Model})");
             MessageBox.Show(this, msg, "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
@@ -388,18 +625,10 @@ public partial class MainWindow : Window
             }
             // Before any disk goes in: the tab is read at insertion.
             _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
-            // The Quadra build carries only the SCSI hard disk so far; the
-            // Classic's other remembered media stay its own.
-            if (!_settings.IsQuadra)
+            // Only the Classic has an external floppy port in this frontend.
+            // The internal-drive restore below is shared by every model.
+            if (!_settings.IsQuadra && !_settings.IsIifx)
             {
-                // A remembered path the core now refuses is forgotten rather
-                // than retried on every boot; the refusal is in the log.
-                if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy) &&
-                    !_emulator.InsertFloppy(_settings.LastFloppy!))
-                {
-                    Log.Line($"floppy refused: {_settings.LastFloppy} -- {_emulator.MediumNote(0)}");
-                    _settings.LastFloppy = null;
-                }
                 if (_settings.ExternalDrive) _emulator.SetExternalDrive(true);
                 if (!string.IsNullOrEmpty(_settings.LastExternalFloppy) &&
                     File.Exists(_settings.LastExternalFloppy) &&
@@ -409,19 +638,20 @@ public partial class MainWindow : Window
                     _settings.LastExternalFloppy = null;
                 }
             }
+            // A remembered path the core now refuses is forgotten rather than
+            // retried on every boot; the refusal is in the log.
+            if (!string.IsNullOrEmpty(_settings.ModelLastFloppy) &&
+                File.Exists(_settings.ModelLastFloppy) &&
+                !_emulator.InsertFloppy(_settings.ModelLastFloppy!))
+            {
+                Log.Line($"floppy refused: {_settings.ModelLastFloppy} -- {_emulator.MediumNote(0)}");
+                _settings.ModelLastFloppy = null;
+            }
             if (!string.IsNullOrEmpty(_settings.ModelLastHardDisk) && File.Exists(_settings.ModelLastHardDisk))
                 _emulator.AttachHardDisk(_settings.ModelLastHardDisk!);
             if (_settings.IsQuadra)
             {
-                // The Quadra reads floppies (DiskCopy 4.2 / MacBinary / raw) through
-                // the .Sony Prime hook and mounts a SCSI CD; restore both so a
-                // remembered boot disk is already in the drive for the boot scan.
-                if (!string.IsNullOrEmpty(_settings.LastFloppy) && File.Exists(_settings.LastFloppy) &&
-                    !_emulator.InsertFloppy(_settings.LastFloppy!))
-                {
-                    Log.Line($"floppy refused: {_settings.LastFloppy} -- {_emulator.MediumNote(0)}");
-                    _settings.LastFloppy = null;
-                }
+                // Mount a remembered SCSI CD so it is present for the scan.
                 if (!string.IsNullOrEmpty(_settings.LastCd) && File.Exists(_settings.LastCd) &&
                     !_emulator.InsertCd(_settings.LastCd!))
                 {
@@ -429,7 +659,7 @@ public partial class MainWindow : Window
                     _settings.LastCd = null;
                 }
             }
-            if (!_settings.IsQuadra)
+            if (!_settings.IsQuadra && !_settings.IsIifx)
             {
                 if (_settings.CdRomAttached) _emulator.SetCdRomAttached(true);
                 if (!string.IsNullOrEmpty(_settings.LastCd) && File.Exists(_settings.LastCd) &&
@@ -448,7 +678,9 @@ public partial class MainWindow : Window
             // Two ways to want it: the drop box is on (use the chosen folder,
             // or make the default one), or a folder disk was simply left open
             // last session (restore exactly that, and create nothing).
-            string? seatFolder = _settings.DropBox ? DropBoxFolder() : ChosenFolder();
+            string? seatFolder = _settings.IsIifx
+                ? null
+                : _settings.DropBox ? DropBoxFolder() : ChosenFolder();
             if (seatFolder is not null &&
                 !_emulator.AttachFolderDisk(seatFolder, out string dbErr))
             {
@@ -490,6 +722,29 @@ public partial class MainWindow : Window
             LoadRom(path);
     }
 
+    private void IifxVideoRom_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_settings.IsIifx) return;
+        if (FilePicker.Open(this, _settings, FilePicker.VideoRom,
+                            "Open Macintosh Display Card 8•24 GC ROM",
+                            "8•24 GC ROM (*.bin;*.rom)|*.bin;*.rom|All files (*.*)|*.*",
+                            _settings.VideoRomIifx) is not { } path)
+            return;
+        long bytes = new FileInfo(path).Length;
+        if (bytes != 32 * 1024 && bytes != 64 * 1024)
+        {
+            MessageBox.Show(this,
+                "An 8•24 GC declaration ROM must be 32 KiB or 64 KiB.",
+                "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        _settings.VideoRomIifx = path;
+        _settings.Save();
+        if (_emulator is IifxEmulator iifx) iifx.VideoRomPath = path;
+        if (_emulator.RomPath is { } rom) LoadRom(rom);
+        UpdateUi();
+    }
+
     private void BuildRecentMenu()
     {
         RecentMenu.Items.Clear();
@@ -523,9 +778,19 @@ public partial class MainWindow : Window
         UpdateUi();
     }
 
-    private void MemoryQuadra_Click(object sender, RoutedEventArgs e)
+    private void MemoryLarge_Click(object sender, RoutedEventArgs e)
     {
-        _settings.RamMBQuadra = int.Parse((string)((MenuItem)sender).Tag);
+        int ram = int.Parse((string)((MenuItem)sender).Tag);
+        if (_settings.IsIifx) _settings.RamMBIifx = ram;
+        else _settings.RamMBQuadra = ram;
+        _settings.Save();
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
+        UpdateUi();
+    }
+
+    private void MemoryIifx_Click(object sender, RoutedEventArgs e)
+    {
+        _settings.RamMBIifx = int.Parse((string)((MenuItem)sender).Tag);
         _settings.Save();
         if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
         UpdateUi();
@@ -568,7 +833,7 @@ public partial class MainWindow : Window
     private void InsertFloppy_Click(object sender, RoutedEventArgs e)
     {
         if (FilePicker.Open(this, _settings, FilePicker.Floppy, "Insert Floppy",
-                            DiskImageFilter, _settings.LastFloppy) is { } path)
+                            DiskImageFilter, _settings.ModelLastFloppy) is { } path)
         {
             if (_emulator.FloppyPath is not null)
             {
@@ -581,7 +846,7 @@ public partial class MainWindow : Window
             }
             if (TryInsert(path, _emulator.InsertFloppy, 0))
             {
-                _settings.LastFloppy = path;
+                _settings.ModelLastFloppy = path;
                 _settings.Save();
             }
             UpdateUi();
@@ -596,7 +861,7 @@ public partial class MainWindow : Window
         _floppyWaiting = null;
         if (TryInsert(path, _emulator.InsertFloppy, 0))
         {
-            _settings.LastFloppy = path;
+            _settings.ModelLastFloppy = path;
             _settings.Save();
         }
     }
@@ -604,7 +869,7 @@ public partial class MainWindow : Window
     private void EjectFloppy_Click(object sender, RoutedEventArgs e)
     {
         _emulator.EjectFloppy();
-        _settings.LastFloppy = null;
+        _settings.ModelLastFloppy = null;
         _settings.Save();
         UpdateUi();
     }
@@ -653,7 +918,7 @@ public partial class MainWindow : Window
     {
         if (FilePicker.Open(this, _settings, FilePicker.Floppy,
                             "Insert Floppy (External Drive)", DiskImageFilter,
-                            _settings.LastExternalFloppy ?? _settings.LastFloppy) is { } path)
+                            _settings.LastExternalFloppy ?? _settings.ModelLastFloppy) is { } path)
         {
             if (TryInsert(path, _emulator.InsertExternalFloppy, 1))
             {
@@ -677,7 +942,7 @@ public partial class MainWindow : Window
     {
         if (FilePicker.Open(this, _settings, FilePicker.HardDisk, "Attach Hard Disk",
                             "Disk image (*.img;*.dsk;*.hda)|*.img;*.dsk;*.hda|All files (*.*)|*.*",
-                            _settings.LastHardDisk) is { } path)
+                            _settings.ModelLastHardDisk) is { } path)
             AttachHardDisk(path);
     }
 
@@ -1084,7 +1349,7 @@ public partial class MainWindow : Window
             if (ok)
             {
                 if (toExternal) _settings.LastExternalFloppy = path;
-                else _settings.LastFloppy = path;
+                else _settings.ModelLastFloppy = path;
                 _settings.Save();
                 Log.Line($"drop: {Path.GetFileName(path)} -> "
                          + $"{(toExternal ? "external" : "internal")} floppy drive");
@@ -1415,8 +1680,9 @@ public partial class MainWindow : Window
 
     private void About_Click(object sender, RoutedEventArgs e) =>
         MessageBox.Show(this,
-            "OpenMac\nA from-scratch Macintosh Classic emulator.\n\n"
-            + "Custom 68000 core, VIA 6522 / RTC / ADB / IWM, and a high-level .Sony disk driver.",
+            "OpenMac\nA from-scratch Macintosh emulator for Windows.\n\n"
+            + "Macintosh Classic · Macintosh IIfx · Quadra 650\n"
+            + "68000, 68030 and 68040 machines with model-specific video, storage, input, audio and PRAM.",
             "About OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
 
     // Capture what the machine is doing right now, next to the app log. Taken
@@ -1508,7 +1774,9 @@ public partial class MainWindow : Window
 
         StatusState.Text = _emulator.IsRomLoaded ? "Running" : "Stopped";
         string machine = _emulator.IsRomLoaded
-            ? (_settings.IsQuadra ? "Quadra 650  •  " : "") + $"{_settings.ModelRamMB} MB"
+            ? (_settings.IsQuadra ? "Quadra 650  •  "
+               : _settings.IsIifx ? "Macintosh IIfx  •  " : "")
+              + $"{_settings.ModelRamMB} MB"
               + (_emulator.FloppyPath is { } f ? $"  •  Floppy: {Path.GetFileName(f)}" : "")
               + (_emulator.ExternalFloppyPath is { } f2
                   ? $"  •  External: {Path.GetFileName(f2)}" : "")
@@ -1523,24 +1791,49 @@ public partial class MainWindow : Window
         Title = _emulator.IsRomLoaded && _emulator.RomPath is { } r
             ? $"OpenMac — {Path.GetFileName(r)}" : "OpenMac";
 
-        ModelClassicItem.IsChecked = !_settings.IsQuadra;
-        ModelQuadraItem.IsChecked = _settings.IsQuadra;
         bool q = _settings.IsQuadra;
-        Mem1Item.IsChecked = !q && _settings.RamMB == 1;
-        Mem2Item.IsChecked = !q && _settings.RamMB == 2;
-        Mem4Item.IsChecked = !q && _settings.RamMB == 4;
-        Mem1Item.IsEnabled = Mem2Item.IsEnabled = Mem4Item.IsEnabled = !q;
+        bool fx = _settings.IsIifx;
+        bool classic = !q && !fx;
+        ModelClassicItem.IsChecked = classic;
+        ModelIifxItem.IsChecked = fx;
+        ModelQuadraItem.IsChecked = q;
+        IifxVideoRomItem.Visibility = fx ? Visibility.Visible : Visibility.Collapsed;
+        IifxVideoRomItem.IsEnabled = fx;
+        IifxVideoRomItem.Header = fx && !string.IsNullOrEmpty(_settings.VideoRomIifx)
+            ? $"8•24 GC Card ROM…  ({Path.GetFileName(_settings.VideoRomIifx)})"
+            : "8•24 GC Card ROM…";
+        Mem1Item.IsChecked = classic && _settings.RamMB == 1;
+        Mem2Item.IsChecked = classic && _settings.RamMB == 2;
+        Mem4Item.IsChecked = classic && _settings.RamMB == 4;
+        Mem1Item.IsEnabled = Mem2Item.IsEnabled = Mem4Item.IsEnabled = classic;
         Mem1Item.Visibility = Mem2Item.Visibility = Mem4Item.Visibility =
-            q ? Visibility.Collapsed : Visibility.Visible;
-        var quadraMems = new[] { MemQ8Item, MemQ16Item, MemQ32Item, MemQ64Item, MemQ128Item, MemQ136Item };
-        foreach (var item in quadraMems)
+            classic ? Visibility.Visible : Visibility.Collapsed;
+        MemFx4Item.Visibility = fx ? Visibility.Visible : Visibility.Collapsed;
+        MemFx4Item.IsEnabled = fx;
+        MemFx4Item.IsChecked = fx && _settings.RamMBIifx == 4;
+        // Each of the IIfx's two four-SIMM banks is empty or holds four equal
+        // 1, 4, or 16 MB 64-pin SIMMs. The mixed-bank totals are therefore 20,
+        // 68 and 80 MB; values such as 12, 48 and 96 MB are not real layouts.
+        var fxOnlyMems = new[] { MemFx20Item, MemFx68Item, MemFx80Item };
+        foreach (var item in fxOnlyMems)
         {
-            item.Visibility = q ? Visibility.Visible : Visibility.Collapsed;
-            item.IsEnabled = q;
-            item.IsChecked = q && _settings.RamMBQuadra == int.Parse((string)item.Tag);
+            item.Visibility = fx ? Visibility.Visible : Visibility.Collapsed;
+            item.IsEnabled = fx;
+            item.IsChecked = fx && _settings.RamMBIifx == int.Parse((string)item.Tag);
         }
+        var largeMems = new[] { MemQ8Item, MemQ16Item, MemQ32Item, MemQ64Item, MemQ128Item };
+        foreach (var item in largeMems)
+        {
+            item.Visibility = q || fx ? Visibility.Visible : Visibility.Collapsed;
+            item.IsEnabled = q || fx;
+            item.IsChecked = (q || fx) && _settings.ModelRamMB == int.Parse((string)item.Tag);
+        }
+        MemQ136Item.Visibility = q ? Visibility.Visible : Visibility.Collapsed;
+        MemQ136Item.IsEnabled = q;
+        MemQ136Item.IsChecked = q && _settings.RamMBQuadra == 136;
+        MonitorMenu.IsEnabled = q;
         BootRomDiskItem.IsChecked = _settings.BootRomDisk;
-        BootRomDiskItem.IsEnabled = !q;
+        BootRomDiskItem.IsEnabled = classic;
         WriteProtectItem.IsChecked = _settings.WriteProtectFloppies;
 
         ScaleFitItem.IsChecked = _settings.Scale == 0;
@@ -1557,6 +1850,7 @@ public partial class MainWindow : Window
         EjectFloppyItem.IsEnabled = _emulator.FloppyPath is not null;
         EjectFloppyItem.Header = EjectLabel("Internal", _emulator.FloppyPath);
         ExternalDriveItem.IsChecked = _emulator.ExternalDriveAttached;
+        ExternalDriveItem.IsEnabled = classic;
         // Inserting into the external drive connects one if there isn't one, so
         // the item stays reachable rather than making the checkbox a prerequisite.
         EjectFloppy2Item.IsEnabled = _emulator.ExternalFloppyPath is not null;
@@ -1568,8 +1862,12 @@ public partial class MainWindow : Window
             ? $"Eject “{Path.GetFileNameWithoutExtension(cdPath)}”" : "Eject CD";
         CloseFolderDiskItem.IsEnabled = _emulator.FolderDiskPath is not null;
         NetworkingItem.IsChecked = _emulator.NetworkingEnabled;
+        NetworkingItem.IsEnabled = classic;
+        CdDriveItem.IsEnabled = !fx;
 
         DropBoxEnabledItem.IsChecked = _settings.DropBox;
+        DropBoxEnabledItem.IsEnabled = !fx;
+        DropBoxFolderItem.IsEnabled = !fx;
         // Name the folder in the menu: a drop box whose folder you cannot see
         // is one you have to go looking for.
         string? dbFolder = ChosenFolder() ?? (_settings.DropBox ? DropBoxSeat.DefaultFolder : null);

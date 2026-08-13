@@ -454,7 +454,11 @@ std::vector<u8> VolumeBuilder::build(u32 sizeBytes) {
         alBlSt = vbmSt + vbmSz;
         if (vlen < alBlSt + 2 + lpa) return false;
         nmAlBlks = (vlen - 2 - alBlSt) / lpa;
-        if (nmAlBlks > 0xFFF0) return false;   // u16 field
+        // drNmAlBlks is an unsigned 16-bit field. Values through $FFFF are
+        // valid; the old $FFF0 safety cutoff rejected otherwise legal period
+        // 160 MB volumes (five 512-byte logical blocks per allocation block
+        // yields about $FFFD blocks).
+        if (nmAlBlks > 0xFFFFu) return false;
         const u32 nodesPerAB = lpa;
         const u32 extABs = std::max(1u, 8u / nodesPerAB + (8u % nodesPerAB ? 1u : 0u));
         const u32 catABs = (catNodes + nodesPerAB - 1) / nodesPerAB;

@@ -13,6 +13,8 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 class Rtc {
 public:
     void reset();
@@ -33,6 +35,8 @@ public:
     std::function<void(const char* what, u8 value)> onByte;
 
 private:
+    friend class IifxStateCodec;
+
     void clockedInBit(bool bit);
     void executeCommand();
     u8   readRegister();

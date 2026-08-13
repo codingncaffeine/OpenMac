@@ -19,6 +19,7 @@ CMakeUserPresets.json
 _plans/
 
 # Apple ROMs and disk images — user-supplied, never committed
+/gitignore/
 *.rom
 roms/
 *.img

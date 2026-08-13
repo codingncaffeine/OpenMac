@@ -31,6 +31,16 @@ std::vector<u8> loadFile(const char* path) {
     return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
 
+std::vector<u8> loadResourceFork(const char* path);
+
+u32 parseFourcc(const char* text) {
+    if (!text || std::strlen(text) != 4) return 0;
+    return (static_cast<u32>(static_cast<u8>(text[0])) << 24) |
+           (static_cast<u32>(static_cast<u8>(text[1])) << 16) |
+           (static_cast<u32>(static_cast<u8>(text[2])) << 8) |
+           static_cast<u32>(static_cast<u8>(text[3]));
+}
+
 // ---- drop box ---------------------------------------------------------
 // The front end walks a host folder and hands each file to the volume
 // builder; this is the same walk, so a headless run exercises the code path
@@ -109,12 +119,21 @@ void writeBmp(const char* path, const std::vector<u32>& px, int w, int h) {
 // harness: rebuild an installed volume without a suspect extension and see
 // whether the boot gets further.
 int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb,
-                   const std::vector<std::string>& except = {}) {
+                   const std::vector<std::string>& except = {},
+                   const char* injectResourcePath = nullptr,
+                   const char* injectName = nullptr, u32 injectType = 0,
+                   u32 injectCreator = 0) {
     auto src = loadFile(srcPath);
     if (src.empty()) {
         std::fprintf(stderr, "cannot read %s\n", srcPath);
         return 2;
     }
+    // Installation media is commonly a DiskCopy 4.2 image, optionally inside
+    // MacBinary. Locate the HFS volume after peeling those host containers;
+    // scanning the wrapped file only at 512-byte boundaries misses a DC42
+    // volume because its 84-byte header deliberately shifts every block.
+    macbinary::split(src);
+    dc42::split(src);
     std::size_t part = 0;
     bool found = false;
     for (std::size_t p = 0; p + 1536 < src.size(); p += 512) {
@@ -178,6 +197,19 @@ int makeBootableHd(const char* srcPath, const char* outPath, u32 sizeMb,
     };
     const u32 dstSys = b.addDir(2, "System Folder");
     copyDir(sysId, dstSys);
+    if (injectResourcePath) {
+        std::vector<u8> resource = loadResourceFork(injectResourcePath);
+        if (resource.empty() || !injectName || !injectType || !injectCreator) {
+            std::fprintf(stderr, "cannot load injected System Folder resource fork\n");
+            return 2;
+        }
+        b.addFile(dstSys, injectName, injectType, injectCreator, 0, {},
+                  std::move(resource));
+        std::printf("  injected into System Folder: %s (%s/%s)\n",
+                    injectName,
+                    std::string(reinterpret_cast<const char*>(&injectType), 4).c_str(),
+                    std::string(reinterpret_cast<const char*>(&injectCreator), 4).c_str());
+    }
 
     auto out = b.build(sizeMb * 1024u * 1024u);
     if (out.empty()) {
@@ -377,9 +409,32 @@ bool listResources(const std::vector<u8>& fork, std::vector<ResEntry>& out) {
     return true;
 }
 
+// unar's portable "visible" fork format is AppleDouble.  Keep the resource
+// tools useful on both forks extracted from HFS volumes (already raw) and
+// forks obtained directly from a MacBinary/StuffIt package.  AppleDouble and
+// AppleSingle share the same entry table; entry id 2 is the resource fork.
+std::vector<u8> loadResourceFork(const char* path) {
+    auto bytes = loadFile(path);
+    if (bytes.size() < 26) return bytes;
+    const u32 magic = rbe32(bytes, 0);
+    if (magic != 0x00051607u && magic != 0x00051600u) return bytes;
+
+    const u16 count = rbe16(bytes, 24);
+    if (26u + static_cast<std::size_t>(count) * 12u > bytes.size()) return {};
+    for (u16 i = 0; i < count; ++i) {
+        const std::size_t entry = 26u + static_cast<std::size_t>(i) * 12u;
+        if (rbe32(bytes, entry) != 2u) continue;
+        const u32 offset = rbe32(bytes, entry + 4);
+        const u32 length = rbe32(bytes, entry + 8);
+        if (offset > bytes.size() || length > bytes.size() - offset) return {};
+        return {bytes.begin() + offset, bytes.begin() + offset + length};
+    }
+    return {};
+}
+
 // --rls: list every resource in a raw resource-fork file (from --extract).
 int lsResources(const char* path) {
-    auto fork = loadFile(path);
+    auto fork = loadResourceFork(path);
     std::vector<ResEntry> res;
     if (!listResources(fork, res)) {
         std::fprintf(stderr, "not a resource fork: %s\n", path);
@@ -394,7 +449,7 @@ int lsResources(const char* path) {
 
 // --rget: dump one resource's bytes to a host file.
 int getResource(const char* path, const char* type, int id, const char* outP) {
-    auto fork = loadFile(path);
+    auto fork = loadResourceFork(path);
     std::vector<ResEntry> res;
     if (!listResources(fork, res)) {
         std::fprintf(stderr, "not a resource fork: %s\n", path);
@@ -592,6 +647,12 @@ int main(int argc, char** argv) {
     // in a row mis-decoded a branch; a listing is not a luxury here.
     u32 disasmAt = 0;
     int disasmCount = 0;
+    // --disasm-file FILE OFFSET N: inspect a driver/resource/slot ROM without
+    // first copying it into a guest machine. OFFSET is hexadecimal and the
+    // listing's PCs are offsets within the file.
+    const char* disasmFilePath = nullptr;
+    u32 disasmFileAt = 0;
+    int disasmFileCount = 0;
     // --disasm-live ADDR N: the same listing, taken at the END of a run, so a
     // driver the System loaded into RAM can be read. The ROM is the same either
     // way; guest code is only there once the guest has put it there.
@@ -640,11 +701,24 @@ int main(int argc, char** argv) {
             const char* outP = argv[++i];
             const int mb = std::atoi(argv[++i]);
             std::vector<std::string> except;
+            const char* injectResourcePath = nullptr;
+            const char* injectName = nullptr;
+            u32 injectType = 0, injectCreator = 0;
             while (i + 2 < argc && std::string(argv[i + 1]) == "--except") {
                 i += 2;
                 except.emplace_back(argv[i]);
             }
-            return makeBootableHd(srcP, outP, static_cast<u32>(mb), except);
+            if (i + 5 < argc &&
+                std::string(argv[i + 1]) == "--inject-system-rsrc") {
+                injectResourcePath = argv[i + 2];
+                injectName = argv[i + 3];
+                injectType = parseFourcc(argv[i + 4]);
+                injectCreator = parseFourcc(argv[i + 5]);
+                i += 5;
+            }
+            return makeBootableHd(srcP, outP, static_cast<u32>(mb), except,
+                                  injectResourcePath, injectName, injectType,
+                                  injectCreator);
         }
         if (a == "--ls" && i + 1 < argc) return lsVolume(argv[++i]);
         if (a == "--rls" && i + 1 < argc) return lsResources(argv[++i]);
@@ -789,6 +863,11 @@ int main(int argc, char** argv) {
             disasmAt = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
             disasmCount = std::atoi(argv[++i]);
         }
+        else if (a == "--disasm-file" && i + 3 < argc) {
+            disasmFilePath = argv[++i];
+            disasmFileAt = static_cast<u32>(std::strtoul(argv[++i], nullptr, 16));
+            disasmFileCount = std::atoi(argv[++i]);
+        }
         else if (a == "--drivers") showDrivers = true;
         // The drive on the bus with nothing in it -- which is what a front end
         // leaves behind when the user attaches a CD-ROM and takes the disc out,
@@ -833,6 +912,33 @@ int main(int argc, char** argv) {
         else if (a == "--break-skip" && i + 1 < argc) breakSkip = std::atoi(argv[++i]);
         else if (a == "--trace-from" && i + 1 < argc) traceFrom = std::strtoul(argv[++i], nullptr, 16);
         else if (a == "--trace-count" && i + 1 < argc) traceCount = std::atoi(argv[++i]);
+    }
+    if (disasmFilePath) {
+        const std::vector<u8> bytes = loadFile(disasmFilePath);
+        if (bytes.empty()) {
+            std::fprintf(stderr, "cannot read %s\n", disasmFilePath);
+            return 2;
+        }
+        const dbg::ReadWord rd = [&bytes](u32 address) {
+            if (address + 1 >= bytes.size()) return u16{0};
+            return static_cast<u16>((static_cast<u16>(bytes[address]) << 8) |
+                                    bytes[address + 1]);
+        };
+        u32 pc = disasmFileAt;
+        for (int n = 0; n < disasmFileCount && pc < bytes.size(); ++n) {
+            std::string instruction;
+            const int length = dbg::disasm(rd, pc, instruction);
+            std::printf("%08X  ", pc);
+            for (int word = 0; word < 5; ++word) {
+                if (word * 2 < length && pc + static_cast<u32>(word * 2 + 1) < bytes.size())
+                    std::printf("%04X ", rd(pc + static_cast<u32>(word * 2)));
+                else
+                    std::printf("     ");
+            }
+            std::printf(" %s\n", instruction.c_str());
+            pc += static_cast<u32>(std::max(length, 2));
+        }
+        return 0;
     }
     if (!romPath) {
         std::fprintf(stderr,

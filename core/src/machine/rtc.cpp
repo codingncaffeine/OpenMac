@@ -55,6 +55,7 @@ void Rtc::clockedInBit(bool bit) {
             state_ = State::ExtendedCommand;
         } else if (cmd_ & 0x80) {
             outShift_ = readRegister();
+            if (onByte) onByte("out", outShift_);
             outBits_ = 0;
             state_ = State::ReadData;
         } else {
@@ -63,9 +64,16 @@ void Rtc::clockedInBit(bool bit) {
         break;
     case State::ExtendedCommand:
         extAddr_ = shift_;
+        if (onByte) onByte("adr", extAddr_);
         if (cmd_ & 0x80) {
-            const u8 addr = static_cast<u8>(((cmd_ & 0x07) << 5) | (extAddr_ >> 2));
+            // The command contributes A7..A5 and the second byte contributes
+            // A4..A0 in bits 6..2. Bit 7 of the second byte is reserved and is
+            // ignored by the RTC; allowing it through aliases (for example)
+            // XPRAM $57 onto $77 and corrupts the Start Manager OS type.
+            const u8 addr = static_cast<u8>(((cmd_ & 0x07) << 5) |
+                                            ((extAddr_ >> 2) & 0x1F));
             outShift_ = xpram_[addr];
+            if (onByte) onByte("out", outShift_);
             outBits_ = 0;
             state_ = State::ReadData;
         } else {
@@ -75,7 +83,8 @@ void Rtc::clockedInBit(bool bit) {
     case State::WriteData:
         if (onByte) onByte("dat", shift_);
         if (extended_) {
-            const u8 addr = static_cast<u8>(((cmd_ & 0x07) << 5) | (extAddr_ >> 2));
+            const u8 addr = static_cast<u8>(((cmd_ & 0x07) << 5) |
+                                            ((extAddr_ >> 2) & 0x1F));
             if (!writeProtect_) xpram_[addr] = shift_;
         } else {
             writeRegister(shift_);
@@ -97,8 +106,15 @@ u8 Rtc::readRegister() {
     case 2: case 6: return static_cast<u8>((seconds_ >> 16) & 0xFF);
     case 3: case 7: return static_cast<u8>((seconds_ >> 24) & 0xFF);
     default:
-        if (reg >= 0x10) return xpram_[static_cast<u8>(reg - 0x10)];
-        if (reg >= 8 && reg <= 0x0B) return xpram_[static_cast<u8>(reg)];
+        // The original 20-byte system-parameter block is split in XPRAM:
+        // legacy registers $10..$1F expose XPRAM $10..$1F (the first 16
+        // bytes), while registers $08..$0B expose XPRAM $08..$0B (the final
+        // four bytes).  Keeping the physical XPRAM offsets here is important:
+        // the validity byte written through register $10 must appear at
+        // XPRAM $10 or the ROM discards the block and installs defaults.
+        if (reg >= 0x10) return xpram_[static_cast<u8>(reg)];
+        if (reg >= 8 && reg <= 0x0B)
+            return xpram_[static_cast<u8>(reg)];
         return 0xFF;
     }
 }
@@ -114,8 +130,9 @@ void Rtc::writeRegister(u8 value) {
     case 0x0C: break;                                   // test register
     case 0x0D: writeProtect_ = (value & 0x80) != 0; break;
     default:
-        if (reg >= 0x10) xpram_[static_cast<u8>(reg - 0x10)] = value;
-        else if (reg >= 8 && reg <= 0x0B) xpram_[static_cast<u8>(reg)] = value;
+        if (reg >= 0x10) xpram_[static_cast<u8>(reg)] = value;
+        else if (reg >= 8 && reg <= 0x0B)
+            xpram_[static_cast<u8>(reg)] = value;
         break;
     }
 }

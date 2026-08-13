@@ -19,6 +19,55 @@ int CpuOps040::opMovec(M68040& c, u16 op) {
     const u16 code = ext & 0x0FFF;
     u32& gen = isAddr ? c.a[reg] : c.d[reg];
 
+    if (c.is68030()) {
+        if (toCtrl) {
+            const u32 v = gen;
+            bool groupB = false; // SFC, DFC, CACR take the longer write path
+            switch (code) {
+            case 0x000: c.sfc = v & 7; groupB = true; break;
+            case 0x001: c.dfc = v & 7; groupB = true; break;
+            case 0x002:
+                c.writeCacr030(v);
+                groupB = true;
+                break;
+            case 0x800:
+                if (!(c.sr_ & kS040)) c.a[7] = v; else c.usp = v;
+                break;
+            case 0x801: c.vbr = v; break;
+            case 0x802: c.caar = v; break;
+            case 0x803:
+                if ((c.sr_ & kS040) && (c.sr_ & kM040)) c.a[7] = v;
+                else c.msp = v;
+                break;
+            case 0x804:
+                if ((c.sr_ & kS040) && !(c.sr_ & kM040)) c.a[7] = v;
+                else c.isp = v;
+                break;
+            default:
+                c.pc = instrStart(c);
+                return raiseException(c, kVec040Illegal, 16);
+            }
+            return groupB ? 12 : 6;
+        }
+
+        u32 v;
+        switch (code) {
+        case 0x000: v = c.sfc; break;
+        case 0x001: v = c.dfc; break;
+        case 0x002: v = c.cacr; break;
+        case 0x800: v = c.uspValue(); break;
+        case 0x801: v = c.vbr; break;
+        case 0x802: v = c.caar; break;
+        case 0x803: v = c.mspValue(); break;
+        case 0x804: v = c.ispValue(); break;
+        default:
+            c.pc = instrStart(c);
+            return raiseException(c, kVec040Illegal, 16);
+        }
+        gen = v;
+        return 6;
+    }
+
     if (toCtrl) {
         const u32 v = gen;
         switch (code) {
@@ -89,6 +138,8 @@ u32 CpuOps040::fcRead(M68040& c, u32 addr, int size, u32 fc) {
         const u32 hi = fcRead(c, addr, 1, fc);
         return (hi << 16) | fcRead(c, addr + 2, 1, fc);
     }
+    if (c.is68030())
+        return c.readCached030(addr, size, fc & 7u, false);
     u32 pa = addr;
     if (c.mmuEnabled()) pa = c.translateFc(addr, false, super, instr);
     try {
@@ -111,6 +162,10 @@ void CpuOps040::fcWrite(M68040& c, u32 addr, u32 v, int size, u32 fc) {
     if (size == 2 && (addr & 3)) {
         fcWrite(c, addr, v >> 16, 1, fc);
         fcWrite(c, addr + 2, v & 0xFFFF, 1, fc);
+        return;
+    }
+    if (c.is68030()) {
+        c.writeCached030(addr, v, size, fc & 7u);
         return;
     }
     u32 pa = addr;
@@ -141,6 +196,13 @@ int CpuOps040::opMoves(M68040& c, u16 op) {
         u32 v = fcRead(c, addr, size, c.sfc);
         if (isAddr) c.a[gr] = static_cast<u32>(signExtend(v, size));
         else        writeSized(c.d[gr], v, size);
+    }
+    if (c.is68030()) {
+        // MC68030UM 11.6.7: the command extension word is part of a
+        // calculate-immediate EA stage; the operation proper is 5 clocks for
+        // Rn->EA and 7 for EA->Rn.
+        return (toMem ? 5 : 7) +
+               eaCalcImmediateTime030(c, eaIndex(mode, reg));
     }
     return (toMem ? 13 : 23) + eaTime(eaIndex(mode, reg));
 }
@@ -254,6 +316,148 @@ int CpuOps040::opPtest(M68040& c, u16 op) {
         c.mmusr = 0x800u;                    // B: bus error during the walk
     }
     return 25;   // UM 10.5: typical three-level search
+}
+
+// MC68030 integrated-PMMU general instruction.  The first word is F000 plus
+// an effective address and the second (command) word selects PMOVE, PLOAD,
+// PFLUSH, or PTEST.  These are the 68851-compatible encodings documented in
+// M68000PRM section 6; 040's one-word F5xx forms must never reach this path.
+int CpuOps040::opPmmu030(M68040& c, u16 op) {
+    if (!c.is68030()) return opFLine(c, op);
+    if (!flag(c, kS040)) return privilegeViolation(c);
+
+    const int mode = (op >> 3) & 7;
+    const int reg = op & 7;
+    const u16 cmd = c.fetch16();
+
+    auto bad = [&]() {
+        c.pc = instrStart(c);
+        return raiseException(c, kVec040Illegal, 16);
+    };
+    auto controlEa = [&]() -> u32 {
+        if (!eaValid(mode, reg, kEaControlAlter)) throw 0;
+        return calcEA(c, mode, reg, 2);
+    };
+    auto functionCode = [&](u16 field, u32& fc) -> bool {
+        field &= 0x1F;
+        if ((field & 0x18) == 0x10) { fc = field & 7; return true; }
+        if ((field & 0x18) == 0x08) { fc = c.d[field & 7] & 7; return true; }
+        if (field == 0) { fc = c.sfc & 7; return true; }
+        if (field == 1) { fc = c.dfc & 7; return true; }
+        return false;
+    };
+
+    try {
+        // PMOVE TC/SRP/CRP: 010 ppp R/W FD 00000000.
+        if ((cmd & 0xE000u) == 0x4000u) {
+            const int preg = (cmd >> 10) & 7;
+            const bool toMemory = (cmd & 0x0200u) != 0;
+            const bool noFlush = (cmd & 0x0100u) != 0;
+            if ((cmd & 0x00FFu) != 0 || (preg != 0 && preg != 2 && preg != 3))
+                return bad();
+            const u32 ea = controlEa();
+            if (preg == 0) {                       // TC, long
+                if (toMemory) c.wr32(ea, c.tc);
+                else {
+                    c.tc = c.rd32(ea);
+                    if (!noFlush) c.tlbFlush();
+                }
+            } else {                               // SRP/CRP, quad
+                u64& rp = preg == 2 ? c.srp030 : c.crp;
+                if (toMemory) {
+                    c.wr32(ea, static_cast<u32>(rp >> 32));
+                    c.wr32(ea + 4, static_cast<u32>(rp));
+                } else {
+                    rp = (static_cast<u64>(c.rd32(ea)) << 32) | c.rd32(ea + 4);
+                    if (!noFlush) c.tlbFlush();
+                }
+            }
+            return 16 + eaTime(eaIndex(mode, reg));
+        }
+
+        // PMOVE MMUSR: 011000 R/W 000000000.
+        if ((cmd & 0xFC00u) == 0x6000u && (cmd & 0x01FFu) == 0) {
+            const bool toMemory = (cmd & 0x0200u) != 0;
+            const u32 ea = controlEa();
+            if (toMemory) c.wr16(ea, static_cast<u16>(c.mmusr));
+            else c.mmusr = c.rd16(ea);
+            return 12 + eaTime(eaIndex(mode, reg));
+        }
+
+        // PMOVE TT0/TT1: 000 ppp R/W FD 00000000, ppp=010/011.
+        if ((cmd & 0xE000u) == 0 &&
+            (((cmd >> 10) & 7) == 2 || ((cmd >> 10) & 7) == 3) &&
+            (cmd & 0x00FFu) == 0) {
+            const int preg = (cmd >> 10) & 7;
+            const bool toMemory = (cmd & 0x0200u) != 0;
+            const bool noFlush = (cmd & 0x0100u) != 0;
+            const u32 ea = controlEa();
+            u32& tt = preg == 2 ? c.tt0 : c.tt1;
+            if (toMemory) c.wr32(ea, tt);
+            else {
+                tt = c.rd32(ea);
+                if (!noFlush) c.tlbFlush();
+            }
+            return 16 + eaTime(eaIndex(mode, reg));
+        }
+
+        // PLOAD: 001000 R/W 0000 FC.
+        if ((cmd & 0xFC00u) == 0x2000u && (cmd & 0x01E0u) == 0) {
+            const bool read = (cmd & 0x0200u) != 0;
+            u32 fc = 0;
+            if (!functionCode(cmd, fc)) return bad();
+            const u32 la = controlEa();
+            c.tlbFlushPage(la);
+            // PLOAD performs a table search even with TC.E clear.  The full
+            // 030 walker handles that special case; until a table exists a
+            // direct address is the only possible result.
+            if (c.mmuEnabled()) (void)c.translateFc030(la, !read, fc);
+            return 25 + eaTime(eaIndex(mode, reg));
+        }
+
+        // PFLUSHA / PFLUSH FC,MASK[,EA]: mode 001/100/110.
+        if ((cmd & 0xE000u) == 0x2000u) {
+            const int flushMode = (cmd >> 10) & 7;
+            if (cmd & 0x0300u) return bad();
+            if (flushMode == 1) {
+                if ((cmd & 0x00FFu) != 0) return bad();
+                c.tlbFlush();
+                return 16;
+            }
+            if (flushMode != 4 && flushMode != 6) return bad();
+            u32 fc = 0;
+            if (!functionCode(cmd, fc)) return bad();
+            (void)fc; // the first ATC representation does not yet split FCs
+            if (flushMode == 6) c.tlbFlushPage(controlEa());
+            else c.tlbFlush();
+            return 18 + (flushMode == 6 ? eaTime(eaIndex(mode, reg)) : 0);
+        }
+
+        // PTEST: 100 level R/W A reg FC.
+        if ((cmd & 0xE000u) == 0x8000u) {
+            const int level = (cmd >> 10) & 7;
+            const bool read = (cmd & 0x0200u) != 0;
+            const bool returnDescriptor = (cmd & 0x0100u) != 0;
+            const int areg = (cmd >> 5) & 7;
+            u32 fc = 0;
+            if (!functionCode(cmd, fc)) return bad();
+            if (!returnDescriptor && areg != 0) return bad();
+            const u32 la = controlEa();
+            c.mmusr = 0;
+            try {
+                const u32 pa = c.translateFc030(la, !read, fc);
+                c.mmusr = static_cast<u16>(1u); // resident; walker refines status
+                if (returnDescriptor) c.a[areg] = pa & ~3u;
+            } catch (const M68040::AccessFault& f) {
+                c.mmusr = f.atc ? 0x0400u : 0x0800u;
+            }
+            return 25 + level * 4 + eaTime(eaIndex(mode, reg));
+        }
+    } catch (int) {
+        return bad();
+    }
+
+    return bad();
 }
 
 } // namespace openmac

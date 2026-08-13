@@ -23,7 +23,7 @@ namespace OpenMac.Gui.Emulation;
 /// machine, so it runs on a task in between. <see cref="Pump"/> drives one
 /// stage per frame batch; everything else is the caller asking.
 ///
-/// Both machines use this — the Classic and the Quadra differ only in which
+/// The Classic and Quadra use this; they differ only in which
 /// native entry points do the unmount, the read and the insert, which is what
 /// the three delegates are.
 /// </summary>

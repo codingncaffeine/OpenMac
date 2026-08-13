@@ -28,6 +28,34 @@ public:
     virtual void write8(u32 addr, u8 value) = 0;
     virtual void write16(u32 addr, u16 value) = 0;
     virtual void write32(u32 addr, u32 value) = 0;
+
+    // A translated 68030 page/TT entry may assert CIOUT even though the
+    // physical target is ordinary RAM.  These reads perform the bus transfer
+    // while bypassing any board-level cache.  The default is appropriate for
+    // buses without an external cache.
+    virtual u8 read8CacheInhibited(u32 addr) { return read8(addr); }
+    virtual u16 read16CacheInhibited(u32 addr) { return read16(addr); }
+    virtual u32 read32CacheInhibited(u32 addr) { return read32(addr); }
+
+    // CIIN/board-decode result for an otherwise valid physical cycle.  The
+    // 68030's on-chip caches only fill from cacheable 32-bit memory; device
+    // registers must retain their read side effects.  Existing test buses and
+    // the 68040 machines are ordinary memory by default.
+    virtual bool cacheable(u32 /*addr*/) const { return true; }
+
+    // A 68030 cache tag miss may request the four-longword line beginning at
+    // firstAddr's current entry and wrapping modulo 16 bytes.  Return true
+    // only when board hardware acknowledged the burst and filled all four
+    // outputs in request order; false means out[0] alone is valid.
+    virtual bool readBurst32(u32 firstAddr, u32 out[4]) {
+        out[0] = read32(firstAddr);
+        return false;
+    }
+
+    // Additional processor clocks caused by board-level retry/wait behavior
+    // since the preceding call.  Instruction tables already include their
+    // nominal two-clock accesses, so this reports only the excess.
+    virtual int takeCyclePenalty() { return 0; }
 };
 
 } // namespace openmac

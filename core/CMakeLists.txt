@@ -16,6 +16,13 @@ add_library(openmac_core STATIC
     src/cpu040_ops_flow.cpp
     src/cpu040_ops_system.cpp
     src/cpu040_fpu.cpp
+    src/hardware_trace.cpp
+    src/r65c02.cpp
+    src/machine/iifx/adb_bus.cpp
+    src/machine/iifx/am29000.cpp
+    src/machine/iifx/iop.cpp
+    src/machine/iifx/iifx.cpp
+    src/machine/iifx/state.cpp
     src/machine/quadra/quadra.cpp
     src/machine/machine.cpp
     src/machine/via.cpp

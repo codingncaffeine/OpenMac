@@ -59,24 +59,34 @@
                 <MenuItem Header="Model">
                     <MenuItem x:Name="ModelClassicItem" Header="Macintosh Classic"
                               Click="ModelClassic_Click" />
+                    <MenuItem x:Name="ModelIifxItem" Header="Macintosh IIfx"
+                              Click="ModelIifx_Click"
+                              ToolTip="68030/68882 @ 40 MHz with OSS, two I/O processors and Macintosh II NuBus video. Needs the 512 KB IIfx ROM; each model remembers its own ROM, RAM and SCSI disk." />
                     <MenuItem x:Name="ModelQuadraItem" Header="Macintosh Quadra 650"
                               Click="ModelQuadra_Click"
                               ToolTip="68040 @ 33 MHz with color DAFB video. Needs the 1 MB Quadra 650 family ROM and boots from a SCSI hard disk; each model remembers its own ROM and disk." />
                 </MenuItem>
                 <MenuItem x:Name="MonitorMenu" Header="Monitor"
                           ToolTip="Which display is plugged into the video port. An Apple monitor of this era runs one resolution, so choosing the monitor chooses the resolution. The ROM senses it at startup, so the machine restarts." />
+                <MenuItem x:Name="IifxVideoRomItem" Header="8•24 GC Card ROM…"
+                          Click="IifxVideoRom_Click"
+                          ToolTip="Choose the declaration ROM from an Apple Macintosh Display Card 8•24 GC. The IIfx restarts with the genuine slot-$9 card; OpenMac does not distribute this ROM." />
                 <Separator />
                 <MenuItem Header="Reset" InputGestureText="Ctrl+R" Click="Reset_Click" />
                 <Separator />
                 <MenuItem x:Name="Mem1Item" Header="1 MB RAM" Tag="1" Click="Memory_Click" />
                 <MenuItem x:Name="Mem2Item" Header="2 MB RAM" Tag="2" Click="Memory_Click" />
                 <MenuItem x:Name="Mem4Item" Header="4 MB RAM" Tag="4" Click="Memory_Click" />
-                <MenuItem x:Name="MemQ8Item" Header="8 MB RAM" Tag="8" Click="MemoryQuadra_Click" />
-                <MenuItem x:Name="MemQ16Item" Header="16 MB RAM" Tag="16" Click="MemoryQuadra_Click" />
-                <MenuItem x:Name="MemQ32Item" Header="32 MB RAM" Tag="32" Click="MemoryQuadra_Click" />
-                <MenuItem x:Name="MemQ64Item" Header="64 MB RAM" Tag="64" Click="MemoryQuadra_Click" />
-                <MenuItem x:Name="MemQ128Item" Header="128 MB RAM" Tag="128" Click="MemoryQuadra_Click" />
-                <MenuItem x:Name="MemQ136Item" Header="136 MB RAM (max)" Tag="136" Click="MemoryQuadra_Click" />
+                <MenuItem x:Name="MemFx4Item" Header="4 MB RAM" Tag="4" Click="MemoryIifx_Click" />
+                <MenuItem x:Name="MemQ8Item" Header="8 MB RAM" Tag="8" Click="MemoryLarge_Click" />
+                <MenuItem x:Name="MemQ16Item" Header="16 MB RAM" Tag="16" Click="MemoryLarge_Click" />
+                <MenuItem x:Name="MemFx20Item" Header="20 MB RAM" Tag="20" Click="MemoryIifx_Click" />
+                <MenuItem x:Name="MemQ32Item" Header="32 MB RAM" Tag="32" Click="MemoryLarge_Click" />
+                <MenuItem x:Name="MemQ64Item" Header="64 MB RAM" Tag="64" Click="MemoryLarge_Click" />
+                <MenuItem x:Name="MemFx68Item" Header="68 MB RAM" Tag="68" Click="MemoryIifx_Click" />
+                <MenuItem x:Name="MemFx80Item" Header="80 MB RAM" Tag="80" Click="MemoryIifx_Click" />
+                <MenuItem x:Name="MemQ128Item" Header="128 MB RAM" Tag="128" Click="MemoryLarge_Click" />
+                <MenuItem x:Name="MemQ136Item" Header="136 MB RAM (max)" Tag="136" Click="MemoryLarge_Click" />
                 <Separator />
                 <MenuItem x:Name="BootRomDiskItem" Header="Boot from ROM Disk (Cmd-Opt-X-O)"
                           Click="BootRomDisk_Click" />
@@ -138,7 +148,7 @@
 
         <Grid x:Name="ScreenHost" Background="{StaticResource Letterbox}">
             <Viewbox Stretch="Uniform" StretchDirection="Both">
-                <Image x:Name="ScreenImage" Width="512" Height="342"
+                <Image x:Name="ScreenImage" Width="512" Height="342" Focusable="True"
                        RenderOptions.BitmapScalingMode="NearestNeighbor" />
             </Viewbox>
             <Border x:Name="Overlay" Background="#D0121214">
@@ -147,7 +157,7 @@
                                Foreground="{StaticResource TextPrimary}" HorizontalAlignment="Center" />
                     <Border Width="66" Height="3" Background="{StaticResource Accent}"
                             Margin="0,12" HorizontalAlignment="Center" />
-                    <TextBlock Text="Macintosh Classic emulator" FontSize="14"
+                    <TextBlock Text="Classic · IIfx · Quadra 650" FontSize="14"
                                Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" />
                     <TextBlock Text="File  ▸  Open ROM  to begin" Margin="0,16,0,0"
                                Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" />

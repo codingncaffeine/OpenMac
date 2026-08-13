@@ -1,12 +1,17 @@
 # OpenMac
 
-A from-scratch Macintosh emulator for Windows: two machines over one core, with
-every chip implemented from documentation.
+A from-scratch Macintosh emulator for Windows: three machines over one shared
+core, implemented from period hardware documentation.
 
 - **Macintosh Classic** — 68000 (validated against the SingleStepTests suite at
   100% state accuracy), VIA 6522, ADB, IWM floppy, NCR 5380 SCSI, real-time
   clock, and the scanline sound buffer. Boots System 6.0.8 and System 7.0.1 to a
   fully working desktop, and the ROM's built-in System 6.0.3 ROM disk.
+- **Macintosh IIfx** — 40 MHz 68030/68882, OSS interrupt controller, dual I/O
+  Processor interfaces, NCR 5380 SCSI, internal SuperDrive, ASC audio, and a
+  slot-$9 Macintosh II NuBus display card. Boots the supplied 512 KB IIfx ROM
+  and compatible System 6/7 media to Finder from either floppy or SCSI, with
+  every legal 4–128 MB physical RAM layout and period 80/160 MB hard disks.
 - **Quadra 650** — 68040 with its FPU and MMU, DAFB video, 53C96 SCSI, SWIM2
   floppy, Z8530 SCC, the Apple Sound Chip, and VIA1/VIA2. Boots System 7.5 and
   7.5.3 from a hard disk to the Finder desktop, with 8 to 136 MB of RAM and six
@@ -18,9 +23,15 @@ every chip implemented from documentation.
 ## Getting started
 
 1. Build (below) or pick up a [release](https://github.com/codingncaffeine/OpenMac/releases).
-2. Machine ▸ Model to choose the Classic or the Quadra 650.
+2. Machine ▸ Model to choose the Classic, Macintosh IIfx, or Quadra 650.
 3. File ▸ Open ROM… and choose the matching ROM dump.
 4. Insert a floppy image, or create a hard disk and install a System onto it, and boot.
+
+For the IIfx, use the 512 KB ROM with checksum `4147DD77`. The RAM menu exposes
+only realizable four-SIMM bank totals: 4, 8, 16, 20, 32, 64, 68, 80, and
+128 MB. File ▸ Create Hard Disk includes the typical 80 MB and 160 MB choices;
+raw, DiskCopy 4.2, and MacBinary-wrapped 400K/800K/1.44 MB floppy images work in
+the internal SuperDrive.
 
 ## What it does
 
@@ -45,7 +56,7 @@ included in — or may be contributed to — this repository.
 
 ## Building
 
-The core is dependency-free C++20; the front end is a .NET 11 WPF app.
+The core is dependency-free C++20; the front end is a .NET 10 WPF app.
 
 ```
 cmake -B build

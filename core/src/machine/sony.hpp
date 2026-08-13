@@ -29,6 +29,8 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 class SonyDrive {
 public:
     // ---- configuration -------------------------------------------------
@@ -46,6 +48,11 @@ public:
     bool hdMedia     = false;   // 1.4 MB high-density media rather than GCR
 
     bool hasDisk() const { return image != nullptr && !image->empty(); }
+
+    // All mechanism timestamps are expressed in the owning machine's cycle
+    // domain. Earlier users run at the original 7.8336 MHz default; faster
+    // machines set their CPU clock once when wiring the drive.
+    void setClockHz(u64 hz) { clockHz_ = hz ? hz : kDefaultClockHz; }
 
     // ---- mechanism state -----------------------------------------------
     int  track     = 0;         // 0..79
@@ -65,17 +72,19 @@ public:
         enabled_ = false;
         stepDoneAt_ = motorUpAt_ = 0;
         diskSwitched_ = false;
+        mfmMode_ = false;
         ejectPending_ = false;
         ejectAt_ = 0;
     }
 
     // A disk was inserted: latch the disk-switched line the driver polls to
     // notice the change, and park the head.
-    void insert(std::vector<u8>* img, bool ro, bool hd) {
+    void insert(std::vector<u8>* img, bool ro, bool hd,
+                bool signalChange = true) {
         image = img;
         readOnly = ro;
         hdMedia = hd;
-        diskSwitched_ = true;
+        diskSwitched_ = signalChange;
         track = 0;
         ++mediaGen;
         invalidateTrack();
@@ -108,6 +117,8 @@ public:
         return motorWanted_ && hasDisk() && now >= motorUpAt_;
     }
     bool motorCommanded() const { return motorWanted_; }
+    bool enabled() const { return enabled_; }
+    bool mfmMode() const { return mfmMode_; }
 
     // The controller's ENABLE output, routed to whichever mechanism the drive-select
     // latch addresses (/ENBL1 to the internal port, /ENBL2 to the external one). It
@@ -122,9 +133,15 @@ public:
     void setEnabled(bool on, u64 now) {
         if (!installed || on == enabled_) return;
         enabled_ = on;
-        if (on && !motorWanted_) { motorUpAt_ = now + kSpinUpCycles; motorWanted_ = true; }
+        if (on && !motorWanted_) {
+            motorUpAt_ = now + clockHz_ * 400u / 1000u;
+            motorWanted_ = true;
+        }
     }
     bool stepping(u64 now) const { return now < stepDoneAt_; }
+    u64 stepRemaining(u64 now) const {
+        return now < stepDoneAt_ ? stepDoneAt_ - now : 0;
+    }
 
     // ---- status lines --------------------------------------------------
     // `addr` is CA2:CA1:CA0:SEL. Returns the line level; active-low, so false
@@ -164,8 +181,14 @@ public:
             case 0x7: return tach(now);            // TACH: 60 pulses per rev
             case 0x8: return true;                 // RDDATA lower head (P3)
             case 0x9: return true;                 // RDDATA upper head (P3)
-            case 0xA: return !superDrive;          // 0 = drive handles HD media
-            case 0xB: return !hdMedia;             // unsettled; not the media sense
+            // rMFMDriveAdr is the mechanism-identification signal, not an
+            // active-low capability bit: 1 means an FDHD/SuperDrive (or a
+            // floating, unconnected port), while 0 identifies an older drive.
+            // The IIfx ISM firmware samples this together with REVISED,
+            // /DrvIn and /SingleSide and indexes its drive-kind table; the
+            // SuperDrive patterns map to kind 4 (400/800/720/1440K).
+            case 0xA: return superDrive;
+            case 0xB: return mfmMode_;             // 0 = GCR, 1 = MFM
             case 0xC: return doubleSided;          // SIDES: 1 = double sided
             // READY, active low like the rest of the 1985 set: low once the
             // spindle is at speed. The driver polls it right after turning the
@@ -214,23 +237,39 @@ public:
                 // latch that never cleared) leaves the latch set forever.
                 if (data) diskSwitched_ = false;
                 break;
-            case 0x2:   // STEP: writing 0 steps one track; done after ~12 ms
+            case 0x2:   // STEP: writing 0 steps one track
                 if (!data) {
                     const int next = track + (stepIn ? 1 : -1);
                     track = next < 0 ? 0 : (next > 79 ? 79 : next);
-                    stepDoneAt_ = now + kStepCycles;
+                    // /STEP is a command-handshake signal, not the complete
+                    // mechanical head-settle interval.  Apple's SWIM3 ERS
+                    // specifies 80 us between step commands while monitoring
+                    // /STEP; the IIfx ISM firmware implements the same contract
+                    // in software and gives the line roughly 135 us to return
+                    // idle.  Holding it for the older drive's millisecond-scale
+                    // settle time makes that firmware report cantStepErr after
+                    // the first pulse.  The firmware supplies its own longer
+                    // post-seek settling delay before reading the surface.
+                    stepDoneAt_ = now + clockHz_ * 80u / 1000000u;
                 }
+                break;
+            case 0x3:   // SEL=1: 0 selects MFM, 1 selects GCR
+                mfmMode_ = !data;
                 break;
             case 0x4:   // MOTORON: 0 turns the motor on, 1 turns it off
                 if (!data) {
-                    if (!motorWanted_) motorUpAt_ = now + kSpinUpCycles;
+                    if (!motorWanted_)
+                        motorUpAt_ = now + clockHz_ * 400u / 1000u;
                     motorWanted_ = true;
                 } else {
                     motorWanted_ = false;
                 }
                 break;
             case 0x6:   // EJECT: writing 1 starts an eject, writing 0 cancels it
-                if (data) { ejectPending_ = true; ejectAt_ = now + kEjectDelayCycles; }
+                if (data) {
+                    ejectPending_ = true;
+                    ejectAt_ = now + clockHz_ * 750u / 1000u;
+                }
                 else      { ejectPending_ = false; }
                 break;
             default:
@@ -256,6 +295,7 @@ public:
     // control register 001, not by reading the line -- so there is deliberately
     // no way to clear it from outside the mechanism.
     bool diskSwitched() const { return diskSwitched_; }
+    void signalMediaChange() { diskSwitched_ = true; }
 
     // ---- the rotating surface -------------------------------------------
     //
@@ -376,7 +416,11 @@ public:
 
     // A GCR disk byte is 2 us of cells; high-density MFM runs at 500 kbit/s,
     // which is a byte every 16 us, so 125 CPU cycles against GCR's 128.
-    u64 cyclesPerByte() const { return hdMedia ? 125u : kCyclesPerByte; }
+    u64 cyclesPerByte() const {
+        const u64 rate = hdMedia ? 62500u : 61200u;
+        const u64 period = clockHz_ / rate;
+        return period ? period : 1u;
+    }
 
     // The write side of the same surface. The controller's write buffer is one
     // byte deep and the driver polls the handshake register until it empties
@@ -403,19 +447,9 @@ private:
     // 7.8336 MHz CPU/FCLK. Motor up to speed within 400 ms, eject needs LSTRB
     // held ~750 ms.
     //
-    // Step: ~3 ms, not the "about 12 msec" Inside Macintosh III-36 quotes for
-    // the 400K single-sided mechanism. The driver's recalibrate loop delays,
-    // checks TK0, and then requires the STEP status line to have gone idle
-    // before strobing the next step, failing with cantStepErr if it has not
-    // ($43543A-$43544E) -- and it halves that delay for a drive that answers
-    // status line $A high ($43542C). This drive answers $A high because the
-    // drive-present check skips a connected drive that answers it low
-    // ($43F7B6-$43F7BE), so a 12 ms step contradicts the mechanism we report:
-    // the head would still be moving every time the driver looked.
-    static constexpr u64 kCpuHz          = 7833600ull;
-    static constexpr u64 kStepCycles     = kCpuHz * 3 / 1000;
-    static constexpr u64 kSpinUpCycles   = kCpuHz * 400 / 1000;
-    static constexpr u64 kEjectDelayCycles = kCpuHz * 750 / 1000;
+    // STEP status is the drive's command handshake.  It returns idle after
+    // 80 us; physical head settling is delayed separately by the driver.
+    static constexpr u64 kDefaultClockHz = 7833600ull;
 
     // TACH produces 60 pulses per revolution. GCR media spins at a speed set by
     // which of the five zones the head is over; HD/MFM media spins at a constant
@@ -424,7 +458,7 @@ private:
         const u64 rpm = hdMedia ? 300u : zoneRpm(track);
         const u64 pulsesPerSec = rpm * 60u / 60u;   // 60 pulses/rev * rev/sec
         if (pulsesPerSec == 0) return true;
-        const u64 halfPeriod = kCpuHz / (pulsesPerSec * 2u);
+        const u64 halfPeriod = clockHz_ / (pulsesPerSec * 2u);
         return halfPeriod == 0 ? true : ((now / halfPeriod) & 1u) != 0;
     }
 
@@ -448,8 +482,11 @@ public:
     }
 
 private:
+    friend class IifxStateCodec;
+
     bool motorWanted_   = false;
     bool diskSwitched_  = false;
+    bool mfmMode_       = false;
     bool enabled_       = false;
     bool ejectPending_  = false;
     bool ejectRequested_ = false;
@@ -462,6 +499,7 @@ private:
     std::size_t bytePos_ = 0;
     u64 lastByteAt_ = 0;
     bool trackDirty_ = false;
+    u64 clockHz_ = kDefaultClockHz;
 };
 
 } // namespace openmac

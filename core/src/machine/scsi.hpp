@@ -27,6 +27,8 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 // A device on the SCSI bus. The controller speaks phases and bytes; a target
 // answers CDBs. Selection finds a target by its ID bit on the data bus (ID 7 is
 // the Mac itself -- the initiator -- so targets live at 0-6).
@@ -139,6 +141,8 @@ public:
     }
 
 private:
+    friend class IifxStateCodec;
+
     static u32 be32(const u8* p) {
         return (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | p[3];
     }
@@ -211,6 +215,11 @@ private:
 };
 
 class Ncr5380 {
+    enum class DmaStart { None, Send, TargetReceive, InitiatorReceive };
+    enum class AckCompletion {
+        None, ExecuteCdb, FinishDataOut, ToStatus, ToMsgIn, BusFree
+    };
+
 public:
     enum Phase { BusFree, Arbitration, Selection, Command, DataOut, DataIn, Status, MsgIn };
 
@@ -250,19 +259,24 @@ public:
         status_ = 0;
         writeMode_ = false;
         sel_ = nullptr;
+        irq_ = false;
+        dmaStart_ = DmaStart::None;
+        ackCompletion_ = AckCompletion::None;
     }
 
     u8 read(int reg) {
         ++diagReads;
         switch (reg & 7) {
-            case 0: return dataIn();        // Current SCSI Data (CSD)
+            case 0: return peekDataIn();    // Current SCSI Data (CSD)
             case 1: return readIcr();       // Initiator Command (ICR)
             case 2: return mr_;             // Mode (MR)
             case 3: return tcr_;            // Target Command (TCR)
             case 4: return readCsr();       // Current SCSI Bus Status (CSR)
             case 5: return readBsr();       // Bus and Status (BSR)
-            case 6: return dataIn();        // Input Data (IDR) -- pseudo-DMA reads here
-            case 7: return 0;               // Reset Parity/Interrupts (read clears)
+            case 6: return dmaDataIn();     // Input Data (IDR) -- pseudo-DMA handshake
+            case 7:                         // Reset Parity/Interrupts
+                irq_ = false;
+                return 0;
         }
         return 0;
     }
@@ -272,13 +286,14 @@ public:
         if (diagWriteTraceLen < 320)
             diagWriteTrace[diagWriteTraceLen++] = static_cast<u16>(((reg & 7) << 8) | v);
         switch (reg & 7) {
-            case 0: dataOut(v); break;      // Output Data (ODR)
+            case 0: writeDataOut(v); break; // Output Data (ODR)
             case 1: writeIcr(v); break;     // Initiator Command (ICR)
             case 2: writeMr(v); break;      // Mode (MR)
             case 3: tcr_ = v; break;        // Target Command (TCR)
             case 4: ser_ = v; break;        // Select Enable (SER)
-            case 6: dataOut(v); break;      // pseudo-DMA send: initiator -> target data (symmetric to read reg 6)
-            case 5: case 7: break;          // Start DMA Send / Reset (mode start; data flows via reg 0/6)
+            case 5: startDma(DmaStart::Send); break;
+            case 6: startDma(DmaStart::TargetReceive); break;
+            case 7: startDma(DmaStart::InitiatorReceive); break;
         }
     }
 
@@ -289,8 +304,27 @@ public:
     u32 xferLen() const { return static_cast<u32>(xfer_.size()); }
     int cdbPos() const { return cdbPos_; }
     int cdbLen() const { return cdbLen_; }
+    bool irqAsserted() const { return irq_; }
+    bool requestAsserted() const { return reqAsserted(); }
+    bool acknowledgeAsserted() const { return (icr_ & 0x10u) != 0; }
+    u8 modeRegister() const { return mr_; }
+    u8 initiatorCommand() const { return icr_; }
+    bool dmaRequestAsserted() const {
+        return reqAsserted() && (mr_ & 0x02) != 0;
+    }
+    bool phaseMatches() const { return phaseMatch(); }
+
+    // /EOP is supplied by the surrounding DMA controller when its byte
+    // counter reaches zero.  The 53C80 turns it into a latched IRQ only when
+    // Enable-EOP-Interrupt (MR bit 3) is set.
+    void signalEndOfProcess() {
+        if (mr_ & 0x08) irq_ = true;
+        dmaStart_ = DmaStart::None;
+    }
 
 private:
+    friend class IifxStateCodec;
+
     // ---- registers -------------------------------------------------------
     void writeMr(u8 v) {
         const u8 prev = mr_;
@@ -305,7 +339,17 @@ private:
     }
 
     void writeIcr(u8 v) {
+        const u8 previous = icr_;
+        const bool hadRequest = reqAsserted();
         icr_ = v;
+        // A bus reset (/RST, b7) drops everything back to Bus Free.
+        if (v & 0x80) {
+            phase_ = BusFree; xfer_.clear(); xferPos_ = 0; cdbPos_ = 0; sel_ = nullptr;
+            irq_ = true;
+            dmaStart_ = DmaStart::None;
+            ackCompletion_ = AckCompletion::None;
+            return;
+        }
         // Selection: the initiator asserts /SEL (b2) with the target ID on the data
         // bus (ODR) and releases its own /BSY (b3) to hand the bus to the target. The
         // ID lands on ODR *after* /SEL is first asserted, so we test the whole
@@ -317,10 +361,11 @@ private:
             (phase_ == BusFree || phase_ == Arbitration || phase_ == Selection)) {
             if (ScsiTarget* t = findTarget(odr_)) { sel_ = t; enterCommand(); }
         }
-        // A bus reset (/RST, b7) drops everything back to Bus Free.
-        if (v & 0x80) {
-            phase_ = BusFree; xfer_.clear(); xferPos_ = 0; cdbPos_ = 0; sel_ = nullptr;
-        }
+
+        const bool ackRose = !(previous & 0x10) && (v & 0x10);
+        const bool ackFell = (previous & 0x10) && !(v & 0x10);
+        if (ackRose && hadRequest) acceptAckByte();
+        if (ackFell) finishAckHandshake();
     }
 
     u8 readIcr() const {
@@ -349,6 +394,7 @@ private:
     u8 readBsr() const {
         u8 s = 0;
         if (reqAsserted() && (mr_ & 0x02)) s |= 0x40;   // DRQ (in DMA mode a byte is ready)
+        if (irq_) s |= 0x10;                            // IRQ active
         if (phaseMatch()) s |= 0x08;                    // Phase Match
         if (icr_ & 0x02) s |= 0x02;                     // /ATN
         if (icr_ & 0x10) s |= 0x01;                     // /ACK
@@ -373,6 +419,8 @@ private:
         cdbPos_ = 0;
         cdbLen_ = 6;   // provisional; refined once the opcode byte arrives
         ++diagSelects;
+        dmaStart_ = DmaStart::None;
+        ackCompletion_ = AckCompletion::None;
     }
 
     // The three phase lines (MSG,C-D,I-O) the target drives for the current phase.
@@ -410,40 +458,106 @@ private:
         return (tcr_ & 0x07) == phaseLines();
     }
 
-    // Initiator -> target byte (Command / Data Out), or the pseudo-DMA send path.
-    void dataOut(u8 v) {
+    // The ordinary Output Data register only drives the SCSI data bus.  In
+    // programmed-I/O mode the target accepts that byte on the following /ACK
+    // edge.  A started DMA-send cycle includes its own handshake and therefore
+    // consumes the byte immediately.
+    void writeDataOut(u8 v) {
         odr_ = v;
+        if ((mr_ & 0x02) && dmaStart_ == DmaStart::Send && reqAsserted())
+            consumeDataOut(true);
+    }
+
+    void consumeDataOut(bool immediate) {
         if (phase_ == Command) {
-            if (cdbPos_ < 12) cdb_[cdbPos_] = v;
-            if (cdbPos_ == 0) cdbLen_ = ScsiTarget::cdbLen(v);
-            if (++cdbPos_ >= cdbLen_) executeCdb();
+            if (cdbPos_ < 12) cdb_[cdbPos_] = odr_;
+            if (cdbPos_ == 0) cdbLen_ = ScsiTarget::cdbLen(odr_);
+            if (++cdbPos_ >= cdbLen_) {
+                if (immediate) executeCdb();
+                else ackCompletion_ = AckCompletion::ExecuteCdb;
+            }
         } else if (phase_ == DataOut) {
-            if (xferPos_ < xfer_.size()) { xfer_[xferPos_++] = v; ++diagDataOutBytes; }
-            if (xferPos_ >= xfer_.size()) finishDataOut();
+            if (xferPos_ < xfer_.size()) {
+                xfer_[xferPos_++] = odr_;
+                ++diagDataOutBytes;
+            }
+            if (xferPos_ >= xfer_.size()) {
+                if (immediate) finishDataOut();
+                else ackCompletion_ = AckCompletion::FinishDataOut;
+            }
         }
     }
 
-    // Target -> initiator byte (Data In / Status / Message In), or pseudo-DMA recv.
-    u8 dataIn() {
+    // Current SCSI Data samples the bus without completing a transfer.  The
+    // byte remains stable until /ACK is asserted and released.
+    u8 peekDataIn() const {
         switch (phase_) {
             case DataIn:
-                if (xferPos_ < xfer_.size()) {
-                    const u8 b = xfer_[xferPos_++];
-                    ++diagDataInBytes;
-                    if (xferPos_ >= xfer_.size()) toStatus();
-                    return b;
-                }
-                return 0;
-            case Status:
-                status_ready_ = false;
-                toMsgIn();
-                return status_;
-            case MsgIn:
-                msg_ready_ = false;
-                phase_ = BusFree;   // Command Complete -> release the bus
-                return 0x00;        // Command Complete message
+                return xferPos_ < xfer_.size() ? xfer_[xferPos_] : 0;
+            case Status: return status_;
+            case MsgIn: return 0x00;             // Command Complete message
             default:
                 return odr_;        // selection: data bus reflects ODR
+        }
+    }
+
+    // The Input Data register is reached through /DACK in pseudo-DMA mode; a
+    // read comprises the complete target handshake rather than merely sampling
+    // the bus as register 0 does.
+    u8 dmaDataIn() {
+        const u8 value = peekDataIn();
+        consumeDataIn(true);
+        return value;
+    }
+
+    void consumeDataIn(bool immediate) {
+        switch (phase_) {
+        case DataIn:
+            if (xferPos_ < xfer_.size()) {
+                ++xferPos_;
+                ++diagDataInBytes;
+            }
+            if (xferPos_ >= xfer_.size()) {
+                if (immediate) toStatus();
+                else ackCompletion_ = AckCompletion::ToStatus;
+            }
+            break;
+        case Status:
+            status_ready_ = false;
+            if (immediate) toMsgIn();
+            else ackCompletion_ = AckCompletion::ToMsgIn;
+            break;
+        case MsgIn:
+            msg_ready_ = false;
+            if (immediate) phase_ = BusFree;
+            else ackCompletion_ = AckCompletion::BusFree;
+            break;
+        default:
+            break;
+        }
+    }
+
+    void acceptAckByte() {
+        if (phase_ == Command || phase_ == DataOut)
+            consumeDataOut(false);
+        else if (phase_ == DataIn || phase_ == Status || phase_ == MsgIn)
+            consumeDataIn(false);
+    }
+
+    void finishAckHandshake() {
+        const AckCompletion completion = ackCompletion_;
+        ackCompletion_ = AckCompletion::None;
+        switch (completion) {
+        case AckCompletion::ExecuteCdb: executeCdb(); break;
+        case AckCompletion::FinishDataOut: finishDataOut(); break;
+        case AckCompletion::ToStatus: toStatus(); break;
+        case AckCompletion::ToMsgIn: toMsgIn(); break;
+        case AckCompletion::BusFree:
+            phase_ = BusFree;
+            sel_ = nullptr;
+            break;
+        case AckCompletion::None:
+            break;
         }
     }
 
@@ -476,7 +590,28 @@ private:
         toStatus();
     }
 
-    void toStatus() { phase_ = Status; status_ready_ = true; xfer_.clear(); xferPos_ = 0; }
+    void toStatus() {
+        phase_ = Status;
+        status_ready_ = true;
+        xfer_.clear();
+        xferPos_ = 0;
+        // In 5380 DMA mode the transition out of the programmed data phase is
+        // End Of Process / phase mismatch.  IRQ remains latched until register
+        // 7 is read.  The IIfx ROM's hardware-handshake path relies on this bit
+        // to distinguish the end of a blind transfer from a stalled bus.
+        if ((mr_ & 0x02) && dmaStart_ != DmaStart::None) irq_ = true;
+        dmaStart_ = DmaStart::None;
+        ackCompletion_ = AckCompletion::None;
+    }
+
+    void startDma(DmaStart start) {
+        dmaStart_ = start;
+        // The enhanced 53C80 samples phase mismatch on the falling edge of
+        // /SREQ (the edge that asserts REQ).  Merely writing a Start-DMA
+        // register while REQ is already asserted does not recreate that edge
+        // and therefore must not synthesize an interrupt.  A later target
+        // phase transition is handled by toStatus(), below.
+    }
     void toMsgIn()  { phase_ = MsgIn; msg_ready_ = true; }
 
     // ---- state -----------------------------------------------------------
@@ -489,6 +624,9 @@ private:
     u8  status_ = 0;
     bool status_ready_ = false, msg_ready_ = false;
     bool writeMode_ = false;
+    bool irq_ = false;
+    DmaStart dmaStart_ = DmaStart::None;
+    AckCompletion ackCompletion_ = AckCompletion::None;
 
     static constexpr int kMaxTargets = 8;
     ScsiTarget* targets_[kMaxTargets] = {};

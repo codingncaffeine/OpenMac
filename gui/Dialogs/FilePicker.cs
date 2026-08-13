@@ -22,6 +22,7 @@ internal static class FilePicker
     // from the same image library, and attaching a hard disk starts where the
     // last one was created.
     public const string Rom = "rom";
+    public const string VideoRom = "video-rom";
     public const string Floppy = "floppy";
     public const string HardDisk = "harddisk";
     public const string Cd = "cd";
@@ -29,6 +30,7 @@ internal static class FilePicker
     private static Guid GuidFor(string purpose) => purpose switch
     {
         Rom      => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d01"),
+        VideoRom => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d05"),
         Floppy   => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d02"),
         HardDisk => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d03"),
         Cd       => new Guid("7f3a1c94-0f6e-4a2d-9c11-4b6b0a5e1d04"),

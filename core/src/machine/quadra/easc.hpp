@@ -26,6 +26,8 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 class Easc {
 public:
     void reset() {
@@ -208,6 +210,8 @@ public:
     }
 
 private:
+    friend class IifxStateCodec;
+
     static constexpr u32 kFifo = 1024;
 
     void diag(const char* fmt, u32 a, u32 b) {

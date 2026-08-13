@@ -54,7 +54,7 @@ inline constexpr int kVec040FpUnsupported = 55;   // packed decimal et al. -> FP
 struct CpuOps040 {
     using Handler = int (*)(M68040&, u16);
 
-    static std::array<Handler, 65536>& table();
+    static std::array<Handler, 65536>& table(M68kCpuModel model);
 
     // ---- size helpers (size: 0=byte 1=word 2=long) ----
     static u32 maskFor(int size) {
@@ -103,6 +103,18 @@ struct CpuOps040 {
     static int  eaIndex(int mode, int reg) { return mode < 7 ? mode : 7 + reg; }
     static int  eaTime(int idx);   // '040 EA fetch clocks (UM section 10)
 
+    // The MC68030 manual separates operand fetch, address calculation, and
+    // jump-address timing.  They are not scaled versions of the 68040 table:
+    // e.g. (An) is 3 clocks when fetched, 2 when merely calculated, and 2 for
+    // a jump.  Keep the three tables explicit so a 030 handler cannot silently
+    // inherit an execute-stage number chosen for the 040.
+    static int eaFetchTime030(int idx, int size);
+    static int eaFetchImmediateTime030(M68040& c, int idx, int size);
+    static int eaCalcTime030(M68040& c, int idx);
+    static int eaCalcImmediateTime030(M68040& c, int idx,
+                                      int operandWords = 1);
+    static int eaJumpTime030(M68040& c, int idx);
+
     enum : u32 {
         EaDn = 1u << 0, EaAn = 1u << 1, EaInd = 1u << 2, EaPostInc = 1u << 3,
         EaPreDec = 1u << 4, EaDisp = 1u << 5, EaIdx8 = 1u << 6, EaAbsW = 1u << 7,
@@ -146,7 +158,7 @@ struct CpuOps040 {
     }
     static int privilegeViolation(M68040& c) {
         c.pc = c.instrStart_;
-        return c.exceptionFrame0(kVec040Privilege, 20);
+        return c.exceptionFrame0(kVec040Privilege, c.is68030() ? 18 : 20);
     }
     static u32 instrStart(const M68040& c) { return c.instrStart_; }
 
@@ -158,7 +170,7 @@ struct CpuOps040 {
     static void fcWrite(M68040& c, u32 addr, u32 v, int size, u32 fc);
 
     // ---- table registration (cpu040_decode.cpp) ----
-    static void buildTableInto(std::array<Handler, 65536>& t);
+    static void buildTableInto(std::array<Handler, 65536>& t, M68kCpuModel model);
 
     // ---- handlers: cpu040_ops_move.cpp ----
     static int opMove(M68040&, u16);
@@ -243,6 +255,7 @@ struct CpuOps040 {
     static int opCinvCpush(M68040&, u16);
     static int opPflush(M68040&, u16);
     static int opPtest(M68040&, u16);
+    static int opPmmu030(M68040&, u16);    // F000 + command word
 
     // ---- handlers: cpu040_fpu.cpp ----
     static int opFpuGen(M68040&, u16);       // F200-F23F general/FMOVE/FMOVEM

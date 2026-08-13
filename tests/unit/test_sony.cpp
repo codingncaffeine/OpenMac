@@ -1,5 +1,7 @@
 #include <doctest/doctest.h>
 
+#include "../../core/src/machine/iwm.hpp"
+#include "../../core/src/machine/mfm.hpp"
 #include "../../core/src/machine/sony.hpp"
 
 #include <vector>
@@ -28,6 +30,88 @@ struct SpunUp {
 };
 
 } // namespace
+
+TEST_CASE("swim: handshake keeps RDDATA and SENSE independent") {
+    Iwm swim;
+    swim.reset();
+    swim.forceIsm();
+
+    // Port 15 is the ISM Handshake register. CRC is nonzero after reset, so
+    // bit 1 remains set alongside the two independently sampled input pins.
+    swim.readDataHigh = true;
+    swim.senseHigh = false;
+    CHECK((swim.access(15, false, 0) & 0x0E) == 0x06);
+
+    swim.readDataHigh = false;
+    swim.senseHigh = true;
+    CHECK((swim.access(15, false, 0) & 0x0E) == 0x0A);
+
+    swim.readDataHigh = true;
+    CHECK((swim.access(15, false, 0) & 0x0E) == 0x0E);
+}
+
+TEST_CASE("swim: read FIFO preserves two bytes and reports exact occupancy") {
+    Iwm swim;
+    swim.reset();
+    swim.forceIsm();
+
+    REQUIRE(swim.ismPushReadByte(0xA1, true));
+    CHECK(swim.ismFifoOccupancy() == 1);
+    CHECK((swim.access(15, false, 0) & 0xC1u) == 0x81u);
+
+    REQUIRE(swim.ismPushReadByte(0xFE, false));
+    CHECK(swim.ismFifoOccupancy() == 2);
+    CHECK((swim.access(15, false, 0) & 0xC1u) == 0xC1u);
+    swim.access(7, true, 0x08); // ACTION: register reads now address the FIFO
+
+    // Mark register consumes the marked head without setting Mark-in-Data.
+    CHECK(swim.access(9, false, 0) == 0xA1);
+    CHECK(swim.ismFifoOccupancy() == 1);
+    CHECK((swim.access(15, false, 0) & 0xC1u) == 0x80u);
+    CHECK(swim.access(8, false, 0) == 0xFE);
+    CHECK(swim.ismFifoOccupancy() == 0);
+    CHECK((swim.access(15, false, 0) & 0xC0u) == 0);
+}
+
+TEST_CASE("swim: CRC handshake follows the newest byte in the read FIFO") {
+    Iwm swim;
+    swim.reset();
+    swim.forceIsm();
+
+    const u8 addressField[8] = {0xA1, 0xA1, 0xA1, 0xFE, 0, 0, 1, 2};
+    const u16 fieldCrc = mfm::crc16(addressField, sizeof addressField);
+    swim.ismCrcReset();
+    for (const u8 byte : addressField) swim.ismCrcAdd(byte);
+
+    const u8 crcHigh = static_cast<u8>(fieldCrc >> 8);
+    const u8 crcLow = static_cast<u8>(fieldCrc);
+    swim.ismCrcAdd(crcHigh);
+    REQUIRE(swim.ismPushReadByte(crcHigh, false));
+    REQUIRE(swim.diagnosticFifoHeadCrc() != 0);
+    swim.ismCrcAdd(crcLow);
+    REQUIRE(swim.ismPushReadByte(crcLow, false));
+
+    CHECK(swim.ismFifoHeadData() == crcHigh);
+    CHECK(swim.ismFifoTailData() == crcLow);
+    CHECK(swim.diagnosticFifoHeadCrc() != 0);
+    CHECK(swim.diagnosticCrc() == 0);
+    CHECK((swim.diagnosticHandshake() & 0x02u) == 0);
+}
+
+TEST_CASE("swim: illegal FIFO reads set the documented error bits") {
+    Iwm swim;
+    swim.reset();
+    swim.forceIsm();
+    REQUIRE(swim.ismPushReadByte(0xA1, true));
+    swim.access(7, true, 0x08);
+
+    CHECK(swim.access(8, false, 0) == 0xA1); // mark through Data
+    CHECK(swim.access(10, false, 0) == 0x02);
+    CHECK(swim.access(10, false, 0) == 0x00); // Error read clears it
+
+    static_cast<void>(swim.access(8, false, 0)); // faster than available
+    CHECK(swim.access(10, false, 0) == 0x04);
+}
 
 TEST_CASE("sony: a fast reader gets every byte of the track, in order") {
     SpunUp s;
@@ -188,6 +272,19 @@ TEST_CASE("sony: stepping walks the head and tracks the direction bit") {
     // The head cannot walk off either end of the disk.
     for (int i = 0; i < 100; ++i) s.drive.command(0x2, false, s.now);
     CHECK(s.drive.track == 0);
+}
+
+TEST_CASE("sony: STEP handshake releases after 80 microseconds") {
+    SpunUp s;
+    s.drive.command(0x0, false, s.now);          // toward track 79
+    s.drive.command(0x2, false, s.now);
+
+    CHECK(s.drive.track == 1);
+    CHECK(s.drive.sense(0x2, s.now) == false);  // /STEP asserted/busy
+    CHECK(s.drive.sense(0x2,
+        s.now + 7833600ull * 79u / 1000000u) == false);
+    CHECK(s.drive.sense(0x2,
+        s.now + 7833600ull * 80u / 1000000u) == true);
 }
 
 TEST_CASE("sony: the disk-switched line is high until the driver acknowledges it") {

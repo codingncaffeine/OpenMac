@@ -316,6 +316,95 @@ u32 fpuOperandEA(M68040& c, int mode, int reg, int fmt) {
     return CpuOps040::calcEA(c, mode, reg, bytes == 1 ? 0 : bytes == 2 ? 1 : 2);
 }
 
+// MC68882UM table 8-3, typical overall time with an FP-register source.  The
+// IIfx clocks its external 68882 with the CPU; values are therefore directly
+// usable as 68030 clocks.  Rounded aliases use the same underlying operation.
+int fpRegisterCycles68882(int opmode) {
+    switch (opmode) {
+    case 0x00: case 0x40: case 0x44: return 21;  // FMOVE
+    case 0x01: return 58;                        // FINT
+    case 0x02: return 690;                       // FSINH
+    case 0x03: return 58;                        // FINTRZ
+    case 0x04: case 0x41: case 0x45: return 110;// FSQRT
+    case 0x06: return 574;                       // FLOGNP1
+    case 0x08: return 548;                       // FETOXM1
+    case 0x09: return 664;                       // FTANH
+    case 0x0A: return 406;                       // FATAN
+    case 0x0C: return 584;                       // FASIN
+    case 0x0D: return 696;                       // FATANH
+    case 0x0E: return 394;                       // FSIN
+    case 0x0F: return 476;                       // FTAN
+    case 0x10: return 500;                       // FETOX
+    case 0x11: return 570;                       // FTWOTOX
+    case 0x12: return 570;                       // FTENTOX
+    case 0x14: return 528;                       // FLOGN
+    case 0x15: case 0x16: return 584;            // FLOG10/FLOG2
+    case 0x18: case 0x58: case 0x5C: return 38; // FABS
+    case 0x19: return 610;                       // FCOSH
+    case 0x1A: case 0x5A: case 0x5E: return 38; // FNEG
+    case 0x1C: return 628;                       // FACOS
+    case 0x1D: return 394;                       // FCOS
+    case 0x1E: return 48;                        // FGETEXP
+    case 0x1F: return 34;                        // FGETMAN
+    case 0x20: case 0x60: case 0x64: return 108; // FDIV/FSDIV/FDDIV
+    case 0x24: return 74;                        // FSGLDIV
+    case 0x21: return 75;                        // FMOD
+    case 0x22: case 0x62: case 0x66: return 56; // FADD
+    case 0x23: case 0x63: case 0x67: return 76; // FMUL/FSMUL/FDMUL
+    case 0x27: return 64;                        // FSGLMUL
+    case 0x25: return 105;                       // FREM
+    case 0x26: return 46;                        // FSCALE
+    case 0x28: case 0x68: case 0x6C: return 56; // FSUB
+    case 0x30: case 0x31: case 0x32: case 0x33:
+    case 0x34: case 0x35: case 0x36: case 0x37: return 454; // FSINCOS
+    case 0x38: return 38;                        // FCMP
+    case 0x3A: return 36;                        // FTST
+    default: return 0;
+    }
+}
+
+bool fpDyadic68882(int opmode) {
+    switch (opmode) {
+    case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:
+    case 0x26: case 0x27: case 0x28: case 0x38:
+    case 0x60: case 0x62: case 0x63: case 0x64: case 0x66: case 0x67:
+    case 0x68: case 0x6C:
+        return true;
+    default:
+        return false;
+    }
+}
+
+int fpSourceCycles68882(int opmode, int fmt, bool mpuDataRegister) {
+    const int base = fpRegisterCycles68882(opmode);
+    int clocks = base;
+    const bool move = opmode == 0x00 || opmode == 0x40 || opmode == 0x44;
+    switch (fmt) {
+    case 1: clocks += 13; break;                 // single
+    case 5: clocks += 19; break;                 // double
+    case 2: clocks += 25; break;                 // extended
+    case 3: clocks += move ? 870 : (fpDyadic68882(opmode) ? 853 : 855); break;
+    default: clocks += move ? 27 : (fpDyadic68882(opmode) ? 38 : 30); break;
+    }
+    // Table 8-3 note: an operand already in a host data register avoids part
+    // of the evaluate-EA/transfer dialogue.
+    if (mpuDataRegister) clocks -= 5;
+    return clocks;
+}
+
+int fpMoveOutCycles68882(int fmt, bool mpuDataRegister) {
+    int clocks;
+    switch (fmt) {
+    case 1: clocks = 38; break;
+    case 5: clocks = 44; break;
+    case 2: clocks = 50; break;
+    case 3: clocks = 2006; break;
+    default: clocks = 110; break;
+    }
+    if (mpuDataRegister) clocks -= 2;
+    return clocks;
+}
+
 } // namespace
 
 // General FPU instruction: F200-F23F with the coprocessor extension word.
@@ -341,7 +430,7 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
             c.fp[dst] = fpuConstant(opmode);
             setFpccFrom(c, c.fp[dst]);
             accrueFp(c);
-            return 4;
+            return c.is68030() ? 32 : 4;
         } else {
             // Fetch by format from the EA.
             const int fmt = srcSpec;
@@ -494,7 +583,7 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
         default:
             // Genuinely undefined opmode: F-line trap.
             c.pc = instrStart(c);
-            return raiseException(c, kVec040FLine, 15);
+            return raiseException(c, kVec040FLine, c.is68030() ? 18 : 15);
         }
 
         // Single/double-rounded variants round the result to that precision.
@@ -523,6 +612,14 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
             setFpccFrom(c, fpd);
         }
         accrueFp(c);
+        if (c.is68030()) {
+            int clocks = cls == 0
+                ? fpRegisterCycles68882(opmode)
+                : fpSourceCycles68882(opmode, srcSpec, mode == 0);
+            if (cls == 2 && mode != 0 && !(mode == 7 && reg == 4))
+                clocks += eaCalcTime030(c, eaIndex(mode, reg));
+            return clocks;
+        }
         return 6;
     }
 
@@ -541,7 +638,7 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
                 writeSized(c.d[reg], static_cast<u32>(toIntegerFormat(c, v, 16)) & 0xFFFF, 1);
             else writeSized(c.d[reg], static_cast<u32>(toIntegerFormat(c, v, 8)) & 0xFF, 0);
             accrueFp(c);
-            return 4;
+            return c.is68030() ? fpMoveOutCycles68882(fmt, true) : 4;
         }
         const u32 addr = fpuOperandEA(c, mode, reg, fmt);
         switch (fmt) {
@@ -574,6 +671,9 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
         default: c.wr8(addr, static_cast<u8>(toIntegerFormat(c, v, 8))); break;
         }
         accrueFp(c);
+        if (c.is68030())
+            return fpMoveOutCycles68882(fmt, false) +
+                   eaCalcTime030(c, eaIndex(mode, reg));
         return 4;
     }
 
@@ -583,13 +683,14 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
         u32 list = (ext >> 10) & 7;   // bit2 FPCR, bit1 FPSR, bit0 FPIAR
         int n = 0;
         for (u32 b = 0; b < 3; ++b) n += (list >> b) & 1;
-        if (n == 0) return 4;
+        if (n == 0) return c.is68030() ? 18 : 4;
 
         if (mode == 0 || mode == 1) {   // single register only
             u32* regp = (list == 4) ? &c.fpcr : (list == 2) ? &c.fpsr : &c.fpiar;
             if (toCtrl) *regp = (mode == 0) ? c.d[reg] : c.a[reg];
             else if (mode == 0) c.d[reg] = *regp;
             else c.a[reg] = *regp;
+            if (c.is68030()) return toCtrl ? 30 : 33;
             return 4;
         }
         // The whole list moves as one block, so predecrement must step back over
@@ -615,6 +716,10 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
             if (toCtrl) *regp = c.rd32(addr);
             else        c.wr32(addr, *regp);
             addr += 4;
+        }
+        if (c.is68030()) {
+            const int base = toCtrl ? (29 + 6 * n) : (29 + 6 * n);
+            return base + eaCalcTime030(c, eaIndex(mode, reg));
         }
         return 4 + n;
     }
@@ -655,6 +760,7 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
                 c.wr32(addr + 8, static_cast<u32>(mant));
             }
             c.a[reg] = addr;
+            if (c.is68030()) return 39 + 25 * n + eaCalcTime030(c, 4);
             return 3 + 2 * n;
         }
 
@@ -677,12 +783,16 @@ int CpuOps040::opFpuGen(M68040& c, u16 op) {
             addr += 12;
         }
         if (mode == 3) c.a[reg] = addr;
+        if (c.is68030()) {
+            const int baseCycles = toRegs ? (37 + 31 * n) : (39 + 25 * n);
+            return baseCycles + eaCalcTime030(c, eaIndex(mode, reg));
+        }
         return 3 + 2 * n;
     }
 
     default:
         c.pc = instrStart(c);
-        return raiseException(c, kVec040FLine, 15);
+        return raiseException(c, kVec040FLine, c.is68030() ? 18 : 15);
     }
 }
 
@@ -695,9 +805,9 @@ int CpuOps040::opFBcc(M68040& c, u16 op) {
     c.fpuUsed_ = true;
     if (fpTestCond(c, cond)) {
         jumpTo(c, base + static_cast<u32>(disp));
-        return 4;
+        return c.is68030() ? 20 : 4;
     }
-    return 3;
+    return c.is68030() ? 18 : 3;
 }
 
 int CpuOps040::opFScc(M68040& c, u16 op) {
@@ -709,31 +819,39 @@ int CpuOps040::opFScc(M68040& c, u16 op) {
     if (mode == 1) {   // FDBcc Dn,disp
         const u32 base = c.pc;
         const s32 disp = static_cast<s16>(c.fetch16());
-        if (fpTestCond(c, cond)) return 4;
+        if (fpTestCond(c, cond)) return c.is68030() ? 20 : 4;
         const u16 count = static_cast<u16>((c.d[reg] & 0xFFFF) - 1);
         writeSized(c.d[reg], count, 1);
         if (count != 0xFFFF) {
             jumpTo(c, base + static_cast<u32>(disp));
-            return 4;
+            return c.is68030() ? 20 : 4;
         }
-        return 4;
+        return c.is68030() ? 24 : 4;
     }
     if (mode == 7 && (reg == 2 || reg == 3 || reg == 4)) {   // FTRAPcc
         if (reg == 2)      (void)c.fetch16();
         else if (reg == 3) (void)c.fetch32();
         if (fpTestCond(c, cond)) {
-            return raiseFrame2(c, kVec040Trapcc, instrStart(c), 15);
+            const int clocks030 = reg == 2 ? 41 : reg == 3 ? 43 : 39;
+            return raiseFrame2(c, kVec040Trapcc, instrStart(c),
+                               c.is68030() ? clocks030 : 15);
         }
+        if (c.is68030()) return reg == 2 ? 20 : reg == 3 ? 22 : 18;
         return 3;
     }
     // FScc
     const u32 v = fpTestCond(c, cond) ? 0xFFu : 0x00u;
     if (mode == 0) {
         writeSized(c.d[reg], v, 0);
-        return 3;
+        return c.is68030() ? 18 : 3;
     }
     const u32 addr = calcEA(c, mode, reg, 0);
     c.wr8(addr, static_cast<u8>(v));
+    if (c.is68030()) {
+        int baseCycles = (mode == 3 || mode == 4) ? 22 : 20;
+        if (!fpTestCond(c, cond) && (mode == 3 || mode == 4)) --baseCycles;
+        return baseCycles + eaCalcTime030(c, eaIndex(mode, reg));
+    }
     return 3 + eaTime(eaIndex(mode, reg));
 }
 
@@ -752,6 +870,8 @@ int CpuOps040::opFSave(M68040& c, u16 op) {
     } else {
         c.wr32(calcEA(c, mode, reg, 2), frame);
     }
+    if (c.is68030())
+        return (c.fpuUsed_ ? 100 : 16) + eaCalcTime030(c, eaIndex(mode, reg));
     return 4;
 }
 
@@ -772,6 +892,9 @@ int CpuOps040::opFRestore(M68040& c, u16 op) {
         c.fpuUsed_ = true;
     }
     if (mode == 3) c.a[reg] += size;
+    if (c.is68030())
+        return ((frame >> 24) == 0 ? 21 : 105) +
+               eaCalcTime030(c, eaIndex(mode, reg));
     return 4;
 }
 

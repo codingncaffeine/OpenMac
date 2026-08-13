@@ -17,6 +17,8 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 // ADB keycodes we care about (Apple keyboard layout).
 namespace adbkey {
 inline constexpr u8 kX = 0x07;
@@ -85,6 +87,8 @@ public:
     int state() const { return state_; }
     bool transactionOpen() const { return open_; }
     u8 lastCommand() const { return cmd_; }
+    int keyboardAddress() const { return kbdAddr_; }
+    int mouseAddress() const { return mouseAddr_; }
 
     // Diagnostics: how often the ROM has Talk-0-polled each device, and how
     // many of those polls actually carried movement/key data.
@@ -206,6 +210,8 @@ public:
     }
 
 private:
+    friend class IifxStateCodec;
+
     static constexpr int kKbdQ = 32;
 
     void emit(u8 a, u8 b) {
@@ -267,7 +273,11 @@ private:
             emit(hi, 0xFF);
         } else if (reg == 3) {
             ++kbdReg3_;
-            emit(0x62, 0x02);   // excep-event | SRQ | addr 2 | handler 2 (ext kbd)
+            // Register 3 byte 0: address in bits 3..0, SRQ enable in bit 5.
+            // Exceptional Event (bit 6) is clear during normal enumeration;
+            // setting it makes the ADB Manager treat every probe as a fresh
+            // device event and repeat collision resolution indefinitely.
+            emit(0x22, 0x02);   // SRQ | addr 2 | handler 2 (extended keyboard)
         }
     }
 
@@ -290,6 +300,11 @@ private:
             const int dy = clampDelta(mouseDy_);
             mouseDx_ -= dx;
             mouseDy_ -= dy;
+            // ADB's classic mouse report has signed 7-bit axes. Keep a large
+            // host delta requesting Talk-0 packets until every count has been
+            // delivered; otherwise only the first +/-63 counts move and the
+            // remainder leaks into a later click or button release.
+            mousePending_ = mouseDx_ != 0 || mouseDy_ != 0;
             // byte0: bit7 = button (0 = down), bits6-0 = Y delta (7-bit signed)
             // byte1: bit7 = 1,                  bits6-0 = X delta (7-bit signed)
             const u8 b0 = static_cast<u8>((mouseButton_ ? 0x00 : 0x80) | (dy & 0x7F));
@@ -298,7 +313,7 @@ private:
             emit(b0, b1);
         } else if (reg == 3) {
             ++mouseReg3_;
-            emit(0x63, 0x01);   // excep-event | SRQ | addr 3 | handler 1 (100cpi mouse)
+            emit(0x23, 0x01);   // SRQ | addr 3 | handler 1 (100 cpi mouse)
         }
     }
 

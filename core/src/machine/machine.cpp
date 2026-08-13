@@ -1326,22 +1326,19 @@ void Machine::ismService(SonyDrive& d) {
     if (!action) return;
 
     if (!iwm_->ismWriting()) {
-        if (!iwm_->ismDataReady) {
+        while (iwm_->ismFifoOccupancy() < 2u) {
             u8 b = 0;
             bool mark = false;
-            if (d.nextByte(totalCycles_, &b, &mark)) {
-                iwm_->ismData = b;
-                iwm_->ismMarkNext = mark;
-                iwm_->ismDataReady = true;
-                // The first mark of a run opens a field and restarts the CRC, so
-                // the check stops depending on where the driver last cleared the
-                // FIFO. Reading from anywhere ahead of an address mark folded the
-                // sync bytes in, and the field could then never verify.
-                if (mark && !ismReadMarkPrev_) iwm_->ismCrcReset();
-                ismReadMarkPrev_ = mark;
-                iwm_->ismCrcAdd(b);
-                ++iwmDataBytes_;
-            }
+            if (!d.nextByte(totalCycles_, &b, &mark)) break;
+            // The first mark of a run opens a field and restarts the CRC, so
+            // the check stops depending on where the driver last cleared the
+            // FIFO. Reading from anywhere ahead of an address mark folded the
+            // sync bytes in, and the field could then never verify.
+            if (mark && !ismReadMarkPrev_) iwm_->ismCrcReset();
+            ismReadMarkPrev_ = mark;
+            iwm_->ismCrcAdd(b);
+            if (!iwm_->ismPushReadByte(b, mark)) break;
+            ++iwmDataBytes_;
         }
         return;
     }

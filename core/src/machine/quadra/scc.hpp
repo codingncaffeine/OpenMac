@@ -47,9 +47,16 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 class Scc8530 {
 public:
     std::function<void(const char*)> onDiag;
+    // The IIfx PIC connects its two byte-DMA channels to the SCC's /W/REQ
+    // output.  Notify that board model whenever transmit-buffer readiness
+    // changes so a DMA burst cannot overrun the SCC's one-byte holding
+    // register.  Quadra machines leave this hook unset.
+    std::function<void()> onDmaRequestChange;
 
     void reset() {
         ptr_ = 0;
@@ -57,6 +64,16 @@ public:
         wr9_ = 0;
         chanReset(ch_[0]);
         chanReset(ch_[1]);
+        if (onDmaRequestChange) onDmaRequestChange();
+    }
+
+    // PIC peripheral selectors 2 and 3 are SCC data B and data A.  An empty
+    // unconnected wire never supplies receive DMA, while a transmit request
+    // follows RR0's Tx-buffer-empty indication.
+    bool dmaRequest(u8 peripheral, bool peripheralToRam) const {
+        if (peripheralToRam || peripheral < 2u || peripheral > 3u)
+            return false;
+        return ch_[static_cast<std::size_t>(peripheral - 2u)].txEmpty;
     }
 
     // off = port offset & 6: 0 = ctl B, 2 = ctl A, 4 = data B, 6 = data A.
@@ -163,6 +180,8 @@ public:
     }
 
 private:
+    friend class IifxStateCodec;
+
     // One byte on the wire at LocalTalk speed: 8 bits at 230.4 kbit/s is
     // ~34.7 us, ~1150 CPU cycles at 33 MHz. The pacing matters more than the
     // exact figure: the driver expects to feed the frame byte by byte.
@@ -276,6 +295,7 @@ private:
     }
 
     void txByte(Chan& c) {
+        const bool wasEmpty = c.txEmpty;
         ++c.bytesSent;
         if (c.shiftTimer > 0) {
             c.bufFull = true;              // queued behind the byte in shift
@@ -292,6 +312,8 @@ private:
                           (&c == &ch_[1]) ? 'A' : 'B', c.bytesSent);
             onDiag(b);
         }
+        if (c.txEmpty != wasEmpty && onDmaRequestChange)
+            onDmaRequestChange();
     }
 
     void tickChan(Chan& c, s32 cycles) {
@@ -307,10 +329,13 @@ private:
             if (c.shiftTimer <= 0) {
                 c.shiftTimer = 0;
                 if (c.bufFull) {
+                    const bool wasEmpty = c.txEmpty;
                     c.bufFull = false;
                     c.txEmpty = true;
                     c.shiftTimer = kByteCycles;
                     c.feedTimer = kFeedDelay;
+                    if (c.txEmpty != wasEmpty && onDmaRequestChange)
+                        onDmaRequestChange();
                 } else if (c.underrunArmed) {
                     // Drained mid-frame: the chip closes the frame itself.
                     // The latch sets and ext/status reports end-of-message.

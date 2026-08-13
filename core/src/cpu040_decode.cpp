@@ -1,6 +1,6 @@
 #include "cpu040_ops.hpp"
 
-// Builds the 68040's 64K opcode dispatch table. Every encoding not claimed
+// Builds a model-selected 68030/68040 opcode dispatch table. Every encoding not claimed
 // here stays on opIllegal (vector 4); $Axxx/$Fxxx trap through their vectors.
 // Differences from the 68000 table are the 68020-era instructions (bitfields,
 // CAS, CHK2/CMP2, long MUL/DIV, PACK/UNPK, RTD, TRAPcc, MOVEC/MOVES, LINK.L,
@@ -13,7 +13,8 @@
 
 namespace openmac {
 
-void CpuOps040::buildTableInto(std::array<Handler, 65536>& t) {
+void CpuOps040::buildTableInto(std::array<Handler, 65536>& t,
+                               M68kCpuModel model) {
     for (u32 opv = 0; opv < 65536; ++opv) {
         const u16 op    = static_cast<u16>(opv);
         const int mode  = (op >> 3) & 7;
@@ -282,7 +283,8 @@ void CpuOps040::buildTableInto(std::array<Handler, 65536>& t) {
         }
 
         case 0xF: {
-            // The '040's own F-line blocks; anything else F-line traps.
+            // Coprocessor ID 1 is the external 68882 on a 68030 and the
+            // integrated FPU on a 68040; its architectural encodings match.
             if ((op & 0xFFC0) == 0xF200) h = &opFpuGen;
             else if ((op & 0xFFC0) == 0xF240) {
                 if (mode == 1) h = &opFScc;                       // FDBcc
@@ -296,15 +298,28 @@ void CpuOps040::buildTableInto(std::array<Handler, 65536>& t) {
             else if ((op & 0xFFC0) == 0xF340) {
                 if (eaValid(mode, reg, kEaControl | EaPostInc)) h = &opFRestore;
             }
-            else if ((op & 0xFF00) == 0xF400) {
+            else if (model == M68kCpuModel::M68030 &&
+                     (op & 0xFFC0) == 0xF000) {
+                // Integrated 030 PMMU general operation plus command word.
+                // The command selects PMOVE/PLOAD/PFLUSH/PTEST and validates
+                // the effective-address class.
+                h = &opPmmu030;
+            }
+            else if (model == M68kCpuModel::M68040 &&
+                     (op & 0xFF00) == 0xF400) {
                 // CINV/CPUSH: scope 00 raises ILLEGAL (vector 4), per PRM 6-3.
                 h = (((op >> 3) & 3) != 0) ? &opCinvCpush : &opIllegal;
             }
-            else if ((op & 0xFFE0) == 0xF500) h = &opPflush;
-            else if ((op & 0xFFF8) == 0xF548) h = &opPtest;   // PTESTW (An)
-            else if ((op & 0xFFF8) == 0xF568) h = &opPtest;   // PTESTR (An)
-            else if ((op & 0xFFF8) == 0xF620) h = &opMove16;                  // (Ax)+,(Ay)+
-            else if ((op & 0xFFE0) == 0xF600) h = &opMove16;                  // absolute forms
+            else if (model == M68kCpuModel::M68040 &&
+                     (op & 0xFFE0) == 0xF500) h = &opPflush;
+            else if (model == M68kCpuModel::M68040 &&
+                     (op & 0xFFF8) == 0xF548) h = &opPtest;   // PTESTW (An)
+            else if (model == M68kCpuModel::M68040 &&
+                     (op & 0xFFF8) == 0xF568) h = &opPtest;   // PTESTR (An)
+            else if (model == M68kCpuModel::M68040 &&
+                     (op & 0xFFF8) == 0xF620) h = &opMove16;  // (Ax)+,(Ay)+
+            else if (model == M68kCpuModel::M68040 &&
+                     (op & 0xFFE0) == 0xF600) h = &opMove16;  // absolute forms
             if (!h) h = &opFLine;
             break;
         }

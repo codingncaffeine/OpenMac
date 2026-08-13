@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 #include <openmac/hfs.hpp>
+#include "../../core/src/machine/scsiimage.hpp"
 
 #include <map>
 #include <string>
@@ -148,4 +149,47 @@ TEST_CASE("the formatter's empty volume still lists as just a root") {
     REQUIRE(items.size() == 1);
     CHECK(items[0].isDir);
     CHECK(items[0].name == "Blank");
+}
+
+TEST_CASE("the HFS builder accepts the IIfx 160 MB hard-disk geometry") {
+    constexpr std::size_t kIifxDiskSize = 160u * 1024u * 1024u;
+    hfs::VolumeBuilder b("IIfx 160");
+    b.addFile(2, "Boot Probe", 0x54455854 /* TEXT */, 0x74747874 /* ttxt */, 0,
+              bytesOf("160 MB geometry"), {});
+
+    auto img = b.build(kIifxDiskSize);
+    REQUIRE_MESSAGE(!img.empty(), b.why());
+    REQUIRE(img.size() == kIifxDiskSize);
+
+    std::vector<hfs::Item> items;
+    REQUIRE(hfs::listVolume(img, items));
+    REQUIRE(items.size() == 2);
+    const auto m = byName(items);
+    REQUIRE(m.count("Boot Probe"));
+    std::vector<u8> fork;
+    REQUIRE(hfs::readFork(img, m.at("Boot Probe").id, false, fork));
+    CHECK(fork == bytesOf("160 MB geometry"));
+}
+
+TEST_CASE("portable SCSI driver preserves its data-phase selector across traps") {
+    const auto driver = scsi::buildScsiDriverPortable();
+    constexpr std::size_t q = 0x54u + 0xC6u;
+    REQUIRE(driver.size() >= q + 134u);
+
+    // Prime selects WRITE(6)/SCSIWrite or READ(6)/SCSIRead as a pair.
+    CHECK(driver[0x54u + 0x1Eu + 90u] == 0x72);
+    CHECK(driver[0x54u + 0x1Eu + 91u] == 0x0A);
+    CHECK(driver[0x54u + 0x1Eu + 92u] == 0x70);
+    CHECK(driver[0x54u + 0x1Eu + 93u] == 0x06);
+    CHECK(driver[0x54u + 0x1Eu + 96u] == 0x72);
+    CHECK(driver[0x54u + 0x1Eu + 97u] == 0x08);
+    CHECK(driver[0x54u + 0x1Eu + 98u] == 0x70);
+    CHECK(driver[0x54u + 0x1Eu + 99u] == 0x05);
+
+    // xfer6 copies volatile D0 to dispatcher-preserved D3 before SCSIGet,
+    // then pushes D3—not the clobbered D0—for SCSIRead/SCSIWrite.
+    CHECK(driver[q + 28] == 0x36);
+    CHECK(driver[q + 29] == 0x00);
+    CHECK(driver[q + 94] == 0x3F);
+    CHECK(driver[q + 95] == 0x03);
 }

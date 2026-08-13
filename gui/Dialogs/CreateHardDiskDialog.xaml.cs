@@ -19,10 +19,14 @@ public partial class CreateHardDiskDialog : Window
 
         foreach (int mb in HardDiskImage.CommonSizesMB)
             SizeBox.Items.Add($"{mb} MB");
-        SizeBox.SelectedIndex = 0;
+        SizeBox.SelectedIndex = settings.IsIifx
+            ? Array.IndexOf(HardDiskImage.CommonSizesMB, 80)
+            : 0;
 
         FormatNote.Text = HardDiskImage.ProducesRealHfs
-            ? "Creates an empty, ready-to-use HFS volume."
+            ? settings.IsIifx
+                ? "Creates an empty, ready-to-use HFS volume. 80 MB and 160 MB are period Macintosh IIfx drive sizes."
+                : "Creates an empty, ready-to-use HFS volume."
             : "Creates the image now; it will mount as an uninitialized disk until "
               + "the built-in HFS formatter is enabled, then you can re-create it ready to use.";
     }
@@ -34,7 +38,7 @@ public partial class CreateHardDiskDialog : Window
         if (FilePicker.Save(this, _settings, FilePicker.HardDisk, "Save hard-disk image",
                             "Disk image (*.img)|*.img|All files (*.*)|*.*",
                             SafeFileName(NameBox.Text) + ".img", ".img",
-                            _settings.LastHardDisk) is { } path)
+                            _settings.ModelLastHardDisk) is { } path)
             PathBox.Text = path;
         Log.Line($"create hard disk: save-as -> \"{PathBox.Text}\"");
     }

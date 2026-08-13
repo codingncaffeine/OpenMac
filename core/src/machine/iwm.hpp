@@ -45,6 +45,8 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 class Iwm {
 public:
     // Latch bits in lines_, in soft-switch order.
@@ -73,6 +75,7 @@ public:
         ismSetup_ = 0;
         ismError_ = 0;
         ismParamIdx_ = 0;
+        clearIsmReadFifo();
     }
 
     u8 lines() const { return lines_; }
@@ -195,6 +198,13 @@ public:
     // lines currently address. Owned by the machine, which knows the drives.
     bool senseHigh = false;
 
+    // The ISM handshake exposes the raw RDDATA and SENSE pins independently on
+    // bits 2 and 3. RDDATA idles high when no flux transition is being sampled;
+    // the rotating-surface path supplies decoded bytes through the FIFO instead.
+    // Keeping this separate from senseHigh matters while the IOP firmware probes
+    // a mechanism: a low status response must not also pull RDDATA low.
+    bool readDataHigh = true;
+
     // ---- ISM (SWIM) register set ---------------------------------------
     //
     // The same sixteen soft switches address a completely different register
@@ -213,11 +223,70 @@ public:
     bool swimEnabled = true;
 
     bool ismSelected() const { return ism_; }
+    // The IIfx's SWIM is reset and owned by the ISM IOP, whose downloaded
+    // firmware immediately uses the direct ISM register map (it writes Phase
+    // at port 4 and verifies the value through read port 12). Earlier Macs
+    // enter that map with the four-write IWM mode sequence instead.
+    void forceIsm() {
+        ism_ = true;
+        ismMode_ = 0x40;
+        ismPhase_ = 0xF0;
+        ismSetup_ = 0;
+        ismError_ = 0;
+        ismParamIdx_ = 0;
+        clearIsmReadFifo();
+        senseHigh = false;
+        readDataHigh = true;
+        syncPhaseLines();
+    }
     u8 ismMode() const { return ismMode_; }
     u8 ismSetup() const { return ismSetup_; }
     bool ismGcr() const { return (ismSetup_ & 0x04) != 0; }   // Setup bit 2: 1 = GCR
     bool ismAction() const { return (ismMode_ & 0x08) != 0; } // Mode bit 3
     bool ismWriting() const { return (ismMode_ & 0x10) != 0; }// Mode bit 4: 1 = write
+    u8 diagnosticHandshake() const { return ismHandshake(); }
+    u8 diagnosticError() const { return ismError_; }
+    // The mark bit describes the oldest byte (the byte about to be read), but
+    // the CRC generator has already clocked every byte that has entered the
+    // two-byte FIFO.  Consequently the CRC bit belongs to the newest entry.
+    // This distinction matters when the two CRC bytes are resident together:
+    // the first byte's snapshot is non-zero while the second one's is zero.
+    u16 diagnosticCrc() const {
+        if (ismFifoCount_ == 0) return ismCrc_;
+        const u8 tail = static_cast<u8>((ismFifoHead_ + ismFifoCount_ - 1u) & 1u);
+        return ismFifoCrc_[tail];
+    }
+    u16 diagnosticFifoHeadCrc() const {
+        return ismFifoCount_ != 0 ? ismFifoCrc_[ismFifoHead_] : ismCrc_;
+    }
+    u8 diagnosticLines() const { return lines_; }
+    u8 ismFifoOccupancy() const {
+        return ismWriting() ? (ismDataReady ? 0u : 2u) : ismFifoCount_;
+    }
+    u8 ismFifoHeadData() const {
+        return ismFifoCount_ != 0 ? ismFifoData_[ismFifoHead_] : ismData;
+    }
+    u8 ismFifoTailData() const {
+        if (ismFifoCount_ == 0) return ismData;
+        const u8 tail = static_cast<u8>((ismFifoHead_ + ismFifoCount_ - 1u) & 1u);
+        return ismFifoData_[tail];
+    }
+
+    // The ISM has a two-byte read FIFO. Bytes enter after the mark-search
+    // state machine has synchronized; an attempted third byte sets Overrun.
+    bool ismPushReadByte(u8 byte, bool mark) {
+        if (ismFifoCount_ >= 2u) {
+            if (!ismError_) ismError_ = 0x01;
+            return false;
+        }
+        const u8 tail = static_cast<u8>((ismFifoHead_ + ismFifoCount_) & 1u);
+        ismFifoData_[tail] = byte;
+        ismFifoMark_[tail] = mark ? 1u : 0u;
+        ismFifoCrc_[tail] = ismCrc_;
+        ++ismFifoCount_;
+        refreshIsmReadFifoView();
+        return true;
+    }
 
     // ISM data path, driven by the machine the way dataByte/writeReady are in
     // IWM mode: the FIFO holds what the framer has produced or wants.
@@ -233,6 +302,8 @@ public:
     mutable bool ismWroteCrc = false;
 
 private:
+    friend class IifxStateCodec;
+
     // IWM Mode bit 6 written 1,0,1,1 in four consecutive writes unlocks the ISM
     // register set (SWIM ref p.12). Nothing else in the chip cares about the
     // sequence, so it is tracked as a four-deep shift of that one bit.
@@ -246,6 +317,7 @@ private:
             ismSetup_ = 0;
             ismError_ = 0;
             ismParamIdx_ = 0;
+            clearIsmReadFifo();
             unlockN_ = 0;
         }
     }
@@ -276,8 +348,7 @@ private:
                     // driver sets it first (SWIM ref p.23).
                     if (data & 0x01) {
                         ismFifoArmed_ = true;
-                        ismDataReady = false;
-                        ismMarkNext = false;
+                        clearIsmReadFifo();
                         ismCrc_ = 0xFFFF;
                     }
                     break;
@@ -302,10 +373,38 @@ private:
         return 0;
     }
 
-    u8 takeFifoByte() const {
-        ismDataReady = false;
+    u8 takeFifoByte() {
+        if (ismFifoCount_ == 0) {
+            if (!ismError_) ismError_ = 0x04;
+            ismDataTaken = true;
+            return ismData;
+        }
+        const u8 value = ismFifoData_[ismFifoHead_];
+        ismFifoHead_ = static_cast<u8>((ismFifoHead_ + 1u) & 1u);
+        --ismFifoCount_;
         ismDataTaken = true;
-        return ismData;
+        refreshIsmReadFifoView();
+        return value;
+    }
+
+    void clearIsmReadFifo() {
+        ismFifoHead_ = 0;
+        ismFifoCount_ = 0;
+        ismDataReady = false;
+        ismMarkNext = false;
+        ismCrcOk = false;
+    }
+
+    void refreshIsmReadFifoView() {
+        ismDataReady = ismFifoCount_ != 0;
+        if (ismFifoCount_ != 0) {
+            ismData = ismFifoData_[ismFifoHead_];
+            ismMarkNext = ismFifoMark_[ismFifoHead_] != 0;
+            ismCrcOk = diagnosticCrc() == 0;
+        } else {
+            ismMarkNext = false;
+            ismCrcOk = ismCrc_ == 0;
+        }
     }
 
 public:
@@ -355,12 +454,18 @@ private:
 
     u8 ismHandshake() const {
         u8 h = 0;
-        if (ismMarkNext) h |= 0x01;
-        if (ismCrc_ != 0) h |= 0x02;
-        if (senseHigh)   h |= 0x08;
+        if (ismFifoCount_ != 0 && ismFifoMark_[ismFifoHead_]) h |= 0x01;
+        if (diagnosticCrc() != 0) h |= 0x02;
+        if (readDataHigh) h |= 0x04;                 // raw RDDATA input
+        if (senseHigh)    h |= 0x08;                 // multiplexed SENSE input
         if (ismMode_ & 0x80) h |= 0x10;              // MotorOn
         if (ismError_)   h |= 0x20;
-        if (ismDataReady) h |= 0xC0;                 // 1-or-2 bytes, and 2 bytes
+        if (ismWriting()) {
+            if (ismDataReady) h |= 0xC0;
+        } else {
+            if (ismFifoCount_ >= 1u) h |= 0x80;
+            if (ismFifoCount_ >= 2u) h |= 0x40;
+        }
         return h;
     }
 
@@ -372,6 +477,11 @@ private:
     u8 ismMode_ = 0, ismPhase_ = 0xF0, ismSetup_ = 0, ismError_ = 0, ismIwmCfg_ = 0;
     mutable u16 ismCrc_ = 0xFFFF;
     bool ismFifoArmed_ = false;
+    u8 ismFifoData_[2]{};
+    u8 ismFifoMark_[2]{};
+    u16 ismFifoCrc_[2]{0xFFFF, 0xFFFF};
+    u8 ismFifoHead_ = 0;
+    u8 ismFifoCount_ = 0;
     u8 ismParam_[16] = {};
     int ismParamIdx_ = 0;
 };

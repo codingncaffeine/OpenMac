@@ -30,7 +30,8 @@ u32 CpuOps040::indexExtension(M68040& c, u32 base) {
     // Full format. BS (bit 7) suppresses the base register, IS (bit 6) the
     // index; BD size (bits 5-4): 01 null, 10 word, 11 long. I/IS (bits 2-0)
     // selects memory indirection and the outer displacement size.
-    c.eaExtra_ += 2;   // full-format parse (UM section 10 tables)
+    c.lastEaFull030_ = c.is68030();
+    if (!c.is68030()) c.eaExtra_ += 2; // 040 full-format parse
     if (ext & 0x0080) base = 0;
     u32 bd = 0;
     const int bdSize = (ext >> 4) & 3;
@@ -40,11 +41,27 @@ u32 CpuOps040::indexExtension(M68040& c, u32 base) {
     if (indexSuppressed) idx = 0;
 
     const int iis = ext & 7;
-    if (iis == 0) return base + bd + idx;       // no memory indirection
+    if (iis == 0) {
+        if (c.is68030()) {
+            // The base 030 indexed timing is the brief-format six-clock
+            // fetch. Full format has the same fetch cost for null/word base
+            // displacement on the ordinary An/PC forms; a long displacement
+            // needs three additional instruction words' worth of work.
+            if (bdSize == 3) c.eaExtra_ += 6;
+            else if (bdSize == 2 && (ext & 0x0080)) c.eaExtra_ += 2;
+        }
+        return base + bd + idx;                 // no memory indirection
+    }
 
     // Memory indirect: 1-3 = preindexed (index applies before the fetch),
     // 5-7 = postindexed (index applies after; only legal with IS clear).
-    c.eaExtra_ += 4;   // the indirection fetch (UM section 10 tables)
+    if (c.is68030()) {
+        c.eaExtra_ += 4;                         // full-format indirection
+        if (bdSize == 3) c.eaExtra_ += 6;
+        else if (bdSize == 2 && (ext & 0x0080)) c.eaExtra_ += 2;
+    } else {
+        c.eaExtra_ += 4;                         // 040 indirection fetch
+    }
     const bool post = (iis & 4) != 0;
     const int odSize = iis & 3;                 // 1 null, 2 word, 3 long
     const u32 inner = post ? (base + bd) : (base + bd + idx);
@@ -52,10 +69,12 @@ u32 CpuOps040::indexExtension(M68040& c, u32 base) {
     u32 od = 0;
     if (odSize == 2) od = static_cast<u32>(static_cast<s32>(static_cast<s16>(c.fetch16())));
     else if (odSize == 3) od = c.fetch32();
+    if (c.is68030() && odSize >= 2) c.eaExtra_ += 2;
     return fetched + (post ? idx : 0) + od;
 }
 
 u32 CpuOps040::calcEA(M68040& c, int mode, int reg, int size) {
+    if (c.is68030()) c.lastEaFull030_ = false;
     switch (mode) {
     case 2:
         return c.a[reg];

@@ -5,6 +5,7 @@
 
 #include "openmac/debugger.hpp"
 #include "openmac/hfs.hpp"
+#include "openmac/iifx.hpp"
 #include "openmac/machine.hpp"
 
 #include <cstdio>
@@ -16,6 +17,8 @@
 using openmac::u8;
 using openmac::u16;
 using openmac::u32;
+using openmac::u64;
+using openmac::s64;
 
 struct OMac {
     openmac::Machine mac;
@@ -398,6 +401,7 @@ OMAC_API int omac_format_hfs(uint32_t size_bytes, const char* name, uint8_t* out
     if (!out) return -1;
     try {
         auto v = openmac::hfs::formatVolume(size_bytes, name ? name : "Untitled");
+        if (v.size() != size_bytes) return -2;
         std::memcpy(out, v.data(), v.size());
         return 0;
     } catch (...) {
@@ -536,6 +540,234 @@ OMAC_API void omac_poll_log(OMac* m, char* out, size_t cap)
 }
 
 OMAC_API const char* omac_version(void) { return "OpenMac core 0.5.0"; }
+
+} // extern "C"
+
+// ---- Macintosh IIfx surface -----------------------------------------------
+
+struct OMacFx {
+    openmac::IifxMachine mac;
+    std::vector<u8> audioBuf;
+    std::vector<std::string> logBuf;
+
+    OMacFx(std::vector<u8> rom, std::vector<u8> videoRom, uint32_t ramMB)
+        : mac(std::move(rom), [&] {
+              openmac::IifxMachine::Config config;
+              config.ramSize = ramMB * 1024u * 1024u;
+              config.videoCard = true;
+              config.nativeStorage = true;
+              config.videoDeclarationRom = std::move(videoRom);
+              return config;
+          }()) {
+        mac.onDiag = [this](const char* s) {
+            if (logBuf.size() < 4000) logBuf.emplace_back(s);
+        };
+        mac.cpu().onException = [this](int vector, u32 pc) {
+            // A-line/F-line traps and TRAP #n are the Macintosh ABI. Keep the
+            // exceptional cases that can explain a bomb or a stalled boot.
+            if (vector == 10 || vector == 11 || (vector >= 32 && vector < 48))
+                return;
+            if (pc >= 0x40000000u || faultBudget <= 0) return;
+            --faultBudget;
+            char line[160];
+            std::snprintf(line, sizeof line,
+                          "[guest] exception %d pc=%08X addr=%08X sr=%04X frame=%llu",
+                          vector, pc, mac.cpu().lastFaultAddr,
+                          mac.cpu().getSR(),
+                          static_cast<unsigned long long>(mac.frameCount()));
+            if (logBuf.size() < 4000) logBuf.emplace_back(line);
+        };
+    }
+
+    int faultBudget = 40;
+    u64 hostMouseCalls = 0;
+    u64 hostMouseMotionCalls = 0;
+    s64 hostMouseDx = 0;
+    s64 hostMouseDy = 0;
+    u64 hostMouseButtonTransitions = 0;
+    bool hostMouseButton = false;
+};
+
+extern "C" {
+
+OMAC_API OMacFx* omac_fx_create(const uint8_t* rom, size_t rom_len,
+                                 uint32_t ram_mb)
+{
+    return omac_fx_create_with_video_rom(rom, rom_len, nullptr, 0, ram_mb);
+}
+
+OMAC_API OMacFx* omac_fx_create_with_video_rom(
+    const uint8_t* rom, size_t rom_len, const uint8_t* video_rom,
+    size_t video_rom_len, uint32_t ram_mb)
+{
+    // This machine has one supported 512 KiB ROM revision. Rejecting a
+    // Classic-family image here is important because both files have the same
+    // length and a padded/incorrect image otherwise appears to start before it
+    // disappears into unrelated vectors.
+    if (!rom || rom_len != 512u * 1024u ||
+        rom[0] != 0x41 || rom[1] != 0x47 ||
+        rom[2] != 0xDD || rom[3] != 0x77)
+        return nullptr;
+    try {
+        std::vector<u8> video;
+        if (video_rom && video_rom_len)
+            video.assign(video_rom, video_rom + video_rom_len);
+        return new OMacFx(std::vector<u8>(rom, rom + rom_len),
+                          std::move(video), ram_mb ? ram_mb : 8u);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+OMAC_API void omac_fx_destroy(OMacFx* m) { delete m; }
+OMAC_API void omac_fx_reset(OMacFx* m) { if (m) m->mac.reset(); }
+OMAC_API void omac_fx_run_frame(OMacFx* m) { if (m) m->mac.runFrame(); }
+OMAC_API int omac_fx_screen_w(OMacFx* m) { return m ? m->mac.screenWidth() : 640; }
+OMAC_API int omac_fx_screen_h(OMacFx* m) { return m ? m->mac.screenHeight() : 480; }
+OMAC_API void omac_fx_render(OMacFx* m, uint32_t* argb)
+{
+    if (m && argb) m->mac.renderScreen(argb);
+}
+
+OMAC_API uint32_t omac_fx_audio_rate(OMacFx* m)
+{
+    return m ? m->mac.audioSampleRate() : 22254u;
+}
+
+OMAC_API size_t omac_fx_drain_audio(OMacFx* m, uint8_t* out, size_t cap)
+{
+    if (!m || !out || cap == 0) return 0;
+    m->mac.drainAudio(m->audioBuf);
+    const size_t n = std::min(m->audioBuf.size(), cap);
+    if (n) std::memcpy(out, m->audioBuf.data(), n);
+    return n;
+}
+
+OMAC_API void omac_fx_mouse(OMacFx* m, int dx, int dy, int button)
+{
+    if (!m) return;
+    ++m->hostMouseCalls;
+    if (dx != 0 || dy != 0) {
+        ++m->hostMouseMotionCalls;
+        m->hostMouseDx += dx;
+        m->hostMouseDy += dy;
+    }
+    const bool down = button != 0;
+    if (down != m->hostMouseButton) {
+        ++m->hostMouseButtonTransitions;
+        m->hostMouseButton = down;
+    }
+    m->mac.mouseMove(dx, dy, down);
+}
+
+OMAC_API void omac_fx_key(OMacFx* m, int adb_code, int down)
+{
+    if (m) m->mac.keyEvent(static_cast<u8>(adb_code), down != 0);
+}
+
+OMAC_API int omac_fx_insert_floppy(OMacFx* m, const uint8_t* img,
+                                    size_t len, int read_only)
+{
+    if (!m || !img || !len) return 0;
+    return m->mac.insertFloppy(std::vector<u8>(img, img + len), read_only != 0);
+}
+
+OMAC_API void omac_fx_eject_floppy(OMacFx* m)
+{
+    if (m) m->mac.ejectFloppy();
+}
+
+OMAC_API int omac_fx_floppy_present(OMacFx* m)
+{
+    return m && m->mac.floppyPresent() ? 1 : 0;
+}
+
+OMAC_API size_t omac_fx_floppy_writeback(OMacFx* m, uint8_t* out, size_t cap)
+{
+    if (!m) return 0;
+    const std::vector<u8> image = m->mac.floppyForWriteBack();
+    if (image.empty()) return 0;
+    if (!out) return image.size();
+    if (cap < image.size()) return 0;
+    std::copy(image.begin(), image.end(), out);
+    return image.size();
+}
+
+OMAC_API void omac_fx_insert_harddisk(OMacFx* m, const uint8_t* img,
+                                       size_t len, int read_only)
+{
+    if (m && img && len)
+        m->mac.insertHardDisk(std::vector<u8>(img, img + len), read_only != 0);
+}
+
+OMAC_API void omac_fx_detach_harddisk(OMacFx* m)
+{
+    if (m) m->mac.insertHardDisk({});
+}
+
+OMAC_API size_t omac_fx_harddisk_data(OMacFx* m, uint8_t* out, size_t cap)
+{
+    if (!m || !m->mac.hardDiskPresent()) return 0;
+    const auto& image = m->mac.hardDiskImage();
+    if (!out) return image.size();
+    if (cap < image.size()) return 0;
+    std::copy(image.begin(), image.end(), out);
+    return image.size();
+}
+
+OMAC_API int omac_fx_shutdown_harddisk(OMacFx* m)
+{
+    return (m && m->mac.shutdownHardDisk()) ? 1 : 0;
+}
+
+OMAC_API size_t omac_fx_pram_save(OMacFx* m, uint8_t* out, size_t cap)
+{
+    return m ? m->mac.savePram(out, static_cast<u32>(cap)) : 0;
+}
+
+OMAC_API int omac_fx_pram_load(OMacFx* m, const uint8_t* data, size_t len,
+                                uint32_t add_seconds)
+{
+    return m && m->mac.loadPram(data, static_cast<u32>(len), add_seconds) ? 1 : 0;
+}
+
+OMAC_API size_t omac_fx_diagnostics(OMacFx* m, char* out, size_t cap)
+{
+    if (!m) return 0;
+    std::string report = m->mac.diagnosticReport();
+    char input[256];
+    std::snprintf(input, sizeof input,
+                  "  host input mouse calls=%llu motion=%llu delta=%lld/%lld "
+                  "button-transitions=%llu down=%d\n",
+                  static_cast<unsigned long long>(m->hostMouseCalls),
+                  static_cast<unsigned long long>(m->hostMouseMotionCalls),
+                  static_cast<long long>(m->hostMouseDx),
+                  static_cast<long long>(m->hostMouseDy),
+                  static_cast<unsigned long long>(m->hostMouseButtonTransitions),
+                  m->hostMouseButton ? 1 : 0);
+    report += input;
+    if (!out || cap == 0) return report.size() + 1;
+    const size_t n = std::min(report.size(), cap - 1);
+    std::copy(report.begin(), report.begin() + static_cast<std::ptrdiff_t>(n), out);
+    out[n] = '\0';
+    return n;
+}
+
+OMAC_API void omac_fx_poll_log(OMacFx* m, char* out, size_t cap)
+{
+    if (!m || !out || cap == 0) return;
+    size_t pos = 0, taken = 0;
+    for (const auto& line : m->logBuf) {
+        if (pos + line.size() + 2 > cap) break;
+        std::memcpy(out + pos, line.data(), line.size());
+        pos += line.size();
+        out[pos++] = '\n';
+        ++taken;
+    }
+    out[pos] = '\0';
+    m->logBuf.erase(m->logBuf.begin(),
+                    m->logBuf.begin() + static_cast<std::ptrdiff_t>(taken));
+}
 
 } // extern "C"
 

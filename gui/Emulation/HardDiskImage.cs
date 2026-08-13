@@ -13,7 +13,10 @@ public static class HardDiskImage
     /// <summary>True once <see cref="CreateBlank"/> produces a real HFS volume.</summary>
     public static bool ProducesRealHfs => NativeFormatter.IsAvailable;
 
-    public static readonly int[] CommonSizesMB = { 20, 40, 80, 120, 240, 500 };
+    // 80 and 160 MB are the two period-typical IIfx choices (and the latter is
+    // the largest internal drive Apple specified). Keep broader sizes for the
+    // other OpenMac models as well.
+    public static readonly int[] CommonSizesMB = { 20, 40, 80, 160, 240, 500 };
 
     /// <summary>
     /// Write a hard-disk image of <paramref name="sizeMB"/> megabytes to

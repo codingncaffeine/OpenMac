@@ -208,7 +208,7 @@ OMAC_API int  omac_net_attached(OMac*);
 OMAC_API int  omac_net_inject(OMac*, const uint8_t* frame, size_t len);
 OMAC_API size_t omac_net_drain(OMac*, uint8_t* out, size_t cap);
 
-/* ---- Quadra 650 (a second machine beside the Classic) ----
+/* ---- Quadra 650 ---------------------------------------------------------
    Additive surface with its own opaque handle: 68040 board, color DAFB
    video whose geometry follows what the ROM programs (ask, don't assume),
    EASC audio on the same 8-bit 22.25 kHz drain contract, and a SCSI hard
@@ -288,6 +288,48 @@ OMAC_API size_t omac_q_floppy_data(OMacQ*, uint8_t* out, size_t cap);
 OMAC_API int    omac_q_insert_cd(OMacQ*, const uint8_t* img, size_t len);
 OMAC_API void   omac_q_eject_cd(OMacQ*);
 OMAC_API int    omac_q_cd_present(OMacQ*);
+
+/* ---- Macintosh IIfx (1990) ---------------------------------------------
+   A separate opaque handle for the 40 MHz 68030 machine. The supplied ROM
+   discovers a slot-$9 Macintosh II Video Card (640x480), the OSS/IOP board,
+   and a SCSI disk. RAM is specified in megabytes; legal physical totals are
+   4, 8, 16, 20, 32, 64, 68, 80 and 128. Audio is unsigned 8-bit mono PCM;
+   query the guest-selected ASC clock with omac_fx_audio_rate(). */
+typedef struct OMacFx OMacFx;
+OMAC_API OMacFx* omac_fx_create(const uint8_t* rom, size_t rom_len, uint32_t ram_mb);
+/* Optional external Apple Macintosh Display Card 8*24 GC declaration ROM.
+   Passing null/zero retains OpenMac's synthetic fallback card. */
+OMAC_API OMacFx* omac_fx_create_with_video_rom(const uint8_t* rom,
+                                                size_t rom_len,
+                                                const uint8_t* video_rom,
+                                                size_t video_rom_len,
+                                                uint32_t ram_mb);
+OMAC_API void    omac_fx_destroy(OMacFx*);
+OMAC_API void    omac_fx_reset(OMacFx*);
+OMAC_API void    omac_fx_run_frame(OMacFx*);
+OMAC_API int     omac_fx_screen_w(OMacFx*);
+OMAC_API int     omac_fx_screen_h(OMacFx*);
+OMAC_API void    omac_fx_render(OMacFx*, uint32_t* argb);
+OMAC_API uint32_t omac_fx_audio_rate(OMacFx*);
+OMAC_API size_t  omac_fx_drain_audio(OMacFx*, uint8_t* out, size_t cap);
+OMAC_API void    omac_fx_mouse(OMacFx*, int dx, int dy, int button);
+OMAC_API void    omac_fx_key(OMacFx*, int adb_code, int down);
+OMAC_API int     omac_fx_insert_floppy(OMacFx*, const uint8_t* img,
+                                        size_t len, int read_only);
+OMAC_API void    omac_fx_eject_floppy(OMacFx*);
+OMAC_API int     omac_fx_floppy_present(OMacFx*);
+OMAC_API size_t  omac_fx_floppy_writeback(OMacFx*, uint8_t* out, size_t cap);
+OMAC_API void    omac_fx_insert_harddisk(OMacFx*, const uint8_t* img,
+                                          size_t len, int read_only);
+OMAC_API void    omac_fx_detach_harddisk(OMacFx*);
+OMAC_API size_t  omac_fx_harddisk_data(OMacFx*, uint8_t* out, size_t cap);
+/* Flush and unmount drive 4 through the guest before saving/replacing it. */
+OMAC_API int     omac_fx_shutdown_harddisk(OMacFx*);
+OMAC_API size_t  omac_fx_pram_save(OMacFx*, uint8_t* out, size_t cap);
+OMAC_API int     omac_fx_pram_load(OMacFx*, const uint8_t* data, size_t len,
+                                    uint32_t add_seconds);
+OMAC_API size_t  omac_fx_diagnostics(OMacFx*, char* out, size_t cap);
+OMAC_API void    omac_fx_poll_log(OMacFx*, char* out, size_t cap);
 
 /* Version string for the About box / logs. */
 OMAC_API const char* omac_version(void);
