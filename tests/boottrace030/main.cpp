@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
                      "       trigger capture: --checkpoint-on-trigger file.iifxstate [--checkpoint-at-pc hex file.iifxstate]\n"
                      "       boot display capture: --frame-timeline prefix first-frame last-frame\n"
                      "       trap probe: --watch-trap hex-opcode [--watch-trap hex-opcode]... [--watch-trap-limit n]\n"
-                     "       concise output/artifacts: --quiet [--cpu-state] [--media-summary] [--dump-audio sound.wav] [--expect-startup-chime] [--no-gc-fast-path]\n"
+                     "       concise output/artifacts: --quiet [--cpu-state] [--media-summary] [--dump-audio sound.wav] [--expect-startup-chime] [--no-gc-fast-path] [--no-tick-batching]\n"
                      "       omit floppy.img and use 'no-video' for a headless machine\n"
                      "       add [input-frame] [mouse-dx] [mouse-dy] to inject motion\n"
                      "       use a negative frame count to run that many instructions\n");
@@ -303,6 +303,7 @@ int main(int argc, char** argv) {
     bool structuredOnly = false;
     bool quiet = false;
     bool noGcFastPath = false;
+    bool noTickBatching = false;
     bool hostProfile = false;
     bool printCpuState = false;
     bool stopOnTrace = false;
@@ -421,6 +422,8 @@ int main(int argc, char** argv) {
         const std::string option = argv[index];
         if (option == "--structured-only")
             structuredOnly = true;
+        else if (option == "--no-tick-batching")
+            noTickBatching = true;
         else if (option == "--no-gc-fast-path")
             noGcFastPath = true;
         else if (option == "--quiet")
@@ -1019,6 +1022,7 @@ int main(int argc, char** argv) {
                                                  profileGcLast);
     if (tapGcRange) mac.diagnosticSetGcPcTapRange(tapGcFirst, tapGcLast);
     if (noGcFastPath) mac.diagnosticSetGcDataFastPath(false);
+    if (noTickBatching) mac.setTickBatching(false);
     if (tapGcAddrRange)
         mac.diagnosticSetGcAddrTapRange(tapGcAddrFirst, tapGcAddrLast,
                                         tapGcAddrWritesOnly);

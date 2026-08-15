@@ -54,6 +54,30 @@ public:
     void reset();
     int stepInstruction();
     void runFrame();
+    // Device time is advanced in batches: a 68030 instruction that touches
+    // only RAM/ROM banks its cycles, and the devices (VIA, IOPs, SCC, SCSI
+    // DMA, the accelerator's Am29000, the audio and frame phases, the
+    // interrupt level) catch up together once the bank reaches
+    // kTickBatchCycles or the next instruction touches I/O space — that
+    // access sees current device state, and its own effect (an interrupt
+    // acknowledged, a request raised) is propagated as soon as it retires,
+    // exactly as when every instruction ticked.  What changes is only how
+    // finely device progress interleaves with RAM-bound code: an interrupt
+    // raised by a device mid-batch is recognized at the batch's end, at most
+    // kTickBatchCycles (8 microseconds at 40 MHz) later.  Off, every
+    // instruction ticks as before (an A/B for the trace tool).
+    static constexpr int kTickBatchCycles = 320;
+    void setTickBatching(bool enabled) {
+        flushPendingTicks();
+        tickBatching_ = enabled;
+    }
+    bool tickBatching() const { return tickBatching_; }
+    void flushPendingTicks() {
+        if (pendingTickCycles_ <= 0) return;
+        const int cycles = pendingTickCycles_;
+        pendingTickCycles_ = 0;
+        tickDevices(cycles);
+    }
 
     M68030& cpu() { return cpu_; }
     const M68030& cpu() const { return cpu_; }
@@ -416,6 +440,11 @@ private:
     std::vector<std::string> accessLog_;
     bool legacyAccessLogEnabled_ = true;
     bool deviceTrafficDiag_ = true;
+    // Tick batching (see setTickBatching): cycles banked since the last
+    // device tick, and whether the executing instruction touched I/O space.
+    int pendingTickCycles_ = 0;
+    bool tickBatching_ = true;
+    bool deviceTouched_ = false;
     HardwareTrace hardwareTrace_;
     int traceBusDepth_ = 0;
     u32 traceLastPc_ = 0;

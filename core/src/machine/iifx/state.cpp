@@ -29,7 +29,7 @@ namespace openmac {
 
 namespace {
 
-constexpr u32 kStateVersion = 16;
+constexpr u32 kStateVersion = 17;
 constexpr u32 kEndianMarker = 0x12345678u;
 constexpr u32 kPageBytes = 4096;
 constexpr u64 kMaxMediaBytes = 1024ull * 1024ull * 1024ull;
@@ -1071,6 +1071,16 @@ private:
         io.intv(machine.fmcCyclePenalty_);
         io.u64v(machine.fmcHits_); io.u64v(machine.fmcMisses_);
         io.u64v(machine.fmcFills_); io.u64v(machine.fmcCacheInhibited_);
+        // Cycles the 68030 has run past the devices' last tick (tick
+        // batching).  Zero at every frame boundary; a checkpoint taken
+        // mid-frame carries it so a run through the checkpoint is the run
+        // without it.
+        if (stateVersion >= 17) {
+            io.intv(machine.pendingTickCycles_);
+        } else if (io.applying()) {
+            machine.pendingTickCycles_ = 0;
+        }
+        if (io.applying()) machine.deviceTouched_ = false;
 
         io.sparse(machine.floppy_, kMaxSmallBlob);
         io.sparse(machine.floppyEjected_, kMaxSmallBlob);

@@ -676,6 +676,8 @@ void IifxMachine::wireDevices() {
 void IifxMachine::reset() {
     overlay_ = true;
     totalCycles_ = 0;
+    pendingTickCycles_ = 0;
+    deviceTouched_ = false;
     frameCounter_ = 0;
     viaPhase_ = 0;
     framePhase_ = 0;
@@ -1055,6 +1057,7 @@ int IifxMachine::stepInstruction() {
             cpu_.a[0] = cpu_.pc;
         }
         inDiskDriver_ = false;
+        flushPendingTicks();
         tickDevices(40);
         return 40;
     }
@@ -1078,6 +1081,7 @@ int IifxMachine::stepInstruction() {
             cpu_.a[0] = cpu_.pc;
         }
         inDiskDriver_ = false;
+        flushPendingTicks();
         tickDevices(40);
         return 40;
     }
@@ -1098,6 +1102,7 @@ int IifxMachine::stepInstruction() {
             cpu_.pc = read32(0x08FC);
             cpu_.a[0] = cpu_.pc;
         }
+        flushPendingTicks();
         tickDevices(40);
         return 40;
     }
@@ -1106,17 +1111,31 @@ int IifxMachine::stepInstruction() {
          cpu_.pc == kSonyControlHandler ||
          cpu_.pc == kSonyControlHandlerAlias)) {
         serveSonyCtlStatus(false);
+        flushPendingTicks();
         tickDevices(40);
         return 40;
     }
     if (!nativeStorage_ &&
         (cpu_.pc == kSonyStatus || cpu_.pc == kSonyStatusAlias)) {
         serveSonyCtlStatus(true);
+        flushPendingTicks();
         tickDevices(40);
         return 40;
     }
     const int cycles = cpu_.step();
-    tickDevices(cycles);
+    if (!tickBatching_) {
+        tickDevices(cycles);
+        return cycles;
+    }
+    // Bank the cycles; the devices catch up when the bank is full or this
+    // instruction touched I/O space (its access already flushed the older
+    // bank before it ran, so the device it spoke to was current; ticking now
+    // propagates the access's own effect before the next instruction).
+    pendingTickCycles_ += cycles;
+    if (deviceTouched_ || pendingTickCycles_ >= kTickBatchCycles) {
+        deviceTouched_ = false;
+        flushPendingTicks();
+    }
     return cycles;
 }
 
@@ -2752,6 +2771,12 @@ void IifxMachine::synchronizeViaAccess() {
 }
 
 u8 IifxMachine::ioRead8(u32 addr) {
+    // Device time must be current for the register read, and the read's
+    // effect (an acknowledged interrupt, a drained FIFO) must reach the
+    // interrupt level as soon as the instruction retires (see
+    // setTickBatching).
+    flushPendingTicks();
+    deviceTouched_ = true;
     const u32 off = addr & kIoMirrorMask;
     const u32 block = off & 0x3E000u;
     u8 value = 0xFF;
@@ -2852,6 +2877,11 @@ u8 IifxMachine::ioRead8(u32 addr) {
 }
 
 void IifxMachine::ioWrite8(u32 addr, u8 value) {
+    // Device time must be current before the register sees the write, and
+    // the write's effect must reach the interrupt level as soon as the
+    // instruction retires (see setTickBatching).
+    flushPendingTicks();
+    deviceTouched_ = true;
     const u32 off = addr & kIoMirrorMask;
     const u32 block = off & 0x3E000u;
     const char* name = "I/O";
@@ -3028,6 +3058,8 @@ u8 IifxMachine::rawRead8Traced(u32 addr) {
 u32 IifxMachine::rawRead32(u32 addr) {
     u32 scsiReg;
     if ((addr & 3u) == 0 && scsiDmaLongRegister(addr, scsiReg)) {
+        flushPendingTicks();
+        deviceTouched_ = true;
         const u32 value = scsiDma_->read32(scsiReg);
         logAccess("SCSI-DMA", false, addr, value, 4);
         return value;
@@ -3258,6 +3290,8 @@ void IifxMachine::write16(u32 addr, u16 value) {
 void IifxMachine::write32(u32 addr, u32 value) {
     u32 scsiReg;
     if ((addr & 3u) == 0 && scsiDmaLongRegister(addr, scsiReg)) {
+        flushPendingTicks();
+        deviceTouched_ = true;
         scsiDma_->write32(scsiReg, value);
         logAccess("SCSI-DMA", true, addr, value, 4);
         return;
