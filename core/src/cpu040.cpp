@@ -194,32 +194,66 @@ u32 M68040::translateFc030(u32 laddr, bool write, u32 fc,
     if (cacheInhibit) *cacheInhibit = false;
     const bool instruction = (fc & 3u) == 2u;
 
-    const bool tt0Match = ttrMatch030(tt0, laddr, fc, write);
-    const bool tt1Match = ttrMatch030(tt1, laddr, fc, write);
-    if (tt0Match || tt1Match) {
-        if (cacheInhibit)
-            *cacheInhibit = (tt0Match && (tt0 & 0x00000400u)) ||
-                            (tt1Match && (tt1 & 0x00000400u));
-        return laddr;
+    if (((tt0 | tt1) & 0x00008000u) != 0) {
+        const bool tt0Match = ttrMatch030(tt0, laddr, fc, write);
+        const bool tt1Match = ttrMatch030(tt1, laddr, fc, write);
+        if (tt0Match || tt1Match) {
+            if (cacheInhibit)
+                *cacheInhibit = (tt0Match && (tt0 & 0x00000400u)) ||
+                                (tt1Match && (tt1 & 0x00000400u));
+            return laddr;
+        }
     }
     if (!mmuEnabled()) return laddr;
 
-    for (int i = 0; i < 22; ++i) {
-        TlbEntry& e = tlb_[i];
-        if (e.tag == 0xFFFFFFFFu || e.fc != fc ||
-            e.tag != (laddr >> e.pageShift))
-            continue;
+    // The 22-entry ATC is fully associative; sequential fetches and stack
+    // traffic hit the same entry over and over, so try the last hit before
+    // scanning.  (Replacement and flushes rewrite entries in place; the
+    // re-check of tag/fc below keeps a stale index harmless.)
+    const auto entryHits = [&](TlbEntry& e) {
+        return e.tag != 0xFFFFFFFFu && e.fc == fc &&
+               e.tag == (laddr >> e.pageShift);
+    };
+    const auto resolve = [&](TlbEntry& e, int index, u32& out) {
         if (write && !e.writable)
             throw AccessFault{laddr, false, 1, instruction, false};
         // A first write to a read-established entry must revisit the page
         // descriptor so its M history bit is committed before the access.
         if (!write || e.modified) {
             if (cacheInhibit) *cacheInhibit = e.cacheInhibit;
-            return e.phys | (laddr & ((1u << e.pageShift) - 1u));
+            tlbLastHit030_ = index;
+            out = e.phys | (laddr & ((1u << e.pageShift) - 1u));
+            return true;
         }
+        return false;
+    };
+    u32 translated = 0;
+    if (tlbLastHit030_ >= 0 && tlbLastHit030_ < 22 &&
+        entryHits(tlb_[tlbLastHit030_])) {
+        if (resolve(tlb_[tlbLastHit030_], tlbLastHit030_, translated))
+            return translated;
+        return tableWalk030(laddr, write, fc, cacheInhibit);
+    }
+    for (int i = 0; i < 22; ++i) {
+        TlbEntry& e = tlb_[i];
+        if (!entryHits(e)) continue;
+        if (resolve(e, i, translated)) return translated;
         break;
     }
     return tableWalk030(laddr, write, fc, cacheInhibit);
+}
+
+// The 68030 ATC holds at most one entry per (logical page, function code):
+// a table search for a page that is already cached -- typically the first
+// write to a read-established page, which must commit the descriptor's M
+// bit -- updates that entry rather than adding a duplicate.  Only when the
+// page is new does the deterministic round-robin replacement pick a slot.
+M68040::TlbEntry& M68040::atcEntryFor030(u32 tag, u32 fc) {
+    for (int i = 0; i < 22; ++i) {
+        TlbEntry& e = tlb_[i];
+        if (e.tag != 0xFFFFFFFFu && e.tag == tag && e.fc == fc) return e;
+    }
+    return tlb_[tlbNext030_++ % 22];
 }
 
 // MC68030 variable-depth table walker.  TC supplies an initial shift, up to
@@ -317,7 +351,7 @@ u32 M68040::tableWalk030(u32 laddr, bool write, u32 fc,
                 const u32 passMask = (1u << passthrough) - 1u;
                 const u32 pa = (pageWord & ~passMask) | (laddr & passMask);
 
-                TlbEntry& e = tlb_[tlbNext030_++ % 22];
+                TlbEntry& e = atcEntryFor030(laddr >> pageShift, fc);
                 e.tag = laddr >> pageShift;
                 e.phys = pa & ~((1u << pageShift) - 1u);
                 e.writable = !wp;
@@ -343,7 +377,7 @@ u32 M68040::tableWalk030(u32 laddr, bool write, u32 fc,
                 const u32 pageWord = p.bytes == 8 ? p.lo : p.hi;
                 const u32 mask = (1u << pageShift) - 1u;
                 const u32 pa = (pageWord & ~mask) | (laddr & mask);
-                TlbEntry& e = tlb_[tlbNext030_++ % 22];
+                TlbEntry& e = atcEntryFor030(laddr >> pageShift, fc);
                 e.tag = laddr >> pageShift;
                 e.phys = pa & ~mask;
                 e.writable = !wp;

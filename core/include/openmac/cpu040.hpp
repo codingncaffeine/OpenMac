@@ -267,6 +267,8 @@ private:
     static constexpr int kTlbSize = 256;   // power of two
     TlbEntry tlb_[kTlbSize];
     int tlbNext030_ = 0;                  // 22-entry fully associative ATC
+    int tlbLastHit030_ = -1;              // most recent ATC hit (lookup hint)
+    TlbEntry& atcEntryFor030(u32 tag, u32 fc);
 };
 
 } // namespace openmac
