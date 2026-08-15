@@ -87,6 +87,10 @@ public sealed class NativeEmulator : IEmulator
             // Boot the built-in ROM disk (System 6.0.3 from ROM) instead of an inserted
             // disk -- the emulated equivalent of holding Cmd-Opt-X-O at power-on.
             if (bootRomDisk) Native.omac_set_force_rom_disk(_h, 1);
+            // A transfer/second disk goes back on the seat before the machine
+            // runs a frame, so the startup scan loads its driver.
+            if (_readOnlySeatImage is { } seat)
+                Native.omac_insert_harddisk2(_h, seat, (nuint)seat.Length, 1);
             // Enable fault logging. The core only BUFFERS lines; we drain them off
             // the CPU exception path via omac_poll_log in the frame loop, so logging
             // can't destabilize emulation the way the in-handler callback did.
@@ -103,7 +107,6 @@ public sealed class NativeEmulator : IEmulator
         CdPath = null;
         Seat.Cancel();
         Seat.Folder = null;
-        TransferDiskLabel = null;
         Log.Line($"[core] created — {ramMB} MB, ROM {Path.GetFileName(path)}");
         // The adapter is per-machine state; re-attach it on the fresh machine.
         if (NetworkingEnabled)
@@ -528,6 +531,11 @@ public sealed class NativeEmulator : IEmulator
 
     // ---- folder disk / drop box ----
     private DropBoxSeat? _seat;
+    // A transfer or second disk has nothing but this image to come back from
+    // when the machine is rebuilt (a folder disk is rebuilt from its folder).
+    // "Restart now so it appears?" depends on it: the seat's driver is loaded
+    // by the startup scan of the NEXT boot, and this is what that boot finds.
+    private byte[]? _readOnlySeatImage;
 
     private DropBoxSeat Seat => _seat ??= new DropBoxSeat(
         unmount: () =>
@@ -560,6 +568,8 @@ public sealed class NativeEmulator : IEmulator
             Native.omac_insert_harddisk2(_h, img, (nuint)img.Length, 0);
         }
         Seat.Folder = folder;
+        TransferDiskLabel = null;
+        _readOnlySeatImage = null;
         Log.Line($"[disk] folder disk built from {folder} ({img.Length / (1024 * 1024)} MB volume)");
         return true;
     }
@@ -570,6 +580,8 @@ public sealed class NativeEmulator : IEmulator
         Seat.Cancel();
         Seat.Folder = null;
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_detach_harddisk2(_h); }
+        _readOnlySeatImage = null;
+        TransferDiskLabel = null;
     }
 
     public bool RepublishFolderDisk(string? addFile, out string error) =>
@@ -593,6 +605,7 @@ public sealed class NativeEmulator : IEmulator
         Seat.Cancel();
         Seat.Folder = null;          // the seat now holds a disk, not a folder
         TransferDiskLabel = Path.GetFileName(imagePath);
+        _readOnlySeatImage = img;
         Log.Line($"[disk] second disk: {TransferDiskLabel} "
                  + $"({img.Length / (1024 * 1024)} MB, read-only)");
         return true;
@@ -643,6 +656,7 @@ public sealed class NativeEmulator : IEmulator
             Native.omac_insert_harddisk2(_h, img, (nuint)img.Length, 1);   // read-only
         }
         TransferDiskLabel = Path.GetFileName(filePath);
+        _readOnlySeatImage = img;
         Log.Line($"[disk] transfer disk built for {TransferDiskLabel} "
                  + $"({img.Length / (1024 * 1024)} MB volume, read-only)");
         return true;

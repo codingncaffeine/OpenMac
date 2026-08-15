@@ -47,6 +47,7 @@ public sealed class IifxEmulator : IEmulator
     public void LoadRom(string path, int ramMB, bool bootRomDisk)
     {
         WriteBackFloppy();
+        SyncFolderDisk();   // the drop box's volume dies with the machine
         WriteBackHardDisk();
         SavePram();
         byte[] rom = File.ReadAllBytes(path);
@@ -81,6 +82,12 @@ public sealed class IifxEmulator : IEmulator
                 _emuFrame = new byte[bytes];
                 lock (_frameLock) _sharedFrame = new byte[bytes];
             }
+            // The seat's volume goes back on before the machine runs a frame,
+            // so the ROM's startup scan finds its driver -- this is the
+            // restart that makes a mid-session transfer disk appear.
+            if (_seatImage is { } seat)
+                Native.omac_fx_insert_harddisk2(_h, seat, (nuint)seat.Length,
+                                                _seatReadOnly ? 1 : 0);
         }
         RomPath = path;
         FloppyPath = null;
@@ -88,6 +95,7 @@ public sealed class IifxEmulator : IEmulator
         _floppyReadOnly = false;
         HardDiskAttached = false;
         HardDiskPath = null;
+        _seat?.Cancel();   // a republish in flight belonged to the old machine
         string video = videoRom is null ? "OpenMac fallback video"
             : $"8•24 GC ROM {Path.GetFileName(VideoRomPath)}";
         Log.Line($"[core] Macintosh IIfx created — {ramMB} MB, ROM {Path.GetFileName(path)}, "
@@ -149,6 +157,10 @@ public sealed class IifxEmulator : IEmulator
             if (frames > 0)
             {
                 DrainLog();
+                // A drop box republish is carried out here, one stage per
+                // batch: the trap injections it needs belong to the thread
+                // that owns the CPU, and only between frames.
+                _seat?.Pump();
                 PublishFrame();
             }
             Thread.Sleep(1);
@@ -342,21 +354,145 @@ public sealed class IifxEmulator : IEmulator
 
     public bool NetworkingEnabled => false;
     public void SetNetworking(bool enabled) { }
-    public string? FolderDiskPath => null;
+
+    // ---- folder disk / drop box / transfer disk (second SCSI seat, ID 1 / drive 5) ----
+    //
+    // The same seat the Quadra offers, with one IIfx-specific rule made
+    // explicit: the ROM loads the seat's driver during its startup bus scan
+    // and never again, so a volume put here while the machine is running
+    // needs a restart to mount. The seat is therefore remembered across
+    // LoadRom and put back on the fresh machine before it runs a frame --
+    // which is exactly what "Restart now so it appears?" relies on.
+    private DropBoxSeat? _seat;
+    private byte[]? _seatImage;      // a read-only seat volume, kept to survive a restart
+    private bool _seatReadOnly;
+
+    private DropBoxSeat Seat => _seat ??= new DropBoxSeat(
+        unmount: () =>
+        {
+            lock (_sync)
+                return _h == IntPtr.Zero || Native.omac_fx_unmount_harddisk2(_h) != 0;
+        },
+        readImage: ReadSeatImage,
+        insert: img => PutOnSeat(img, false));
+
+    private void PutOnSeat(byte[] img, bool readOnly)
+    {
+        // A folder disk is rebuilt from its folder on every boot by the window;
+        // only a transfer/second disk has nothing but this image to come back from.
+        _seatImage = readOnly ? img : null;
+        _seatReadOnly = readOnly;
+        lock (_sync)
+        {
+            if (_h != IntPtr.Zero)
+                Native.omac_fx_insert_harddisk2(_h, img, (nuint)img.Length, readOnly ? 1 : 0);
+        }
+    }
+
+    private void ClearSeat()
+    {
+        _seatImage = null;
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_fx_detach_harddisk2(_h); }
+    }
+
+    public string? FolderDiskPath => _seat?.Folder;
+
     public bool AttachFolderDisk(string folder, out string error)
-    { error = "The IIfx currently exposes its startup SCSI disk only."; return false; }
-    public void DetachFolderDisk() { }
-    public bool RepublishFolderDisk(string? addFile, out string error)
-    { error = "No IIfx folder disk is attached."; return false; }
-    public bool RetargetFolderDisk(string folder, out string error)
-    { error = "No IIfx folder disk is attached."; return false; }
+    {
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        SyncFolderDisk();   // a previously attached folder gets its changes first
+        byte[]? img = FolderDisk.Build(folder, out error);
+        if (img is null) return false;
+        PutOnSeat(img, false);
+        Seat.Folder = folder;
+        TransferDiskLabel = null;
+        Log.Line($"[disk] IIfx folder disk built from {folder} "
+                 + $"({img.Length / (1024 * 1024)} MB volume)");
+        return true;
+    }
+
+    public void DetachFolderDisk()
+    {
+        SyncFolderDisk();
+        Seat.Cancel();
+        Seat.Folder = null;
+        ClearSeat();
+    }
+
+    public bool RepublishFolderDisk(string? addFile, out string error) =>
+        Seat.Request(addFile, out error);
+
+    public bool RetargetFolderDisk(string folder, out string error) =>
+        Seat.Request(null, folder, out error);
+
     public bool AttachSecondDisk(string imagePath, out string error)
-    { error = "The IIfx second SCSI seat is not enabled."; return false; }
-    public bool RepublishPending => false;
-    public string? TransferDiskLabel => null;
-    public bool TransferDiskResident => false;
+    {
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        byte[] img;
+        try { img = File.ReadAllBytes(imagePath); }
+        catch (Exception ex) { error = ex.Message; return false; }
+        Seat.Cancel();
+        Seat.Folder = null;          // the seat now holds a disk, not a folder
+        PutOnSeat(img, true);        // read-only
+        TransferDiskLabel = Path.GetFileName(imagePath);
+        Log.Line($"[disk] IIfx second disk: {TransferDiskLabel} "
+                 + $"({img.Length / (1024 * 1024)} MB, read-only)");
+        return true;
+    }
+
+    public bool RepublishPending => _seat?.Pending == true;
+
+    public string? TransferDiskLabel { get; private set; }
+
+    public bool TransferDiskResident
+    {
+        get
+        {
+            lock (_sync)
+                return _h != IntPtr.Zero && Native.omac_fx_harddisk2_booted(_h) != 0;
+        }
+    }
+
     public bool AttachTransferDisk(string filePath, out string error)
-    { error = "The IIfx second SCSI seat is not enabled."; return false; }
+    {
+        error = "";
+        if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        byte[]? img = FolderDisk.BuildTransferVolume(filePath, 0, out error);
+        if (img is null) return false;
+        // Software-locked in both MDB copies (drAtrb bit 15), so the System
+        // mounts it read-only and never tries to write. An unlocked volume that
+        // silently drops writes leaves the guest's cached view diverging from
+        // the disk.
+        img[1024 + 10] |= 0x80;
+        int altMdb = img.Length - 2 * 512;
+        if (altMdb > 0) img[altMdb + 10] |= 0x80;
+        Seat.Cancel();
+        Seat.Folder = null;
+        PutOnSeat(img, true);        // read-only
+        TransferDiskLabel = Path.GetFileName(filePath);
+        Log.Line($"[disk] IIfx transfer disk built for {TransferDiskLabel} "
+                 + $"({img.Length / (1024 * 1024)} MB volume, read-only)");
+        return true;
+    }
+
+    /// <summary>Write the guest's folder-disk changes back to the host folder.</summary>
+    private void SyncFolderDisk() => _seat?.Sync();
+
+    private byte[]? ReadSeatImage()
+    {
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return null;
+            nuint size = Native.omac_fx_harddisk2_data(_h, null, 0);
+            if (size == 0) return null;
+            byte[] img = new byte[size];
+            if (Native.omac_fx_harddisk2_data(_h, img, size) == 0) return null;
+            return img;
+        }
+    }
+
     public bool CdRomAttached => false;
     public string? CdPath => null;
     public void SetCdRomAttached(bool attached) { }
@@ -409,6 +545,7 @@ public sealed class IifxEmulator : IEmulator
         _stop = true;
         _worker.Join();
         WriteBackFloppy();
+        SyncFolderDisk();   // the drop box's volume dies with the machine
         WriteBackHardDisk();
         SavePram();
         lock (_sync) DestroyLocked();

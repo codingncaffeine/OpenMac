@@ -112,10 +112,15 @@ public sealed class QuadraEmulator : IEmulator
                 _emuFrame = new byte[bytes];
                 lock (_frameLock) _sharedFrame = new byte[bytes];
             }
+            // A transfer/second disk goes back on the seat before the machine
+            // runs a frame, so the startup scan loads its driver.
+            if (_readOnlySeatImage is { } seat)
+                Native.omac_q_insert_harddisk2(_h, seat, (nuint)seat.Length, 1);
         }
         RomPath = path;
         HardDiskAttached = false;
         HardDiskPath = null;
+        _seat?.Cancel();   // a republish in flight belonged to the old machine
         Log.Line($"[core] Quadra 650 created — {ramMB} MB, ROM {Path.GetFileName(path)}, "
                  + $"monitor {Monitor ?? "13-inch RGB"} ({_screenW}x{_screenH})");
     }
@@ -369,6 +374,11 @@ public sealed class QuadraEmulator : IEmulator
     // back -- the same thing that happens when a removable cartridge is
     // swapped, which is a sequence this System handles natively.
     private DropBoxSeat? _seat;
+    // A transfer or second disk has nothing but this image to come back from
+    // when the machine is rebuilt (a folder disk is rebuilt from its folder).
+    // "Restart now so it appears?" depends on it: the seat's driver is loaded
+    // by the startup scan of the NEXT boot, and this is what that boot finds.
+    private byte[]? _readOnlySeatImage;
 
     private DropBoxSeat Seat => _seat ??= new DropBoxSeat(
         unmount: () =>
@@ -402,6 +412,7 @@ public sealed class QuadraEmulator : IEmulator
         }
         Seat.Folder = folder;
         TransferDiskLabel = null;
+        _readOnlySeatImage = null;
         Log.Line($"[disk] folder disk built from {folder} "
                  + $"({img.Length / (1024 * 1024)} MB volume)");
         return true;
@@ -413,6 +424,8 @@ public sealed class QuadraEmulator : IEmulator
         Seat.Cancel();
         Seat.Folder = null;
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_detach_harddisk2(_h); }
+        _readOnlySeatImage = null;
+        TransferDiskLabel = null;
     }
 
     public bool RepublishFolderDisk(string? addFile, out string error) =>
@@ -436,6 +449,7 @@ public sealed class QuadraEmulator : IEmulator
         Seat.Cancel();
         Seat.Folder = null;          // the seat now holds a disk, not a folder
         TransferDiskLabel = Path.GetFileName(imagePath);
+        _readOnlySeatImage = img;
         Log.Line($"[disk] second disk: {TransferDiskLabel} "
                  + $"({img.Length / (1024 * 1024)} MB, read-only)");
         return true;
@@ -474,6 +488,7 @@ public sealed class QuadraEmulator : IEmulator
             Native.omac_q_insert_harddisk2(_h, img, (nuint)img.Length, 1);   // read-only
         }
         TransferDiskLabel = Path.GetFileName(filePath);
+        _readOnlySeatImage = img;
         Log.Line($"[disk] transfer disk built for {TransferDiskLabel} "
                  + $"({img.Length / (1024 * 1024)} MB volume, read-only)");
         return true;

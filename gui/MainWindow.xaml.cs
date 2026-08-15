@@ -673,14 +673,12 @@ public partial class MainWindow : Window
             // The folder goes on the seat before the machine runs a frame, so
             // its driver is there for the ROM's startup bus scan to load --
             // which is the difference between the volume appearing on its own
-            // and needing a restart. Both models have the seat.
+            // and needing a restart. All three models have the seat.
             //
             // Two ways to want it: the drop box is on (use the chosen folder,
             // or make the default one), or a folder disk was simply left open
             // last session (restore exactly that, and create nothing).
-            string? seatFolder = _settings.IsIifx
-                ? null
-                : _settings.DropBox ? DropBoxFolder() : ChosenFolder();
+            string? seatFolder = _settings.DropBox ? DropBoxFolder() : ChosenFolder();
             if (seatFolder is not null &&
                 !_emulator.AttachFolderDisk(seatFolder, out string dbErr))
             {
@@ -1900,8 +1898,8 @@ public partial class MainWindow : Window
         CdDriveItem.IsEnabled = !fx;
 
         DropBoxEnabledItem.IsChecked = _settings.DropBox;
-        DropBoxEnabledItem.IsEnabled = !fx;
-        DropBoxFolderItem.IsEnabled = !fx;
+        DropBoxEnabledItem.IsEnabled = true;
+        DropBoxFolderItem.IsEnabled = true;
         // Name the folder in the menu: a drop box whose folder you cannot see
         // is one you have to go looking for.
         string? dbFolder = ChosenFolder() ?? (_settings.DropBox ? DropBoxSeat.DefaultFolder : null);
