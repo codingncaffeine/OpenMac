@@ -97,6 +97,13 @@ public sealed class Settings
     /// disk -- to protect a master on purpose -- not as a safety net.
     /// </summary>
     public bool WriteProtectFloppies { get; set; }
+    /// <summary>
+    /// Hold the Shift key down inside the Mac through the start of every boot,
+    /// so System 6/7 starts with extensions off. Exists because holding the
+    /// real key for that long trips Windows' sticky/filter-keys accessibility
+    /// traps on the host. Stays on until unchecked, like the physical habit.
+    /// </summary>
+    public bool BootExtensionsOff { get; set; }
     public List<string> RecentRoms { get; set; } = new();
 
     /// <summary>

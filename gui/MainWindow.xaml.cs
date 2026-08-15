@@ -707,6 +707,9 @@ public partial class MainWindow : Window
             return;
         }
         Log.Line("  ROM loaded ok");
+        // Every boot invalidates any pending Shift release from the last one.
+        _bootShiftGen++;
+        if (_settings.BootExtensionsOff) HoldBootShift();
         _settings.PushRecentRom(path);
         _settings.Save();
         BuildRecentMenu();
@@ -803,6 +806,36 @@ public partial class MainWindow : Window
         // Reboot immediately so the toggle takes effect now (mirrors the RAM menu).
         if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
         UpdateUi();
+    }
+
+    private void BootExtensionsOff_Click(object sender, RoutedEventArgs e)
+    {
+        _settings.BootExtensionsOff = !_settings.BootExtensionsOff;
+        _settings.Save();
+        // Reboot immediately so the toggle takes effect now (mirrors the RAM menu).
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
+        UpdateUi();
+    }
+
+    // ---- extensions-off boot: the virtual held Shift ----
+    // System 6/7 samples Shift early in the boot (the "Extensions off" welcome);
+    // holding it that long on the real keyboard trips Windows' sticky/filter-keys
+    // accessibility hooks. So the hold happens inside the machine instead: one
+    // Shift-down as the boot begins, one Shift-up 25 s later — past the check on
+    // the slowest machine here (IIfx, 128 MB RAM test), before desktop typing.
+    // The generation counter keeps a restart mid-hold from releasing the new
+    // boot's Shift: only the newest hold owns the release.
+    private int _bootShiftGen;
+
+    private async void HoldBootShift()
+    {
+        int gen = ++_bootShiftGen;
+        _emulator.KeyEvent(0x38 /* ADB Shift */, true);
+        Log.Line("extensions-off boot: virtual Shift held");
+        await Task.Delay(TimeSpan.FromSeconds(25));
+        if (gen != _bootShiftGen || !_emulator.IsRomLoaded) return;
+        _emulator.KeyEvent(0x38, false);
+        Log.Line("extensions-off boot: virtual Shift released");
     }
 
     // ---- disks ----
@@ -1834,6 +1867,7 @@ public partial class MainWindow : Window
         MonitorMenu.IsEnabled = q;
         BootRomDiskItem.IsChecked = _settings.BootRomDisk;
         BootRomDiskItem.IsEnabled = classic;
+        BootExtensionsOffItem.IsChecked = _settings.BootExtensionsOff;
         WriteProtectItem.IsChecked = _settings.WriteProtectFloppies;
 
         ScaleFitItem.IsChecked = _settings.Scale == 0;

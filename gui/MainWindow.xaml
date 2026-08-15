@@ -90,6 +90,9 @@
                 <Separator />
                 <MenuItem x:Name="BootRomDiskItem" Header="Boot from ROM Disk (Cmd-Opt-X-O)"
                           Click="BootRomDisk_Click" />
+                <MenuItem x:Name="BootExtensionsOffItem" Header="Boot with Extensions Off (Shift)"
+                          IsCheckable="True" Click="BootExtensionsOff_Click"
+                          ToolTip="Holds the Shift key down inside the Mac at the start of every boot, so System 6/7 loads no extensions — without holding the real key, which can trip Windows' sticky-keys traps. Applies until unchecked; restarts the machine when toggled." />
                 <Separator />
                 <MenuItem x:Name="NetworkingItem" Header="Networking (DaynaPORT at SCSI 4)"
                           IsCheckable="True" Click="Networking_Click"
