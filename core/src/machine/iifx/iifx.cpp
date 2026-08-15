@@ -3375,10 +3375,6 @@ void IifxMachine::diagnosticSetGcRegisterWatch(u16 physicalIndex) {
     video_->gcSetProcessorRegisterWatch(physicalIndex);
 }
 
-void IifxMachine::setGcLoopFastForward(bool enabled) {
-    video_->gcSetLoopFastForward(enabled);
-}
-
 void IifxMachine::diagnosticSetGcPcSnap(u32 pc, u16 architecturalIndex) {
     video_->gcSetProcessorPcSnap(pc, architecturalIndex);
 }
@@ -3589,7 +3585,7 @@ std::string IifxMachine::diagnosticReport() const {
         char item[320];
         std::snprintf(item, sizeof item,
                        "    GC Am29000 released=%d pc=%08X cps=%08X cfg=%08X mmu=%08X "
-                       "tmc/tmr=%06X/%08X instructions=%llu (%llu fast-forwarded) "
+                       "tmc/tmr=%06X/%08X instructions=%llu "
                        "gc-vram=%llu fault=%d unknown-data=%llu "
                        "first-unknown=%08X%s%s\n",
                       video_->gcProcessorReleased() ? 1 : 0,
@@ -3601,8 +3597,6 @@ std::string IifxMachine::diagnosticReport() const {
                       video_->gcProcessorTimerReload(),
                        static_cast<unsigned long long>(
                            video_->gcProcessorInstructions()),
-                       static_cast<unsigned long long>(
-                           video_->gcProcessorLoopSkipped()),
                        static_cast<unsigned long long>(
                            video_->gcProcessorVramWrites()),
                       video_->gcProcessorFaulted() ? 1 : 0,

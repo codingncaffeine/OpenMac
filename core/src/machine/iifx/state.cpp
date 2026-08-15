@@ -849,7 +849,6 @@ private:
         for (u32& value : cpu.m_tlb) io.u32v(value);
         cpu.fetchTranslationValid_ = false; // hint derived from m_tlb
         cpu.clearFetchWindows();            // host pointers; re-registered lazily
-        cpu.loopReset();                    // learned loops belong to the old state
         io.u32v(cpu.m_pc); io.u32v(cpu.m_vab); io.u32v(cpu.m_ops);
         io.u32v(cpu.m_cps); io.u32v(cpu.m_cfg); io.u32v(cpu.m_cha);
         io.u32v(cpu.m_chd); io.u32v(cpu.m_chc); io.u32v(cpu.m_rbp);

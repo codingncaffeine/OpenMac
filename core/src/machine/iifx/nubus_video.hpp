@@ -110,11 +110,6 @@ public:
         gcCpu_.writeData = [this](u32 address, u32 value, bool inputOutput) {
             gcWriteData(address, value, inputOutput);
         };
-        // The loop fast-forward may only learn a loop whose loads are pure;
-        // an MFB instruction-cache fill in flight consumes every data read.
-        gcCpu_.dataReadsPure = [this] {
-            return !(gcCacheFillActive_ && gcCacheFillWordsRemaining_ != 0);
-        };
         reset();
     }
 
@@ -290,7 +285,6 @@ public:
 
     void writeStandard(u32 slotOffset, u8 value) {
         ++writes;
-        gcCpu_.noteHostMemoryWrite();
         slotOffset &= 0x00FFFFFFu;
         if (genuineGc_) {
             const u32 compatibleOffset = slotOffset & 0x000FFFFFu;
@@ -476,7 +470,6 @@ public:
 
     void writeSuper(u32 slotOffset, u8 value) {
         ++writes;
-        gcCpu_.noteHostMemoryWrite();
         slotOffset &= 0x0FFFFFFFu;
         if (!genuineGc_) return;
         if (slotOffset >= kGcVramOffset &&
@@ -755,12 +748,6 @@ public:
         return gcCpu_.faultReason();
     }
     u64 gcProcessorInstructions() const { return gcCpu_.instructions(); }
-    u64 gcProcessorLoopSkipped() const {
-        return gcCpu_.loopSkippedInstructions();
-    }
-    void gcSetLoopFastForward(bool enabled) {
-        gcCpu_.setLoopFastForward(enabled);
-    }
     void gcSetProcessorRegisterWatch(u16 physicalIndex) {
         gcCpu_.setDiagnosticRegisterWatch(physicalIndex);
     }
