@@ -72,6 +72,7 @@ void Rtc::clockedInBit(bool bit) {
             // XPRAM $57 onto $77 and corrupts the Start Manager OS type.
             const u8 addr = static_cast<u8>(((cmd_ & 0x07) << 5) |
                                             ((extAddr_ >> 2) & 0x1F));
+            if (onByte) onByte("xra", addr);
             outShift_ = xpram_[addr];
             if (onByte) onByte("out", outShift_);
             outBits_ = 0;
@@ -85,6 +86,7 @@ void Rtc::clockedInBit(bool bit) {
         if (extended_) {
             const u8 addr = static_cast<u8>(((cmd_ & 0x07) << 5) |
                                             ((extAddr_ >> 2) & 0x1F));
+            if (onByte) onByte(writeProtect_ ? "xwp" : "xwa", addr);
             if (!writeProtect_) xpram_[addr] = shift_;
         } else {
             writeRegister(shift_);
@@ -100,6 +102,7 @@ void Rtc::clockedInBit(bool bit) {
 
 u8 Rtc::readRegister() {
     const int reg = (cmd_ >> 2) & 0x1F;
+    if (onByte) onByte("rrg", static_cast<u8>(reg));
     switch (reg) {
     case 0: case 4: return static_cast<u8>(seconds_ & 0xFF);
     case 1: case 5: return static_cast<u8>((seconds_ >> 8) & 0xFF);
@@ -121,6 +124,8 @@ u8 Rtc::readRegister() {
 
 void Rtc::writeRegister(u8 value) {
     const int reg = (cmd_ >> 2) & 0x1F;
+    if (onByte) onByte(writeProtect_ && reg != 0x0D ? "wrp" : "wrg",
+                       static_cast<u8>(reg));
     if (writeProtect_ && reg != 0x0D) return;
     switch (reg) {
     case 0: case 4: seconds_ = (seconds_ & 0xFFFFFF00u) | value; break;
