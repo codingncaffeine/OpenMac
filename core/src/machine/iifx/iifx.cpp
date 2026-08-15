@@ -1715,17 +1715,40 @@ bool IifxMachine::execute68kTrap(u16 trap) {
     return completed;
 }
 
+bool IifxMachine::driveInQueue(u16 drive) {
+    u32 entry = read32(0x030Au);
+    for (int count = 0; count < 16 && entry && entry != 0xFFFFFFFFu; ++count) {
+        entry = guestPtr(entry);
+        if (entry + 12u > ram_.size()) break;
+        if (read16(entry + 6u) == drive) return true;
+        entry = read32(entry);
+    }
+    return false;
+}
+
+bool IifxMachine::secondDiskDriverResident() {
+    if (hardDisk2_.empty()) return false;
+    const u32 vcbHead = read32(0x0358u);
+    if (vcbHead == 0 || vcbHead == 0xFFFFFFFFu) return false;
+    return driveInQueue(5);
+}
+
 void IifxMachine::announceHardDisk() {
-    if (!hardDiskMountPending_ || hardDisk_.empty() ||
-        hardDiskMountInFlight_ || inDiskDriver_) return;
+    const bool bootWanted = hardDiskMountPending_ && !hardDisk_.empty();
+    const bool secondWanted = hardDisk2MountPending_ && !hardDisk2_.empty();
+    if ((!bootWanted && !secondWanted) || hardDiskMountInFlight_ ||
+        inDiskDriver_) return;
 
     const u32 vcbHead = read32(0x0358u);
     if (vcbHead == 0 || vcbHead == 0xFFFFFFFFu) return;  // System not up
-    if (volumeMountedFor(4)) {
+    if (bootWanted && volumeMountedFor(4)) {
         hardDiskMountPending_ = false;
         hardDiskMounted_ = true;
-        return;
     }
+    if (secondWanted && volumeMountedFor(5)) hardDisk2MountPending_ = false;
+    const bool bootPending = bootWanted && hardDiskMountPending_;
+    const bool secondPending = secondWanted && hardDisk2MountPending_;
+    if (!bootPending && !secondPending) return;
     if ((read8(0x0360u) & 1u) != 0) return;             // File Manager busy
     if (read32(0x0360u) == 0xFFFFFFFFu) return;         // queue not built
     if ((cpu_.getSR() & 0x0700u) != 0) return;          // mid-interrupt
@@ -1736,18 +1759,12 @@ void IifxMachine::announceHardDisk() {
     // established Classic and Quadra backends.
     if (++hardDiskMountDelay_ < 2) return;
 
-    bool drivePresent = false;
-    u32 entry = read32(0x030Au);
-    for (int count = 0; count < 16 && entry && entry != 0xFFFFFFFFu; ++count) {
-        entry = guestPtr(entry);
-        if (entry + 12u > ram_.size()) break;
-        if (read16(entry + 6u) == 4) {
-            drivePresent = true;
-            break;
-        }
-        entry = read32(entry);
-    }
-    if (!drivePresent) return;
+    // A drive can only be mounted once its driver has put it in the drive
+    // queue; the ROM's startup scan does that for every disk on the bus at
+    // boot, so a disk attached later stays here until the next restart.
+    const bool mountBoot = bootPending && driveInQueue(4);
+    const bool mountSecond = secondPending && driveInQueue(5);
+    if (!mountBoot && !mountSecond) return;
 
     hardDiskMountInFlight_ = true;
     u32 savedD[8], savedA[8];
@@ -1762,28 +1779,49 @@ void IifxMachine::announceHardDisk() {
             hardDiskMountPb_ = guestPtr(cpu_.a[0]);
     }
 
-    s16 result = -108;                                 // memFullErr fallback
-    if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
-        for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
-        write16(hardDiskMountPb_ + 22u, 4);             // ioVRefNum = drive 4
-        cpu_.a[0] = hardDiskMountPb_;
-        if (execute68kTrap(0xA00Fu))                    // _MountVol
-            result = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
+    const auto mountDrive = [this](u16 drive) -> s16 {
+        s16 result = -108;                              // memFullErr fallback
+        if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
+            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
+            write16(hardDiskMountPb_ + 22u, drive);     // ioVRefNum = the drive
+            cpu_.a[0] = hardDiskMountPb_;
+            if (execute68kTrap(0xA00Fu))                // _MountVol
+                result = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
+        }
+        return result;
+    };
+
+    if (mountBoot) {
+        const s16 result = mountDrive(4);
+        hardDiskMountResult_ = result;
+        ++hardDiskMountTries_;
+        if (result == 0 || result == -55) {             // mounted/already online
+            hardDiskMountPending_ = false;
+            hardDiskMounted_ = true;
+        } else if (hardDiskMountTries_ >= 15) {
+            hardDiskMountPending_ = false;
+        }
+        if (onDiag) {
+            char message[112];
+            std::snprintf(message, sizeof message,
+                          "IIfx hard disk drive 4 mount result=%d try=%u%s",
+                          result, hardDiskMountTries_,
+                          hardDiskMounted_ ? " mounted" : "");
+            onDiag(message);
+        }
     }
-    hardDiskMountResult_ = result;
-    ++hardDiskMountTries_;
-    if (result == 0 || result == -55) {                 // mounted/already online
-        hardDiskMountPending_ = false;
-        hardDiskMounted_ = true;
-    } else if (hardDiskMountTries_ >= 15) {
-        hardDiskMountPending_ = false;
-    }
-    if (onDiag) {
-        char message[112];
-        std::snprintf(message, sizeof message,
-                      "IIfx hard disk drive 4 mount result=%d try=%u%s",
-                      result, hardDiskMountTries_, hardDiskMounted_ ? " mounted" : "");
-        onDiag(message);
+    if (mountSecond) {
+        const s16 result = mountDrive(5);
+        ++hardDisk2MountTries_;
+        if (result == 0 || result == -55 || hardDisk2MountTries_ >= 15)
+            hardDisk2MountPending_ = false;
+        if (onDiag) {
+            char message[112];
+            std::snprintf(message, sizeof message,
+                          "IIfx second disk drive 5 mount result=%d try=%u",
+                          result, hardDisk2MountTries_);
+            onDiag(message);
+        }
     }
 
     for (int i = 0; i < 8; ++i) {
@@ -1791,6 +1829,103 @@ void IifxMachine::announceHardDisk() {
         cpu_.a[i] = savedA[i];
     }
     hardDiskMountInFlight_ = false;
+}
+
+void IifxMachine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
+    hardDisk2_ = std::move(image);
+    scsiImage2_.clear();
+    hfsImageOffset2_ = 0;
+    hardDisk2IsWholeScsi_ = false;
+    hardDisk2MountPending_ = false;
+    hardDisk2MountTries_ = 0;
+    ScsiDisk& seat = scsi_->disk;
+    seat.readOnly = readOnly;
+    if (hardDisk2_.empty()) {
+        seat.detach();
+        return;
+    }
+    if (hardDisk2_.size() >= 512 && hardDisk2_[0] == 0x45 && hardDisk2_[1] == 0x52) {
+        // A complete physical SCSI image keeps its own map and driver.
+        scsiImage2_ = hardDisk2_;
+        hardDisk2IsWholeScsi_ = true;
+    } else {
+        // A bare volume gets the boot disk's wrapping one seat along: SCSI ID
+        // 1, drive 5, the next unit-table slot.
+        scsiImage2_ = scsi::buildAppleScsiDisk(
+            hardDisk2_, scsi::buildScsiDriverPortable(
+                            1, 5, static_cast<u8>(kScsiDiskUnit + 1u)));
+        hfsImageOffset2_ = static_cast<u32>(scsiImage2_.size() - hardDisk2_.size());
+    }
+    seat.attach(&scsiImage2_, 1);
+    hardDisk2MountPending_ = true;
+}
+
+void IifxMachine::detachHardDisk2() {
+    hardDisk2_.clear();
+    scsiImage2_.clear();
+    hardDisk2MountPending_ = false;
+    scsi_->disk.detach();
+}
+
+const std::vector<u8>& IifxMachine::hardDisk2Image() const {
+    if (scsiImage2_.empty()) return hardDisk2_;
+    if (hardDisk2IsWholeScsi_) {
+        hardDisk2_ = scsiImage2_;
+    } else if (static_cast<std::size_t>(hfsImageOffset2_) + hardDisk2_.size() <=
+               scsiImage2_.size()) {
+        hardDisk2_.assign(scsiImage2_.begin() + hfsImageOffset2_,
+                          scsiImage2_.begin() + hfsImageOffset2_ + hardDisk2_.size());
+    }
+    return hardDisk2_;
+}
+
+bool IifxMachine::unmountHardDisk2() {
+    if (hardDisk2_.empty()) return true;
+    if (inDiskDriver_ || hardDiskMountInFlight_) return false;
+    const u32 vcbHead = read32(0x0358u);
+    if (vcbHead == 0 || vcbHead == 0xFFFFFFFFu) return true;   // System never came up
+    if (read32(0x0360u) == 0xFFFFFFFFu) return true;           // FS queue not built
+    if ((read8(0x0360u) & 1u) != 0) return false;              // FSBusy: not now
+    if ((cpu_.getSR() & 0x0700u) != 0) return false;           // mid-interrupt
+    if (!volumeMountedFor(5)) return true;                     // already off line
+
+    hardDiskMountInFlight_ = true;
+    u32 savedD[8], savedA[8];
+    for (int i = 0; i < 8; ++i) {
+        savedD[i] = cpu_.d[i];
+        savedA[i] = cpu_.a[i];
+    }
+    if (!hardDiskMountPb_) {
+        cpu_.d[0] = 80;
+        if (execute68kTrap(0xA71Eu))                  // _NewPtr,Sys,Clear
+            hardDiskMountPb_ = guestPtr(cpu_.a[0]);
+    }
+    s16 flushed = -108, unmounted = -108;
+    if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
+        auto call = [this](u16 trap) -> s16 {
+            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
+            write16(hardDiskMountPb_ + 22u, 5);       // ioVRefNum = drive 5
+            cpu_.a[0] = hardDiskMountPb_;
+            if (!execute68kTrap(trap)) return -36;    // ioErr
+            return static_cast<s16>(cpu_.d[0] & 0xFFFFu);
+        };
+        flushed = call(0xA013u);                      // _FlushVol
+        unmounted = call(0xA00Eu);                    // _UnmountVol
+    }
+    for (int i = 0; i < 8; ++i) {
+        cpu_.d[i] = savedD[i];
+        cpu_.a[i] = savedA[i];
+    }
+    hardDiskMountInFlight_ = false;
+    const bool offLine = !volumeMountedFor(5);
+    if (onDiag) {
+        char message[128];
+        std::snprintf(message, sizeof message,
+                      "IIfx second disk drive 5 flush=%d unmount=%d -- volume %s",
+                      flushed, unmounted, offLine ? "off line" : "STILL MOUNTED");
+        onDiag(message);
+    }
+    return offLine;
 }
 
 void IifxMachine::serveSonyPrime() {

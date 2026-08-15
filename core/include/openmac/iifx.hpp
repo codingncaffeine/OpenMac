@@ -69,6 +69,22 @@ public:
     // host persists or replaces its image.
     bool shutdownHardDisk();
 
+    // The second SCSI seat (ID 1, drive 5): the transfer disk and the folder
+    // disk ride here, the same surface the Quadra offers. It is served by the
+    // controller's built-in target, so a checkpoint's bus topology does not
+    // change. Its driver, like the boot disk's, is loaded by the ROM's startup
+    // scan; a volume put here after that scan cannot mount until a restart.
+    void insertHardDisk2(std::vector<u8> image, bool readOnly = false);
+    void detachHardDisk2();
+    bool hardDisk2Present() const { return !hardDisk2_.empty(); }
+    const std::vector<u8>& hardDisk2Image() const;
+    // True once the System has the seat's drive (5) in its drive queue, i.e.
+    // the driver came in with the startup scan and a volume here mounts live.
+    bool secondDiskDriverResident();
+    // Flush and unmount ONLY drive 5's volume, leaving the boot disk alone.
+    // Returns true once the volume is off line (or was never mounted).
+    bool unmountHardDisk2();
+
     // Internal FDHD/SuperDrive. Raw 400K/800K/1.44 MB media and DiskCopy 4.2
     // or MacBinary wrappers are accepted. The wrappers are retained so sector
     // writes go back to the same host-file format on eject/exit.
@@ -240,6 +256,7 @@ private:
     bool execute68kTrap(u16 trap);
     void announceHardDisk();
     bool volumeMountedFor(u16 drive);
+    bool driveInQueue(u16 drive);
     bool markHardDiskClean();
     u32 guestPtr(u32 address) const;
     static bool floppyGeometry(std::vector<u8>& image);
@@ -298,6 +315,12 @@ private:
     u32 hfsImageOffset_ = 0;
     u32 hfsVolumeBytes_ = 0;
     bool hardDiskIsWholeScsi_ = false;
+    mutable std::vector<u8> hardDisk2_;
+    std::vector<u8> scsiImage2_;
+    u32 hfsImageOffset2_ = 0;
+    bool hardDisk2IsWholeScsi_ = false;
+    bool hardDisk2MountPending_ = false;
+    u32 hardDisk2MountTries_ = 0;
     bool inDiskDriver_ = false;
     u32 diskPrimePc_ = 0;
     u32 diskCtlPc_ = 0;

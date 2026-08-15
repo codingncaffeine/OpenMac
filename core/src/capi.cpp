@@ -720,6 +720,38 @@ OMAC_API int omac_fx_shutdown_harddisk(OMacFx* m)
     return (m && m->mac.shutdownHardDisk()) ? 1 : 0;
 }
 
+OMAC_API void omac_fx_insert_harddisk2(OMacFx* m, const uint8_t* img,
+                                        size_t len, int read_only)
+{
+    if (m && img && len)
+        m->mac.insertHardDisk2(std::vector<u8>(img, img + len), read_only != 0);
+}
+
+OMAC_API void omac_fx_detach_harddisk2(OMacFx* m)
+{
+    if (m) m->mac.detachHardDisk2();
+}
+
+OMAC_API size_t omac_fx_harddisk2_data(OMacFx* m, uint8_t* out, size_t cap)
+{
+    if (!m || !m->mac.hardDisk2Present()) return 0;
+    const auto& image = m->mac.hardDisk2Image();
+    if (!out) return image.size();
+    if (cap < image.size()) return 0;
+    std::copy(image.begin(), image.end(), out);
+    return image.size();
+}
+
+OMAC_API int omac_fx_harddisk2_booted(OMacFx* m)
+{
+    return (m && m->mac.secondDiskDriverResident()) ? 1 : 0;
+}
+
+OMAC_API int omac_fx_unmount_harddisk2(OMacFx* m)
+{
+    return (m && m->mac.unmountHardDisk2()) ? 1 : 0;
+}
+
 OMAC_API size_t omac_fx_pram_save(OMacFx* m, uint8_t* out, size_t cap)
 {
     return m ? m->mac.savePram(out, static_cast<u32>(cap)) : 0;

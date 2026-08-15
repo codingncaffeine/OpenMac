@@ -325,6 +325,18 @@ OMAC_API void    omac_fx_detach_harddisk(OMacFx*);
 OMAC_API size_t  omac_fx_harddisk_data(OMacFx*, uint8_t* out, size_t cap);
 /* Flush and unmount drive 4 through the guest before saving/replacing it. */
 OMAC_API int     omac_fx_shutdown_harddisk(OMacFx*);
+/* The second SCSI disk (ID 1, drive 5) -- the transfer disk's and the folder
+   disk's seat, the same shape as the Quadra's omac_q_harddisk2_*. _booted
+   reports whether the System has that seat's driver (its drive is in the
+   drive queue): the ROM loads it during the startup scan, so a disk put here
+   afterwards needs a restart to mount. _unmount flushes and unmounts ONLY this
+   volume; non-zero once it is off line. */
+OMAC_API void    omac_fx_insert_harddisk2(OMacFx*, const uint8_t* img,
+                                           size_t len, int read_only);
+OMAC_API void    omac_fx_detach_harddisk2(OMacFx*);
+OMAC_API size_t  omac_fx_harddisk2_data(OMacFx*, uint8_t* out, size_t cap);
+OMAC_API int     omac_fx_harddisk2_booted(OMacFx*);
+OMAC_API int     omac_fx_unmount_harddisk2(OMacFx*);
 OMAC_API size_t  omac_fx_pram_save(OMacFx*, uint8_t* out, size_t cap);
 OMAC_API int     omac_fx_pram_load(OMacFx*, const uint8_t* data, size_t len,
                                     uint32_t add_seconds);
