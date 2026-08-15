@@ -1321,19 +1321,29 @@ TEST_CASE("IIfx 8 24 GC selects and renders direct xRGB color") {
 
     // Apple's authentic 341-0266 Dolphin ROM programs AC842 PBCTRL with $9C
     // for direct color. Its MFB then receives the host-aperture base and
-    // stride serially: $2000 * 8 = $10000 and $140 * 8 = 2560 xRGB bytes.
-    // The packed side of that aperture stores 3/4 as many physical bytes.
+    // stride serially: $2000 * 8 = $10000 and $140 * 8 = 2560 xRGB bytes,
+    // one linear VRAM byte per aperture byte in every depth.
     mac.write32(0x96C00008u, 0x9C000000u);
     CHECK(mac.read32(0x96C00008u) == 0x9C000000u);
     serialRegister(0x94000000u, 0x02000u, 20);
     serialRegister(0x940000A0u, 0x00140u, 12);
 
     // QuickDraw's direct PixMap is xRGB, so a 640-pixel scanline is 2560
-    // bytes. The card ignores X and emits the following three components.
+    // bytes. The X byte is stored (the GC driver's start-up self test walks
+    // ones through it); the RAMDAC emits the following three components.
     mac.write32(0x9C010000u, 0x00123456u);
     mac.write32(0x9C010004u, 0x00ABCDEFu);
     CHECK(mac.read32(0x9C010000u) == 0x00123456u);
     CHECK(mac.read32(0x9C010004u) == 0x00ABCDEFu);
+    // The whole longword round-trips, X byte included, right up to the top
+    // of the two-megabyte aperture: the driver walks ones through every bit
+    // of $9C1FFFF0 before it will install the accelerator on a Millions boot.
+    mac.write32(0x9C010008u, 0xA0654321u);
+    CHECK(mac.read32(0x9C010008u) == 0xA0654321u);
+    mac.write32(0x9C1FFFF0u, 0x80000000u);
+    CHECK(mac.read32(0x9C1FFFF0u) == 0x80000000u);
+    mac.write32(0x9C1FFFF0u, 0x9C1FFFF0u);
+    CHECK(mac.read32(0x9C1FFFF0u) == 0x9C1FFFF0u);
     std::vector<u32> pixels(640u * 480u);
     mac.renderScreen(pixels.data());
     CHECK(pixels[0] == 0xFF123456u);

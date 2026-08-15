@@ -365,9 +365,8 @@ public:
             slotOffset < kGcVramOffset + kGcSharedDramBytes)
             return gcDram_[slotOffset - kGcVramOffset];
         u32 vramOffset = 0;
-        bool padding = false;
-        if (translateVramAddress(slotOffset, vramOffset, padding))
-            return padding ? 0 : vram_[vramOffset];
+        if (translateVramAddress(slotOffset, vramOffset))
+            return vram_[vramOffset];
         // Dolphin's Am29000 executes from a mandatory 64 KiB static-RAM
         // window at the bottom of super-slot space.  The declaration-ROM
         // primary-init code writes one longword every $100 bytes through the
@@ -483,18 +482,12 @@ public:
             return;
         }
         u32 vramOffset = 0;
-        bool padding = false;
-        if (translateVramAddress(slotOffset, vramOffset, padding)) {
-            // Direct QuickDraw PixMaps contain xRGB longwords.  Dolphin's
-            // packed aperture discards X and places RGB contiguously in its
-            // physical VRAM, exactly as the display engine consumes it.
-            if (!padding) {
-                if (gcSuperWriteFromCard_)
-                    gcNoteVramWatch(vramOffset, vramOffset, value);
-                vram_[vramOffset] = value;
-                ++vramWrites;
-                ++frameVramWrites_;
-            }
+        if (translateVramAddress(slotOffset, vramOffset)) {
+            if (gcSuperWriteFromCard_)
+                gcNoteVramWatch(vramOffset, vramOffset, value);
+            vram_[vramOffset] = value;
+            ++vramWrites;
+            ++frameVramWrites_;
             return;
         }
         if (slotOffset < kGcSramBytes) {
@@ -725,24 +718,21 @@ public:
     bool genuineGc() const { return genuineGc_; }
     u32 displayBase() const {
         if (!genuineGc_) return 0;
-        // Dolphin expresses the host-visible xRGB aperture in eight-byte
-        // units.  In direct mode the aperture packs every four host bytes
-        // into three physical RGB bytes, so the scanout base uses six-byte
-        // units.  Apple's $02000 base consequently maps $010000 -> $00C000.
-        const u32 unit = packedRgb() ? 6u : 8u;
-        const u32 programmed = base_ * unit;
+        // MFB takes the display base and stride in eight-byte units in every
+        // depth: the declaration ROM programs $2000 (-> $010000) and $140
+        // (-> 2560 bytes) for direct color, the same 2560-byte xRGB scanline
+        // QuickDraw publishes as rowBytes. VRAM is one linear store, so the
+        // scanout walks the same bytes the host and GC QuickDraw wrote.
+        const u32 programmed = base_ * 8u;
         // Primary init publishes $9C010000 as ScrnBase. Until the MFB display
         // start register is decoded separately from the +$08 sense/control
         // port, preserve that card-ROM-defined initial page exactly.
-        return programmed ? programmed
-                          : (packedRgb() ? 0x0000C000u : 0x00010000u);
+        return programmed ? programmed : 0x00010000u;
     }
     u32 displayStride() const {
-        const u32 programmed = stride_ * (packedRgb() ? 6u : 8u);
+        const u32 programmed = stride_ * 8u;
         if (programmed) return programmed;
-        // QuickDraw publishes 2560 xRGB bytes, while the packed scanout side
-        // stores the same 640 pixels as 1920 contiguous RGB bytes.
-        return bitsPerPixel() == 24 ? static_cast<u32>(kWidth * 3)
+        return bitsPerPixel() == 24 ? static_cast<u32>(kWidth * 4)
                                     : 128u * static_cast<u32>(bitsPerPixel());
     }
     u16 control() const { return control_; }
@@ -1263,11 +1253,13 @@ public:
             const u8* row = vram_.data() + rowOffset;
             for (int x = 0; x < kWidth; ++x) {
                 if (bpp == 24) {
-                    const std::size_t pixel = static_cast<std::size_t>(x) * 3u;
-                    if (pixel + 2 >= rowBytes) break;
+                    // Direct color is QuickDraw's xRGB longword; the RAMDAC
+                    // takes the low three bytes and ignores X.
+                    const std::size_t pixel = static_cast<std::size_t>(x) * 4u;
+                    if (pixel + 3 >= rowBytes) break;
                     argb[static_cast<std::size_t>(y) * kWidth + x] =
-                        0xFF000000u | (u32(row[pixel]) << 16) |
-                        (u32(row[pixel + 1]) << 8) | row[pixel + 2];
+                        0xFF000000u | (u32(row[pixel + 1]) << 16) |
+                        (u32(row[pixel + 2]) << 8) | row[pixel + 3];
                     continue;
                 }
                 const u32 levels = (1u << bpp) - 1u;
@@ -1297,8 +1289,6 @@ public:
 
 private:
     friend class IifxStateCodec;
-
-    bool packedRgb() const { return genuineGc_ && mode_ == 0x84; }
 
     void writeClutAddress(u8 value) {
         clutAddress_ = value;
@@ -2263,29 +2253,20 @@ private:
         }
     }
 
-    bool translateVramAddress(u32 slotOffset, u32& physical,
-                              bool& padding) const {
+    // The $9C aperture is the two-megabyte VRAM itself, byte for byte, in
+    // every depth. Direct color stores QuickDraw's xRGB longword whole: the
+    // 8*24 GC driver's start-up self test walks ones through all 32 bits of
+    // the longword at $9C1FFFF0 while the card is already in mode $84 (a
+    // Millions boot) and reports "a hardware error has been detected" if any
+    // bit fails to come back, so the X byte is real memory. GC QuickDraw
+    // likewise addresses the same pixel through this aperture and through
+    // the Am29000's $41000000 window interchangeably, which is only possible
+    // when both are identity maps of one linear store.
+    bool translateVramAddress(u32 slotOffset, u32& physical) const {
         if (slotOffset < kGcVramOffset) return false;
         const u32 logical = slotOffset - kGcVramOffset;
-        if (!packedRgb()) {
-            if (logical >= vram_.size()) return false;
-            physical = logical;
-            padding = false;
-            return true;
-        }
-
-        const u32 lane = logical & 3u;
-        const u64 groupBase = static_cast<u64>(logical >> 2) * 3u;
-        if (lane == 0u) {
-            if (groupBase >= vram_.size()) return false;
-            physical = static_cast<u32>(groupBase);
-            padding = true;
-            return true;
-        }
-        const u64 packed = groupBase + lane - 1u;
-        if (packed >= vram_.size()) return false;
-        physical = static_cast<u32>(packed);
-        padding = false;
+        if (logical >= vram_.size()) return false;
+        physical = logical;
         return true;
     }
 
