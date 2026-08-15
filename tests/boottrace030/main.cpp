@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
                      "       media/input timing: [--floppy-at-frame n file.img]... [--eject-floppy-at-frame n]... [--input-at-frame n dx dy up|down]... [--milestone-timeout name:frames]\n"
                      "       trigger capture: --checkpoint-on-trigger file.iifxstate [--checkpoint-at-pc hex file.iifxstate]\n"
                      "       boot display capture: --frame-timeline prefix first-frame last-frame\n"
-                     "       trap probe: --watch-trap hex-opcode [--watch-trap-limit n]\n"
+                     "       trap probe: --watch-trap hex-opcode [--watch-trap hex-opcode]... [--watch-trap-limit n]\n"
                      "       concise output/artifacts: --quiet [--cpu-state] [--media-summary] [--dump-audio sound.wav] [--expect-startup-chime]\n"
                      "       omit floppy.img and use 'no-video' for a headless machine\n"
                      "       add [input-frame] [mouse-dx] [mouse-dy] to inject motion\n"
@@ -410,7 +410,7 @@ int main(int argc, char** argv) {
     std::string frameTimelinePrefix;
     int frameTimelineFirst = 0;
     int frameTimelineLast = -1;
-    u16 watchedTrap = 0;
+    std::vector<u16> watchedTraps;
     bool watchedTrapEnabled = false;
     u64 watchedTrapLimit = 32;
     for (int index = 2; index < argc; ++index) {
@@ -770,7 +770,7 @@ int main(int argc, char** argv) {
                              "--watch-trap requires a 16-bit opcode\n");
                 return 2;
             }
-            watchedTrap = static_cast<u16>(value);
+            watchedTraps.push_back(static_cast<u16>(value));
             watchedTrapEnabled = true;
         }
         else if (option == "--watch-trap-limit" && index + 1 < argc) {
@@ -1096,16 +1096,31 @@ int main(int argc, char** argv) {
                 // The CPU will take the architected fetch fault. A diagnostic
                 // watch must not replace it with a host-side failure.
             }
-            if (opcode == watchedTrap) {
+            if (std::find(watchedTraps.begin(), watchedTraps.end(), opcode) !=
+                watchedTraps.end()) {
                 ++watchedTrapHits;
                 if (watchedTrapHits <= watchedTrapLimit) {
                     std::printf("WATCH-TRAP hit=%llu frame=%llu cycle=%llu "
-                                "op=%04X pc=%08X sp=%08X d0=%08X a0=%08X\n",
+                                "op=%04X pc=%08X sp=%08X d0=%08X a0=%08X",
                                 static_cast<unsigned long long>(watchedTrapHits),
                                 static_cast<unsigned long long>(mac.frameCount()),
                                 static_cast<unsigned long long>(mac.totalCycles()),
                                 opcode, pc, mac.cpu().a[7], mac.cpu().d[0],
                                 mac.cpu().a[0]);
+                    // OS traps carry a parameter block in A0: show ioRefNum,
+                    // csCode and the first csParam words (Device Manager
+                    // layout) so a Control/Status conversation reads at a
+                    // glance. An unreadable block prints nothing extra.
+                    if ((opcode & 0x0800u) == 0) {
+                        try {
+                            std::printf(" pb+18:");
+                            for (u32 offset = 0x18u; offset < 0x28u; offset += 2u)
+                                std::printf(" %04X",
+                                            mac.read16(mac.cpu().a[0] + offset));
+                        } catch (...) {
+                        }
+                    }
+                    std::printf("\n");
                 }
             }
         }
@@ -1190,6 +1205,14 @@ int main(int argc, char** argv) {
                             pcCheckpointPath,
                             static_cast<unsigned long long>(mac.totalCycles()),
                             static_cast<unsigned long long>(mac.frameCount()), pc);
+                // The register file at the trigger lets a follow-up run dump
+                // frame-relative locals without guessing A6/A7.
+                std::printf("PC checkpoint registers:");
+                for (int index = 0; index < 8; ++index)
+                    std::printf(" D%d=%08X", index, mac.cpu().d[index]);
+                for (int index = 0; index < 8; ++index)
+                    std::printf(" A%d=%08X", index, mac.cpu().a[index]);
+                std::printf("\n");
             }
         }
         if (profilePcRange && pc >= profilePcFirst && pc <= profilePcLast &&
@@ -1467,7 +1490,9 @@ int main(int argc, char** argv) {
     if (structuredOnly || quiet) {
         mac.setLegacyAccessLogEnabled(false);
         mac.onDiag = {};
-        mac.cpu().onException = {};
+        // A trap watch is an explicitly requested probe: keep the exception
+        // hook (its other prints already honour quiet).
+        if (!watchedTrapEnabled) mac.cpu().onException = {};
         mac.cpu().onInterrupt = {};
     }
 
@@ -2091,9 +2116,12 @@ int main(int argc, char** argv) {
             std::printf(" A%d=%08X", index, mac.cpu().a[index]);
         std::printf("\n");
     }
-    if (watchedTrapEnabled)
-        std::printf("watched trap %04X hits=%llu\n", watchedTrap,
+    if (watchedTrapEnabled) {
+        std::printf("watched traps");
+        for (const u16 opcode : watchedTraps) std::printf(" %04X", opcode);
+        std::printf(" hits=%llu\n",
                     static_cast<unsigned long long>(watchedTrapHits));
+    }
 
     // Quiet/structured captures still produce explicitly requested artifacts.
     // Suppressing legacy printf diagnostics must never suppress observability.
