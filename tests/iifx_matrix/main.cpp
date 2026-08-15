@@ -45,12 +45,6 @@ std::vector<u8> matrixRom() {
     return rom;
 }
 
-u64 hashBytes(const std::vector<u8>& bytes) {
-    u64 hash = 1469598103934665603ull;
-    for (u8 value : bytes) hash = (hash ^ value) * 1099511628211ull;
-    return hash;
-}
-
 std::string hex64(u64 value) {
     static constexpr char digits[] = "0123456789ABCDEF";
     std::string result(16, '0');
@@ -163,7 +157,14 @@ int main(int argc, char** argv) {
                                    machine.read32(0x1004u) == 0x49580001u;
             machine.recordHardwareMilestone("matrix-boot");
 
+            // The checkpoint must still serialize, but its bytes are not a
+            // cross-compiler contract; the state hash is the machine's
+            // deterministic CPU/device hash instead.
             const std::vector<u8> checkpoint = machine.saveState();
+            if (checkpoint.empty()) {
+                std::cerr << "matrix checkpoint failed\n";
+                return 2;
+            }
             const std::string caseName = std::string(profile.name) + "-ram" +
                                          std::to_string(ramMb);
             nlohmann::json record{
@@ -174,7 +175,7 @@ int main(int argc, char** argv) {
                 {"floppy_bytes", profile.floppy ? 1440u * 1024u : 0u},
                 {"milestone", milestone ? "matrix-boot" : "missing"},
                 {"instructions", instructions},
-                {"state_hash", hex64(hashBytes(checkpoint))},
+                {"state_hash", hex64(machine.deterministicStateHash())},
                 {"framebuffer_hash", hex64(machine.framebufferHash())},
                 {"assertion", machine.hardwareTrace().triggerReason()},
             };

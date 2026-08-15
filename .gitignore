@@ -38,5 +38,8 @@ roms/
 *.lha
 *.lzh
 
-# Locally fetched test data (SingleStepTests etc.)
-tests/data/
+# Locally fetched test data (SingleStepTests etc.); the synthetic IIfx
+# public boot-matrix baseline is tracked (regenerate with
+# openmac_iifx_matrix --emit whenever the checkpoint format changes)
+tests/data/*
+!tests/data/iifx-public-matrix.jsonl
