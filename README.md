@@ -8,10 +8,12 @@ core, implemented from period hardware documentation.
   clock, and the scanline sound buffer. Boots System 6.0.8 and System 7.0.1 to a
   fully working desktop, and the ROM's built-in System 6.0.3 ROM disk.
 - **Macintosh IIfx** — 40 MHz 68030/68882, OSS interrupt controller, dual I/O
-  Processor interfaces, NCR 5380 SCSI, internal SuperDrive, ASC audio, and a
-  slot-$9 Macintosh II NuBus display card. Boots the supplied 512 KB IIfx ROM
-  and compatible System 6/7 media to Finder from either floppy or SCSI, with
-  every legal 4–128 MB physical RAM layout and period 80/160 MB hard disks.
+  Processor interfaces, NCR 5380 SCSI, internal SuperDrive, ASC audio, and the
+  **Macintosh Display Card 8•24 GC** in slot $9: the card's Am29000 runs Apple's
+  own GC QuickDraw, so the desktop is drawn by the accelerator, in 1-bit through
+  24-bit color. Boots the supplied 512 KB IIfx ROM and compatible System 6/7
+  media to Finder from either floppy or SCSI, with every legal 4–128 MB physical
+  RAM layout and period 80/160 MB hard disks.
 - **Quadra 650** — 68040 with its FPU and MMU, DAFB video, 53C96 SCSI, SWIM2
   floppy, Z8530 SCC, the Apple Sound Chip, and VIA1/VIA2. Boots System 7.5 and
   7.5.3 from a hard disk to the Finder desktop, with 8 to 136 MB of RAM and six
@@ -56,7 +58,7 @@ included in — or may be contributed to — this repository.
 
 ## Building
 
-The core is dependency-free C++20; the front end is a .NET 10 WPF app.
+The core is dependency-free C++20; the front end is a .NET 11 WPF app.
 
 ```
 cmake -B build
@@ -66,4 +68,21 @@ dotnet build gui -c Release
 
 MIT licensed. Clean-room: primary sources are the chip datasheets and Apple's
 published hardware documentation; other emulators were consulted only as
-behavioral references, never copied.
+behavioral references, never copied — with the one exception credited below.
+
+## Credits
+
+- **Philip Bennett** — the Am29000 CPU core that drives the 8•24 GC's
+  processor is adapted from his portable Am29000 core in MAME (BSD-3-Clause;
+  see `THIRD-PARTY-NOTICES.md`). Having a working instruction set, pipeline
+  model and dispatch tables to start from is what made bringing up Apple's GC
+  QuickDraw software on the card possible. OpenMac's copy adds the Dolphin
+  memory callbacks and the corrections documented in the wiki (data-width
+  load/store semantics, channel-register restart of trapped accesses, timer
+  and interrupt-return behavior).
+- **AMD** — the Am29000 and Am29030 user's manuals, preserved by Bitsavers,
+  settled every question about what the processor really does.
+- **SingleStepTests** — the 680x0 conformance suite the 68000 core is
+  validated against.
+- doctest, nlohmann/json and miniz (tests), SDL3 and Dear ImGui (the optional
+  developer shell) — fetched at build time under their own licenses.
