@@ -248,7 +248,16 @@ public partial class MainWindow : Window
             SeatWaitingFloppy();   // the drive is empty and the old disk is saved
             UpdateUi();
         }
+        // The speed readout: once a second, from the run loop's own count.
+        long tick = Environment.TickCount64;
+        if (tick - _speedShownAt >= 1000)
+        {
+            _speedShownAt = tick;
+            StatusSpeed.Text = _emulator.IsRomLoaded
+                ? $"speed {_emulator.SpeedPercent:0}%   •   " : "";
+        }
     }
+    private long _speedShownAt;
 
     [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint ms);

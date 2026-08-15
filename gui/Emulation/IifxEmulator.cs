@@ -37,6 +37,8 @@ public sealed class IifxEmulator : IEmulator
     private readonly Thread _worker;
     private volatile bool _stop;
     private const double FrameSeconds = 1.0 / 60.15;
+    private double _speedPercent;
+    public double SpeedPercent => Volatile.Read(ref _speedPercent);
 
     public IifxEmulator()
     {
@@ -112,7 +114,8 @@ public sealed class IifxEmulator : IEmulator
         var clock = System.Diagnostics.Stopwatch.StartNew();
         double frequency = System.Diagnostics.Stopwatch.Frequency;
         long last = clock.ElapsedTicks;
-        double accumulator = 0;
+        double accumulator = 0, speedElapsed = 0;
+        int speedFrames = 0;
 
         while (!_stop)
         {
@@ -122,6 +125,9 @@ public sealed class IifxEmulator : IEmulator
                 {
                     last = clock.ElapsedTicks;
                     accumulator = 0;
+                    speedElapsed = 0;
+                    speedFrames = 0;
+                    Volatile.Write(ref _speedPercent, 0);
                 }
             }
             if (_h == IntPtr.Zero) { Thread.Sleep(10); continue; }
@@ -131,6 +137,7 @@ public sealed class IifxEmulator : IEmulator
             last = now;
             if (elapsed > 0.25) elapsed = 0.25;
             accumulator += elapsed;
+            speedElapsed += elapsed;
 
             int frames = 0;
             while (accumulator >= FrameSeconds && frames < 4)
@@ -152,6 +159,7 @@ public sealed class IifxEmulator : IEmulator
                 }
                 accumulator -= FrameSeconds;
                 frames++;
+                speedFrames++;
             }
             if (accumulator > FrameSeconds) accumulator = FrameSeconds;
             if (frames > 0)
@@ -162,6 +170,16 @@ public sealed class IifxEmulator : IEmulator
                 // that owns the CPU, and only between frames.
                 _seat?.Pump();
                 PublishFrame();
+            }
+            // Speed over the last wall second: frames actually run against
+            // the frames a real machine would have run. Owed frames beyond the
+            // catch-up cap are dropped, so this is the honest number.
+            if (speedElapsed >= 1.0)
+            {
+                Volatile.Write(ref _speedPercent,
+                    speedFrames * FrameSeconds / speedElapsed * 100.0);
+                speedFrames = 0;
+                speedElapsed = 0;
             }
             Thread.Sleep(1);
         }

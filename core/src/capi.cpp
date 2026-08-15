@@ -559,6 +559,15 @@ struct OMacFx {
               config.videoDeclarationRom = std::move(videoRom);
               return config;
           }()) {
+        // The front end keeps the low-volume lines (disk attach/mount, driver
+        // install, GC report, guest faults). The per-access diagnostics are a
+        // boot-trace tool: the rolling formatted access log costs a snprintf
+        // on EVERY I/O access, and the device-traffic lines (one per SCSI
+        // register byte, RTC bit, SCC write, IOP mailbox step) were half a
+        // million of the 557k lines in a 45 MB session log — burying the
+        // twenty that mattered while the machine paid to format them.
+        mac.setLegacyAccessLogEnabled(false);
+        mac.setDeviceTrafficDiagnostics(false);
         mac.onDiag = [this](const char* s) {
             if (logBuf.size() < 4000) logBuf.emplace_back(s);
         };

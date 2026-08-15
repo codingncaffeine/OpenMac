@@ -170,6 +170,16 @@ public:
         legacyAccessLogEnabled_ = enabled;
         if (!enabled) accessLog_.clear();
     }
+    // Device-traffic diagnostics are the onDiag lines that scale with bus
+    // activity: one per SCSI register byte outside DataIn, per RTC bit-bang
+    // transaction, per SCC register write and per IOP mailbox/DMA step.  A
+    // boot trace wants them (they are how a stalled protocol is read); an
+    // interactive front end does not — at the desktop they are half a million
+    // formatted lines an hour that bury the mounts and guest faults it keeps.
+    void setDeviceTrafficDiagnostics(bool enabled) {
+        deviceTrafficDiag_ = enabled;
+    }
+    bool deviceTrafficDiagnostics() const { return deviceTrafficDiag_; }
     // Boot-trace aid: capture the shared SRAM after the motherboard ROM has
     // downloaded either IOP firmware image.  This exposes no Apple data unless
     // the caller explicitly supplies and runs its own ROM.
@@ -401,6 +411,7 @@ private:
 
     std::vector<std::string> accessLog_;
     bool legacyAccessLogEnabled_ = true;
+    bool deviceTrafficDiag_ = true;
     HardwareTrace hardwareTrace_;
     int traceBusDepth_ = 0;
     u32 traceLastPc_ = 0;

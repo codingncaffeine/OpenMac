@@ -144,8 +144,12 @@
                     <TextBlock Text="   " />
                     <TextBlock x:Name="StatusMachine" Text="No ROM loaded" Foreground="{StaticResource TextSecondary}" />
                 </StackPanel>
-                <TextBlock x:Name="StatusBackend" HorizontalAlignment="Right" Text="core: stub"
-                           Foreground="{StaticResource TextSecondary}" />
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <TextBlock x:Name="StatusSpeed" Text="" Foreground="{StaticResource TextSecondary}"
+                               ToolTip="Emulation speed over the last second: guest frames run against real time. 100% is a real machine." />
+                    <TextBlock x:Name="StatusBackend" Text="core: stub"
+                               Foreground="{StaticResource TextSecondary}" />
+                </StackPanel>
             </Grid>
         </Border>
 

@@ -421,7 +421,7 @@ void IifxMachine::wireDevices() {
                     // initial media status after this command completes.
                 }
             }
-            if (onDiag) {
+            if (onDiag && deviceTrafficDiag_) {
                 char text[192];
                 std::snprintf(text, sizeof text,
                     "IOP %s %s ch%d %s by %s: %02X %02X %02X %02X %02X %02X %02X %02X",
@@ -526,7 +526,7 @@ void IifxMachine::wireDevices() {
                           static_cast<unsigned>(reg));
             hardwareTrace_.record(std::move(event));
         }
-        if (!nativeStorage_ || !onDiag) return;
+        if (!nativeStorage_ || !onDiag || !deviceTrafficDiag_) return;
         char message[112];
         std::snprintf(message, sizeof message,
                       "IOP ISM DMA%d reg%u=%02X -> ctrl=%02X map=%04X count=%04X req=%d",
@@ -536,7 +536,7 @@ void IifxMachine::wireDevices() {
         onDiag(message);
     };
     rtc_->onByte = [this](const char* what, u8 value) {
-        if (!onDiag) return;
+        if (!onDiag || !deviceTrafficDiag_) return;
         char message[48];
         std::snprintf(message, sizeof message, "RTC %s=%02X pc=%08X",
                       what, value, cpu_.pc);
@@ -629,7 +629,7 @@ void IifxMachine::wireDevices() {
         if (onDiag) onDiag(message);
     };
     scc_->onDiag = [this](const char* message) {
-        if (onDiag) onDiag(message);
+        if (onDiag && deviceTrafficDiag_) onDiag(message);
     };
     disk_->onBlockIo = [this](bool write, u32 lba, const u8*, u32 length) {
         if (!onDiag) return;
@@ -2838,7 +2838,7 @@ u8 IifxMachine::ioRead8(u32 addr) {
         throw BusFault{addr, true, 1};
     }
     logAccess(name, false, addr, value);
-    if (onDiag && scsi_->diagCommands >= 8 &&
+    if (onDiag && deviceTrafficDiag_ && scsi_->diagCommands >= 8 &&
         scsi_->phase() != Ncr5380::DataIn &&
         (block == 0x08000u || block == 0x0C000u || block == 0x0E000u)) {
         char message[112];
@@ -2925,7 +2925,7 @@ void IifxMachine::ioWrite8(u32 addr, u8 value) {
         throw BusFault{addr, false, 1};
     }
     logAccess(name, true, addr, value);
-    if (onDiag && scsi_->diagCommands >= 8 &&
+    if (onDiag && deviceTrafficDiag_ && scsi_->diagCommands >= 8 &&
         scsi_->phase() != Ncr5380::DataIn &&
         (block == 0x08000u || block == 0x0C000u || block == 0x0E000u)) {
         char message[112];

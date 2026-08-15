@@ -47,6 +47,8 @@ public sealed class NativeEmulator : IEmulator
     private readonly Thread _worker;
     private volatile bool _stop;
     private const double FrameSeconds = 1.0 / 60.147;   // Mac vertical rate (22254.5/370 Hz)
+    private double _speedPercent;
+    public double SpeedPercent => Volatile.Read(ref _speedPercent);
 
     public NativeEmulator()
     {
@@ -142,6 +144,9 @@ public sealed class NativeEmulator : IEmulator
                 Thread.Sleep(10);          // idle cheaply until a ROM is loaded
                 last = sw.ElapsedTicks;    // don't bank idle time as owed frames
                 acc = 0;
+                fpsElapsed = 0;
+                fpsFrames = 0;
+                Volatile.Write(ref _speedPercent, 0);
                 continue;
             }
 
@@ -171,6 +176,7 @@ public sealed class NativeEmulator : IEmulator
             // low fps => pacing, high underruns => buffering.
             if (fpsElapsed >= 1.0)
             {
+                Volatile.Write(ref _speedPercent, fpsFrames * FrameSeconds / fpsElapsed * 100.0);
                 string audio = _audio.Ok ? _audio.Stats() : "audio: (no device)";
                 Log.Line($"perf: fps={fpsFrames / fpsElapsed:F1}  {audio}");
                 fpsFrames = 0;

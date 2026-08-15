@@ -15,6 +15,7 @@ public sealed class StubEmulator : IEmulator
 
     public bool IsRomLoaded { get; private set; }
     public string? RomPath { get; private set; }
+    public double SpeedPercent => IsRomLoaded ? 100.0 : 0.0;
     public string? FloppyPath { get; private set; }
     public bool HardDiskAttached { get; private set; }
     public string? HardDiskPath { get; private set; }

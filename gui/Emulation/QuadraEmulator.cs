@@ -63,6 +63,8 @@ public sealed class QuadraEmulator : IEmulator
     private readonly Thread _worker;
     private volatile bool _stop;
     private const double FrameSeconds = 1.0 / 60.147;
+    private double _speedPercent;
+    public double SpeedPercent => Volatile.Read(ref _speedPercent);
 
     public QuadraEmulator()
     {
@@ -147,6 +149,9 @@ public sealed class QuadraEmulator : IEmulator
                 Thread.Sleep(10);
                 last = sw.ElapsedTicks;
                 acc = 0;
+                fpsElapsed = 0;
+                fpsFrames = 0;
+                Volatile.Write(ref _speedPercent, 0);
                 continue;
             }
 
@@ -189,6 +194,7 @@ public sealed class QuadraEmulator : IEmulator
 
             if (fpsElapsed >= 1.0)
             {
+                Volatile.Write(ref _speedPercent, fpsFrames * FrameSeconds / fpsElapsed * 100.0);
                 string audio = _audio.Ok ? _audio.Stats() : "audio: (no device)";
                 Log.Line($"perf: fps={fpsFrames / fpsElapsed:F1}  {audio} loud={_loudFed}");
                 fpsFrames = 0;

@@ -16,6 +16,16 @@ public interface IEmulator : IDisposable
 
     bool IsRomLoaded { get; }
     string? RomPath { get; }
+
+    /// <summary>
+    /// Emulation speed over the last second as a percentage of real time:
+    /// guest frames actually run per wall second against the machine's own
+    /// vertical rate. 100 means real time; below it the run loop could not
+    /// keep up (frames owed are dropped, not fast-forwarded). 0 while stopped.
+    /// Measured, not felt: this is the number a slow machine is judged by.
+    /// </summary>
+    double SpeedPercent { get; }
+
     string? FloppyPath { get; }
     bool HardDiskAttached { get; }
     string? HardDiskPath { get; }
