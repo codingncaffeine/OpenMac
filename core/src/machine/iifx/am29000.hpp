@@ -42,6 +42,7 @@ public:
     }
     void clearFetchWindows() {
         for (auto& window : fetchWindows_) window = FetchWindow{};
+        fetchTranslationPage_ = nullptr;
     }
     // Direct data windows: physical ranges of plain memory backed by
     // contiguous big-endian host arrays, so an ordinary LOAD/STORE that
@@ -475,6 +476,28 @@ private:
     u32 fetchTranslationPhys_ = 0;
     u32 fetchTranslationLine_ = 0;
     int fetchTranslationSet_ = 0;
+    // Precomputed for the hint's hit path: the two TLB words whose Usage
+    // bit the hit rewrites (same value each time), the mask of in-page
+    // address bits, and -- when the whole physical page sits inside one
+    // fetch window -- the host bytes of that page, so a hit is two stores
+    // and a load with no window scan.  Derived; dropped with the hint or
+    // the windows.
+    u32 fetchTranslationTlbIndex0_ = 0;
+    u32 fetchTranslationTlbIndex1_ = 0;
+    u32 fetchTranslationUsage_ = 0;
+    u32 fetchTranslationPageMask_ = 0;
+    const u8* fetchTranslationPage_ = nullptr;
+    void resolveFetchTranslationPage() {
+        fetchTranslationPage_ = nullptr;
+        for (const FetchWindow& window : fetchWindows_) {
+            const u32 offset = fetchTranslationPhys_ - window.base;
+            if (window.data && offset < window.size &&
+                window.size - offset > fetchTranslationPageMask_) {
+                fetchTranslationPage_ = window.data + offset;
+                return;
+            }
+        }
+    }
 
     u32 m_pc = 0;
     u32 m_vab = 0;

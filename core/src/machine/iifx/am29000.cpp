@@ -313,24 +313,40 @@ u32 Am29000::read_program_word(u32 address) {
         const bool user = USER_MODE != 0;
         if (fetchTranslationValid_ && fetchTranslationVpage_ == vpage &&
             fetchTranslationUser_ == user) {
-            const u32 usage = fetchTranslationSet_ == 0 ? 2u : 0u;
-            const std::size_t line = fetchTranslationLine_;
-            m_tlb[line * 2u + 1u] = (m_tlb[line * 2u + 1u] & ~2u) | usage;
-            m_tlb[64u + line * 2u + 1u] =
-                (m_tlb[64u + line * 2u + 1u] & ~2u) | usage;
-            physicalAddress = fetchTranslationPhys_ |
-                (address & ((1u << pageShift) - 1u));
+            m_tlb[fetchTranslationTlbIndex0_] =
+                (m_tlb[fetchTranslationTlbIndex0_] & ~2u) |
+                fetchTranslationUsage_;
+            m_tlb[fetchTranslationTlbIndex1_] =
+                (m_tlb[fetchTranslationTlbIndex1_] & ~2u) |
+                fetchTranslationUsage_;
+            const u32 inPage = address & fetchTranslationPageMask_;
+            // The page's host bytes, resolved lazily: the windows may be
+            // registered (by the slow path below) only after the hint was.
+            if (!fetchTranslationPage_) resolveFetchTranslationPage();
+            if (fetchTranslationPage_ && (inPage & 3u) == 0) {
+                const u8* word = fetchTranslationPage_ + inPage;
+                return (u32(word[0]) << 24) | (u32(word[1]) << 16) |
+                       (u32(word[2]) << 8) | u32(word[3]);
+            }
+            physicalAddress = fetchTranslationPhys_ | inPage;
         } else {
             int matchingSet = -1;
             if (!translateAddress(address, Access::Instruction, user,
                                   physicalAddress, &matchingSet))
                 return 0;
+            const u32 pageMask = (1u << pageShift) - 1u;
+            const u32 line = (address >> pageShift) & 31u;
             fetchTranslationValid_ = true;
             fetchTranslationVpage_ = vpage;
             fetchTranslationUser_ = user;
-            fetchTranslationLine_ = (address >> pageShift) & 31u;
+            fetchTranslationLine_ = line;
             fetchTranslationSet_ = matchingSet;
-            fetchTranslationPhys_ = physicalAddress & ~((1u << pageShift) - 1u);
+            fetchTranslationPhys_ = physicalAddress & ~pageMask;
+            fetchTranslationTlbIndex0_ = line * 2u + 1u;
+            fetchTranslationTlbIndex1_ = 64u + line * 2u + 1u;
+            fetchTranslationUsage_ = matchingSet == 0 ? 2u : 0u;
+            fetchTranslationPageMask_ = pageMask;
+            resolveFetchTranslationPage();
         }
     }
     {
@@ -809,7 +825,10 @@ int Am29000::run(int instructionSlots) {
                                                callTracePc_.size());
                 }
             }
-            if (m_r[64] != oldRegister64) {
+            // The gr64 change ring is a chase-era probe (the phantom-memory
+            // campaign read GCOS globals through it); it costs a compare per
+            // instruction and rides the same arm flag as the other probes.
+            if (probesArmed_ && m_r[64] != oldRegister64) {
                 register64ChangePc_[register64ChangeHead_] = m_exec_pc;
                 register64ChangeIr_[register64ChangeHead_] = m_exec_ir;
                 register64ChangeOld_[register64ChangeHead_] = oldRegister64;
