@@ -248,7 +248,7 @@ int main(int argc, char** argv) {
                      "usage: openmac_trace030 <IIfx.ROM> [frames] [disk.img] [ram-mb] [floppy.img] [no-video|no-frame|frame.ppm] [input-frame dx dy] [--shutdown] [--expect-finder|--expect-app name] [--stop-on-milestone] [--native-storage] [--video-rom card.bin] [--dump-iops prefix]\n"
                      "       structured trace: --hw-trace file.jsonl [--structured-only] [--stop-on-trace] [--trace-capacity n] [--trace-post n] [--trace-mask n] [--trace-sources via,oss,biu] [--trace-address-range hex:hex] [--trace-cycle n] [--trace-pc hex --trace-pc-hits n]\n"
                      "       IOP flight/trigger: --trace-iop-flight n [--trace-iop-operation hex] [--trace-iop-block n] [--trace-iop-hits n]\n"
-                     "       replay: --load-state file.iifxstate [--save-state file.iifxstate] [--save-disk file.img] [--disk2 file.img [--disk2-read-only] [--save-disk2 file.img]] [--load-pram file [--pram-poke hex-offset:hex-byte]] [--checkpoint-cycle n] [--stop-after-checkpoint] [--verify-replay instructions] [--trace-gc-pc hex] [--trace-gc-pc-hits n] [--profile-pc-range hex:hex] [--profile-pc-limit n] [--key-at-frame n hex-adb-code up|down] [--disasm-live hex count] [--poke16 hex:value] [--invalidate-data-cache hex:size] [--dump-memory hex:size] [--dump-logical-memory hex:size] [--dump-binary hex size file] [--dump-gc-dram hex-offset hex-size file] [--dump-gc-binary hex-offset hex-size file] [--dump-gc-sram hex-offset hex-size file]\n"
+                     "       replay: --load-state file.iifxstate [--save-state file.iifxstate] [--save-disk file.img] [--disk2 file.img [--disk2-read-only] [--save-disk2 file.img]] [--gc-fast-forward] [--load-pram file [--pram-poke hex-offset:hex-byte]] [--checkpoint-cycle n] [--stop-after-checkpoint] [--verify-replay instructions] [--trace-gc-pc hex] [--trace-gc-pc-hits n] [--profile-pc-range hex:hex] [--profile-pc-limit n] [--key-at-frame n hex-adb-code up|down] [--disasm-live hex count] [--poke16 hex:value] [--invalidate-data-cache hex:size] [--dump-memory hex:size] [--dump-logical-memory hex:size] [--dump-binary hex size file] [--dump-gc-dram hex-offset hex-size file] [--dump-gc-binary hex-offset hex-size file] [--dump-gc-sram hex-offset hex-size file]\n"
                      "       media/input timing: [--floppy-at-frame n file.img]... [--eject-floppy-at-frame n]... [--input-at-frame n dx dy up|down]... [--milestone-timeout name:frames]\n"
                      "       trigger capture: --checkpoint-on-trigger file.iifxstate [--checkpoint-at-pc hex file.iifxstate]\n"
                      "       boot display capture: --frame-timeline prefix first-frame last-frame\n"
@@ -317,6 +317,7 @@ int main(int argc, char** argv) {
     const char* saveDiskPath = nullptr;
     const char* disk2Path = nullptr;
     bool disk2ReadOnly = false;
+    bool loopFastForward = false;
     const char* saveDisk2Path = nullptr;
     const char* audioDumpPath = nullptr;
     u64 checkpointCycle = 0;
@@ -454,6 +455,8 @@ int main(int argc, char** argv) {
             disk2Path = argv[++index];
         else if (option == "--disk2-read-only")
             disk2ReadOnly = true;
+        else if (option == "--gc-fast-forward")
+            loopFastForward = true;
         else if (option == "--save-disk2" && index + 1 < argc)
             saveDisk2Path = argv[++index];
         else if (option == "--dump-audio" && index + 1 < argc)
@@ -959,6 +962,7 @@ int main(int argc, char** argv) {
         }
         if (!disk.empty()) mac.insertHardDisk(std::move(disk));
     }
+    if (loopFastForward) mac.setGcLoopFastForward(true);
     if (disk2Path) {
         std::vector<u8> disk2 = loadFile(disk2Path);
         if (disk2.empty()) {

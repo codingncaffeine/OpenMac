@@ -70,6 +70,37 @@ public:
     void setInterruptHold(bool held) { interruptHold_ = held; }
     bool interruptHold() const { return interruptHold_; }
 
+    // Loop fast-forward. A short straight-line loop whose iterations are
+    // provably identical -- only pure register ops and loads of plain card
+    // memory, and the whole processor state at the loop head equal to what
+    // it was one iteration earlier -- is advanced arithmetically instead of
+    // being interpreted again: the timer and instruction count move by n,
+    // the register/pipeline state is set to what the loop leaves at that
+    // position, and nothing observable differs. GCOS's idle loop, which
+    // polls the IPC block from the moment the desktop is up, is what this
+    // catches. The host memory epoch (bumped by every host write into card
+    // memory) and the interrupt lines are what can change a loop's inputs;
+    // either one disarms it. OFF by default while one inexactness is open (see
+    // _plans: the card timer drifts by ~2050 cycles during boot); on for the
+    // idle desktop it is exact and takes the frame from 21 to 13 ms.
+    void setLoopFastForward(bool enabled) {
+        loopFastForward_ = enabled;
+        if (!enabled) loopStage_ = LoopStage::None;
+    }
+    bool loopFastForward() const { return loopFastForward_; }
+    u64 loopSkippedInstructions() const { return loopSkipped_; }
+    // Bumped by the card model for every host write into card memory.
+    void noteHostMemoryWrite() { ++hostMemoryEpoch_; }
+    // Whether the current data reads are side-effect free (no MFB cache fill
+    // in flight); the card model supplies it, the learner asks once at arm.
+    std::function<bool()> dataReadsPure;
+    // Forget any learned loop: after a checkpoint load, or a reset.
+    void loopReset() {
+        loopStage_ = LoopStage::None;
+        loopHead_ = 0;
+        loopLen_ = 0;
+    }
+
     u32 pc() const { return m_pc; }
     u32 instructionPc() const { return m_exec_pc; }
     u32 pc0() const { return m_pc0; }
@@ -511,6 +542,35 @@ private:
     std::string faultReason_;
     // Derived from the MFB +$088 latch by the video model; not serialized.
     bool interruptHold_ = false;
+
+    // ---- loop fast-forward (host-side cache; nothing here is serialized) --
+    enum class LoopStage : u8 { None, Pending, Learning, Armed };
+    struct LoopSnapshot {
+        u32 pc, exec_pc, exec_ir, next_ir, next_pc, pl_flags, next_pl_flags;
+        u32 pc0, pc1, pc2, alu, cha, chd, chc;
+        std::array<u32, 256> regs;      // learning only; W is extracted after
+    };
+    static constexpr u32 kLoopMaxLen = 16;
+    bool loopFastForward_ = false;
+    LoopStage loopStage_ = LoopStage::None;
+    u32 loopHead_ = 0;
+    u32 loopLen_ = 0;
+    u32 loopPos_ = 0;                  // instructions executed since the head
+    bool loopPure_ = true;             // no impure op seen this iteration
+    u64 loopEpoch_ = 0;                // host memory epoch the loop was armed at
+    u64 hostMemoryEpoch_ = 0;
+    u64 loopSkipped_ = 0;
+    std::array<LoopSnapshot, kLoopMaxLen> loopSnaps_{};
+    std::array<u8, 32> loopWritten_{}; // registers the loop writes (indices)
+    u32 loopWrittenCount_ = 0;
+    std::array<std::array<u32, 32>, kLoopMaxLen> loopWrittenValues_{};
+    void loopNoteJump(u32 opcode);      // called after a taken jump executes
+    void loopAtTop();                   // called at each run-loop top
+    void loopNoteExecuted(u32 opcode);  // called after each executed instruction
+    void loopNoteLoad(u32 physical, bool inputOutput);   // from LOAD
+    bool loopTrySkip(int& consumed, int slots);          // Armed and at head
+    void loopCapture(u32 position);
+    static bool pureOpcode(OpcodeFunction op);
     // Physical-register write watch (diagnostic-only, not serialized).
     u16 registerWatchIndex_ = 0xFFFFu;
     std::array<u32, 64> registerWatchPc_{};

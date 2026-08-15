@@ -207,6 +207,7 @@ void Am29000::reset(u32 resetPc) {
     m_r.fill(0);
     m_tlb.fill(0);
     fetchTranslationValid_ = false;
+    loopReset();
     m_exception_queue.fill(0);
     m_pc = resetPc;
     m_vab = m_ops = m_cha = m_chd = m_chc = 0;
@@ -601,6 +602,210 @@ void Am29000::fetch_decode() {
     else m_next_pc += 4;
 }
 
+// ---- loop fast-forward ------------------------------------------------------
+//
+// The contract: while a loop is Armed, executing n more of its instructions
+// from position p leaves the processor exactly in the state captured at
+// position (p + n) mod len, with the timer n cycles further along and the
+// instruction count n higher -- and nothing else changed. That holds when
+// every instruction of the loop is a pure register operation, a load of plain
+// card memory, or the loop's own backward jump; when the state at the loop
+// head after one iteration equals the state at the head before it (so the
+// loop is stationary: it does not count, accumulate or advance anything);
+// when no host write into card memory has happened since (the memory epoch);
+// and when no interrupt or exception can be taken. Every one of those is
+// checked; any doubt disarms and the loop is simply interpreted again.
+
+// Register operations and loads with no side effect beyond their result and
+// the ALU/channel registers the snapshot carries. Everything else -- stores,
+// special-register moves, traps, calls, register-stack ops, MUL/DIV steps
+// (the Q register), IRET, TLB ops -- disqualifies the loop.
+bool Am29000::pureOpcode(OpcodeFunction op) {
+    static const OpcodeFunction pure[] = {
+        &Am29000::CONSTN, &Am29000::CONSTH, &Am29000::CONST,
+        &Am29000::ADD, &Am29000::ADDS, &Am29000::ADDU,
+        &Am29000::ADDC, &Am29000::ADDCS, &Am29000::ADDCU,
+        &Am29000::SUB, &Am29000::SUBS, &Am29000::SUBU,
+        &Am29000::SUBC, &Am29000::SUBCS, &Am29000::SUBCU,
+        &Am29000::SUBR, &Am29000::SUBRS, &Am29000::SUBRU,
+        &Am29000::SUBRC, &Am29000::SUBRCS, &Am29000::SUBRCU,
+        &Am29000::CPEQ, &Am29000::CPNEQ, &Am29000::CPLT, &Am29000::CPLTU,
+        &Am29000::CPLE, &Am29000::CPLEU, &Am29000::CPGT, &Am29000::CPGTU,
+        &Am29000::CPGE, &Am29000::CPGEU, &Am29000::CPBYTE,
+        &Am29000::AND, &Am29000::OR, &Am29000::XOR, &Am29000::XNOR,
+        &Am29000::NOR, &Am29000::NAND, &Am29000::ANDN,
+        &Am29000::SLL, &Am29000::SRL, &Am29000::SRA, &Am29000::EXTRACT,
+        &Am29000::EXBYTE, &Am29000::EXHW, &Am29000::EXHWS,
+        &Am29000::INBYTE, &Am29000::INHW, &Am29000::CLZ,
+        &Am29000::JMP, &Am29000::JMPF, &Am29000::JMPT, &Am29000::LOAD,
+    };
+    for (const auto candidate : pure)
+        if (candidate == op) return true;
+    return false;
+}
+
+void Am29000::loopNoteJump(u32 opcode) {
+    if (!loopFastForward_ || loopStage_ != LoopStage::None) return;
+    const auto op = opTable_[opcode].opcode;
+    if (op != &Am29000::JMP && op != &Am29000::JMPF && op != &Am29000::JMPT)
+        return;
+    if (m_next_pc >= m_exec_pc) return;
+    const u32 span = m_exec_pc - m_next_pc;
+    if ((span & 3u) != 0 || span > 4u * (kLoopMaxLen - 2u)) return;
+    loopHead_ = m_next_pc;
+    loopLen_ = span / 4u + 2u;             // body through the jump, plus its delay slot
+    loopStage_ = LoopStage::Pending;
+}
+
+void Am29000::loopCapture(u32 position) {
+    LoopSnapshot& snap = loopSnaps_[position];
+    snap.pc = m_pc;
+    snap.exec_pc = m_exec_pc;
+    snap.exec_ir = m_exec_ir;
+    snap.next_ir = m_next_ir;
+    snap.next_pc = m_next_pc;
+    snap.pl_flags = m_pl_flags;
+    snap.next_pl_flags = m_next_pl_flags;
+    snap.pc0 = m_pc0;
+    snap.pc1 = m_pc1;
+    snap.pc2 = m_pc2;
+    snap.alu = m_alu;
+    snap.cha = m_cha;
+    snap.chd = m_chd;
+    snap.chc = m_chc;
+    snap.regs = m_r;
+}
+
+void Am29000::loopAtTop() {
+    if (loopStage_ == LoopStage::Pending) {
+        if (m_pc != loopHead_) return;
+        loopPos_ = 0;
+        loopPure_ = true;
+        loopCapture(0);
+        loopStage_ = LoopStage::Learning;
+        return;
+    }
+    if (loopStage_ != LoopStage::Learning) return;
+    const u32 position = (m_pc - loopHead_) / 4u;
+    if (m_pc == loopHead_) {
+        // One full iteration observed. Stationary means the head state now
+        // equals the head state then: registers, ALU, channel, pipeline.
+        const LoopSnapshot& head = loopSnaps_[0];
+        const bool stationary =
+            loopPos_ == loopLen_ && loopPure_ && head.regs == m_r &&
+            head.alu == m_alu && head.cha == m_cha && head.chd == m_chd &&
+            head.chc == m_chc && head.exec_pc == m_exec_pc &&
+            head.exec_ir == m_exec_ir && head.pl_flags == m_pl_flags &&
+            head.pc0 == m_pc0 && head.pc1 == m_pc1 && head.pc2 == m_pc2 &&
+            (!dataReadsPure || dataReadsPure());
+        if (!stationary) {
+            loopStage_ = LoopStage::None;
+            return;
+        }
+        // The registers the loop writes: any that differ between positions.
+        loopWrittenCount_ = 0;
+        for (u32 reg = 0; reg < 256u; ++reg) {
+            bool written = false;
+            for (u32 p = 1; p < loopLen_ && !written; ++p)
+                written = loopSnaps_[p].regs[reg] != head.regs[reg];
+            if (!written) continue;
+            if (loopWrittenCount_ == loopWritten_.size()) {
+                loopStage_ = LoopStage::None;      // too busy a loop to bother
+                return;
+            }
+            loopWritten_[loopWrittenCount_++] = static_cast<u8>(reg);
+        }
+        for (u32 p = 0; p < loopLen_; ++p)
+            for (u32 k = 0; k < loopWrittenCount_; ++k)
+                loopWrittenValues_[p][k] = loopSnaps_[p].regs[loopWritten_[k]];
+        loopEpoch_ = hostMemoryEpoch_;
+        loopStage_ = LoopStage::Armed;
+        return;
+    }
+    if ((m_pc & 3u) != 0 || position >= loopLen_ || position != loopPos_) {
+        loopStage_ = LoopStage::None;              // not the straight line we saw
+        return;
+    }
+    loopCapture(position);
+}
+
+void Am29000::loopNoteExecuted(u32 opcode) {
+    if (loopStage_ == LoopStage::Learning) {
+        if (!pureOpcode(opTable_[opcode].opcode)) loopPure_ = false;
+        ++loopPos_;
+        return;
+    }
+    if (loopStage_ == LoopStage::Armed &&
+        (m_exec_pc - loopHead_) >= 4u * loopLen_)
+        loopStage_ = LoopStage::None;              // the loop was left
+}
+
+void Am29000::loopNoteLoad(u32 physical, bool inputOutput) {
+    if (loopStage_ != LoopStage::Learning) return;
+    // Plain card memories only: their reads change nothing but counters. The
+    // MFB/RAMDAC/control apertures and Macintosh memory are excluded -- the
+    // former for their read side effects, the latter because the host memory
+    // epoch does not see 68030 writes.
+    const bool plain =
+        (physical - 0x41000000u) < 0x00200000u ||    // display VRAM
+        (physical - 0x42000000u) < 0x00010000u ||    // data-side SRAM
+        (physical - 0x4C000000u) < 0x00200000u ||    // GCOS DRAM
+        (physical - 0x4D000000u) < 0x00800000u ||    // expansion DRAM
+        (physical - 0x9C000000u) < 0x00200000u ||    // $9C aperture (DRAM + VRAM)
+        (physical - 0x9D000000u) < 0x00800000u;      // $9D expansion window
+    static_cast<void>(inputOutput);
+    if (!plain) loopPure_ = false;
+}
+
+bool Am29000::loopTrySkip(int& consumed, int slots) {
+    if (m_pc < loopHead_ || (m_pc - loopHead_) >= 4u * loopLen_) {
+        loopStage_ = LoopStage::None;
+        return false;
+    }
+    if (hostMemoryEpoch_ != loopEpoch_) {
+        loopStage_ = LoopStage::None;              // inputs may have changed
+        return false;
+    }
+    if (m_exceptions != 0 || m_irq_lines != 0 || interruptHold_ ||
+        FREEZE_MODE != 0 ||
+        ((m_pl_flags >> PFLAG_REFILL_HOLD_SHIFT) & PFLAG_REFILL_HOLD_MASK) != 0 ||
+        (m_tmc & TCV_RELOAD_PENDING) != 0)
+        return false;
+    if ((m_tmr & (TMR_IN | TMR_IE)) == (TMR_IN | TMR_IE) &&
+        (m_cps & CPS_DA) == 0)
+        return false;                              // a timer trap is due now
+    const u32 remaining = static_cast<u32>(slots - consumed);
+    const u32 tmc = m_tmc & TCV_MASK;
+    if (tmc < 2u || remaining == 0) return false;
+    // Stay clear of the timer reaching zero: it reloads and interrupts there,
+    // and that cycle is interpreted.
+    const u32 n = std::min(remaining, tmc - 1u);
+    const u32 position = (m_pc - loopHead_) / 4u;
+    const u32 target = (position + n) % loopLen_;
+    const LoopSnapshot& snap = loopSnaps_[target];
+    m_pc = snap.pc;
+    m_exec_pc = snap.exec_pc;
+    m_exec_ir = snap.exec_ir;
+    m_next_ir = snap.next_ir;
+    m_next_pc = snap.next_pc;
+    m_pl_flags = snap.pl_flags;
+    m_next_pl_flags = snap.next_pl_flags;
+    m_pc0 = snap.pc0;
+    m_pc1 = snap.pc1;
+    m_pc2 = snap.pc2;
+    m_alu = snap.alu;
+    m_cha = snap.cha;
+    m_chd = snap.chd;
+    m_chc = snap.chc;
+    for (u32 k = 0; k < loopWrittenCount_; ++k)
+        m_r[loopWritten_[k]] = loopWrittenValues_[target][k];
+    m_tmc = (m_tmc & ~TCV_MASK) | (tmc - n);
+    instructions_ += n;
+    loopSkipped_ += n;
+    consumed += static_cast<int>(n);
+    return true;
+}
+
 void Am29000::setInput(int input, bool asserted) {
     if (input < 0 || input >= 4) return;
     const u8 bit = static_cast<u8>(1u << input);
@@ -625,6 +830,15 @@ int Am29000::run(int instructionSlots) {
     if (instructionSlots <= 0 || faulted_) return 0;
     int consumed = 0;
     while (consumed < instructionSlots && !faulted_) {
+        // A learned, armed loop is advanced without interpretation (see
+        // loopTrySkip); one still being learned is watched at each top.
+        if (loopStage_ != LoopStage::None) {
+            if (loopStage_ == LoopStage::Armed) {
+                if (loopTrySkip(consumed, instructionSlots)) continue;
+            } else {
+                loopAtTop();
+            }
+        }
         // The Timer Facility advances on every processor cycle, independently
         // of instruction execution and the register-freeze bit.
         timer_cycle();
@@ -676,6 +890,7 @@ int Am29000::run(int instructionSlots) {
             m_next_pc = m_pc;
             m_exceptions = 0;
             m_pl_flags = 0;
+            loopStage_ = LoopStage::None;      // a handler runs: relearn after
         }
 
         const u32 queuedBeforeFetch = m_exceptions;
@@ -777,7 +992,10 @@ int Am29000::run(int instructionSlots) {
                     callTraceCount_ = std::min(callTraceCount_ + 1u,
                                                callTracePc_.size());
                 }
+                // A short backward jump is where a loop worth learning starts.
+                if (loopStage_ == LoopStage::None) loopNoteJump(opcode);
             }
+            if (loopStage_ != LoopStage::None) loopNoteExecuted(m_exec_ir >> 24);
             if (m_r[64] != oldRegister64) {
                 register64ChangePc_[register64ChangeHead_] = m_exec_pc;
                 register64ChangeIr_[register64ChangeHead_] = m_exec_ir;

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -85,6 +86,36 @@ public:
                                       static_cast<double>(total)
                                 : 0.0,
                           sorted[index].first.c_str());
+            result += line;
+        }
+        // The same samples by source line, so a hot function's cost can be
+        // placed on the statements that carry it.
+        std::unordered_map<std::string, std::uint64_t> byLine;
+        for (const auto& [address, count] : samples_) {
+            IMAGEHLP_LINE64 info{};
+            info.SizeOfStruct = sizeof info;
+            DWORD displacement = 0;
+            if (SymGetLineFromAddr64(process, address, &displacement, &info)) {
+                const char* file = info.FileName ? info.FileName : "?";
+                const char* base = std::strrchr(file, '\\');
+                char key[320];
+                std::snprintf(key, sizeof key, "%s:%lu", base ? base + 1 : file,
+                              static_cast<unsigned long>(info.LineNumber));
+                byLine[key] += count;
+            }
+        }
+        std::vector<std::pair<std::string, std::uint64_t>> lines(
+            byLine.begin(), byLine.end());
+        std::sort(lines.begin(), lines.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        result += "host profile by line:\n";
+        for (std::size_t index = 0; index < lines.size() && index < top;
+             ++index) {
+            std::snprintf(line, sizeof line, "  %6.2f%%  %s\n",
+                          total ? 100.0 * static_cast<double>(lines[index].second) /
+                                      static_cast<double>(total)
+                                : 0.0,
+                          lines[index].first.c_str());
             result += line;
         }
         SymCleanup(process);

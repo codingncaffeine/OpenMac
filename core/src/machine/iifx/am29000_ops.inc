@@ -1023,6 +1023,8 @@ void Am29000::LOAD()
 		}
 		// With CFG.DW the processor aligns sub-word data itself; SB then
 		// selects sign extension (see read_data_value).
+		if (loopStage_ == LoopStage::Learning)
+			loopNoteLoad(physical, inputOutput);
 		r = read_data_value(physical, INST_OPT_FIELD,
 			(m_cfg & CFG_DW) != 0 && INST_SB_BIT != 0, inputOutput);
 		// *DERR: the access did not complete, but its instruction RETIRES
