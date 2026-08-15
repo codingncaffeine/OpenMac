@@ -19,7 +19,11 @@ namespace openmac {
 
 class IifxStateCodec;
 
-// ADB keycodes we care about (Apple keyboard layout).
+// ADB keycodes we care about: the RAW codes an Apple ADB keyboard puts on the
+// bus, not the virtual key codes the System's KMAP turns them into. Control
+// is raw $36 (virtual $3B); the arrows are raw $3B-$3E (virtual $7B-$7E), and
+// on the Extended keyboard raw $7B/$7D/$7E are the RIGHT-hand modifiers --
+// which is what a front end that sent virtual codes was pressing.
 namespace adbkey {
 inline constexpr u8 kX = 0x07;
 inline constexpr u8 kO = 0x1F;
@@ -27,7 +31,7 @@ inline constexpr u8 kCommand = 0x37;
 inline constexpr u8 kShift   = 0x38;
 inline constexpr u8 kCapsLock = 0x39;
 inline constexpr u8 kOption  = 0x3A;
-inline constexpr u8 kControl = 0x3B;
+inline constexpr u8 kControl = 0x36;
 } // namespace adbkey
 
 class AdbTransceiver {

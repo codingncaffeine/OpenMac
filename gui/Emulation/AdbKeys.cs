@@ -2,7 +2,12 @@ using System.Windows.Input;
 
 namespace OpenMac.Gui.Emulation;
 
-/// <summary>WPF Key -> Apple ADB keycode. Partial; extend as the core needs.</summary>
+/// <summary>WPF Key -> Apple ADB keycode. Partial; extend as the core needs.
+/// These are the RAW codes the keyboard puts on the ADB bus, which the System's
+/// KMAP turns into the virtual key codes applications see -- the two differ for
+/// Control (raw $36, virtual $3B) and the arrows (raw $3B-$3E, virtual $7B-$7E).
+/// Sending the virtual codes pressed the Extended keyboard's raw $7B/$7D/$7E,
+/// its right-hand Shift/Option/Control, so the arrows acted as modifiers.</summary>
 internal static class AdbKeys
 {
     public static int Map(Key k) => k switch
@@ -19,9 +24,9 @@ internal static class AdbKeys
         Key.OemQuestion => 0x2C, Key.OemSemicolon => 0x29, Key.OemQuotes => 0x27,
         Key.OemOpenBrackets => 0x21, Key.OemCloseBrackets => 0x1E, Key.OemBackslash => 0x2A,
         Key.OemTilde => 0x32, Key.Delete => 0x75,
-        Key.Left => 0x7B, Key.Right => 0x7C, Key.Down => 0x7D, Key.Up => 0x7E,
+        Key.Left => 0x3B, Key.Right => 0x3C, Key.Down => 0x3D, Key.Up => 0x3E,
         Key.LeftShift or Key.RightShift => 0x38, Key.CapsLock => 0x39,
-        Key.LeftCtrl or Key.RightCtrl => 0x3B, Key.LeftAlt or Key.RightAlt => 0x3A,
+        Key.LeftCtrl or Key.RightCtrl => 0x36, Key.LeftAlt or Key.RightAlt => 0x3A,
         Key.LWin or Key.RWin => 0x37,
         // Keypad (the emulated keyboard reports itself as an extended ADB
         // keyboard, so the full keypad is fair game; 0x5A is unused on Apple)
