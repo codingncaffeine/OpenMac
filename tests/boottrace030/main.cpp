@@ -6,8 +6,10 @@
 #include <openmac/iifx.hpp>
 #include <openmac/debugger.hpp>
 #include <openmac/hfs.hpp>
+#include "host_sampler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -246,7 +248,7 @@ int main(int argc, char** argv) {
                      "usage: openmac_trace030 <IIfx.ROM> [frames] [disk.img] [ram-mb] [floppy.img] [no-video|no-frame|frame.ppm] [input-frame dx dy] [--shutdown] [--expect-finder|--expect-app name] [--stop-on-milestone] [--native-storage] [--video-rom card.bin] [--dump-iops prefix]\n"
                      "       structured trace: --hw-trace file.jsonl [--structured-only] [--stop-on-trace] [--trace-capacity n] [--trace-post n] [--trace-mask n] [--trace-sources via,oss,biu] [--trace-address-range hex:hex] [--trace-cycle n] [--trace-pc hex --trace-pc-hits n]\n"
                      "       IOP flight/trigger: --trace-iop-flight n [--trace-iop-operation hex] [--trace-iop-block n] [--trace-iop-hits n]\n"
-                     "       replay: --load-state file.iifxstate [--save-state file.iifxstate] [--save-disk file.img] [--load-pram file [--pram-poke hex-offset:hex-byte]] [--checkpoint-cycle n] [--stop-after-checkpoint] [--verify-replay instructions] [--trace-gc-pc hex] [--trace-gc-pc-hits n] [--profile-pc-range hex:hex] [--profile-pc-limit n] [--disasm-live hex count] [--poke16 hex:value] [--invalidate-data-cache hex:size] [--dump-memory hex:size] [--dump-logical-memory hex:size] [--dump-binary hex size file] [--dump-gc-binary hex-offset hex-size file] [--dump-gc-sram hex-offset hex-size file]\n"
+                     "       replay: --load-state file.iifxstate [--save-state file.iifxstate] [--save-disk file.img] [--load-pram file [--pram-poke hex-offset:hex-byte]] [--checkpoint-cycle n] [--stop-after-checkpoint] [--verify-replay instructions] [--trace-gc-pc hex] [--trace-gc-pc-hits n] [--profile-pc-range hex:hex] [--profile-pc-limit n] [--key-at-frame n hex-adb-code up|down] [--disasm-live hex count] [--poke16 hex:value] [--invalidate-data-cache hex:size] [--dump-memory hex:size] [--dump-logical-memory hex:size] [--dump-binary hex size file] [--dump-gc-dram hex-offset hex-size file] [--dump-gc-binary hex-offset hex-size file] [--dump-gc-sram hex-offset hex-size file]\n"
                      "       media/input timing: [--floppy-at-frame n file.img]... [--eject-floppy-at-frame n]... [--input-at-frame n dx dy up|down]... [--milestone-timeout name:frames]\n"
                      "       trigger capture: --checkpoint-on-trigger file.iifxstate [--checkpoint-at-pc hex file.iifxstate]\n"
                      "       boot display capture: --frame-timeline prefix first-frame last-frame\n"
@@ -300,6 +302,7 @@ int main(int argc, char** argv) {
     hardwareTraceConfig.postTriggerEvents = 16384;
     bool structuredOnly = false;
     bool quiet = false;
+    bool hostProfile = false;
     bool printCpuState = false;
     bool stopOnTrace = false;
     bool shutdown = false;
@@ -321,6 +324,29 @@ int main(int argc, char** argv) {
     u32 profilePcFirst = 0;
     u32 profilePcLast = 0;
     bool profilePcRange = false;
+    u32 profileGcFirst = 0;
+    u32 profileGcLast = 0;
+    bool profileGcRange = false;
+    u32 tapGcFirst = 0;
+    u32 tapGcLast = 0;
+    bool tapGcRange = false;
+    u32 tapGcAddrFirst = 0;
+    u32 tapGcAddrLast = 0;
+    bool tapGcAddrRange = false;
+    bool tapGcAddrWritesOnly = false;
+    u32 watchGcRegister = 0;
+    bool watchGcRegisterEnabled = false;
+    u32 watchGcVram = 0;
+    bool watchGcVramEnabled = false;
+    u32 snapGcPc = 0;
+    u32 snapGcRegister = 0;
+    bool snapGcEnabled = false;
+    u64 flightGcStart = 0;
+    u64 flightGcCount = 0;
+    u32 flightGcRegister = 0;
+    const char* flightGcPath = nullptr;
+    u32 watchGcDoorbell = 0;
+    bool watchGcDoorbellEnabled = false;
     std::size_t profilePcLimit = 64;
     std::vector<u64> profilePcCounts;
     const char* iopDumpPrefix = nullptr;
@@ -338,6 +364,25 @@ int main(int argc, char** argv) {
         bool button = false;
     };
     std::vector<InputEvent> inputEvents;
+    struct KeyEvent {
+        int frame = 0;
+        u8 adbCode = 0;
+        bool down = false;
+    };
+    std::vector<KeyEvent> keyEvents;
+    // Closed-loop mouse positioning: from `frame` on, nudge the mouse a few
+    // pixels per frame toward (x, y) as reported by the guest's low-memory
+    // Mouse global ($830: v, h) until it lands there.  Relative motion alone
+    // cannot place the pointer because System 7 accelerates fast moves.
+    struct MouseGoto {
+        int frame = 0;
+        int x = 0;
+        int y = 0;
+        bool active = false;
+        bool done = false;
+        bool button = false;
+    };
+    std::vector<MouseGoto> mouseGotos;
     const char* triggerCheckpointPath = nullptr;
     const char* pcCheckpointPath = nullptr;
     u32 pcCheckpointAddress = 0;
@@ -348,12 +393,14 @@ int main(int argc, char** argv) {
     std::vector<MemoryRange> dataCacheInvalidations;
     struct BinaryMemoryDump { u32 address; u32 size; std::string path; };
     std::vector<BinaryMemoryDump> binaryMemoryDumps;
+    std::vector<BinaryMemoryDump> gcDataMemoryDumps;
     std::vector<BinaryMemoryDump> gcBinaryMemoryDumps;
     std::vector<BinaryMemoryDump> gcSramBinaryMemoryDumps;
     struct MemoryPoke16 { u32 address; u16 value; };
     std::vector<MemoryPoke16> memoryPokes16;
     struct PramPoke { u8 offset; u8 value; };
     std::vector<PramPoke> pramPokes;
+    std::vector<u8> pramOverride;
     struct MilestoneDeadline {
         std::string name;
         u64 frames = 0;
@@ -372,6 +419,8 @@ int main(int argc, char** argv) {
             structuredOnly = true;
         else if (option == "--quiet")
             quiet = true;
+        else if (option == "--host-profile")
+            hostProfile = true;
         else if (option == "--cpu-state")
             printCpuState = true;
         else if (option == "--stop-on-trace")
@@ -423,6 +472,97 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if ((option == "--tap-gc-addr-range" ||
+                  option == "--tap-gc-addr-writes") && index + 1 < argc) {
+            if (!parseTraceAddressRange(argv[++index], tapGcAddrFirst,
+                                        tapGcAddrLast) ||
+                tapGcAddrLast <= tapGcAddrFirst) {
+                std::fprintf(stderr,
+                    "%s requires hex-first:hex-last\n", option.c_str());
+                return 2;
+            }
+            tapGcAddrRange = true;
+            tapGcAddrWritesOnly = option == "--tap-gc-addr-writes";
+        }
+        else if (option == "--watch-gc-doorbell" && index + 1 < argc) {
+            char* end = nullptr;
+            const unsigned long value = std::strtoul(argv[++index], &end, 16);
+            if (!end || *end != '\0' || value > 0xFFFFFFFFul) {
+                std::fprintf(stderr,
+                    "--watch-gc-doorbell requires a hexadecimal address\n");
+                return 2;
+            }
+            watchGcDoorbell = static_cast<u32>(value);
+            watchGcDoorbellEnabled = true;
+        }
+        else if (option == "--watch-gc-vram" && index + 1 < argc) {
+            char* end = nullptr;
+            const unsigned long value = std::strtoul(argv[++index], &end, 16);
+            if (!end || *end != 0 || value > 0xFFFFFFFFul) {
+                std::fprintf(stderr,
+                    "--watch-gc-vram requires a hexadecimal VRAM offset\n");
+                return 2;
+            }
+            watchGcVram = static_cast<u32>(value);
+            watchGcVramEnabled = true;
+        }
+        else if (option == "--watch-gc-register" && index + 1 < argc) {
+            char* end = nullptr;
+            const unsigned long value = std::strtoul(argv[++index], &end, 16);
+            if (!end || *end != '\0' || value > 0xFFul) {
+                std::fprintf(stderr,
+                    "--watch-gc-register requires a hex physical register "
+                    "0-FF\n");
+                return 2;
+            }
+            watchGcRegister = static_cast<u32>(value);
+            watchGcRegisterEnabled = true;
+        }
+        else if (option == "--snap-gc-pc" && index + 1 < argc) {
+            if (!parseHexPair(argv[++index], snapGcPc, snapGcRegister) ||
+                snapGcPc == 0 || snapGcRegister > 0xFFu) {
+                std::fprintf(stderr,
+                    "--snap-gc-pc requires hex-pc:hex-architectural-register "
+                    "(0-7F gr, 80-FF lr)\n");
+                return 2;
+            }
+            snapGcEnabled = true;
+        }
+        else if (option == "--flight-gc" && index + 4 < argc) {
+            flightGcStart = parseU64(argv[++index]);
+            flightGcCount = parseU64(argv[++index]);
+            char* end = nullptr;
+            const unsigned long reg = std::strtoul(argv[++index], &end, 16);
+            flightGcPath = argv[++index];
+            if (!end || *end != '\0' || reg > 0xFFul || flightGcCount == 0 ||
+                flightGcCount > (1ul << 20)) {
+                std::fprintf(stderr,
+                    "--flight-gc requires start-instr count hex-physical-"
+                    "register file (count <= 1M)\n");
+                return 2;
+            }
+            flightGcRegister = static_cast<u32>(reg);
+        }
+        else if (option == "--tap-gc-pc-range" && index + 1 < argc) {
+            if (!parseTraceAddressRange(argv[++index], tapGcFirst,
+                                        tapGcLast) || tapGcLast <= tapGcFirst) {
+                std::fprintf(stderr,
+                    "--tap-gc-pc-range requires hex-first:hex-last\n");
+                return 2;
+            }
+            tapGcRange = true;
+        }
+        else if (option == "--profile-gc-range" && index + 1 < argc) {
+            if (!parseTraceAddressRange(argv[++index], profileGcFirst,
+                                        profileGcLast) ||
+                profileGcLast <= profileGcFirst ||
+                profileGcLast - profileGcFirst > 0x00400000u) {
+                std::fprintf(stderr,
+                    "--profile-gc-range requires hex-first:hex-last spanning at most 4 MiB\n");
+                return 2;
+            }
+            profileGcRange = true;
+        }
         else if (option == "--profile-pc-range" && index + 1 < argc) {
             if (!parseTraceAddressRange(argv[++index], profilePcFirst,
                                         profilePcLast) ||
@@ -472,6 +612,36 @@ int main(int argc, char** argv) {
             event.button = button == "down";
             inputEvents.push_back(event);
         }
+        else if ((option == "--mouse-goto-at-frame" ||
+                  option == "--mouse-drag-to-at-frame") && index + 3 < argc) {
+            MouseGoto target;
+            target.frame = std::atoi(argv[++index]);
+            target.x = std::atoi(argv[++index]);
+            target.y = std::atoi(argv[++index]);
+            target.button = option == "--mouse-drag-to-at-frame";
+            if (target.frame < 0 || target.x < 0 || target.y < 0) {
+                std::fprintf(stderr,
+                    "%s requires non-negative frame x y\n", option.c_str());
+                return 2;
+            }
+            mouseGotos.push_back(target);
+        }
+        else if (option == "--key-at-frame" && index + 3 < argc) {
+            KeyEvent event;
+            event.frame = std::atoi(argv[++index]);
+            char* end = nullptr;
+            const unsigned long code = std::strtoul(argv[++index], &end, 16);
+            const std::string state = argv[++index];
+            if (event.frame < 0 || !end || *end != '\0' || code > 0x7Ful ||
+                (state != "up" && state != "down")) {
+                std::fprintf(stderr,
+                    "--key-at-frame requires non-negative n hex-adb-code up|down\n");
+                return 2;
+            }
+            event.adbCode = static_cast<u8>(code);
+            event.down = state == "down";
+            keyEvents.push_back(event);
+        }
         else if (option == "--checkpoint-on-trigger" && index + 1 < argc)
             triggerCheckpointPath = argv[++index];
         else if (option == "--checkpoint-at-pc" && index + 2 < argc) {
@@ -509,6 +679,7 @@ int main(int argc, char** argv) {
                 {address, size, option == "--dump-logical-memory"});
         }
         else if ((option == "--dump-binary" ||
+                  option == "--dump-gc-dram" ||
                   option == "--dump-gc-binary" ||
                   option == "--dump-gc-sram") && index + 3 < argc) {
             char* addressEnd = nullptr;
@@ -526,10 +697,12 @@ int main(int argc, char** argv) {
                     option.c_str());
                 return 2;
             }
-            auto& dumps = option == "--dump-gc-binary"
-                ? gcBinaryMemoryDumps
-                : option == "--dump-gc-sram"
-                    ? gcSramBinaryMemoryDumps : binaryMemoryDumps;
+            auto& dumps = option == "--dump-gc-dram"
+                ? gcDataMemoryDumps
+                : option == "--dump-gc-binary"
+                    ? gcBinaryMemoryDumps
+                    : option == "--dump-gc-sram"
+                        ? gcSramBinaryMemoryDumps : binaryMemoryDumps;
             dumps.push_back({static_cast<u32>(addressValue),
                              static_cast<u32>(sizeValue), path});
         }
@@ -704,23 +877,32 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (loadPramPath) {
-        std::vector<u8> pram = loadFile(loadPramPath);
-        if (pram.size() != mac.savePram(nullptr, 0)) {
+        pramOverride = loadFile(loadPramPath);
+        if (pramOverride.size() != mac.savePram(nullptr, 0)) {
             std::fprintf(stderr, "invalid PRAM blob: %s (%zu bytes)\n",
-                         loadPramPath, pram.size());
+                         loadPramPath, pramOverride.size());
             return 2;
         }
         for (const PramPoke& poke : pramPokes)
-            pram[8u + poke.offset] = poke.value;
-        if (!mac.loadPram(pram.data(), static_cast<u32>(pram.size()))) {
+            pramOverride[8u + poke.offset] = poke.value;
+    }
+    const auto applyPramOverride = [&]() {
+        if (!loadPramPath) return true;
+        if (!mac.loadPram(pramOverride.data(),
+                          static_cast<u32>(pramOverride.size()))) {
             std::fprintf(stderr, "PRAM load rejected: %s\n", loadPramPath);
-            return 2;
+            return false;
         }
         std::printf("PRAM loaded: %s", loadPramPath);
         for (const PramPoke& poke : pramPokes)
             std::printf(" [%02X=%02X]", poke.offset, poke.value);
         std::printf("\n");
-    }
+        return true;
+    };
+    // A checkpoint contains the complete RTC/XPRAM state. Defer an explicit
+    // command-line override until after that checkpoint is restored so the
+    // user's later, more specific option cannot be silently discarded.
+    if (!loadStatePath && !applyPramOverride()) return 2;
 
     if (disassembleOnly) {
         if (argc < 4) {
@@ -810,7 +992,26 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(
                         mac.diagnosticMediaEventId()));
     }
+    if (loadStatePath && !applyPramOverride()) return 2;
     if (traceGcPcEnabled) mac.diagnosticSetGcProcessorPcWatch(traceGcPc);
+    if (profileGcRange)
+        mac.diagnosticSetGcProcessorProfileRange(profileGcFirst,
+                                                 profileGcLast);
+    if (tapGcRange) mac.diagnosticSetGcPcTapRange(tapGcFirst, tapGcLast);
+    if (tapGcAddrRange)
+        mac.diagnosticSetGcAddrTapRange(tapGcAddrFirst, tapGcAddrLast,
+                                        tapGcAddrWritesOnly);
+    if (watchGcDoorbellEnabled)
+        mac.diagnosticSetGcDoorbellWatch(watchGcDoorbell);
+    if (watchGcRegisterEnabled)
+        mac.diagnosticSetGcRegisterWatch(static_cast<u16>(watchGcRegister));
+    if (watchGcVramEnabled) mac.diagnosticSetGcVramWatch(watchGcVram);
+    if (snapGcEnabled)
+        mac.diagnosticSetGcPcSnap(snapGcPc,
+                                  static_cast<u16>(snapGcRegister));
+    if (flightGcPath)
+        mac.diagnosticSetGcFlightWindow(flightGcStart, flightGcCount,
+                                        static_cast<u16>(flightGcRegister));
     // A replay begins a new diagnostic capture. Old checkpoints predate
     // correlation IDs, so start its event namespace cleanly only when a new
     // physical insertion is staged; otherwise the restored medium remains the
@@ -942,11 +1143,11 @@ int main(int argc, char** argv) {
     };
     int deviceBudget = 48;
     int iopDeviceBudget = 4096;
-    int nubusBudget = 160;
-    int gcRegisterBudget = 320;
+    int nubusBudget = 400000;
+    int gcRegisterBudget = 400000;
     int lowMemoryBudget = 0;
     int scsiBudget = 120;
-    int rtcBudget = 48;
+    int rtcBudget = 400000;
     mac.onDiag = [&](const char* message) {
         if (structuredOnly || quiet) return;
         const bool iop = std::string(message).find("IOP ") != std::string::npos;
@@ -1520,6 +1721,26 @@ int main(int argc, char** argv) {
             if (stopOnTrace && mac.hardwareTrace().frozen()) break;
         }
     } else {
+        HostSampler hostSampler;
+        if (hostProfile) hostSampler.start();
+        const auto frameLoopStart = std::chrono::steady_clock::now();
+        struct SamplerStop {
+            HostSampler& sampler;
+            bool enabled;
+            std::chrono::steady_clock::time_point start;
+            int framesRequested;
+            ~SamplerStop() {
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count();
+                std::printf("frame loop wall: %.3f s for %d frames (%.2f ms/frame)\n",
+                            seconds, framesRequested,
+                            framesRequested > 0 ? seconds * 1000.0 / framesRequested
+                                                : 0.0);
+                if (!enabled) return;
+                sampler.stop();
+                std::printf("%s", sampler.report().c_str());
+            }
+        } samplerStop{hostSampler, hostProfile, frameLoopStart, frames};
         for (int frame = 0; frame < frames; ++frame) {
             for (FloppyEvent& event : floppyEvents) {
                 if (event.frame != frame) continue;
@@ -1553,6 +1774,46 @@ int main(int argc, char** argv) {
                 std::printf("input event: frame=%d mouse=%d,%d button=%s\n",
                             frame, event.dx, event.dy,
                             event.button ? "down" : "up");
+            }
+            for (MouseGoto& target : mouseGotos) {
+                if (target.done || frame < target.frame) continue;
+                const int guestV = static_cast<int>(
+                    static_cast<int16_t>((mac.read8(0x830u) << 8) |
+                                         mac.read8(0x831u)));
+                const int guestH = static_cast<int>(
+                    static_cast<int16_t>((mac.read8(0x832u) << 8) |
+                                         mac.read8(0x833u)));
+                const int dx = target.x - guestH;
+                const int dy = target.y - guestV;
+                if (dx == 0 && dy == 0) {
+                    target.done = true;
+                    std::printf("mouse goto reached: frame=%d at %d,%d%s\n",
+                                frame, guestH, guestV,
+                                target.button ? " (button held)" : "");
+                    continue;
+                }
+                const auto step = [](int delta) {
+                    if (delta > 3) return 2;
+                    if (delta < -3) return -2;
+                    return delta > 0 ? 1 : delta < 0 ? -1 : 0;
+                };
+                mac.mouseMove(step(dx), step(dy), target.button);
+                if (!target.active) {
+                    target.active = true;
+                    std::printf("mouse goto started: frame=%d from %d,%d to "
+                                "%d,%d\n", frame, guestH, guestV, target.x,
+                                target.y);
+                }
+                break; // one goto drives the pointer at a time
+            }
+            for (const KeyEvent& event : keyEvents) {
+                if (event.frame != frame) continue;
+                adbTraceBudget = 96;
+                iopDeviceBudget = 96;
+                mac.keyEvent(event.adbCode, event.down);
+                std::printf("key event: frame=%d adb=%02X state=%s\n",
+                            frame, event.adbCode,
+                            event.down ? "down" : "up");
             }
             try {
                 const u64 targetFrame = mac.frameCount() + 1;
@@ -1781,6 +2042,24 @@ int main(int argc, char** argv) {
             bytes[offset] = mac.read8(dump.address + offset);
         saveBinary(bytes, dump.path);
     }
+    for (const BinaryMemoryDump& dump : gcDataMemoryDumps) {
+        const std::vector<u8> bytes =
+            mac.diagnosticGcDataMemory(dump.address, dump.size);
+        if (bytes.size() != dump.size) {
+            std::fprintf(stderr,
+                "invalid GC data-memory dump range: %08X:%X\n",
+                dump.address, dump.size);
+            return 2;
+        }
+        saveBinary(bytes, dump.path);
+    }
+    if (flightGcPath) {
+        if (mac.diagnosticWriteGcFlight(flightGcPath))
+            std::printf("flight recorder saved: %s\n", flightGcPath);
+        else
+            std::fprintf(stderr, "flight recorder write failed: %s\n",
+                         flightGcPath);
+    }
     for (const BinaryMemoryDump& dump : gcBinaryMemoryDumps) {
         const std::vector<u8> bytes =
             mac.diagnosticGcExpansionMemory(dump.address, dump.size);
@@ -1931,6 +2210,17 @@ int main(int argc, char** argv) {
                     mac.hardwareTrace().frozen() ? 1 : 0,
                     mac.hardwareTrace().triggerReason().c_str());
         if (!saved) return 2;
+    }
+    if (profileGcRange) {
+        const auto sites = mac.diagnosticGcProcessorProfile(profilePcLimit);
+        u64 total = 0;
+        for (const auto& site : sites) total += site.first;
+        std::printf("GC profile %08X:%08X top %zu sites (%llu counted):\n",
+                    profileGcFirst, profileGcLast, sites.size(),
+                    static_cast<unsigned long long>(total));
+        for (const auto& site : sites)
+            std::printf("  %08X %llu\n", site.second,
+                        static_cast<unsigned long long>(site.first));
     }
     if (profilePcRange) {
         std::vector<std::pair<u64, u32>> sites;
