@@ -1212,10 +1212,16 @@ void IifxMachine::serviceSwimSurface() {
     swimActionPrev_ = action;
 
     if (!action || !floppyDrive_->hasDisk()) {
-        ismIop_->setDmaRequest(0, false);
-        ismIop_->setDmaRequest(1, false);
+        // The requests are already down after the first idle pass; the two
+        // deassertions are idempotent, so skipping them is exact.
+        if (!swimDmaIdle_) {
+            ismIop_->setDmaRequest(0, false);
+            ismIop_->setDmaRequest(1, false);
+            swimDmaIdle_ = true;
+        }
         return;
     }
+    swimDmaIdle_ = false;
 
     if (!swim_->ismWriting()) {
         while (swim_->ismFifoOccupancy() < 2u) {

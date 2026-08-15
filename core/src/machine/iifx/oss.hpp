@@ -106,15 +106,21 @@ public:
     }
 
     int ipl() const {
-        const u16 active = pending();
-        int result = 0;
-        for (int source = 0; source < 16; ++source) {
-            if (active & (1u << source)) {
-                const int p = priority_[source] & 7;
-                if (p > result) result = p;
+        // Recomputed only after a level, latch or priority change; the machine
+        // asks after every 68030 instruction.
+        if (iplDirty_) {
+            const u16 active = pending();
+            int result = 0;
+            for (int source = 0; source < 16; ++source) {
+                if (active & (1u << source)) {
+                    const int p = priority_[source] & 7;
+                    if (p > result) result = p;
+                }
             }
+            cachedIpl_ = result;
+            iplDirty_ = false;
         }
-        return result;
+        return cachedIpl_;
     }
 
     u8 romControl() const { return romControl_; }
@@ -123,13 +129,18 @@ public:
 private:
     friend class IifxStateCodec;
 
-    void changed() { if (onInterruptChange) onInterruptChange(); }
+    void changed() {
+        iplDirty_ = true;
+        if (onInterruptChange) onInterruptChange();
+    }
 
     std::array<u8, 16> priority_{};
     u16 levelMask_ = 0;
     u16 latchMask_ = 0;
     u8 romControl_ = 0;
     bool poweredOff_ = false;
+    mutable bool iplDirty_ = true;
+    mutable int cachedIpl_ = 0;
 };
 
 } // namespace openmac

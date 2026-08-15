@@ -333,9 +333,20 @@ u32 Am29000::read_program_word(u32 address) {
             fetchTranslationPhys_ = physicalAddress & ~((1u << pageShift) - 1u);
         }
     }
-    for (const FetchWindow& window : fetchWindows_) {
+    {
+        const FetchWindow& window = fetchWindows_[lastFetchWindow_];
         const u32 offset = physicalAddress - window.base;
         if (window.data && offset < window.size && (offset & 3u) == 0) {
+            const u8* word = window.data + offset;
+            return (u32(word[0]) << 24) | (u32(word[1]) << 16) |
+                   (u32(word[2]) << 8) | u32(word[3]);
+        }
+    }
+    for (std::size_t index = 0; index < fetchWindows_.size(); ++index) {
+        const FetchWindow& window = fetchWindows_[index];
+        const u32 offset = physicalAddress - window.base;
+        if (window.data && offset < window.size && (offset & 3u) == 0) {
+            lastFetchWindow_ = index;
             const u8* word = window.data + offset;
             return (u32(word[0]) << 24) | (u32(word[1]) << 16) |
                    (u32(word[2]) << 8) | u32(word[3]);
@@ -673,44 +684,50 @@ int Am29000::run(int instructionSlots) {
         const u32 queuedByFetch = m_exceptions - queuedBeforeFetch;
         if ((m_pl_flags & PFLAG_EXECUTE_EN) != 0) {
             if (!FREEZE_MODE) m_pc2 = m_pc1;
-            if (!diagnosticProfileCounts_.empty() &&
-                m_exec_pc >= diagnosticProfileFirst_) {
-                const std::size_t slot =
-                    (m_exec_pc - diagnosticProfileFirst_) >> 2u;
-                if (slot < diagnosticProfileCounts_.size())
-                    ++diagnosticProfileCounts_[slot];
-            }
             recentPc_[recentHead_] = m_exec_pc;
             recentIr_[recentHead_] = m_exec_ir;
             recentHead_ = (recentHead_ + 1u) & (recentPc_.size() - 1u);
             recentCount_ = std::min(recentCount_ + 1u, recentPc_.size());
-            if (m_exec_pc == diagnosticWatchPc_) {
-                ++diagnosticWatchHits_;
-                if (diagnosticWatchHitCount_ <
-                    diagnosticWatchHitInstructions_.size())
-                    diagnosticWatchHitInstructions_[
-                        diagnosticWatchHitCount_++] = instructions_;
-            }
-            if (flightCount_ != 0 && instructions_ >= flightStart_ &&
-                instructions_ < flightStart_ + flightCount_) {
-                flight_.push_back({instructions_, m_exec_pc, m_r[1],
-                                   m_r[126], m_r[127],
-                                   m_r[flightWatchIndex_ & 0xFFu]});
-            }
-            if (pcSnapPc_ != 0 && m_exec_pc == pcSnapPc_) {
-                pcSnapInstruction_[pcSnapHead_] = instructions_;
-                pcSnapGr1_[pcSnapHead_] = m_r[1];
-                pcSnapValue_[pcSnapHead_] =
-                    registerValue(pcSnapRegister_);
-                pcSnapGr126_[pcSnapHead_] = m_r[126];
-                pcSnapGr127_[pcSnapHead_] = m_r[127];
-                pcSnapHead_ = (pcSnapHead_ + 1u) &
-                              (pcSnapInstruction_.size() - 1u);
-                pcSnapCount_ = std::min(pcSnapCount_ + 1u,
-                                        pcSnapInstruction_.size());
+            // The optional probes are one branch when nothing is armed; the
+            // recent-instruction and call-trace rings above and below stay
+            // on, they are the flight recorder every card fault was read from.
+            if (probesArmed_) {
+                if (!diagnosticProfileCounts_.empty() &&
+                    m_exec_pc >= diagnosticProfileFirst_) {
+                    const std::size_t slot =
+                        (m_exec_pc - diagnosticProfileFirst_) >> 2u;
+                    if (slot < diagnosticProfileCounts_.size())
+                        ++diagnosticProfileCounts_[slot];
+                }
+                if (m_exec_pc == diagnosticWatchPc_) {
+                    ++diagnosticWatchHits_;
+                    if (diagnosticWatchHitCount_ <
+                        diagnosticWatchHitInstructions_.size())
+                        diagnosticWatchHitInstructions_[
+                            diagnosticWatchHitCount_++] = instructions_;
+                }
+                if (flightCount_ != 0 && instructions_ >= flightStart_ &&
+                    instructions_ < flightStart_ + flightCount_) {
+                    flight_.push_back({instructions_, m_exec_pc, m_r[1],
+                                       m_r[126], m_r[127],
+                                       m_r[flightWatchIndex_ & 0xFFu]});
+                }
+                if (pcSnapPc_ != 0 && m_exec_pc == pcSnapPc_) {
+                    pcSnapInstruction_[pcSnapHead_] = instructions_;
+                    pcSnapGr1_[pcSnapHead_] = m_r[1];
+                    pcSnapValue_[pcSnapHead_] =
+                        registerValue(pcSnapRegister_);
+                    pcSnapGr126_[pcSnapHead_] = m_r[126];
+                    pcSnapGr127_[pcSnapHead_] = m_r[127];
+                    pcSnapHead_ = (pcSnapHead_ + 1u) &
+                                  (pcSnapInstruction_.size() - 1u);
+                    pcSnapCount_ = std::min(pcSnapCount_ + 1u,
+                                            pcSnapInstruction_.size());
+                }
             }
             const u32 oldRegister64 = m_r[64];
-            const bool watchingRegister = registerWatchIndex_ < m_r.size();
+            const bool watchingRegister =
+                probesArmed_ && registerWatchIndex_ < m_r.size();
             const u32 oldWatched =
                 watchingRegister ? m_r[registerWatchIndex_] : 0u;
             (this->*opTable_[m_exec_ir >> 24].opcode)();

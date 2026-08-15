@@ -374,6 +374,7 @@ private:
     s64 floppyEventRetryCycles_ = 0;
     bool swimLstrbPrev_ = false;
     bool swimActionPrev_ = false;
+    bool swimDmaIdle_ = false;
     bool swimWriteMarkPrev_ = false;
     bool swimReadMarkPrev_ = false;
     bool swimReadSynced_ = false;

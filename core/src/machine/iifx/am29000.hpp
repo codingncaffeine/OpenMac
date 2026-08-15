@@ -97,6 +97,7 @@ public:
     // writer pcs and values.  0xFFFF disables.  Diagnostic-only.
     void setDiagnosticRegisterWatch(u16 physicalIndex) {
         registerWatchIndex_ = physicalIndex;
+        refreshProbeFlag();
     }
     std::size_t diagnosticRegisterWatchCount() const {
         return registerWatchCount_;
@@ -127,6 +128,7 @@ public:
     void setDiagnosticPcSnap(u32 pc, u16 architecturalIndex) {
         pcSnapPc_ = pc;
         pcSnapRegister_ = architecturalIndex;
+        refreshProbeFlag();
     }
     // Flight recorder: capture pc/gr1/gr126/gr127 + one PHYSICAL register
     // for every instruction in [start, start+count).  Diagnostic-only.
@@ -140,6 +142,7 @@ public:
         flightWatchIndex_ = physicalIndex;
         flight_.clear();
         if (count != 0 && count <= (1u << 20)) flight_.reserve(count);
+        refreshProbeFlag();
     }
     const std::vector<FlightEntry>& diagnosticFlight() const {
         return flight_;
@@ -271,6 +274,7 @@ public:
         diagnosticWatchPc_ = pc;
         diagnosticWatchHits_ = 0;
         diagnosticWatchHitCount_ = 0;
+        refreshProbeFlag();
     }
     // Instruction numbers of the first 32 watched-pc hits.
     std::size_t diagnosticPcWatchHitCount() const {
@@ -284,6 +288,7 @@ public:
         diagnosticProfileFirst_ = first;
         diagnosticProfileCounts_.assign(
             (static_cast<std::size_t>(last - first) >> 2u) + 1u, 0);
+        refreshProbeFlag();
     }
     u32 diagnosticProfileFirst() const { return diagnosticProfileFirst_; }
     const std::vector<u64>& diagnosticProfileCounts() const {
@@ -388,6 +393,10 @@ private:
     DataSpace m_data{this};
     std::array<u32, 256> m_r{};
     std::array<FetchWindow, kFetchWindows> fetchWindows_{};
+    // The window the last fetch hit is tried first: code runs for long
+    // stretches inside one memory (GCOS in the D expansion DRAM, the kernel
+    // in SRAM), and it is the last-registered window that GCOS lives in.
+    std::size_t lastFetchWindow_ = 0;
     std::array<u32, 128> m_tlb{};
     // Instruction-fetch translation hint (see read_program_word).  Not
     // architectural state: derived from m_tlb, dropped on any TLB/MMU write.
@@ -439,6 +448,16 @@ private:
     // Trace-only watch state. This is deliberately excluded from save states
     // so replay checkpoints remain independent of the front end's trigger.
     u32 diagnosticWatchPc_ = 0xFFFFFFFFu;
+    // True while any optional per-instruction probe (pc watch, profile,
+    // flight recorder, pc snapshot, register watch, gr64 change ring) is
+    // armed; the always-on flight rings (recent instructions, call trace)
+    // do not depend on it. Recomputed by the probes' setters.
+    bool probesArmed_ = false;
+    void refreshProbeFlag() {
+        probesArmed_ = diagnosticWatchPc_ != 0xFFFFFFFFu ||
+                       !diagnosticProfileCounts_.empty() || flightCount_ != 0 ||
+                       pcSnapPc_ != 0 || registerWatchIndex_ < 256u;
+    }
     u64 diagnosticWatchHits_ = 0;
     std::array<u64, 32> diagnosticWatchHitInstructions_{};
     std::size_t diagnosticWatchHitCount_ = 0;

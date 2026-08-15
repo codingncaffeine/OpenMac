@@ -588,6 +588,7 @@ private:
         io.bytes(oss.priority_.data(), oss.priority_.size());
         io.u16v(oss.levelMask_); io.u16v(oss.latchMask_);
         io.u8v(oss.romControl_); io.boolv(oss.poweredOff_);
+        oss.iplDirty_ = true;   // the cached level belongs to the old state
     }
 
     template <typename Io>
@@ -1079,6 +1080,9 @@ private:
         io.boolv(machine.floppyReadOnly_); io.boolv(machine.floppyServiceReady_);
         io.s64v(machine.floppyEventRetryCycles_);
         io.boolv(machine.swimLstrbPrev_); io.boolv(machine.swimActionPrev_);
+        // A host-side skip flag, not machine state: a loaded checkpoint may
+        // carry live SWIM DMA requests, so the next idle pass must clear them.
+        if (io.applying()) machine.swimDmaIdle_ = false;
         io.boolv(machine.swimWriteMarkPrev_); io.boolv(machine.swimReadMarkPrev_);
         if (stateVersion >= 3) {
             io.boolv(machine.swimReadSynced_);
