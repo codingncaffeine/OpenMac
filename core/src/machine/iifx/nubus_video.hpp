@@ -54,9 +54,16 @@ public:
     static constexpr u32 kGcVectorBytes = 256u * sizeof(u32);
     // Dolphin has three physically distinct memories: 64 KiB instruction
     // SRAM, two megabytes of GCOS data DRAM, and two megabytes of display
-    // VRAM. The host uploads GCOS data through super-slot +$02000000; MFB
-    // presents that DRAM to the Am29000 at physical $4C000000.
-    static constexpr u32 kGcHostDramOffset = 0x02000000u;
+    // VRAM.  Super-slot offset +$02000000 is the host's window on the
+    // Am29000's SRAM at its own local address $02000000: the .GraphAccel
+    // kernel loader translates an ACEF section address into slot space as
+    // (slot << 28) | address, so the kernel's .bss clear of $02003800-
+    // $0200FFFF arrives at $92003800-$9200FFFF.  It must land in the SRAM
+    // (behind the freshly uploaded $0000-$37FF kernel image), NOT in the
+    // shared data DRAM: the IPC block there already holds the cursor-shield
+    // pointers the driver's Open wrote through $F99091F8, and GC QuickDraw's
+    // card-side cursor routines read them for the life of the session.
+    static constexpr u32 kGcHostSramOffset = 0x02000000u;
     // MFB presents the board's two-megabyte frame buffer directly on the
     // Am29000 data bus at $41000000.  GCOS seeds this address in its global
     // register block and the accelerated QuickDraw rasterizers use it rather
@@ -373,11 +380,12 @@ public:
         // first 128 KiB and verifies that only the first 64 KiB retained it;
         // consequently this must neither be omitted nor mirrored.
         if (slotOffset < kGcSramBytes) return gcSram_[slotOffset];
-        // The +$02000000 aperture is the host view of accelerator DRAM. The
-        // Apple loader clears $92003800-$9200FFFF and uploads GCOS data here.
-        if (slotOffset >= kGcHostDramOffset &&
-            slotOffset < kGcHostDramOffset + kGcDramBytes)
-            return gcDram_[slotOffset - kGcHostDramOffset];
+        // The +$02000000 aperture is the host view of the instruction SRAM at
+        // the Am29000's local $02000000: the loader clears the kernel's .bss
+        // ($02003800-$0200FFFF) through it.  See kGcHostSramOffset.
+        if (slotOffset >= kGcHostSramOffset &&
+            slotOffset < kGcHostSramOffset + kGcSramBytes)
+            return gcSram_[slotOffset - kGcHostSramOffset];
         // Apple's primary init probes the optional GC DRAM through the $9D
         // super-slot aperture.  A fully populated card has eight distinct
         // megabytes here; the probe deliberately compares locations four
@@ -494,13 +502,9 @@ public:
             gcSram_[slotOffset] = value;
             return;
         }
-        if (slotOffset >= kGcHostDramOffset &&
-            slotOffset < kGcHostDramOffset + kGcDramBytes) {
-            const u32 offset = slotOffset - kGcHostDramOffset;
-            gcDram_[offset] = value;
-            if (offset >= 0x8DD4u && offset <= 0x8DD7u)
-                noteGcSemaphoreMutation(3);
-            if (offset == 0x8DD7u) noteGcHostCommand(3);
+        if (slotOffset >= kGcHostSramOffset &&
+            slotOffset < kGcHostSramOffset + kGcSramBytes) {
+            gcSram_[slotOffset - kGcHostSramOffset] = value;
             return;
         }
         if (slotOffset >= kGcExpansionDramOffset &&

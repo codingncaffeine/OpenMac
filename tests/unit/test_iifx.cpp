@@ -1122,16 +1122,27 @@ TEST_CASE("IIfx 8 24 GC separates instruction SRAM, data DRAM, and VRAM") {
     CHECK(mac.read32(0x90000000u) == 0x89ABCDEFu);
     CHECK(mac.read32(0x9000FFFCu) == 0x01234567u);
     CHECK(mac.read32(0x90010000u) == 0u);
-    CHECK(mac.read32(0x92000000u) == 0u);
+    // Super-slot +$02000000 is the host's window on that same SRAM at the
+    // Am29000's local $02000000 (the .GraphAccel kernel loader clears the
+    // kernel's .bss, $02003800-$0200FFFF, through $92003800).  It is NOT
+    // the shared data DRAM behind $9C00xxxx / $F900xxxx: the IPC block there
+    // keeps the cursor-shield pointers the driver wrote before activation.
+    CHECK(mac.read32(0x92000000u) == 0x89ABCDEFu);
+    CHECK(mac.read32(0x9200FFFCu) == 0x01234567u);
+    CHECK(mac.read32(0x92010000u) == 0u);
     CHECK(mac.read32(0xF9000000u) == 0u);
     mac.write32(0x92000004u, 0x10203040u);
     CHECK(mac.read32(0x92000004u) == 0x10203040u);
-    CHECK(mac.read32(0x9C000004u) == 0x10203040u);
-    CHECK(mac.read32(0x90000004u) == 0u);
+    CHECK(mac.read32(0x90000004u) == 0x10203040u);
+    CHECK(mac.read32(0x9C000004u) == 0u);
     CHECK(mac.read32(0x9C010004u) == 0xAAAAAAAAu);
+    const std::vector<u8> sram = mac.diagnosticGcInstructionSram(4u, 4u);
+    REQUIRE(sram.size() == 4u);
+    CHECK(sram[0] == 0x10u);
+    CHECK(sram[3] == 0x40u);
     mac.write32(0xF9000008u, 0x50607080u);
     CHECK(mac.read32(0x90000008u) == 0u);
-    CHECK(mac.read32(0x92000008u) == 0x50607080u);
+    CHECK(mac.read32(0x92000008u) == 0u);
     CHECK(mac.read32(0x9C000008u) == 0x50607080u);
     mac.write32(0x9C01000Cu, 0xA1B2C3D4u);
     CHECK(mac.read32(0x9C01000Cu) == 0xA1B2C3D4u);
