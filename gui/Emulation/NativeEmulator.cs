@@ -576,12 +576,50 @@ public sealed class NativeEmulator : IEmulator
 
     public void DetachFolderDisk()
     {
+        // The Mac puts the volume away BEFORE the disk leaves the bus. Pulling
+        // the disk from under a mounted volume leaves the System holding a
+        // catalog for blocks that are gone -- and, worse, for whatever disk
+        // is put on the seat next: the drive number is the same, so its
+        // volume then looks "already mounted" and never comes up.
+        PutAwaySeatVolume();
         SyncFolderDisk();
         Seat.Cancel();
         Seat.Folder = null;
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_detach_harddisk2(_h); }
         _readOnlySeatImage = null;
         TransferDiskLabel = null;
+    }
+
+    /// <summary>Flush and unmount the seat's volume through the guest, retrying
+    /// across frames while the File Manager is busy. False (and a log line)
+    /// only when the Mac keeps a file open on it.</summary>
+    private bool PutAwaySeatVolume()
+    {
+        for (int attempt = 0; attempt < 100; ++attempt)
+        {
+            bool offLine;
+            lock (_sync)
+                offLine = _h == IntPtr.Zero || Native.omac_unmount_harddisk2(_h) != 0;
+            if (offLine) return true;
+            Thread.Sleep(20);   // let the worker run a frame or two
+        }
+        Log.Line("[disk] the Mac would not let go of the seat's volume (a file on it is open)");
+        return false;
+    }
+
+    /// <summary>Make the seat free for another transfer disk. A previous one
+    /// the Mac has mounted is flushed and unmounted (the guest must let go of
+    /// its catalog before the blocks change under it); one the Mac never saw
+    /// -- no driver resident, or the restart it needed was declined -- needs
+    /// nothing. Refuses only when the Mac still has a file open on it.</summary>
+    private bool ReleaseSeatForSwap(out string error)
+    {
+        error = "";
+        if (TransferDiskLabel is not { } prev || !TransferDiskResident) return true;
+        if (PutAwaySeatVolume()) return true;
+        error = $"the transfer disk “{prev}” is still in use in the Mac (a file on it is open); "
+              + "put it away first, then drop the new one";
+        return false;
     }
 
     public bool RepublishFolderDisk(string? addFile, out string error) =>
@@ -641,6 +679,7 @@ public sealed class NativeEmulator : IEmulator
     {
         error = "";
         if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+        if (!ReleaseSeatForSwap(out error)) return false;
         byte[]? img = FolderDisk.BuildTransferVolume(filePath, 0, out error);
         if (img is null) return false;
         // Mark the volume software-locked (drAtrb bit 15 in both MDB copies)

@@ -1571,22 +1571,24 @@ public partial class MainWindow : Window
     {
         if (_emulator.FolderDiskPath is { } fd)
         {
-            MessageBox.Show(this,
+            var r = MessageBox.Show(this,
                 Path.GetFileName(path) + " needs the second SCSI disk, but the folder disk " +
                 $"“{Path.GetFileName(fd.TrimEnd('\\', '/'))}” is using it.\n\n" +
-                "Close the folder disk first — or just copy the file into that folder " +
-                "and restart; it rides in with the folder.",
-                "Transfer Disk", MessageBoxButton.OK, MessageBoxImage.Information);
-            return true;   // handled: told the user what to do
+                "Close the folder disk and put this file on that seat instead? " +
+                "(The folder's changes are written back first. Alternatively, copy the " +
+                "file into that folder and restart; it rides in with the folder.)",
+                "Transfer Disk", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (r != MessageBoxResult.Yes) return true;   // handled: they said no
+            _emulator.DetachFolderDisk();
+            _settings.DropBox = false;
+            _settings.LastFolderDisk = null;
+            _settings.Save();
         }
-        if (_emulator.TransferDiskLabel is { } prev)
-        {
-            MessageBox.Show(this,
-                $"The transfer disk “{prev}” is still attached. Drag its volume to the " +
-                "Trash in the Mac, then restart before dropping another big file.",
-                "Transfer Disk", MessageBoxButton.OK, MessageBoxImage.Information);
-            return true;
-        }
+        // A transfer disk already on the seat is swapped out by the backend:
+        // one the Mac has mounted is flushed and unmounted first (the guest
+        // must forget its catalog before the blocks change under it), and one
+        // it never got to see is simply replaced. Only a volume with a file
+        // still open in the Mac refuses, and says so.
         if (!_emulator.AttachTransferDisk(path, out string error))
         {
             Log.Line($"transfer refused: {path} -- {error}");
