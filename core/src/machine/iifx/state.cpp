@@ -846,6 +846,8 @@ private:
     static void visitAm29000(Io& io, Am29000& cpu) {
         for (u32& value : cpu.m_r) io.u32v(value);
         for (u32& value : cpu.m_tlb) io.u32v(value);
+        cpu.fetchTranslationValid_ = false; // hint derived from m_tlb
+        cpu.clearFetchWindows();            // host pointers; re-registered lazily
         io.u32v(cpu.m_pc); io.u32v(cpu.m_vab); io.u32v(cpu.m_ops);
         io.u32v(cpu.m_cps); io.u32v(cpu.m_cfg); io.u32v(cpu.m_cha);
         io.u32v(cpu.m_chd); io.u32v(cpu.m_chc); io.u32v(cpu.m_rbp);
@@ -969,10 +971,14 @@ private:
                     video.gcMfbShadow_[0x64u >> 2u] =
                         video.gcHostRequest_ ? 0xFFFFFFFFu : 0u;
                     video.gcCpu_.setInput(2, video.gcHostRequest_);
+                    // The $44000088 interrupt hold stays disarmed (see
+                    // nubus_video.hpp); keep the derived CPU state in the
+                    // matching disarmed position on load.
+                    video.gcCpu_.setInterruptHold(false);
                 }
             } else if (io.applying()) {
                 video.gcMfbShadow_.fill(0);
-                video.gcCacheControl_ = 0;
+                video.gcCacheControl_ = 0xFFFF0000u;
                 video.gcHostRequest_ = false;
                 video.gcCpu_.setInput(0, false);
                 video.gcCpu_.setInput(2, false);

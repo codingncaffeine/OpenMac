@@ -150,7 +150,12 @@ public:
         gcResetControl_ = 0;
         gcInterruptControl_ = 0;
         gcMacInterruptControl_ = 0;
-        gcCacheControl_ = 0;
+        // The DRAM controller powers up decoding every bank: absent SIMMs
+        // report *DERR from the first access, which is what lets GCOS's
+        // early sizing find the real memory end.  A reset value of zero
+        // would alias the whole window onto the populated banks and the
+        // sizing would believe in sixteen phantom megabytes.
+        gcCacheControl_ = 0xFFFF0000u;
         gcCacheFillAddress_ = 0;
         gcCacheFillWordsRemaining_ = 0;
         gcCacheFillActive_ = false;
@@ -290,6 +295,16 @@ public:
                     noteGcSemaphoreMutation(1);
                 if (compatibleOffset == 0x8DD7u)
                     noteGcHostCommand(1);
+                return;
+            }
+            ++gcDroppedStandardWrites;
+            if (gcDroppedStandardWriteCount <
+                gcDroppedStandardWriteOffsets.size()) {
+                gcDroppedStandardWriteOffsets[gcDroppedStandardWriteCount] =
+                    slotOffset;
+                gcDroppedStandardWriteValues[gcDroppedStandardWriteCount] =
+                    value;
+                ++gcDroppedStandardWriteCount;
             }
             return;
         }
@@ -371,6 +386,14 @@ public:
         if (slotOffset >= kGcExpansionDramOffset &&
             slotOffset < kGcExpansionDramOffset + kGcExpansionDramBytes)
             return gcExpansionDram_[slotOffset - kGcExpansionDramOffset];
+        // Unpopulated expansion sockets float the bus.  GCOS sizes its DRAM
+        // by writing through this window and reading back; zeros here read
+        // as a successful round-trip, so the sizing walks off the end of
+        // real memory and the kernel then zero-fills phantom banks forever
+        // (the $9E000000+ sweep).  Absent SIMMs read as open-bus $FF.
+        if (slotOffset >= kGcExpansionDramOffset + kGcExpansionDramBytes &&
+            slotOffset < 0x10000000u)
+            return 0xFF;
 
         // The declaration-ROM primary-init routine samples bit 7 of these
         // three byte-wide inputs with BFEXTU.  An AppleColor High-Resolution
@@ -466,6 +489,8 @@ public:
             // packed aperture discards X and places RGB contiguously in its
             // physical VRAM, exactly as the display engine consumes it.
             if (!padding) {
+                if (gcSuperWriteFromCard_)
+                    gcNoteVramWatch(vramOffset, vramOffset, value);
                 vram_[vramOffset] = value;
                 ++vramWrites;
                 ++frameVramWrites_;
@@ -517,9 +542,22 @@ public:
             return;
         }
         if (slotOffset >= 0x04000050u && slotOffset < 0x04000054u) {
+            const bool requestBefore = gcHostRequest_;
             mergeRegister(gcInterruptControl_, slotOffset & 3u, value);
             if ((slotOffset & 3u) == 3u) {
                 gcHostRequest_ = gcInterruptControl_ != 0;
+                if (gcHostRequest_ != requestBefore &&
+                    gcDoorbellEdgeCount < gcDoorbellEdgeStates.size()) {
+                    gcDoorbellEdgeInstructions[gcDoorbellEdgeCount] =
+                        gcCpu_.instructions();
+                    gcDoorbellEdgeCps[gcDoorbellEdgeCount] =
+                        gcCpu_.processorStatus();
+                    gcDoorbellEdgeControl[gcDoorbellEdgeCount] =
+                        gcInterruptControl_;
+                    gcDoorbellEdgeStates[gcDoorbellEdgeCount] =
+                        gcHostRequest_ ? 1u : 0u;
+                    ++gcDoorbellEdgeCount;
+                }
                 // MFB combines the host doorbell onto INTR2.  Its firmware
                 // vector reads +$64 to identify this source before clearing
                 // the request through +$50.
@@ -720,9 +758,123 @@ public:
         return gcCpu_.faultReason();
     }
     u64 gcProcessorInstructions() const { return gcCpu_.instructions(); }
+    void gcSetProcessorRegisterWatch(u16 physicalIndex) {
+        gcCpu_.setDiagnosticRegisterWatch(physicalIndex);
+    }
+    std::size_t gcProcessorRegisterWatchCount() const {
+        return gcCpu_.diagnosticRegisterWatchCount();
+    }
+    u32 gcProcessorRegisterWatchPc(std::size_t back) const {
+        return gcCpu_.diagnosticRegisterWatchPc(back);
+    }
+    u32 gcProcessorRegisterWatchValue(std::size_t back) const {
+        return gcCpu_.diagnosticRegisterWatchValue(back);
+    }
+    u64 gcProcessorRegisterWatchInstruction(std::size_t back) const {
+        return gcCpu_.diagnosticRegisterWatchInstruction(back);
+    }
+    void gcSetProcessorPcSnap(u32 pc, u16 architecturalIndex) {
+        gcCpu_.setDiagnosticPcSnap(pc, architecturalIndex);
+    }
+    void gcSetProcessorFlightWindow(u64 start, u64 count, u16 physicalIndex) {
+        gcCpu_.setDiagnosticFlightWindow(start, count, physicalIndex);
+    }
+    const std::vector<Am29000::FlightEntry>& gcProcessorFlight() const {
+        return gcCpu_.diagnosticFlight();
+    }
+    std::size_t gcProcessorPcSnapCount() const {
+        return gcCpu_.diagnosticPcSnapCount();
+    }
+    u64 gcProcessorPcSnapInstruction(std::size_t back) const {
+        return gcCpu_.diagnosticPcSnapInstruction(back);
+    }
+    u32 gcProcessorPcSnapWindowBase(std::size_t back) const {
+        return gcCpu_.diagnosticPcSnapWindowBase(back);
+    }
+    u32 gcProcessorPcSnapValue(std::size_t back) const {
+        return gcCpu_.diagnosticPcSnapValue(back);
+    }
+    u32 gcProcessorPcSnapSpillBound(std::size_t back) const {
+        return gcCpu_.diagnosticPcSnapSpillBound(back);
+    }
+    u32 gcProcessorPcSnapFillBound(std::size_t back) const {
+        return gcCpu_.diagnosticPcSnapFillBound(back);
+    }
+    std::size_t gcProcessorTimerWriteRingCount() const {
+        return gcCpu_.diagnosticTimerWriteRingCount();
+    }
+    u32 gcProcessorTimerWritePc(std::size_t back) const {
+        return gcCpu_.diagnosticTimerWritePc(back);
+    }
+    u32 gcProcessorTimerWriteValue(std::size_t back) const {
+        return gcCpu_.diagnosticTimerWriteValue(back);
+    }
+    bool gcProcessorTimerWriteIsReload(std::size_t back) const {
+        return gcCpu_.diagnosticTimerWriteIsReload(back);
+    }
+    u64 gcProcessorTimerWriteInstruction(std::size_t back) const {
+        return gcCpu_.diagnosticTimerWriteInstruction(back);
+    }
+    std::size_t gcProcessorCallTraceCount() const {
+        return gcCpu_.diagnosticCallTraceCount();
+    }
+    u32 gcProcessorCallTracePc(std::size_t back) const {
+        return gcCpu_.diagnosticCallTracePc(back);
+    }
+    u32 gcProcessorCallTraceTarget(std::size_t back) const {
+        return gcCpu_.diagnosticCallTraceTarget(back);
+    }
+    u64 gcProcessorCallTraceInstruction(std::size_t back) const {
+        return gcCpu_.diagnosticCallTraceInstruction(back);
+    }
     u32 gcProcessorTimerCounter() const { return gcCpu_.timerCounter(); }
     u32 gcProcessorTimerReload() const { return gcCpu_.timerReload(); }
+    u64 gcProcessorTimerExpiries() const {
+        return gcCpu_.diagnosticTimerExpiries();
+    }
+    u64 gcProcessorTimerInterrupts() const {
+        return gcCpu_.diagnosticTimerInterrupts();
+    }
+    u64 gcProcessorTimerWrites() const {
+        return gcCpu_.diagnosticTimerWrites();
+    }
+    u64 gcProcessorExternalInterrupts(int input) const {
+        return gcCpu_.diagnosticExternalInterrupts(input);
+    }
+    u64 gcProcessorExternalAssertions(int input) const {
+        return gcCpu_.diagnosticExternalAssertions(input);
+    }
+    void setGcDoorbellWatchAddress(u32 address) {
+        gcDoorbellWatchAddress_ = address;
+        gcDoorbellTraceCount = 0;
+    }
     void setGcProcessorPcWatch(u32 pc) { gcCpu_.setDiagnosticPcWatch(pc); }
+    void setGcProcessorProfileRange(u32 first, u32 last) {
+        gcCpu_.setDiagnosticProfileRange(first, last);
+    }
+    void setGcPcTapRange(u32 first, u32 last) {
+        gcPcTapFirst_ = first;
+        gcPcTapLast_ = last;
+        gcPcTapCount = 0;
+    }
+    void setGcAddrTapRange(u32 first, u32 last, bool writesOnly = false) {
+        gcAddrTapFirst_ = first;
+        gcAddrTapLast_ = last;
+        gcAddrTapWritesOnly_ = writesOnly;
+        gcPcTapCount = 0;
+    }
+    u32 gcProcessorProfileFirst() const {
+        return gcCpu_.diagnosticProfileFirst();
+    }
+    const std::vector<u64>& gcProcessorProfileCounts() const {
+        return gcCpu_.diagnosticProfileCounts();
+    }
+    std::size_t gcProcessorPcWatchHitCount() const {
+        return gcCpu_.diagnosticPcWatchHitCount();
+    }
+    u64 gcProcessorPcWatchHitInstruction(std::size_t index) const {
+        return gcCpu_.diagnosticPcWatchHitInstruction(index);
+    }
     u64 gcProcessorPcWatchHits() const {
         return gcCpu_.diagnosticPcWatchHits();
     }
@@ -933,6 +1085,111 @@ public:
     std::array<u32, 512> gcAbnormalCompletionRecentPcs{};
     std::array<u32, 512> gcAbnormalCompletionRecentInstructions{};
     std::size_t gcAbnormalCompletionRecentCount = 0;
+    // Bounded tap of every data access issued from one GC PC window.
+    // Diagnostic-only; not serialized.
+    u32 gcPcTapFirst_ = 0;
+    u32 gcPcTapLast_ = 0;
+    // Bounded tap of every GC data access touching one address window,
+    // regardless of the executing PC.  Shares the same ring.
+    u32 gcAddrTapFirst_ = 0;
+    u32 gcAddrTapLast_ = 0;
+    bool gcAddrTapWritesOnly_ = false;
+    std::array<u32, 2048> gcPcTapPcs{};
+    std::array<u64, 2048> gcPcTapInstructions{};
+    std::array<u32, 2048> gcPcTapAddresses{};
+    std::array<u32, 2048> gcPcTapValues{};
+    std::array<u8, 2048> gcPcTapWrites{};
+    std::size_t gcPcTapCount = 0;
+    // First data access into the phantom expansion window
+    // ($9D800000-$9FFFFFFF): who issued it and the call trail that led
+    // there.  Diagnostic-only; not serialized.
+    bool gcPhantomCaptured = false;
+    u64 gcPhantomInstruction = 0;
+    u32 gcPhantomPc = 0;
+    u32 gcPhantomAddress = 0;
+    u32 gcPhantomValue = 0;
+    bool gcPhantomWrite = false;
+    std::array<u32, 96> gcPhantomTracePcs{};
+    std::array<u32, 96> gcPhantomTraceTargets{};
+    std::array<u64, 96> gcPhantomTraceInstructions{};
+    std::array<u32, 256> gcPhantomRegisters{};
+    std::size_t gcPhantomTraceCount = 0;
+    // VRAM byte watch: every card-side write covering one physical VRAM
+    // byte, with the call trail that produced it.  Diagnostic-only.
+    u32 gcVramWatchOffset_ = 0xFFFFFFFFu;
+    static constexpr std::size_t kGcVramWatchEntries = 48;
+    static constexpr std::size_t kGcVramWatchTrail = 12;
+    std::array<u64, kGcVramWatchEntries> gcVramWatchInstructions{};
+    std::array<u32, kGcVramWatchEntries> gcVramWatchPcs{};
+    std::array<u32, kGcVramWatchEntries> gcVramWatchValues{};
+    std::array<u32, kGcVramWatchEntries * kGcVramWatchTrail>
+        gcVramWatchTrailPcs{};
+    std::array<u32, kGcVramWatchEntries * kGcVramWatchTrail>
+        gcVramWatchTrailTargets{};
+    std::size_t gcVramWatchCount = 0;
+    void setGcVramWatch(u32 offset) {
+        gcVramWatchOffset_ = offset;
+        gcVramWatchCount = 0;
+    }
+    void gcNoteVramWatch(u32 firstByte, u32 lastByte, u32 value) {
+        if (gcVramWatchOffset_ < firstByte || gcVramWatchOffset_ > lastByte ||
+            gcVramWatchCount >= kGcVramWatchEntries)
+            return;
+        const std::size_t index = gcVramWatchCount++;
+        gcVramWatchInstructions[index] = gcCpu_.instructions();
+        gcVramWatchPcs[index] = gcCpu_.instructionPc();
+        gcVramWatchValues[index] = value;
+        for (std::size_t back = 0; back < kGcVramWatchTrail; ++back) {
+            const bool have = back < gcCpu_.diagnosticCallTraceCount();
+            gcVramWatchTrailPcs[index * kGcVramWatchTrail + back] =
+                have ? gcCpu_.diagnosticCallTracePc(back) : 0u;
+            gcVramWatchTrailTargets[index * kGcVramWatchTrail + back] =
+                have ? gcCpu_.diagnosticCallTraceTarget(back) : 0u;
+        }
+    }
+    void gcCapturePhantom(u32 address, u32 value, bool write) {
+        if (gcPhantomCaptured || gcPeeking_) return;
+        gcPhantomCaptured = true;
+        gcPhantomInstruction = gcCpu_.instructions();
+        gcPhantomPc = gcCpu_.instructionPc();
+        gcPhantomAddress = address;
+        gcPhantomValue = value;
+        gcPhantomWrite = write;
+        gcPhantomTraceCount = 0;
+        for (std::size_t back = 0; back < gcPhantomTracePcs.size() &&
+             back < gcCpu_.diagnosticCallTraceCount(); ++back) {
+            gcPhantomTracePcs[back] = gcCpu_.diagnosticCallTracePc(back);
+            gcPhantomTraceTargets[back] =
+                gcCpu_.diagnosticCallTraceTarget(back);
+            gcPhantomTraceInstructions[back] =
+                gcCpu_.diagnosticCallTraceInstruction(back);
+            ++gcPhantomTraceCount;
+        }
+        for (u32 index = 0; index < 256u; ++index)
+            gcPhantomRegisters[index] = gcCpu_.registerValue(index);
+    }
+    // Bounded record of genuine-GC standard-space writes that land outside
+    // the shared-DRAM window and are therefore ignored by the current model.
+    // Diagnostic-only; not serialized.
+    std::array<u32, 128> gcDroppedStandardWriteOffsets{};
+    std::array<u8, 128> gcDroppedStandardWriteValues{};
+    std::size_t gcDroppedStandardWriteCount = 0;
+    u64 gcDroppedStandardWrites = 0;
+    // Bounded record of every host doorbell (INTR2) line transition with the
+    // card's instruction count and CPS at that moment.  Diagnostic-only.
+    std::array<u64, 64> gcDoorbellEdgeInstructions{};
+    std::array<u32, 64> gcDoorbellEdgeCps{};
+    std::array<u32, 64> gcDoorbellEdgeControl{};
+    std::array<u8, 64> gcDoorbellEdgeStates{};
+    std::size_t gcDoorbellEdgeCount = 0;
+    // Bounded card-side bus-master watch on one Macintosh RAM cell (the GCQD
+    // doorbell/command long).  Diagnostic-only; not serialized.
+    u32 gcDoorbellWatchAddress_ = 0x00003D34u;
+    std::array<u32, 512> gcDoorbellTracePcs{};
+    std::array<u32, 512> gcDoorbellTraceValues{};
+    std::array<u64, 512> gcDoorbellTraceInstructions{};
+    std::array<u8, 512> gcDoorbellTraceWrites{};
+    std::size_t gcDoorbellTraceCount = 0;
     std::array<u32, 256> gcLowReadTraceAddresses{};
     std::array<u32, 256> gcLowReadTracePcs{};
     std::array<u32, 256> gcLowReadTraceValues{};
@@ -1101,11 +1358,15 @@ private:
         switch ((address - kGcProcessorRamdacBase) >> 2u) {
         case 0: return u32(clutAddress_) << 24;
         case 1: return u32(clutData()) << 24;
-        // PBCTRL is write-only.  The reset firmware reaches this address
-        // through an as-yet-uninitialised queue pointer and deliberately
-        // waits while it reads as zero; echoing the programmed mode lets it
-        // escape that wait before the host has installed the queue.
-        case 2: return 0;
+        // PBCTRL echoes the programmed control byte in the low lane, the
+        // same lane GCOS's word stores carry it in: the depth re-config
+        // derives the new mode's geometry from a read-back of this
+        // register, and the 24-bit flow polls it for the depth to take.
+        // (An earlier era returned 0 here so the reset firmware's
+        // accidental read through an uninitialised queue pointer kept
+        // waiting; that read was collateral of the since-fixed dropped
+        // same-cycle exception, and the depth path needs the truth.)
+        case 2: return ramdacControl_;
         default: return 0;
         }
     }
@@ -1170,8 +1431,10 @@ private:
     }
 
     void noteGcCompletion(u32 address, u32 value, u32 pc) {
-        if (value != 3u && value != 4u &&
-            !gcAbnormalCompletionCaptured) {
+        // Capture the FIRST completion seen in this process, whatever its
+        // value; a replay from a mid-boot checkpoint makes this a
+        // representative accelerated-command acknowledgement trace.
+        if (!gcAbnormalCompletionCaptured) {
             gcAbnormalCompletionCaptured = true;
             gcAbnormalCompletionAddress = address;
             gcAbnormalCompletionValue = value;
@@ -1273,8 +1536,14 @@ private:
                u32(readSuper(slotOffset + 3u));
     }
 
+    bool gcSuperWriteFromCard_ = false;
     void gcWriteSuperWord(u32 address, u32 value) {
         const u32 slotOffset = address - kSuperSlotBase;
+        struct CardWriteScope {
+            bool& flag;
+            explicit CardWriteScope(bool& f) : flag(f) { flag = true; }
+            ~CardWriteScope() { flag = false; }
+        } scope(gcSuperWriteFromCard_);
         writeSuper(slotOffset, static_cast<u8>(value >> 24));
         writeSuper(slotOffset + 1u, static_cast<u8>(value >> 16));
         writeSuper(slotOffset + 2u, static_cast<u8>(value >> 8));
@@ -1335,9 +1604,32 @@ private:
         // vector: inventing one bypasses the card's own MMU bootstrap.
     }
 
+    // Register the card memories as direct fetch windows on the Am29000
+    // (see Am29000::FetchWindow).  Called from the fetch slow path, so a
+    // fresh object or a reloaded checkpoint re-registers on first use.
+    void installGcFetchWindows() {
+        gcCpu_.setFetchWindow(0, 0u, kGcSramBytes, gcSram_.data());
+        gcCpu_.setFetchWindow(1, kGcProcessorSramBase, kGcSramBytes,
+                              gcSram_.data());
+        gcCpu_.setFetchWindow(2, kGcProcessorDataSramBase, kGcSramBytes,
+                              gcSram_.data());
+        gcCpu_.setFetchWindow(3, kGcProcessorDramBase,
+                              static_cast<u32>(gcDram_.size()),
+                              gcDram_.empty() ? nullptr : gcDram_.data());
+        gcCpu_.setFetchWindow(4, kGcProcessorExpansionDramBase,
+                              static_cast<u32>(gcExpansionDram_.size()),
+                              gcExpansionDram_.empty() ? nullptr
+                                                        : gcExpansionDram_.data());
+        gcCpu_.setFetchWindow(5, 0x9D000000u,
+                              static_cast<u32>(gcExpansionDram_.size()),
+                              gcExpansionDram_.empty() ? nullptr
+                                                        : gcExpansionDram_.data());
+    }
+
     u32 gcReadInstruction(u32 address, bool translated) {
         ++gcInstructionReads_;
         static_cast<void>(translated);
+        installGcFetchWindows();
         if ((address & 3u) == 0 && address <= kGcSramBytes - 4u)
             return gcReadSramWord(address);
         if ((address & 3u) == 0 &&
@@ -1378,10 +1670,54 @@ private:
             address >= kGcProcessorRamdacBase &&
             address < kGcProcessorRamdacBase + 0x10u)
             return gcPeekRamdacWord(address);
-        return gcReadData(address, inputOutput);
+        gcPeeking_ = true;
+        const u32 value = gcReadData(address, inputOutput);
+        gcPeeking_ = false;
+        return value;
     }
 
     u32 gcReadData(u32 address, bool inputOutput) {
+        const u32 tapPc = gcCpu_.instructionPc();
+        if ((gcPcTapLast_ != 0 && tapPc >= gcPcTapFirst_ &&
+             tapPc <= gcPcTapLast_) ||
+            (!gcAddrTapWritesOnly_ && gcAddrTapLast_ != 0 &&
+             address >= gcAddrTapFirst_ && address <= gcAddrTapLast_)) {
+            const u32 value = gcReadDataInner(address, inputOutput);
+            if (gcPcTapCount < gcPcTapPcs.size()) {
+                const std::size_t index = gcPcTapCount++;
+                gcPcTapInstructions[index] = gcCpu_.instructions();
+                gcPcTapPcs[index] = tapPc;
+                gcPcTapAddresses[index] = address;
+                gcPcTapValues[index] = value;
+                gcPcTapWrites[index] = 0;
+            }
+            return value;
+        }
+        return gcReadDataInner(address, inputOutput);
+    }
+
+    // The DRAM controller's absent-bank behavior, per GCOS's own sizing
+    // machinery: the expansion window spans sixteen 1 MiB banks; a bank
+    // the kernel still believes in (its bit set in the mask it programs
+    // through [$46000000], kept here as gcCacheControl_ = mask << 16)
+    // reports *DERR on access, and the Data Access Exception handler
+    // prunes the bank and restarts; a pruned bank re-decodes onto the
+    // populated SIMMs, so the restarted access completes.
+    bool gcExpansionBankAbsent(u32 offset, u32& aliasedOffset) {
+        // The kernel's Data Access Exception handler numbers megabyte
+        // banks from one: its prune of the first absent megabyte
+        // ($800000-$8FFFFF on an 8 MiB card) clears mask bit 9.
+        const u32 bank = (offset >> 20u) + 1u;
+        if ((gcCacheControl_ >> 16u) & (1u << bank)) {
+            if (!gcPeeking_) gcCpu_.noteDataBusFault();
+            return true;
+        }
+        aliasedOffset = offset & (kGcExpansionDramBytes - 1u);
+        return false;
+    }
+    bool gcPeeking_ = false;
+
+    u32 gcReadDataInner(u32 address, bool inputOutput) {
         ++gcDataReads_;
         const u32 readPc = gcCpu_.instructionPc();
         const std::size_t readRegion = address >> 24u;
@@ -1446,11 +1782,21 @@ private:
                 gcReadSramWord(address - kGcProcessorDataSramBase));
         // RDNC's $FC00xxxx alias is the same low data-DRAM window that the Mac
         // sees in the bottom 64 KiB of slot-9 standard space.  It is not MFB's
-        // physically separate instruction-cache SRAM.
+        // physically separate instruction-cache SRAM.  Beyond that window the
+        // $FC aperture reaches Macintosh memory as a NuBus master with the
+        // low 24 bits as the address, whichever address space the access
+        // uses: GC QuickDraw's 24-bit-mode importer block-reads Macintosh
+        // buffers through it with AS=0.
         if (!inputOutput && (address & 3u) == 0 &&
             address >= 0xFC000000u &&
             address <= 0xFC000000u + kGcSharedDramBytes - 4u)
             return notePointerRead(gcReadDramWord(address - 0xFC000000u));
+        if (!inputOutput && (address & 3u) == 0 &&
+            (address & 0xFF000000u) == 0xFC000000u &&
+            (address & 0x00FFFFFFu) >= kGcSharedDramBytes &&
+            gcBusMasterRead32_)
+            return notePointerRead(gcSupplyCacheFillWord(
+                gcBusMasterRead32_(address & 0x00FFFFFFu)));
         if ((address & 3u) == 0 &&
             address >= 0x44000000u && address < 0x44000200u) {
             // Dolphin's reset loader samples the NuBus slot ID one bit at a
@@ -1483,16 +1829,35 @@ private:
                 gcReadDramWord(address - kGcProcessorDramBase)));
         if ((address & 3u) == 0 &&
             address >= kGcProcessorExpansionDramBase &&
-            address <= kGcProcessorExpansionDramBase +
-                       kGcExpansionDramBytes - 4u)
+            address < kGcProcessorExpansionDramBase + 0x01000000u) {
+            u32 offset = address - kGcProcessorExpansionDramBase;
+            if (offset >= kGcExpansionDramBytes &&
+                gcExpansionBankAbsent(offset, offset))
+                return 0;
             return notePointerRead(gcSupplyCacheFillWord(
-                gcReadExpansionDramWord(
-                    address - kGcProcessorExpansionDramBase)));
+                gcReadExpansionDramWord(offset)));
+        }
+        // The $9D expansion window carries the DRAM controller's bank
+        // semantics for data accesses: reads past the populated SIMMs
+        // report *DERR while the kernel still believes in the bank, and
+        // alias onto the populated banks once it has pruned them.
+        if ((address & 3u) == 0 &&
+            address >= 0x9D000000u && address < 0x9E000000u) {
+            u32 offset = address - 0x9D000000u;
+            if (offset >= kGcExpansionDramBytes) {
+                gcCapturePhantom(address, 0, false);
+                if (gcExpansionBankAbsent(offset, offset))
+                    return 0;
+            }
+            return notePointerRead(gcSupplyCacheFillWord(
+                gcReadExpansionDramWord(offset)));
+        }
         // RDNC loops the card's complete slot-9 super-space back locally.
         // This includes GCOS's $9D expansion heap, the $9C framebuffer/IPC
         // window, and the lower SRAM/control apertures.
         if ((address & 3u) == 0 &&
             address >= kSuperSlotBase && address <= 0x9FFFFFFFu - 3u) {
+            if (address >= 0x9E000000u) gcCapturePhantom(address, 0, false);
             const u32 value = noteFramebufferRead(
                 gcSupplyCacheFillWord(gcReadSuperWord(address)));
             if (gcRasterStoreSnapshotCaptured &&
@@ -1531,6 +1896,14 @@ private:
         // 128 MiB is the IIfx system-memory window.
         if ((address & 3u) == 0 && address >= kGcVectorBytes &&
             address < 0x08000000u && gcBusMasterRead32_) {
+            if (address == gcDoorbellWatchAddress_ &&
+                gcDoorbellTraceCount < gcDoorbellTracePcs.size()) {
+                const std::size_t index = gcDoorbellTraceCount++;
+                gcDoorbellTracePcs[index] = readPc;
+                gcDoorbellTraceWrites[index] = 0;
+                gcDoorbellTraceValues[index] = gcBusMasterRead32_(address);
+                gcDoorbellTraceInstructions[index] = gcCpu_.instructions();
+            }
             const bool pointerRead = readPc == 0x9D7D42E0u;
             const bool rasterRead = readPc >= 0x9D7C0000u &&
                                     readPc < 0x9D7C1000u;
@@ -1592,6 +1965,18 @@ private:
     void gcWriteData(u32 address, u32 value, bool inputOutput) {
         ++gcDataWrites_;
         const u32 writePc = gcCpu_.instructionPc();
+        if (((gcPcTapLast_ != 0 && writePc >= gcPcTapFirst_ &&
+              writePc <= gcPcTapLast_) ||
+             (gcAddrTapLast_ != 0 && address >= gcAddrTapFirst_ &&
+              address <= gcAddrTapLast_)) &&
+            gcPcTapCount < gcPcTapPcs.size()) {
+            const std::size_t index = gcPcTapCount++;
+            gcPcTapInstructions[index] = gcCpu_.instructions();
+            gcPcTapPcs[index] = writePc;
+            gcPcTapAddresses[index] = address;
+            gcPcTapValues[index] = value;
+            gcPcTapWrites[index] = 1;
+        }
         const std::size_t writeRegion = address >> 24u;
         if (gcWriteRegionCounts[writeRegion]++ == 0) {
             gcWriteRegionFirstAddresses[writeRegion] = address;
@@ -1696,6 +2081,7 @@ private:
             address >= kGcProcessorVramBase &&
             address <= kGcProcessorVramBase + kGcVramBytes - 4u) {
             const u32 offset = address - kGcProcessorVramBase;
+            gcNoteVramWatch(offset, offset + 3u, value);
             vram_[offset] = static_cast<u8>(value >> 24);
             vram_[offset + 1u] = static_cast<u8>(value >> 16);
             vram_[offset + 2u] = static_cast<u8>(value >> 8);
@@ -1731,6 +2117,16 @@ private:
             gcWriteDramWord(address - 0xFC000000u, value);
             return;
         }
+        // Beyond the shared-DRAM window the $FC aperture is a NuBus master
+        // path to Macintosh memory for AS=0 accesses as well (the mirror of
+        // the read side; GC QuickDraw's 24-bit importer uses it).
+        if (!inputOutput && (address & 3u) == 0 &&
+            (address & 0xFF000000u) == 0xFC000000u &&
+            (address & 0x00FFFFFFu) >= kGcSharedDramBytes &&
+            gcBusMasterWrite32_) {
+            gcBusMasterWrite32_(address & 0x00FFFFFFu, value);
+            return;
+        }
         if ((address & 3u) == 0 &&
             address >= 0x44000000u && address < 0x44000200u) {
             const std::size_t registerIndex =
@@ -1764,6 +2160,14 @@ private:
             } else if (address == 0x44000088u) {
                 gcCacheFillActive_ = value != 0;
                 if (!gcCacheFillActive_) gcCacheFillWordsRemaining_ = 0;
+                // GCOS raises this latch around its context-switch
+                // register-file restore ($02001FA8/$02001FD0 bracket).
+                // Wiring it to gcCpu_.setInterruptHold(value != 0) is
+                // plausibly the real MFB behavior, but ANY shift in tick
+                // delivery timing lands the GCOS init-sequencing race
+                // (CLAUDE_GC_NOTES 2026-08-14c), so it stays disarmed
+                // until that race is fixed; re-arm together with the
+                // loaded-zero timer change and the IRET refill hold.
             }
             return;
         }
@@ -1784,15 +2188,21 @@ private:
             return;
         }
         if ((address & 3u) == 0 &&
-            address >= kGcProcessorExpansionDramBase &&
-            address <= kGcProcessorExpansionDramBase +
-                       kGcExpansionDramBytes - 4u) {
-            gcWriteExpansionDramWord(
-                address - kGcProcessorExpansionDramBase, value);
+            ((address >= kGcProcessorExpansionDramBase &&
+              address < kGcProcessorExpansionDramBase + 0x01000000u) ||
+             (address >= 0x9D000000u && address < 0x9E000000u))) {
+            u32 offset = address & 0x00FFFFFFu;
+            if (offset >= kGcExpansionDramBytes) {
+                gcCapturePhantom(address, value, true);
+                if (gcExpansionBankAbsent(offset, offset))
+                    return;
+            }
+            gcWriteExpansionDramWord(offset, value);
             return;
         }
         if ((address & 3u) == 0 &&
             address >= kSuperSlotBase && address <= 0x9FFFFFFFu - 3u) {
+            if (address >= 0x9E000000u) gcCapturePhantom(address, value, true);
             const u64 before = vramWrites;
             gcWriteSuperWord(address, value);
             gcProcessorVramWrites_ += vramWrites - before;
@@ -1805,6 +2215,14 @@ private:
         }
         if ((address & 3u) == 0 && address >= kGcVectorBytes &&
             address < 0x08000000u && gcBusMasterWrite32_) {
+            if (address == gcDoorbellWatchAddress_ &&
+                gcDoorbellTraceCount < gcDoorbellTracePcs.size()) {
+                const std::size_t index = gcDoorbellTraceCount++;
+                gcDoorbellTracePcs[index] = writePc;
+                gcDoorbellTraceWrites[index] = 1;
+                gcDoorbellTraceValues[index] = value;
+                gcDoorbellTraceInstructions[index] = gcCpu_.instructions();
+            }
             gcBusMasterWrite32_(address, value);
             return;
         }
@@ -2340,7 +2758,7 @@ private:
     u32 gcResetControl_ = 0;
     u32 gcInterruptControl_ = 0;
     u32 gcMacInterruptControl_ = 0;
-    u32 gcCacheControl_ = 0;
+    u32 gcCacheControl_ = 0xFFFF0000u;
     u32 gcCacheFillAddress_ = 0;
     u32 gcCacheFillWordsRemaining_ = 0;
     bool gcHostRequest_ = false;

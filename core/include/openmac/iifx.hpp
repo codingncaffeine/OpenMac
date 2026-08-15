@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace openmac {
@@ -116,6 +117,32 @@ public:
     bool diagnosticGcProcessorRecentlyExecuted(u32 pc) const;
     void diagnosticSetGcProcessorPcWatch(u32 pc);
     u64 diagnosticGcProcessorPcWatchHits() const;
+    // Sample-free execution histogram over one GC PC range; pairs of
+    // (count, pc) sorted most-executed first.
+    void diagnosticSetGcProcessorProfileRange(u32 first, u32 last);
+    std::vector<std::pair<u64, u32>> diagnosticGcProcessorProfile(
+        std::size_t limit) const;
+    // Record every data access issued from GC PCs inside [first, last].
+    void diagnosticSetGcPcTapRange(u32 first, u32 last);
+    // Record every GC data access touching addresses inside [first, last].
+    void diagnosticSetGcAddrTapRange(u32 first, u32 last,
+                                     bool writesOnly = false);
+    // Point the card-side bus-master watch at one Macintosh RAM long.
+    void diagnosticSetGcDoorbellWatch(u32 address);
+    // Record card-side writes covering one physical VRAM byte offset.
+    void diagnosticSetGcVramWatch(u32 offset);
+    // Watch one PHYSICAL Am29000 register (0-255) for writes.
+    void diagnosticSetGcRegisterWatch(u16 physicalIndex);
+    // Snapshot one ARCHITECTURAL register (0-127 gr, 128-255 lr through the
+    // live window) plus gr1 each time the given GC pc executes.
+    void diagnosticSetGcPcSnap(u32 pc, u16 architecturalIndex);
+    // Record pc/gr1/bounds + one PHYSICAL register for every GC instruction
+    // in [start, start+count); write the capture as text lines to a file.
+    void diagnosticSetGcFlightWindow(u64 start, u64 count, u16 physicalIndex);
+    bool diagnosticWriteGcFlight(const char* path) const;
+    // Read the GC card's 2 MiB data DRAM without changing emulated state.
+    // The low 64 KiB is shared with the Macintosh IPC aperture.
+    std::vector<u8> diagnosticGcDataMemory(u32 offset, u32 size) const;
     // Read the GC card's expansion DRAM without changing emulated state.
     // Addresses are offsets within the card's 8 MiB expansion bank.
     std::vector<u8> diagnosticGcExpansionMemory(u32 offset, u32 size) const;

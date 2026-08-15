@@ -12,6 +12,7 @@
 #include <array>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace openmac {
 
@@ -22,6 +23,26 @@ public:
     // The MFB needs to distinguish reset/physical fetches from translated
     // instruction fetches; the latter use its external MMU and SRAM cache.
     std::function<u32(u32, bool)> readInstruction;
+    // Direct instruction-fetch windows: the memory device may register
+    // physical ranges backed by contiguous host arrays so ordinary fetches
+    // skip the readInstruction callback entirely.  Fetches outside every
+    // window (or before any is registered) take the callback, which the
+    // device uses to (re)register the windows -- so a checkpoint load only
+    // has to clear them.  Purely a host-side fast path; no emulated state.
+    struct FetchWindow {
+        u32 base = 0;
+        u32 size = 0;
+        const u8* data = nullptr;
+    };
+    static constexpr std::size_t kFetchWindows = 6;
+    void setFetchWindow(std::size_t index, u32 base, u32 size,
+                        const u8* data) {
+        if (index >= kFetchWindows) return;
+        fetchWindows_[index] = FetchWindow{base, size, data};
+    }
+    void clearFetchWindows() {
+        for (auto& window : fetchWindows_) window = FetchWindow{};
+    }
     // Vector fetches are physical data-memory cycles with distinct STAT
     // signalling on the Am29000 bus.  Cards such as Dolphin use that signal
     // to select a small MFB vector store rather than ordinary data SRAM.
@@ -41,6 +62,13 @@ public:
     void reset(u32 resetPc = 0);
     int run(int instructionSlots);
     void setInput(int input, bool asserted);
+    // External interrupt/timer recognition hold, driven by MFB register
+    // +$088: GCOS raises it around the context-switch register-file
+    // restore so the 1 kHz tick cannot preempt the loop whose own pointer
+    // registers the tick handler clobbers.  Derived state — the video
+    // model reapplies it from its serialized register shadow on load.
+    void setInterruptHold(bool held) { interruptHold_ = held; }
+    bool interruptHold() const { return interruptHold_; }
 
     u32 pc() const { return m_pc; }
     u32 instructionPc() const { return m_exec_pc; }
@@ -64,6 +92,122 @@ public:
         if (back >= recentCount_) return 0;
         return recentIr_[(recentHead_ - 1u - back) &
                          (recentIr_.size() - 1u)];
+    }
+    // Watch one PHYSICAL register (0-255) for writes; rolling ring of the
+    // writer pcs and values.  0xFFFF disables.  Diagnostic-only.
+    void setDiagnosticRegisterWatch(u16 physicalIndex) {
+        registerWatchIndex_ = physicalIndex;
+    }
+    std::size_t diagnosticRegisterWatchCount() const {
+        return registerWatchCount_;
+    }
+    u32 diagnosticRegisterWatchPc(std::size_t back) const {
+        if (back >= registerWatchCount_) return 0;
+        return registerWatchPc_[(registerWatchHead_ - 1u - back) &
+                                (registerWatchPc_.size() - 1u)];
+    }
+    u32 diagnosticRegisterWatchValue(std::size_t back) const {
+        if (back >= registerWatchCount_) return 0;
+        return registerWatchValue_[(registerWatchHead_ - 1u - back) &
+                                   (registerWatchValue_.size() - 1u)];
+    }
+    u64 diagnosticRegisterWatchInstruction(std::size_t back) const {
+        if (back >= registerWatchCount_) return 0;
+        return registerWatchInstruction_[(registerWatchHead_ - 1u - back) &
+                                         (registerWatchInstruction_.size() -
+                                          1u)];
+    }
+    // The data bus reports *DERR for the access in flight: the executing
+    // load/store raises the Data Access Exception with CHC.TF set instead
+    // of completing.  Called by the bus model from inside the access.
+    void noteDataBusFault() { dataBusFault_ = true; }
+    // Snapshot one ARCHITECTURAL register (0-127 = gr, 128-255 = lr through
+    // the live window rotation) plus gr1 each time one pc is about to
+    // execute; rolling ring.  pc 0 disables.  Diagnostic-only.
+    void setDiagnosticPcSnap(u32 pc, u16 architecturalIndex) {
+        pcSnapPc_ = pc;
+        pcSnapRegister_ = architecturalIndex;
+    }
+    // Flight recorder: capture pc/gr1/gr126/gr127 + one PHYSICAL register
+    // for every instruction in [start, start+count).  Diagnostic-only.
+    struct FlightEntry {
+        u64 instr;
+        u32 pc, gr1, rfb, rab, watched;
+    };
+    void setDiagnosticFlightWindow(u64 start, u64 count, u16 physicalIndex) {
+        flightStart_ = start;
+        flightCount_ = count;
+        flightWatchIndex_ = physicalIndex;
+        flight_.clear();
+        if (count != 0 && count <= (1u << 20)) flight_.reserve(count);
+    }
+    const std::vector<FlightEntry>& diagnosticFlight() const {
+        return flight_;
+    }
+    std::size_t diagnosticPcSnapCount() const { return pcSnapCount_; }
+    u64 diagnosticPcSnapInstruction(std::size_t back) const {
+        if (back >= pcSnapCount_) return 0;
+        return pcSnapInstruction_[(pcSnapHead_ - 1u - back) &
+                                  (pcSnapInstruction_.size() - 1u)];
+    }
+    u32 diagnosticPcSnapWindowBase(std::size_t back) const {
+        if (back >= pcSnapCount_) return 0;
+        return pcSnapGr1_[(pcSnapHead_ - 1u - back) &
+                          (pcSnapGr1_.size() - 1u)];
+    }
+    u32 diagnosticPcSnapValue(std::size_t back) const {
+        if (back >= pcSnapCount_) return 0;
+        return pcSnapValue_[(pcSnapHead_ - 1u - back) &
+                            (pcSnapValue_.size() - 1u)];
+    }
+    u32 diagnosticPcSnapSpillBound(std::size_t back) const {
+        if (back >= pcSnapCount_) return 0;
+        return pcSnapGr126_[(pcSnapHead_ - 1u - back) &
+                            (pcSnapGr126_.size() - 1u)];
+    }
+    u32 diagnosticPcSnapFillBound(std::size_t back) const {
+        if (back >= pcSnapCount_) return 0;
+        return pcSnapGr127_[(pcSnapHead_ - 1u - back) &
+                            (pcSnapGr127_.size() - 1u)];
+    }
+    std::size_t diagnosticTimerWriteRingCount() const {
+        return timerWriteRingCount_;
+    }
+    u32 diagnosticTimerWritePc(std::size_t back) const {
+        if (back >= timerWriteRingCount_) return 0;
+        return timerWritePc_[(timerWriteHead_ - 1u - back) &
+                             (timerWritePc_.size() - 1u)];
+    }
+    u32 diagnosticTimerWriteValue(std::size_t back) const {
+        if (back >= timerWriteRingCount_) return 0;
+        return timerWriteValue_[(timerWriteHead_ - 1u - back) &
+                                (timerWriteValue_.size() - 1u)];
+    }
+    bool diagnosticTimerWriteIsReload(std::size_t back) const {
+        if (back >= timerWriteRingCount_) return false;
+        return timerWriteIsReload_[(timerWriteHead_ - 1u - back) &
+                                   (timerWriteIsReload_.size() - 1u)] != 0;
+    }
+    u64 diagnosticTimerWriteInstruction(std::size_t back) const {
+        if (back >= timerWriteRingCount_) return 0;
+        return timerWriteInstruction_[(timerWriteHead_ - 1u - back) &
+                                      (timerWriteInstruction_.size() - 1u)];
+    }
+    std::size_t diagnosticCallTraceCount() const { return callTraceCount_; }
+    u32 diagnosticCallTracePc(std::size_t back) const {
+        if (back >= callTraceCount_) return 0;
+        return callTracePc_[(callTraceHead_ - 1u - back) &
+                            (callTracePc_.size() - 1u)];
+    }
+    u32 diagnosticCallTraceTarget(std::size_t back) const {
+        if (back >= callTraceCount_) return 0;
+        return callTraceTarget_[(callTraceHead_ - 1u - back) &
+                                (callTraceTarget_.size() - 1u)];
+    }
+    u64 diagnosticCallTraceInstruction(std::size_t back) const {
+        if (back >= callTraceCount_) return 0;
+        return callTraceInstruction_[(callTraceHead_ - 1u - back) &
+                                     (callTraceInstruction_.size() - 1u)];
     }
     std::size_t diagnosticRegister64ChangeCount() const {
         return register64ChangeCount_;
@@ -114,9 +258,36 @@ public:
     }
     u32 registerWindowBase() const { return m_r[1]; }
     u64 instructions() const { return instructions_; }
+    u64 diagnosticTimerExpiries() const { return timerExpiries_; }
+    u64 diagnosticTimerInterrupts() const { return timerInterrupts_; }
+    u64 diagnosticTimerWrites() const { return timerWrites_; }
+    u64 diagnosticExternalInterrupts(int input) const {
+        return externalInterrupts_[input & 3];
+    }
+    u64 diagnosticExternalAssertions(int input) const {
+        return externalAssertions_[input & 3];
+    }
     void setDiagnosticPcWatch(u32 pc) {
         diagnosticWatchPc_ = pc;
         diagnosticWatchHits_ = 0;
+        diagnosticWatchHitCount_ = 0;
+    }
+    // Instruction numbers of the first 32 watched-pc hits.
+    std::size_t diagnosticPcWatchHitCount() const {
+        return diagnosticWatchHitCount_;
+    }
+    u64 diagnosticPcWatchHitInstruction(std::size_t index) const {
+        return index < diagnosticWatchHitCount_
+            ? diagnosticWatchHitInstructions_[index] : 0;
+    }
+    void setDiagnosticProfileRange(u32 first, u32 last) {
+        diagnosticProfileFirst_ = first;
+        diagnosticProfileCounts_.assign(
+            (static_cast<std::size_t>(last - first) >> 2u) + 1u, 0);
+    }
+    u32 diagnosticProfileFirst() const { return diagnosticProfileFirst_; }
+    const std::vector<u64>& diagnosticProfileCounts() const {
+        return diagnosticProfileCounts_;
     }
     u64 diagnosticPcWatchHits() const { return diagnosticWatchHits_; }
     bool faulted() const { return faulted_; }
@@ -140,6 +311,8 @@ private:
         ExceptionUnalignedAccess = 1,
         ExceptionOutOfRange = 2,
         ExceptionProtectionViolation = 5,
+        ExceptionInstructionAccessException = 6,
+        ExceptionDataAccessException = 7,
         ExceptionUserInstructionTlbMiss = 8,
         ExceptionUserDataTlbMiss = 9,
         ExceptionSupervisorInstructionTlbMiss = 10,
@@ -164,11 +337,12 @@ private:
     void timer_interrupt_check();
     enum class Access { Instruction, Load, Store };
     bool translateAddress(u32 virtualAddress, Access access,
-                          bool userAccess, u32& physicalAddress);
+                          bool userAccess, u32& physicalAddress,
+                          int* hitSet = nullptr);
     bool trapsUnalignedDataAccess(u32 address, u32 option,
                                   bool instructionData) const;
     u32 read_program_word(u32 address);
-    u32 read_data_value(u32 address, u32 option, bool signExtend,
+    u32 read_data_value(u32 address, u32 option, bool setBytePointer,
                         bool inputOutput);
     void write_data_value(u32 address, u32 value, u32 option,
                           bool inputOutput);
@@ -213,7 +387,16 @@ private:
 
     DataSpace m_data{this};
     std::array<u32, 256> m_r{};
+    std::array<FetchWindow, kFetchWindows> fetchWindows_{};
     std::array<u32, 128> m_tlb{};
+    // Instruction-fetch translation hint (see read_program_word).  Not
+    // architectural state: derived from m_tlb, dropped on any TLB/MMU write.
+    bool fetchTranslationValid_ = false;
+    bool fetchTranslationUser_ = false;
+    u32 fetchTranslationVpage_ = 0;
+    u32 fetchTranslationPhys_ = 0;
+    u32 fetchTranslationLine_ = 0;
+    int fetchTranslationSet_ = 0;
 
     u32 m_pc = 0;
     u32 m_vab = 0;
@@ -257,6 +440,17 @@ private:
     // so replay checkpoints remain independent of the front end's trigger.
     u32 diagnosticWatchPc_ = 0xFFFFFFFFu;
     u64 diagnosticWatchHits_ = 0;
+    std::array<u64, 32> diagnosticWatchHitInstructions_{};
+    std::size_t diagnosticWatchHitCount_ = 0;
+    // Diagnostic-only interrupt-facility counters; not serialized.
+    u64 timerExpiries_ = 0;
+    u64 timerInterrupts_ = 0;
+    u64 timerWrites_ = 0;
+    std::array<u64, 4> externalInterrupts_{};
+    std::array<u64, 4> externalAssertions_{};
+    // Diagnostic-only execution profile over one PC range; not serialized.
+    u32 diagnosticProfileFirst_ = 0;
+    std::vector<u64> diagnosticProfileCounts_;
     // Keep enough history to see through an exception prologue and a GCOS
     // completion/error helper.  These rings are diagnostic-only and are not
     // part of the checkpoint format.
@@ -270,8 +464,64 @@ private:
     std::array<u32, 64> register64ChangeNew_{};
     std::size_t register64ChangeHead_ = 0;
     std::size_t register64ChangeCount_ = 0;
+    // Rolling ring of taken CALL/CALLI/JMPI/JMPTI/JMPFI transfers so a wedge
+    // can be traced to the call chain that led there.  Diagnostic-only.
+    std::array<u32, 4096> callTracePc_{};
+    std::array<u32, 4096> callTraceTarget_{};
+    std::array<u64, 4096> callTraceInstruction_{};
+    std::size_t callTraceHead_ = 0;
+    std::size_t callTraceCount_ = 0;
+    // Rolling ring of TMC/TMR special-register writes: which code re-arms the
+    // timer, and with what values.  Diagnostic-only.
+    std::array<u32, 64> timerWritePc_{};
+    std::array<u32, 64> timerWriteValue_{};
+    std::array<u64, 64> timerWriteInstruction_{};
+    std::array<u8, 64> timerWriteIsReload_{};
+    std::size_t timerWriteHead_ = 0;
+    std::size_t timerWriteRingCount_ = 0;
+    void recordTimerWrite(bool reloadRegister, u32 value) {
+        timerWritePc_[timerWriteHead_] = m_exec_pc;
+        timerWriteValue_[timerWriteHead_] = value;
+        timerWriteInstruction_[timerWriteHead_] = instructions_;
+        timerWriteIsReload_[timerWriteHead_] = reloadRegister ? 1u : 0u;
+        timerWriteHead_ = (timerWriteHead_ + 1u) & (timerWritePc_.size() - 1u);
+        timerWriteRingCount_ = std::min(timerWriteRingCount_ + 1u,
+                                        timerWritePc_.size());
+    }
     bool faulted_ = false;
     std::string faultReason_;
+    // Derived from the MFB +$088 latch by the video model; not serialized.
+    bool interruptHold_ = false;
+    // Physical-register write watch (diagnostic-only, not serialized).
+    u16 registerWatchIndex_ = 0xFFFFu;
+    std::array<u32, 64> registerWatchPc_{};
+    std::array<u32, 64> registerWatchValue_{};
+    std::array<u64, 64> registerWatchInstruction_{};
+    std::size_t registerWatchHead_ = 0;
+    std::size_t registerWatchCount_ = 0;
+    bool dataBusFault_ = false;
+    bool takeDataBusFault() {
+        const bool faulted = dataBusFault_;
+        dataBusFault_ = false;
+        return faulted;
+    }
+    // A *DERR'd access RETIRES its instruction (the access lives on only
+    // in the channel registers); the dispatcher advances the resume pcs
+    // past it when this is set.
+    void restartChannelAccess();
+    u64 flightStart_ = 0;
+    u64 flightCount_ = 0;
+    u16 flightWatchIndex_ = 0;
+    std::vector<FlightEntry> flight_;
+    u32 pcSnapPc_ = 0;
+    u16 pcSnapRegister_ = 0;
+    std::array<u64, 64> pcSnapInstruction_{};
+    std::array<u32, 64> pcSnapGr1_{};
+    std::array<u32, 64> pcSnapValue_{};
+    std::array<u32, 64> pcSnapGr126_{};
+    std::array<u32, 64> pcSnapGr127_{};
+    std::size_t pcSnapHead_ = 0;
+    std::size_t pcSnapCount_ = 0;
 };
 
 } // namespace openmac

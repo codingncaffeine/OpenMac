@@ -52,9 +52,9 @@
 #define JMP_ZEX                     (I16 << 2)
 #define JMP_SEX                     ((int32_t)(int16_t)(((m_exec_ir >> 8) & 0xff00) | (m_exec_ir & 0xff)) << 2)
 
-#define BOOLEAN_MASK                (1 << 31)
-#define BOOLEAN_TRUE                (1 << 31)
-#define BOOLEAN_FALSE               (0)
+#define BOOLEAN_MASK                (0x80000000u)
+#define BOOLEAN_TRUE                (0x80000000u)
+#define BOOLEAN_FALSE               (0u)
 
 #define UNHANDLED_OP                fatalerror("Am29000: Unhandled inst %s at %x\n", __FUNCTION__, m_exec_pc);
 
@@ -153,8 +153,24 @@ void Am29000::write_spr(uint32_t idx, uint32_t val)
 		case SprRbp:   m_rbp = val & RBP_MASK;
 						break;
 		case SprTmc:   m_tmc = val & TCV_MASK;
+						// The Timer Facility is a zero-detect counter: "the
+						// TCV field is zero for a complete cycle before the
+						// IN bit is set" (Am29030 User's Manual 8.7.5), so a
+						// software-loaded zero expires on the next cycle.
+						// GCOS arms its 1 kHz heartbeat as TMR=IE|$7530 then
+						// TMC=0 and expects the first tick at once; reading
+						// the zero as a full 2^24-cycle interval starved the
+						// tick (the per-round re-INIT re-zeroed TMC before it
+						// ever fired).  The init-sequencing fault this once
+						// appeared to expose was the dropped same-cycle
+						// exception, fixed in run().
+						if (m_tmc == 0) m_tmc = TCV_RELOAD_PENDING;
+						++timerWrites_;
+						recordTimerWrite(false, val);
 						break;
 		case SprTmr:   m_tmr = val & (TMR_OV | TMR_IN | TMR_IE | TMR_TRV_MASK);
+						++timerWrites_;
+						recordTimerWrite(true, val);
 						break;
 		case SprPc0:   m_pc0 = val & PC_MASK;
 						break;
@@ -163,6 +179,7 @@ void Am29000::write_spr(uint32_t idx, uint32_t val)
 		case SprPc2:   m_pc2 = val & PC_MASK;
 						break;
 		case SprMmu:   m_mmu = val & ((MMU_PS_MASK << MMU_PS_SHIFT) | MMU_PID_MASK);
+						fetchTranslationValid_ = false;
 						break;
 		case SprLru:   m_lru = val & (LRU_MASK << LRU_SHIFT);
 						break;
@@ -986,12 +1003,43 @@ void Am29000::LOAD()
 		// address is presented directly to the external bus.
 		if (!inputOutput && !INST_PA_BIT && !(m_cps & CPS_PD) &&
 			!translateAddress(addr, Access::Load, userAccess, physical))
+		{
+			// Data TLB miss / protection violation: PC1 = "next" and the
+			// channel registers describe the access (User's Manual Table
+			// 3-11, "all"), so the instruction retires and IRET restarts
+			// the load from CHA/CHC once the handler has mapped the page.
+			// Leaving the channel registers stale silently DROPPED the
+			// load: a `CALLI` whose delay-slot `LOAD lr2,[lr7]` missed the
+			// TLB entered its callee with the previous argument (24-bit
+			// GC activation passed pointer 1 -> unaligned copy -> kernel
+			// restart, forever).
+			if (!FREEZE_MODE)
+			{
+				m_chc = channelControl;
+				m_cha = addr;
+				m_chd = 0;
+			}
 			return;
-		// Rev-C and later parts use SB as signed-byte/half-word selection when
-		// CFG.DW enables the external-width hardware.  GC QuickDraw relies on
-		// this for signed 16-bit Rect/Point coordinates in its command stream.
+		}
+		// With CFG.DW the processor aligns sub-word data itself; SB then
+		// selects sign extension (see read_data_value).
 		r = read_data_value(physical, INST_OPT_FIELD,
 			(m_cfg & CFG_DW) != 0 && INST_SB_BIT != 0, inputOutput);
+		// *DERR: the access did not complete, but its instruction RETIRES
+		// -- the access lives on only in the channel registers (TF set).
+		// GCOS's Data Access Exception handler either abandons it (clears
+		// CV) or prunes the absent DRAM bank and lets IRET restart it.
+		if (takeDataBusFault())
+		{
+			if (!FREEZE_MODE)
+			{
+				m_chc = channelControl | CHC_TF;
+				m_cha = addr;
+				m_chd = 0;
+			}
+			SIGNAL_EXCEPTION(ExceptionDataAccessException);
+			return;
+		}
 	}
 
 //  if (opt & 2)
@@ -999,22 +1047,22 @@ void Am29000::LOAD()
 
 	if (!FREEZE_MODE)
 	{
-		m_chc = channelControl;
+		// The access completed, so its channel description is no longer
+		// valid for restart (CV clears on normal completion).
+		m_chc = channelControl & ~CHC_CV;
 		m_cha = addr;
 		m_chd = r;
 
-		if (!(m_cfg & CFG_DW) && INST_SB_BIT)
+		// SB latches the Byte Pointer (LATCH_SB_BP: address bits without
+		// CFG.DW, the low lane with it); EXBYTE/EXHW(S)/INBYTE/INHW then
+		// address the datum.  GC QuickDraw's rect importer depends on it.
+		if (INST_SB_BIT)
 		{
-			SET_ALU_BP(addr);
+			LATCH_SB_BP(addr);
 		}
 	}
 
 	m_r[target] = r;
-
-	if (m_cfg & CFG_DW)
-	{
-		logerror("DW ON A STORE");
-	}
 }
 
 void Am29000::LOADL()
@@ -1073,24 +1121,60 @@ void Am29000::LOADM()
 		m_cha = addr;
 		m_chd = r; // ?????
 
-		if (!(m_cfg & CFG_DW) && INST_SB_BIT)
+		if (INST_SB_BIT)
 		{
-			SET_ALU_BP(addr);
+			LATCH_SB_BP(addr);
 		}
 	}
 
 	r = target;
 
-	for (int32_t cnt = 0; cnt <= GET_CHC_CR; ++cnt)
+	for (uint32_t cnt = 0; cnt <= GET_CHC_CR; ++cnt)
 	{
 		uint32_t physical = addr;
 		const bool userAccess = USER_MODE || INST_UA_BIT;
 		const bool inputOutput = INST_AS_BIT != 0;
 		if (!inputOutput && !INST_PA_BIT && !(m_cps & CPS_PD) &&
 			!translateAddress(addr, Access::Load, userAccess, physical))
+		{
+			// TLB miss mid-multiple: leave the channel registers at the
+			// faulting transfer (TR = current target, CR = transfers left)
+			// so the IRET restart resumes there.
+			if (!FREEZE_MODE)
+			{
+				m_chc = (channelControl &
+					~(CHC_CR_MASK << CHC_CR_SHIFT |
+					  CHC_TR_MASK << CHC_TR_SHIFT)) |
+					(static_cast<uint32_t>(GET_CHC_CR - cnt) &
+					 CHC_CR_MASK) << CHC_CR_SHIFT |
+					(r & CHC_TR_MASK) << CHC_TR_SHIFT;
+				m_cha = addr;
+				m_chd = 0;
+			}
 			return;
-		m_r[r] = read_data_value(physical, INST_OPT_FIELD,
+		}
+		const uint32_t loaded = read_data_value(physical, INST_OPT_FIELD,
 			(m_cfg & CFG_DW) != 0 && INST_SB_BIT != 0, inputOutput);
+		// *DERR mid-multiple: leave the channel registers describing the
+		// faulting transfer (TR = current target, CR = transfers left)
+		// with TF set, so the handler can prune and restart.
+		if (takeDataBusFault())
+		{
+			if (!FREEZE_MODE)
+			{
+				m_chc = (channelControl &
+					~(CHC_CR_MASK << CHC_CR_SHIFT |
+					  CHC_TR_MASK << CHC_TR_SHIFT)) |
+					(static_cast<uint32_t>(GET_CHC_CR - cnt) &
+					 CHC_CR_MASK) << CHC_CR_SHIFT |
+					(r & CHC_TR_MASK) << CHC_TR_SHIFT | CHC_TF;
+				m_cha = addr;
+				m_chd = 0;
+			}
+			SIGNAL_EXCEPTION(ExceptionDataAccessException);
+			return;
+		}
+		m_r[r] = loaded;
 
 //          SET_CHC_CR(cnt - 1);
 		addr += 4;
@@ -1100,6 +1184,8 @@ void Am29000::LOADM()
 			r = 128;
 		}
 	}
+	// CV clears on normal completion of the whole multiple.
+	if (!FREEZE_MODE) m_chc &= ~CHC_CV;
 }
 
 void Am29000::STORE()
@@ -1140,24 +1226,43 @@ void Am29000::STORE()
 	const bool inputOutput = INST_AS_BIT != 0;
 	if (!inputOutput && !INST_PA_BIT && !(m_cps & CPS_PD) &&
 		!translateAddress(addr, Access::Store, userAccess, physical))
+	{
+		// See LOAD: the store retires and IRET re-issues it from the
+		// channel registers.
+		if (!FREEZE_MODE)
+		{
+			m_chc = channelControl;
+			m_cha = addr;
+			m_chd = value;
+		}
 		return;
+	}
 	write_data_value(physical, value, INST_OPT_FIELD, inputOutput);
+	// *DERR: see LOAD.
+	if (takeDataBusFault())
+	{
+		if (!FREEZE_MODE)
+		{
+			m_chc = channelControl | CHC_TF;
+			m_cha = addr;
+			m_chd = value;
+		}
+		SIGNAL_EXCEPTION(ExceptionDataAccessException);
+		return;
+	}
 
 	if (!FREEZE_MODE)
 	{
-		m_chc = channelControl;
+		// CV clears on normal completion; see LOAD.
+		m_chc = channelControl & ~CHC_CV;
 		m_cha = addr;
 		m_chd = value;
 
-		if (!(m_cfg & CFG_DW) && INST_SB_BIT)
+		// Byte-pointer latch mirrors LOAD.
+		if (INST_SB_BIT)
 		{
-			SET_ALU_BP(addr);
+			LATCH_SB_BP(addr);
 		}
-	}
-
-	if (m_cfg & CFG_DW)
-	{
-		logerror("DW ON A STORE");
 	}
 }
 
@@ -1208,23 +1313,54 @@ void Am29000::STOREM()
 		m_cha = addr;
 		m_chd = m_r[source];
 
-		if (!(m_cfg & CFG_DW) && INST_SB_BIT)
+		if (INST_SB_BIT)
 		{
-			SET_ALU_BP(addr);
+			LATCH_SB_BP(addr);
 		}
 	}
 
 	r = source;
 
-	for (int32_t cnt = 0; cnt <= GET_CHC_CR; ++cnt)
+	for (uint32_t cnt = 0; cnt <= GET_CHC_CR; ++cnt)
 	{
 		uint32_t physical = addr;
 		const bool userAccess = USER_MODE || INST_UA_BIT;
 		const bool inputOutput = INST_AS_BIT != 0;
 		if (!inputOutput && !INST_PA_BIT && !(m_cps & CPS_PD) &&
 			!translateAddress(addr, Access::Store, userAccess, physical))
+		{
+			// TLB miss mid-multiple: see LOADM.
+			if (!FREEZE_MODE)
+			{
+				m_chc = (channelControl &
+					~(CHC_CR_MASK << CHC_CR_SHIFT |
+					  CHC_TR_MASK << CHC_TR_SHIFT)) |
+					(static_cast<uint32_t>(GET_CHC_CR - cnt) &
+					 CHC_CR_MASK) << CHC_CR_SHIFT |
+					(r & CHC_TR_MASK) << CHC_TR_SHIFT;
+				m_cha = addr;
+				m_chd = m_r[r];
+			}
 			return;
+		}
 		write_data_value(physical, m_r[r], INST_OPT_FIELD, inputOutput);
+		// *DERR mid-multiple: see LOADM.
+		if (takeDataBusFault())
+		{
+			if (!FREEZE_MODE)
+			{
+				m_chc = (channelControl &
+					~(CHC_CR_MASK << CHC_CR_SHIFT |
+					  CHC_TR_MASK << CHC_TR_SHIFT)) |
+					(static_cast<uint32_t>(GET_CHC_CR - cnt) &
+					 CHC_CR_MASK) << CHC_CR_SHIFT |
+					(r & CHC_TR_MASK) << CHC_TR_SHIFT | CHC_TF;
+				m_cha = addr;
+				m_chd = m_r[r];
+			}
+			SIGNAL_EXCEPTION(ExceptionDataAccessException);
+			return;
+		}
 
 		addr += 4;
 
@@ -1233,6 +1369,8 @@ void Am29000::STOREM()
 			r = 128;
 		}
 	}
+	// CV clears on normal completion of the whole multiple.
+	if (!FREEZE_MODE) m_chc &= ~CHC_CV;
 }
 
 void Am29000::EXBYTE()
@@ -1337,6 +1475,7 @@ void Am29000::MTSRIM()
 void Am29000::MTTLB()
 {
 	m_tlb[GET_RA_VAL & 0x7f] = GET_RB_VAL;
+	fetchTranslationValid_ = false;
 }
 
 
@@ -1492,12 +1631,86 @@ void Am29000::INV()
 	/* Nothing to do yet */
 }
 
+// Interrupt-return step 10 (User's Manual): a CV=1/NN=0 channel
+// description re-issues its access from the channel registers -- the
+// faulted instruction already retired, so this, not instruction replay,
+// is how an interrupted or *DERR'd access resumes.  A handler that
+// cleared CV abandoned the access (GCOS's fault-swallow path does).
+void Am29000::restartChannelAccess()
+{
+	const uint32_t control = (m_chc >> CHC_CE_CNTL_SHIFT) & CHC_CE_CNTL_MASK;
+	const uint32_t option = control & 7u;
+	const bool inputOutput = (control & 0x40u) != 0;
+	const bool physicalOnly = (control & 0x20u) != 0;
+	const bool isLoad = (m_chc & CHC_LS) != 0;
+	const bool multiple = (m_chc & CHC_ML) != 0;
+	uint32_t remaining = multiple ? GET_CHC_CR + 1u : 1u;
+	uint32_t target = (m_chc >> CHC_TR_SHIFT) & CHC_TR_MASK;
+	uint32_t addr = m_cha;
+	const bool userAccess = USER_MODE || (control & 0x08u) != 0;
+	bool faulted = false;
+	while (remaining != 0)
+	{
+		uint32_t physical = addr;
+		if (!inputOutput && !physicalOnly && !(m_cps & CPS_PD) &&
+			!translateAddress(addr,
+				isLoad ? Access::Load : Access::Store,
+				userAccess, physical))
+		{
+			// A TLB trap during the restart: leave the channel registers
+			// at the current position (CV still set) so the next IRET
+			// resumes the remaining transfers.
+			m_chc = (m_chc & ~(CHC_CR_MASK << CHC_CR_SHIFT |
+			                   CHC_TR_MASK << CHC_TR_SHIFT)) |
+				((remaining - 1u) & CHC_CR_MASK) << CHC_CR_SHIFT |
+				(target & CHC_TR_MASK) << CHC_TR_SHIFT;
+			m_cha = addr;
+			if (!isLoad && multiple) m_chd = m_r[target];
+			return;
+		}
+		if (isLoad)
+		{
+			const uint32_t value =
+				read_data_value(physical, option, false, inputOutput);
+			if (takeDataBusFault()) { faulted = true; break; }
+			m_r[target] = value;
+		}
+		else
+		{
+			write_data_value(physical,
+				multiple ? m_r[target] : m_chd, option, inputOutput);
+			if (takeDataBusFault()) { faulted = true; break; }
+		}
+		addr += 4u;
+		if (++target == 256u) target = 128u;
+		--remaining;
+	}
+	if (faulted)
+	{
+		m_chc = (m_chc & ~(CHC_CR_MASK << CHC_CR_SHIFT |
+	                       CHC_TR_MASK << CHC_TR_SHIFT)) |
+			((remaining - 1u) & CHC_CR_MASK) << CHC_CR_SHIFT |
+			(target & CHC_TR_MASK) << CHC_TR_SHIFT | CHC_TF;
+		m_cha = addr;
+		SIGNAL_EXCEPTION(ExceptionDataAccessException);
+		return;
+	}
+	m_chc &= ~CHC_CV;
+}
+
 void Am29000::IRET()
 {
 	m_iret_pc = m_pc0;
 	m_next_pc = m_pc1;
 	m_cps = m_ops;
-	m_next_pl_flags = PFLAG_IRET;
+	if ((m_chc & CHC_CV) != 0 && (m_chc & CHC_NN) == 0)
+		restartChannelAccess();
+	// Interrupts and traps stay disabled through the return sequence
+	// (User's Manual interrupt-return steps 2-11): the refilled
+	// instructions execute before a still-pending request is recognized
+	// again.  Without the hold a persistent request (GCOS's deferred tick
+	// leaves IN set and IRETs) re-preempts the refill forever.
+	m_next_pl_flags = PFLAG_IRET | (2u << PFLAG_REFILL_HOLD_SHIFT);
 }
 
 void Am29000::IRETINV()

@@ -95,13 +95,33 @@ void adbCommand(IifxAdbBus& bus, u64& cycles, u8 command) {
 
 } // namespace
 
-TEST_CASE("Am29000 DW signed half-word loads preserve QuickDraw coordinates") {
+TEST_CASE("Am29000 DW sub-word loads right-justify and SB sign-extends") {
+    // With CFG.DW set the processor aligns sub-word data itself: the
+    // addressed byte/half-word lands right-justified in the destination,
+    // sign-extended when SB=1 and zero-extended when SB=0, and an SB access
+    // parks the Byte Pointer on the low lane (~BO in both bits) so the
+    // EXBYTE/EXHW/INBYTE/INHW idiom still addresses the datum (Am29030
+    // User's Manual 3.3.7.2 and the SB bit description; the DW-enabled
+    // Am29000 revisions GCOS configures follow it).  GCOS is compiled for
+    // this: ~1300 half-word loads carry SB=1 for signed shorts and SB=0 for
+    // unsigned ones and use the value directly -- the region-row merge at
+    // $9D7BEB88 compares a loaded half-word against the $7FFF sentinel.
+    // The broadcast model ($7FFF7FFF) never matched and the merge ran off
+    // the end of card memory.
     Am29000 cpu;
-    const std::array<u32, 4> program{
+    const std::array<u32, 12> program{
+        0x04010273u, // mtsrim CPS,$0173 (leave freeze mode; BP can latch)
         0x04000330u, // mtsrim CFG,$0030 (DW and fetched vectors)
         0x03014000u, // const  gr64,$0100
-        0x16124140u, // load   0,$12,gr65,gr64 (signed half-word)
-        0x16024240u, // load   0,$02,gr66,gr64 (unsigned half-word)
+        0x16124140u, // load   0,$12,gr65,gr64   (signed half-word at +0)
+        0x7D424100u, // exhw   gr66,gr65,0       (extract via latched BP)
+        0x03014402u, // const  gr68,$0102
+        0x16024344u, // load   0,$02,gr67,gr68   (unsigned half-word at +2)
+        0x7D454300u, // exhw   gr69,gr67,0       (extract via latched BP)
+        0x03014601u, // const  gr70,$0101
+        0x16114746u, // load   0,$11,gr71,gr70   (signed byte at +1)
+        0x16014846u, // load   0,$01,gr72,gr70   (unsigned byte at +1)
+        0x70400101u, // nop
     };
     cpu.readInstruction = [&](u32 address, bool) {
         const std::size_t index = address / 4u;
@@ -109,14 +129,498 @@ TEST_CASE("Am29000 DW signed half-word loads preserve QuickDraw coordinates") {
     };
     cpu.readData = [](u32 address, bool inputOutput) {
         CHECK_FALSE(inputOutput);
-        return address == 0x100u ? 0x80017FFEu : 0u;
+        return (address & ~3u) == 0x100u ? 0x80817FFEu : 0u;
     };
     cpu.writeData = [](u32, u32, bool) {};
 
-    REQUIRE(cpu.run(5) == 5);
+    REQUIRE(cpu.run(13) == 13);
     CHECK_FALSE(cpu.faulted());
-    CHECK(cpu.registerValue(65) == 0xFFFF8001u);
-    CHECK(cpu.registerValue(66) == 0x00008001u);
+    // SB=1 ($12): half-word $8081 at +0 arrives right-justified and
+    // sign-extended; BP now points at the low lane, so EXHW re-extracts
+    // the same half-word.
+    CHECK(cpu.registerValue(65) == 0xFFFF8081u);
+    CHECK(cpu.registerValue(66) == 0x00008081u);
+    // SB=0 ($02): half-word $7FFE at +2 arrives zero-extended, and EXHW
+    // through the still-parked BP yields it unchanged.
+    CHECK(cpu.registerValue(67) == 0x00007FFEu);
+    CHECK(cpu.registerValue(69) == 0x00007FFEu);
+    // Bytes: $81 at +1 is $FFFFFF81 signed and $00000081 unsigned.
+    CHECK(cpu.registerValue(71) == 0xFFFFFF81u);
+    CHECK(cpu.registerValue(72) == 0x00000081u);
+}
+
+TEST_CASE("Am29000 DW sub-word stores replicate the low lane into the addressed lanes") {
+    // With CFG.DW set a byte/half-word store replicates the LOW byte or
+    // half-word of the source register into every lane and the write
+    // enables strobe only the addressed lane(s) (Am29030 User's Manual
+    // 3.3.7.2).  Compiled GCOS stores right-justified values with plain
+    // STORE.half at any alignment; taking the register lane matching the
+    // address wrote the empty high half to even offsets, and writing the
+    // full word sprayed the other lanes over the neighbours.
+    Am29000 cpu;
+    const std::array<u32, 12> program{
+        0x04010273u, // mtsrim CPS,$0173 (leave freeze mode)
+        0x04000330u, // mtsrim CFG,$0030 (DW and fetched vectors)
+        0x03014000u, // const  gr64,$0100
+        0x03CC41DDu, // const  gr65,$CCDD
+        0x02AA41BBu, // consth gr65,$AABB      (gr65 = $AABBCCDD)
+        0x1E024140u, // store  0,$02,gr65,gr64 (half at +0: lanes 0-1)
+        0x03014402u, // const  gr68,$0102
+        0x1E024144u, // store  0,$02,gr65,gr68 (half at +2: lanes 2-3)
+        0x03014501u, // const  gr69,$0101
+        0x0311461Fu, // const  gr70,$111F
+        0x1E014645u, // store  0,$01,gr70,gr69 (byte at +1)
+        0x70400101u, // nop
+    };
+    cpu.readInstruction = [&](u32 address, bool) {
+        const std::size_t index = address / 4u;
+        return index < program.size() ? program[index] : 0u;
+    };
+    u32 memory = 0x11223344u;
+    cpu.readData = [&](u32 address, bool) {
+        return (address & ~3u) == 0x100u ? memory : 0u;
+    };
+    cpu.writeData = [&](u32 address, u32 value, bool) {
+        REQUIRE((address & ~3u) == 0x100u);
+        memory = value;
+    };
+
+    REQUIRE(cpu.run(13) == 13);
+    CHECK_FALSE(cpu.faulted());
+    // Both half stores wrote gr65's LOW half ($CCDD): +0 took lanes 0-1
+    // and +2 took lanes 2-3.  The byte store wrote gr70's LOW byte ($1F)
+    // to +1 without touching the neighbours.
+    CHECK(memory == 0xCC1FCCDDu);
+}
+
+TEST_CASE("Am29000 DW importer idiom copies half-words at either alignment") {
+    // GC QuickDraw's rect importer ($9D7F8A5C) copies half-words with
+    // LOAD.half(SB) -> EXHW -> LOAD.half(SB) -> INHW -> STORE.half.  Under
+    // the DW semantics the SB loads park BP on the low lane, EXHW/INHW
+    // work on the right-justified datum, and the store replicates it into
+    // the addressed lanes -- so the copy is exact for both the even (+0)
+    // and odd (+2) half-word of a word.
+    Am29000 cpu;
+    const std::array<u32, 20> program{
+        0x04010273u, // mtsrim CPS,$0173
+        0x04000330u, // mtsrim CFG,$0030
+        0x03014000u, // const  gr64,$0100 (source, +0)
+        0x03024100u, // const  gr65,$0200 (dest, +0)
+        0x16124240u, // load   0,$12,gr66,gr64
+        0x7D424200u, // exhw   gr66,gr66,0
+        0x16124341u, // load   0,$12,gr67,gr65
+        0x78434342u, // inhw   gr67,gr67,gr66
+        0x1E024341u, // store  0,$02,gr67,gr65
+        0x03014402u, // const  gr68,$0102 (source, +2)
+        0x03024502u, // const  gr69,$0202 (dest, +2)
+        0x16124644u, // load   0,$12,gr70,gr68
+        0x7D464600u, // exhw   gr70,gr70,0
+        0x16124745u, // load   0,$12,gr71,gr69
+        0x78474746u, // inhw   gr71,gr71,gr70
+        0x1E024745u, // store  0,$02,gr71,gr69
+        0x70400101u, // nop
+        0x70400101u, // nop
+        0x70400101u, // nop
+        0x70400101u, // nop
+    };
+    cpu.readInstruction = [&](u32 address, bool) {
+        const std::size_t index = address / 4u;
+        return index < program.size() ? program[index] : 0u;
+    };
+    u32 source = 0x1234FEDCu;
+    u32 dest = 0x00000000u;
+    cpu.readData = [&](u32 address, bool) {
+        if ((address & ~3u) == 0x100u) return source;
+        if ((address & ~3u) == 0x200u) return dest;
+        return 0u;
+    };
+    cpu.writeData = [&](u32 address, u32 value, bool) {
+        REQUIRE((address & ~3u) == 0x200u);
+        dest = value;
+    };
+
+    REQUIRE(cpu.run(17) == 17);
+    CHECK_FALSE(cpu.faulted());
+    CHECK(dest == 0x1234FEDCu);
+}
+
+TEST_CASE("Am29000 assert trap in a jump delay slot resumes at the target") {
+    // GCOS returns with `JMPI lr0` and puts the register-stack FILL assert
+    // (ASLEU V=41) in the delay slot.  When the assert traps, the handler
+    // IRET must resume at the JUMP TARGET: the assert already completed and
+    // the branch was already taken.  Resuming at the fall-through instead
+    // silently discards the return jump, which sent the 24-bit GC activation
+    // task into the scheduler exit instead of back up its call chain (R1).
+    Am29000 cpu;
+    const std::array<u32, 24> program{
+        0x04010272u, // 00 mtsrim CPS,$0172 (freeze off, traps deliverable)
+        0x04000330u, // 04 mtsrim CFG,$0030 (DW and fetched vectors)
+        0x03004040u, // 08 const  gr64,$0040 (jump target)
+        0x03004102u, // 0C const  gr65,2
+        0x03004201u, // 10 const  gr66,1
+        0xC0000040u, // 14 jmpi   gr64
+        0x56414142u, // 18 asleu  V=$41,gr65,gr66 (delay slot; 2<=1 traps)
+        0x030043BBu, // 1C const  gr67,$BB (fall-through: must NOT run)
+        0x70400101u, // 20 nop
+        0x70400101u, // 24 nop
+        0x70400101u, // 28 nop
+        0x70400101u, // 2C nop
+        0x70400101u, // 30
+        0x70400101u, // 34
+        0x70400101u, // 38
+        0x70400101u, // 3C
+        0x030043AAu, // 40 const  gr67,$AA (branch target: must run)
+        0x70400101u, // 44 nop
+        0x70400101u, // 48
+        0x70400101u, // 4C
+        0x70400101u, // 50
+        0x70400101u, // 54
+        0x70400101u, // 58
+        0x70400101u, // 5C
+    };
+    const std::array<u32, 2> handler{
+        0x88000000u, // 80 iret
+        0x70400101u, // 84 nop
+    };
+    cpu.readInstruction = [&](u32 address, bool) -> u32 {
+        if (address >= 0x80u) {
+            const std::size_t index = (address - 0x80u) / 4u;
+            return index < handler.size() ? handler[index] : 0x70400101u;
+        }
+        const std::size_t index = address / 4u;
+        return index < program.size() ? program[index] : 0x70400101u;
+    };
+    cpu.readVector = [](u32 address) -> u32 {
+        // Vector 65 ($41) entry points at the IRET stub.
+        return address == (0x41u << 2u) ? 0x80u : 0x70400101u;
+    };
+    cpu.readData = [](u32, bool) { return 0u; };
+    cpu.writeData = [](u32, u32, bool) {};
+
+    REQUIRE(cpu.run(40) == 40);
+    CHECK_FALSE(cpu.faulted());
+    // The fill assert fired and returned; execution must have continued at
+    // the branch target, not the fall-through after the delay slot.
+    CHECK(cpu.registerValue(67) == 0x000000AAu);
+}
+
+TEST_CASE("Am29000 execute-stage trap outranks the same cycle's fetch "
+          "exception") {
+    // A branch's delay slot holds a failing fill assert (ASLEU V=$41) while
+    // the SAME cycle's fetch of the branch target raises its own exception.
+    // The execute-stage trap belongs to the older instruction and must be
+    // the one dispatched; the fetch simply re-issues after the handler
+    // returns and re-derives its exception.  Dispatching the fetch's vector
+    // instead silently DROPS the fill assert -- the lost window refill let
+    // GCQD's sequencer read a stale physical register slot and CALLI the
+    // $80000000 callback sentinel (the 8*24 GC depth-path card fault).
+    //
+    // Fetch-side exception here: the branch target names an RBP-protected
+    // register, tripping fetch_decode's user-mode check.  The V41 handler
+    // clears RBP, so with the correct dispatch order the refetched target
+    // then executes; with the wrong order the V41 vector never arrives and
+    // the RBP violation handler loops instead.
+    Am29000 cpu;
+    const std::array<u32, 24> program{
+        0x04010272u, // 00 mtsrim CPS,$0172 (supervisor, traps deliverable)
+        0x04000330u, // 04 mtsrim CFG,$0030 (fetched vectors)
+        0x04000720u, // 08 mtsrim RBP,$0020 (protect gr80-95 from user mode)
+        0x03004040u, // 0C const  gr64,$0040 (branch target)
+        0x03004102u, // 10 const  gr65,2
+        0x03004201u, // 14 const  gr66,1
+        0x04010262u, // 18 mtsrim CPS,$0162 (drop to user mode)
+        0xC0000040u, // 1C jmpi   gr64
+        0x56414142u, // 20 asleu  V=$41,gr65,gr66 (delay slot; 2<=1 traps)
+        0x030043BBu, // 24 const  gr67,$BB (fall-through: must NOT run)
+        0x70400101u, // 28 nop
+        0x70400101u, // 2C nop
+        0x70400101u, // 30
+        0x70400101u, // 34
+        0x70400101u, // 38
+        0x70400101u, // 3C
+        0x15505000u, // 40 add    gr80,gr80,0 (RBP-protected at fetch)
+        0x030046AAu, // 44 const  gr70,$AA (proof the target ran)
+        0xA0000000u, // 48 jmp    . (park; falling into the stubs below
+        0x70400101u, // 4C nop      would run a bare IRET with no context)
+        0x70400101u, // 50
+        0x70400101u, // 54
+        0x70400101u, // 58
+        0x70400101u, // 5C
+    };
+    const std::array<u32, 4> fillHandler{
+        0x04000700u, // 80 mtsrim RBP,0 (unprotect, so the refetch passes)
+        0x03004441u, // 84 const  gr68,$41 (V41 arrived)
+        0x88000000u, // 88 iret
+        0x70400101u, // 8C nop
+    };
+    const std::array<u32, 3> protectionHandler{
+        0x03004505u, // A0 const  gr69,$05 (protection vector arrived)
+        0x88000000u, // A4 iret
+        0x70400101u, // A8 nop
+    };
+    std::vector<u32> fetched;
+    cpu.readInstruction = [&](u32 address, bool) -> u32 {
+        fetched.push_back(address);
+        if (address >= 0xA0u) {
+            const std::size_t index = (address - 0xA0u) / 4u;
+            return index < protectionHandler.size() ? protectionHandler[index]
+                                                    : 0x70400101u;
+        }
+        if (address >= 0x80u) {
+            const std::size_t index = (address - 0x80u) / 4u;
+            return index < fillHandler.size() ? fillHandler[index]
+                                              : 0x70400101u;
+        }
+        const std::size_t index = address / 4u;
+        return index < program.size() ? program[index] : 0x70400101u;
+    };
+    std::vector<u32> dispatched;
+    cpu.readVector = [&](u32 address) -> u32 {
+        dispatched.push_back(address);
+        if (address == (0x41u << 2u)) return 0x80u;  // V41 fill assert
+        if (address == (5u << 2u)) return 0xA0u;     // protection violation
+        return 0x70400101u;
+    };
+    cpu.readData = [](u32, bool) { return 0u; };
+    cpu.writeData = [](u32, u32, bool) {};
+
+    REQUIRE(cpu.run(60) == 60);
+    REQUIRE(dispatched.size() >= 1);
+    // The FIRST dispatch must be the fill assert's vector, not the fetch's.
+    CHECK(dispatched[0] == (0x41u << 2u));
+    {
+        std::string order;
+        for (u32 address : dispatched) {
+            char item[16];
+            std::snprintf(item, sizeof item, "%X ", address);
+            order += item;
+        }
+        std::string fetches;
+        for (u32 address : fetched) {
+            char item[16];
+            std::snprintf(item, sizeof item, "%X ", address);
+            fetches += item;
+        }
+        INFO("fetch stream: " << fetches);
+        CHECK(order == "104 ");
+    }
+    CHECK_FALSE(cpu.faulted());
+    // The fill assert's vector was dispatched (not dropped), the protection
+    // handler was never needed (RBP cleared before the refetch), and the
+    // branch target executed.
+    CHECK(cpu.registerValue(68) == 0x00000041u);
+    CHECK(cpu.registerValue(69) == 0x00000000u);
+    CHECK(cpu.registerValue(70) == 0x000000AAu);
+    CHECK(cpu.registerValue(67) != 0x000000BBu);
+}
+
+TEST_CASE("Am29000 data TLB miss retires the load and IRET restarts it from "
+          "the channel registers") {
+    // User's Manual Table 3-11: a Data TLB Miss reports PC1 = "next" with
+    // the channel registers describing the access ("all").  The load
+    // therefore RETIRES, the handler maps the page, and the interrupt
+    // return re-issues the access from CHA/CHC (return step 5) -- the
+    // register is written before the next instruction runs.  Here the load
+    // sits in a jump's delay slot, the exact shape of GCOS's
+    // `CALLI lr0,gr96 / LOAD lr2,[lr7]` argument load: leaving the channel
+    // registers stale dropped the load, the callee ran with the previous
+    // argument (pointer 1), and the 24-bit GC activation died in an
+    // unaligned copy every round.
+    Am29000 cpu;
+    const std::array<u32, 12> program{
+        0x04010233u, // 00 mtsrim CPS,$0233 (freeze off, PI physical, PD=0)
+        0x04000330u, // 04 mtsrim CFG,$0030 (fetched vectors)
+        0x04000D00u, // 08 mtsrim MMU,0 (1 KiB pages, PID 0)
+        0x03104000u, // 0C const  gr64,$1000 (virtual data address)
+        0xA0000004u, // 10 jmp    $0020
+        0x16004240u, // 14 load   0,0,gr66,gr64 (delay slot: TLB miss)
+        0x030043BBu, // 18 const  gr67,$BB (skipped by the jump)
+        0x70400101u, // 1C nop
+        0x030044AAu, // 20 const  gr68,$AA (target)
+        0x15454201u, // 24 add    gr69,gr66,1 (needs the loaded value)
+        0xA0000000u, // 28 jmp    .
+        0x70400101u, // 2C nop
+    };
+    const std::array<u32, 10> handler{
+        0xC6460400u, // 80 mfsr   gr70,CHA
+        0xC64B0600u, // 84 mfsr   gr75,CHC
+        0x03784700u, // 88 const  gr71,$7800 (word0: valid, supervisor RWX)
+        0x03104800u, // 8C const  gr72,$1000 (word1: physical page)
+        0x03004908u, // 90 const  gr73,8 (line 4, set 0, word0)
+        0x03004A09u, // 94 const  gr74,9 (word1)
+        0xBE004947u, // 98 mttlb  gr73,gr71
+        0xBE004A48u, // 9C mttlb  gr74,gr72
+        0x88000000u, // A0 iret
+        0x70400101u, // A4 nop
+    };
+    cpu.readInstruction = [&](u32 address, bool) -> u32 {
+        if (address >= 0x80u) {
+            const std::size_t index = (address - 0x80u) / 4u;
+            return index < handler.size() ? handler[index] : 0x70400101u;
+        }
+        const std::size_t index = address / 4u;
+        return index < program.size() ? program[index] : 0x70400101u;
+    };
+    std::vector<u32> dispatched;
+    cpu.readVector = [&](u32 address) -> u32 {
+        dispatched.push_back(address);
+        return address == (11u << 2u) ? 0x80u : 0x70400101u;
+    };
+    u32 dataReads = 0;
+    cpu.readData = [&](u32 address, bool) -> u32 {
+        if (address == 0x1000u) {
+            ++dataReads;
+            return 0x12345678u;
+        }
+        return 0u;
+    };
+    cpu.writeData = [](u32, u32, bool) {};
+
+    REQUIRE(cpu.run(40) == 40);
+    CHECK_FALSE(cpu.faulted());
+    REQUIRE(dispatched.size() == 1);
+    CHECK(dispatched[0] == (11u << 2u));
+    // The handler saw the access in the channel registers: CHA = the
+    // virtual address, CHC.CV set.
+    CHECK(cpu.registerValue(70) == 0x00001000u);
+    CHECK((cpu.registerValue(75) & 1u) == 1u);
+    // The load completed on the interrupt return, before the target ran.
+    CHECK(dataReads == 1u);
+    CHECK(cpu.registerValue(66) == 0x12345678u);
+    CHECK(cpu.registerValue(69) == 0x12345679u);
+    CHECK(cpu.registerValue(68) == 0x000000AAu);
+    CHECK(cpu.registerValue(67) != 0x000000BBu);
+}
+
+TEST_CASE("Am29000 *DERR retires the load; IRET resumes at the next "
+          "instruction and restarts the access") {
+    // Data Access Exception (Table 3-11): PC1 = "next", channel registers
+    // "all", CHC.TF set.  The faulted load retires; the handler here clears
+    // TF (as GCOS's does) and returns with CV set, so the return step 5
+    // restart re-issues the access -- which now succeeds -- and execution
+    // continues with the instruction AFTER the load, exactly once.
+    Am29000 cpu;
+    const std::array<u32, 12> program{
+        0x04010273u, // 00 mtsrim CPS,$0273 (freeze off, physical)
+        0x04000330u, // 04 mtsrim CFG,$0030 (fetched vectors)
+        0x03104000u, // 08 const  gr64,$1000
+        0x16004240u, // 0C load   0,0,gr66,gr64 (first access faults)
+        0x03004301u, // 10 const  gr67,1 (must run exactly once)
+        0x15454201u, // 14 add    gr69,gr66,1
+        0x15434301u, // 18 add    gr67,gr67,1 (gr67 ends at 2 iff 10 ran once)
+        0xA0000000u, // 1C jmp    .
+        0x70400101u, // 20 nop
+        0x70400101u, // 24
+        0x70400101u, // 28
+        0x70400101u, // 2C
+    };
+    const std::array<u32, 6> handler{
+        0xC6460400u, // 80 mfsr   gr70,CHA
+        0xC64B0600u, // 84 mfsr   gr75,CHC
+        0x034C4F00u, // 88 const  gr76,$4C00... (unused filler)
+        0x9C4B4B4Cu, // 8C andn   gr75,gr75,gr76 -> placeholder, replaced below
+        0x88000000u, // 90 iret
+        0x70400101u, // 94 nop
+    };
+    // Handler: read CHC, clear TF (bit 10) keeping CV, write it back, IRET.
+    std::array<u32, 8> realHandler{
+        0xC6460400u, // 80 mfsr   gr70,CHA
+        0xC64B0600u, // 84 mfsr   gr75,CHC
+        0x03044C00u, // 88 const  gr76,$0400 (TF)
+        0x9C4D4B4Cu, // 8C andn   gr77,gr75,gr76
+        0xCE00064Du, // 90 mtsr   CHC,gr77
+        0x88000000u, // 94 iret
+        0x70400101u, // 98 nop
+        0x70400101u, // 9C nop
+    };
+    (void)handler;
+    cpu.readInstruction = [&](u32 address, bool) -> u32 {
+        if (address >= 0x80u) {
+            const std::size_t index = (address - 0x80u) / 4u;
+            return index < realHandler.size() ? realHandler[index]
+                                              : 0x70400101u;
+        }
+        const std::size_t index = address / 4u;
+        return index < program.size() ? program[index] : 0x70400101u;
+    };
+    std::vector<u32> dispatched;
+    cpu.readVector = [&](u32 address) -> u32 {
+        dispatched.push_back(address);
+        return address == (7u << 2u) ? 0x80u : 0x70400101u;
+    };
+    u32 dataReads = 0;
+    cpu.readData = [&](u32 address, bool) -> u32 {
+        if (address == 0x1000u) {
+            if (++dataReads == 1u) {
+                cpu.noteDataBusFault(); // absent memory: *DERR
+                return 0u;
+            }
+            return 0x12345678u;
+        }
+        return 0u;
+    };
+    cpu.writeData = [](u32, u32, bool) {};
+
+    REQUIRE(cpu.run(40) == 40);
+    CHECK_FALSE(cpu.faulted());
+    REQUIRE(dispatched.size() == 1);
+    CHECK(dispatched[0] == (7u << 2u));
+    CHECK(cpu.registerValue(70) == 0x00001000u);
+    CHECK((cpu.registerValue(75) & 0x401u) == 0x401u); // TF|CV in handler
+    CHECK(dataReads == 2u);
+    CHECK(cpu.registerValue(66) == 0x12345678u);
+    CHECK(cpu.registerValue(69) == 0x12345679u);
+    // The instruction after the load ran exactly once (not skipped, not
+    // repeated).
+    CHECK(cpu.registerValue(67) == 0x00000002u);
+}
+
+TEST_CASE("Am29000 IRET refill completes before a pending timer interrupt") {
+    // IRET's two-instruction refill executes with external/timer
+    // recognition held off, as on silicon.  Without the hold, a persistent
+    // timer request (IN outlives a deferred delivery) preempts the refill
+    // at its first boundary forever: GCOS's deferred tick never lets the
+    // replayed instruction retire.
+    // The handler is GCOS's defer shape: a bare IRET that leaves TMR.IN
+    // set.  The request is therefore still pending the moment the return
+    // completes.  Without the refill hold the very first interrupted
+    // instruction is preempted again forever and never retires; with it,
+    // two instructions retire per delivery and the program advances.
+    Am29000 cpu;
+    const std::array<u32, 12> program{
+        0x04010273u, // 00 mtsrim CPS,$0173 (freeze off, DA holds interrupts)
+        0x04000330u, // 04 mtsrim CFG,$0030 (fetched vectors)
+        0x03754030u, // 08 const  gr64,$7530
+        0x02034000u, // 0C consth gr64,$0300  (gr64 = IN|IE|TRV)
+        0xCE000940u, // 10 mtsr   TMR,gr64    (timer request pending)
+        0xC6420200u, // 14 mfsr   gr66,CPS
+        0x9D424201u, // 18 andn   gr66,gr66,1
+        0xCE000242u, // 1C mtsr   CPS,gr66    (DA clear: delivery begins)
+        0x03004101u, // 20 const  gr65,1
+        0x03004202u, // 24 const  gr66,2
+        0x14444142u, // 28 add    gr68,gr65,gr66
+        0xA0000000u, // 2C jmp .
+    };
+    cpu.readInstruction = [&](u32 address, bool) -> u32 {
+        if (address == 0x80u) return 0x88000000u; // handler: bare iret
+        const std::size_t index = address / 4u;
+        return index < program.size() ? program[index] : 0x70400101u;
+    };
+    cpu.readVector = [](u32 address) -> u32 {
+        // Vector 14 (timer) lands on the deferring handler.
+        return address == (14u << 2u) ? 0x80u : 0x70400101u;
+    };
+    cpu.readData = [](u32, bool) { return 0u; };
+    cpu.writeData = [](u32, u32, bool) {};
+
+    REQUIRE(cpu.run(120) == 120);
+    CHECK_FALSE(cpu.faulted());
+    // Positive control: the persistent request delivered repeatedly.
+    CHECK(cpu.diagnosticTimerInterrupts() >= 2u);
+    // The program made forward progress between deliveries.
+    CHECK(cpu.registerValue(65) == 0x00000001u);
+    CHECK(cpu.registerValue(66) == 0x00000002u);
+    CHECK(cpu.registerValue(68) == 0x00000003u);
 }
 
 TEST_CASE("Am29000 preserves the load-store address-space signal") {
@@ -574,6 +1078,39 @@ TEST_CASE("IIfx 8 24 GC maps lane-zero ROM and super-slot hardware") {
     CHECK(mac.read8(0x9C010000u) == 0x80);
 }
 
+TEST_CASE("IIfx 8 24 GC keeps standard-slot aliases in 24-bit addressing") {
+    IifxMachine::Config config;
+    config.ramSize = 16u * 1024u * 1024u;
+    config.videoDeclarationRom = gcDeclarationRom();
+    IifxMachine mac(testRom(), config);
+
+    // With the MMU off, this populated low address is ordinary IIfx RAM.
+    // Accessing the native ROM first removes the reset overlay.
+    (void)mac.read8(0x40000000u);
+    mac.write8(0x00901234u, 0x11u);
+    CHECK(mac.read8(0x00901234u) == 0x11u);
+
+    // A 68030 TC initial shift of eight discards the logical high byte. Slot
+    // $9 must therefore claim the resulting $009xxxxx physical cycle ahead
+    // of RAM, and FMC must treat it as an expansion rather than a cache fill.
+    mac.cpu().tc = 0x80080000u;              // E | IS=8
+    CHECK_FALSE(mac.cacheable(0x00901234u));
+    CHECK(mac.read8(0x00901234u) == 0x00u);  // GC shared DRAM, not IIfx RAM
+    mac.write8(0x00901234u, 0xA5u);
+    CHECK(mac.read8(0x00901234u) == 0xA5u);
+    CHECK(mac.read8(0xF9001234u) == 0xA5u);
+
+    // The explicitly 24-bit-compatible Slot Manager form aliases the same
+    // standard slot space when its tagged high byte reaches the machine bus.
+    mac.write8(0xF9905678u, 0x5Au);
+    CHECK(mac.read8(0xF9905678u) == 0x5Au);
+    CHECK(mac.read8(0xF9005678u) == 0x5Au);
+
+    // Leaving 24-bit mode exposes the original RAM byte again.
+    mac.cpu().tc = 0;
+    CHECK(mac.read8(0x00901234u) == 0x11u);
+}
+
 TEST_CASE("IIfx 8 24 GC separates instruction SRAM, data DRAM, and VRAM") {
     IifxMachine::Config config;
     config.videoDeclarationRom = gcDeclarationRom();
@@ -630,8 +1167,11 @@ TEST_CASE("IIfx 8 24 GC separates instruction SRAM, data DRAM, and VRAM") {
     CHECK(card.gcDiagnosticReadProcessorData(0x46C00004u) == 0x12000000u);
     CHECK(card.gcDiagnosticReadProcessorData(0x46C00004u) == 0x34000000u);
     CHECK(card.gcDiagnosticReadProcessorData(0x46C00004u) == 0x56000000u);
+    // PBCTRL echoes the programmed control byte in the low lane: the depth
+    // re-config derives mode geometry from a read-back, and the 24-bit
+    // flow polls it for the depth to take.
     card.gcDiagnosticWriteProcessorData(0x46C00008u, 0x0000009Cu);
-    CHECK(card.gcDiagnosticReadProcessorData(0x46C00008u) == 0u);
+    CHECK(card.gcDiagnosticReadProcessorData(0x46C00008u) == 0x9Cu);
     CHECK(card.mode() == 0x84u);
     CHECK(card.gcUnknownDataAccesses() == unknownBeforeRamdac);
     card.gcDiagnosticWriteProcessorData(0x9D100000u, 0xA5C33C5Au);

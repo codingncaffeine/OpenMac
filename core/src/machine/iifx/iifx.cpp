@@ -383,8 +383,13 @@ void IifxMachine::wireDevices() {
             // host insertions can assert the physical SWITCHED latch.
             if (isIsm && !host && send && channel == 1 &&
                 value == IifxIop::MsgComplete) {
+                // An explicitly requested cycle/PC trigger owns the trace;
+                // the opportunistic floppy-error trigger must not freeze a
+                // capture aimed at something else.
                 if (operation == 0x0Bu && operationResult != 0 &&
-                    hardwareTrace_.enabled() && !hardwareTrace_.triggered()) {
+                    hardwareTrace_.enabled() && !hardwareTrace_.triggered() &&
+                    hardwareTrace_.config().triggerCycle == 0 &&
+                    hardwareTrace_.config().triggerPc == 0) {
                     char reason[96];
                     std::snprintf(reason, sizeof reason,
                                   "IOP SWIM Read completed with error=%d ($%04X)",
@@ -533,7 +538,8 @@ void IifxMachine::wireDevices() {
     rtc_->onByte = [this](const char* what, u8 value) {
         if (!onDiag) return;
         char message[48];
-        std::snprintf(message, sizeof message, "RTC %s=%02X", what, value);
+        std::snprintf(message, sizeof message, "RTC %s=%02X pc=%08X",
+                      what, value, cpu_.pc);
         onDiag(message);
     };
     via_->inA = [] {
@@ -2796,7 +2802,7 @@ u8 IifxMachine::rawRead8(u32 addr) {
     // Do this ahead of DRAM decode; in 32-bit mode the same physical addresses
     // are ordinary RAM, which matters on 16-128 MB IIfx configurations.
     const bool address24 = cpu_.mmuEnabled() && ((cpu_.tc >> 16) & 0x0Fu) == 8u;
-    if (videoEnabled_ && !video_->genuineGc() && address24 &&
+    if (videoEnabled_ && address24 &&
         (addr & 0x00F00000u) == 0x00900000u) {
         const u32 slotOffset = addr & 0x000FFFFFu;
         const u8 value = video_->readStandard(slotOffset);
@@ -2807,7 +2813,7 @@ u8 IifxMachine::rawRead8(u32 addr) {
     // Macintosh II bus hardware aliases that form to slot s standard space;
     // decode it before the ordinary physical map so it cannot fall through as
     // ROM or RAM after the 68030 discards the logical high byte.
-    if (videoEnabled_ && !video_->genuineGc() &&
+    if (videoEnabled_ &&
         (addr & 0xFFF00000u) == 0xF9900000u) {
         const u32 slotOffset = addr & 0x000FFFFFu;
         const u8 value = video_->readStandard(slotOffset);
@@ -2991,7 +2997,7 @@ void IifxMachine::rawWrite8(u32 addr, u8 value) {
         onDiag(message);
     }
     const bool address24 = cpu_.mmuEnabled() && ((cpu_.tc >> 16) & 0x0Fu) == 8u;
-    if (videoEnabled_ && !video_->genuineGc() && address24 &&
+    if (videoEnabled_ && address24 &&
         (addr & 0x00F00000u) == 0x00900000u) {
         const u64 before = video_->vramWrites;
         video_->writeStandard(addr & 0x000FFFFFu, value);
@@ -3000,7 +3006,7 @@ void IifxMachine::rawWrite8(u32 addr, u8 value) {
         updateIpl();
         return;
     }
-    if (videoEnabled_ && !video_->genuineGc() &&
+    if (videoEnabled_ &&
         (addr & 0xFFF00000u) == 0xF9900000u) {
         const u64 before = video_->vramWrites;
         video_->writeStandard(addr & 0x000FFFFFu, value);
@@ -3052,6 +3058,15 @@ void IifxMachine::rawWrite8(u32 addr, u8 value) {
             char message[112];
             std::snprintf(message, sizeof message,
                           "NuBus9 GC W %08X=%02X pc=%08X",
+                          addr, value, cpu_.pc);
+            onDiag(message);
+        }
+        const u32 superOffset = addr - IifxNuBusVideo::kSuperSlotBase;
+        if (onDiag && superOffset >= 0x04000050u &&
+            superOffset < 0x04000058u) {
+            char message[112];
+            std::snprintf(message, sizeof message,
+                          "GC DBELL W %08X=%02X pc=%08X",
                           addr, value, cpu_.pc);
             onDiag(message);
         }
@@ -3111,7 +3126,7 @@ void IifxMachine::write32(u32 addr, u32 value) {
 }
 
 bool IifxMachine::cacheable(u32 addr) const {
-    if (videoEnabled_ && !video_->genuineGc() && cpu_.mmuEnabled() &&
+    if (videoEnabled_ && cpu_.mmuEnabled() &&
         ((cpu_.tc >> 16) & 0x0Fu) == 8u &&
         (addr & 0x00F00000u) == 0x00900000u)
         return false;
@@ -3192,6 +3207,84 @@ void IifxMachine::diagnosticSetGcProcessorPcWatch(u32 pc) {
 }
 u64 IifxMachine::diagnosticGcProcessorPcWatchHits() const {
     return video_->gcProcessorPcWatchHits();
+}
+
+void IifxMachine::diagnosticSetGcProcessorProfileRange(u32 first, u32 last) {
+    video_->setGcProcessorProfileRange(first, last);
+}
+
+void IifxMachine::diagnosticSetGcPcTapRange(u32 first, u32 last) {
+    video_->setGcPcTapRange(first, last);
+}
+
+void IifxMachine::diagnosticSetGcAddrTapRange(u32 first, u32 last,
+                                              bool writesOnly) {
+    video_->setGcAddrTapRange(first, last, writesOnly);
+}
+
+void IifxMachine::diagnosticSetGcDoorbellWatch(u32 address) {
+    video_->setGcDoorbellWatchAddress(address);
+}
+
+void IifxMachine::diagnosticSetGcVramWatch(u32 offset) {
+    video_->setGcVramWatch(offset);
+}
+
+void IifxMachine::diagnosticSetGcRegisterWatch(u16 physicalIndex) {
+    video_->gcSetProcessorRegisterWatch(physicalIndex);
+}
+
+void IifxMachine::diagnosticSetGcPcSnap(u32 pc, u16 architecturalIndex) {
+    video_->gcSetProcessorPcSnap(pc, architecturalIndex);
+}
+
+void IifxMachine::diagnosticSetGcFlightWindow(u64 start, u64 count,
+                                              u16 physicalIndex) {
+    video_->gcSetProcessorFlightWindow(start, count, physicalIndex);
+}
+
+bool IifxMachine::diagnosticWriteGcFlight(const char* path) const {
+    std::ofstream file(path);
+    if (!file) return false;
+    char line[96];
+    for (const Am29000::FlightEntry& entry : video_->gcProcessorFlight()) {
+        std::snprintf(line, sizeof line, "%llu %08X %08X %08X %08X %08X\n",
+                      static_cast<unsigned long long>(entry.instr), entry.pc,
+                      entry.gr1, entry.rfb, entry.rab, entry.watched);
+        file << line;
+    }
+    return file.good();
+}
+
+std::vector<std::pair<u64, u32>> IifxMachine::diagnosticGcProcessorProfile(
+    std::size_t limit) const {
+    std::vector<std::pair<u64, u32>> sites;
+    const std::vector<u64>& counts = video_->gcProcessorProfileCounts();
+    const u32 first = video_->gcProcessorProfileFirst();
+    for (std::size_t index = 0; index < counts.size(); ++index) {
+        if (counts[index] == 0) continue;
+        sites.emplace_back(counts[index],
+                           first + static_cast<u32>(index << 2u));
+    }
+    std::sort(sites.begin(), sites.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    if (sites.size() > limit) sites.resize(limit);
+    return sites;
+}
+
+std::vector<u8> IifxMachine::diagnosticGcDataMemory(
+    u32 offset, u32 size) const {
+    std::vector<u8> result;
+    if (size == 0 || offset >= IifxNuBusVideo::kGcDramBytes ||
+        size > IifxNuBusVideo::kGcDramBytes - offset)
+        return result;
+    result.resize(size);
+    for (u32 byte = 0; byte < size; ++byte) {
+        const u32 address = offset + byte;
+        const u32 word = video_->gcDiagnosticDramWord(address & ~3u);
+        result[byte] = static_cast<u8>(word >> ((3u - (address & 3u)) * 8u));
+    }
+    return result;
 }
 
 std::vector<u8> IifxMachine::diagnosticGcExpansionMemory(
@@ -3373,6 +3466,261 @@ std::string IifxMachine::diagnosticReport() const {
                       video_->gcProcessorFaulted()
                           ? video_->gcProcessorFaultReason().c_str() : "");
         result += item;
+        std::snprintf(item, sizeof item,
+                      "      GC interrupt facility: timer-expiries=%llu "
+                      "timer-interrupts=%llu timer-writes=%llu "
+                      "external=%llu/%llu/%llu/%llu\n",
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorTimerExpiries()),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorTimerInterrupts()),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorTimerWrites()),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorExternalInterrupts(0)),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorExternalInterrupts(1)),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorExternalInterrupts(2)),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorExternalInterrupts(3)));
+        result += item;
+        std::snprintf(item, sizeof item,
+                      "      GC external lines asserted=%llu/%llu/%llu/%llu "
+                      "dropped-standard-writes=%llu\n",
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorExternalAssertions(0)),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorExternalAssertions(1)),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorExternalAssertions(2)),
+                      static_cast<unsigned long long>(
+                          video_->gcProcessorExternalAssertions(3)),
+                      static_cast<unsigned long long>(
+                          video_->gcDroppedStandardWrites));
+        result += item;
+        if (video_->gcDoorbellEdgeCount != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC doorbell INTR2 edges (%zu):",
+                          video_->gcDoorbellEdgeCount);
+            result += item;
+            for (std::size_t index = 0;
+                 index < video_->gcDoorbellEdgeCount; ++index) {
+                std::snprintf(item, sizeof item, " %s#%llu cps=%08X ctl=%08X",
+                              video_->gcDoorbellEdgeStates[index] ? "SET"
+                                                                  : "CLR",
+                              static_cast<unsigned long long>(
+                                  video_->gcDoorbellEdgeInstructions[index]),
+                              video_->gcDoorbellEdgeCps[index],
+                              video_->gcDoorbellEdgeControl[index]);
+                result += item;
+            }
+            result += '\n';
+        }
+        if (video_->gcDroppedStandardWriteCount != 0) {
+            std::snprintf(item, sizeof item,
+                          "      first dropped standard writes (%zu):",
+                          video_->gcDroppedStandardWriteCount);
+            result += item;
+            for (std::size_t index = 0;
+                 index < video_->gcDroppedStandardWriteCount; ++index) {
+                std::snprintf(item, sizeof item, " %06X:%02X",
+                              video_->gcDroppedStandardWriteOffsets[index],
+                              video_->gcDroppedStandardWriteValues[index]);
+                result += item;
+            }
+            result += '\n';
+        }
+        if (video_->gcPcTapCount != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC pc-tap ring (%zu):",
+                          video_->gcPcTapCount);
+            result += item;
+            for (std::size_t index = 0;
+                 index < video_->gcPcTapCount; ++index) {
+                std::snprintf(item, sizeof item, " %s@%08X %08X=%08X#%llu",
+                              video_->gcPcTapWrites[index] ? "W" : "R",
+                              video_->gcPcTapPcs[index],
+                              video_->gcPcTapAddresses[index],
+                              video_->gcPcTapValues[index],
+                              static_cast<unsigned long long>(
+                                  video_->gcPcTapInstructions[index]));
+                result += item;
+            }
+            result += '\n';
+        }
+        std::snprintf(item, sizeof item,
+                      "      GC window rsp=%08X msp(gr125)=%08X\n",
+                      video_->gcProcessorRegister(1),
+                      video_->gcProcessorRegister(125));
+        result += item;
+        if (video_->gcProcessorPcWatchHitCount() != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC pc-watch hits (first %zu, instr#):",
+                          video_->gcProcessorPcWatchHitCount());
+            result += item;
+            for (std::size_t index = 0;
+                 index < video_->gcProcessorPcWatchHitCount(); ++index) {
+                std::snprintf(item, sizeof item, " %llu",
+                              static_cast<unsigned long long>(
+                                  video_->gcProcessorPcWatchHitInstruction(
+                                      index)));
+                result += item;
+            }
+            result += '\n';
+        }
+        if (video_->gcProcessorRegisterWatchCount() != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC register watch (last %zu, newest first):",
+                          video_->gcProcessorRegisterWatchCount());
+            result += item;
+            for (std::size_t back = 0;
+                 back < video_->gcProcessorRegisterWatchCount(); ++back) {
+                std::snprintf(item, sizeof item, " %08X@%08X#%llu",
+                              video_->gcProcessorRegisterWatchValue(back),
+                              video_->gcProcessorRegisterWatchPc(back),
+                              static_cast<unsigned long long>(
+                                  video_->gcProcessorRegisterWatchInstruction(
+                                      back)));
+                result += item;
+            }
+            result += '\n';
+        }
+        if (video_->gcProcessorPcSnapCount() != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC pc snap (last %zu, newest first, "
+                          "gr1/value/rfb/rab#instr):",
+                          video_->gcProcessorPcSnapCount());
+            result += item;
+            for (std::size_t back = 0;
+                 back < video_->gcProcessorPcSnapCount(); ++back) {
+                std::snprintf(item, sizeof item, " %08X/%08X/%08X/%08X#%llu",
+                              video_->gcProcessorPcSnapWindowBase(back),
+                              video_->gcProcessorPcSnapValue(back),
+                              video_->gcProcessorPcSnapSpillBound(back),
+                              video_->gcProcessorPcSnapFillBound(back),
+                              static_cast<unsigned long long>(
+                                  video_->gcProcessorPcSnapInstruction(back)));
+                result += item;
+            }
+            result += '\n';
+        }
+        if (video_->gcProcessorTimerWriteRingCount() != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC timer writes (last %zu, newest first):",
+                          video_->gcProcessorTimerWriteRingCount());
+            result += item;
+            for (std::size_t back = 0;
+                 back < video_->gcProcessorTimerWriteRingCount(); ++back) {
+                std::snprintf(item, sizeof item, " %s=%08X@%08X#%llu",
+                              video_->gcProcessorTimerWriteIsReload(back)
+                                  ? "TMR" : "TMC",
+                              video_->gcProcessorTimerWriteValue(back),
+                              video_->gcProcessorTimerWritePc(back),
+                              static_cast<unsigned long long>(
+                                  video_->gcProcessorTimerWriteInstruction(
+                                      back)));
+                result += item;
+            }
+            result += '\n';
+        }
+        if (video_->gcProcessorCallTraceCount() != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC call trace (last %zu, newest first):",
+                          video_->gcProcessorCallTraceCount());
+            result += item;
+            for (std::size_t back = 0;
+                 back < video_->gcProcessorCallTraceCount(); ++back) {
+                std::snprintf(item, sizeof item, " %08X>%08X#%llu",
+                              video_->gcProcessorCallTracePc(back),
+                              video_->gcProcessorCallTraceTarget(back),
+                              static_cast<unsigned long long>(
+                                  video_->gcProcessorCallTraceInstruction(
+                                      back)));
+                result += item;
+            }
+            result += '\n';
+        }
+        if (video_->gcVramWatchCount != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC vram watch @%06X (%zu writes):\n",
+                          video_->gcVramWatchOffset_,
+                          video_->gcVramWatchCount);
+            result += item;
+            for (std::size_t index = 0; index < video_->gcVramWatchCount;
+                 ++index) {
+                std::snprintf(item, sizeof item,
+                              "        #%llu pc=%08X value=%08X trail:",
+                              static_cast<unsigned long long>(
+                                  video_->gcVramWatchInstructions[index]),
+                              video_->gcVramWatchPcs[index],
+                              video_->gcVramWatchValues[index]);
+                result += item;
+                for (std::size_t back = 0;
+                     back < IifxNuBusVideo::kGcVramWatchTrail; ++back) {
+                    const std::size_t slot =
+                        index * IifxNuBusVideo::kGcVramWatchTrail + back;
+                    if (video_->gcVramWatchTrailPcs[slot] == 0) break;
+                    std::snprintf(item, sizeof item, " %08X>%08X",
+                                  video_->gcVramWatchTrailPcs[slot],
+                                  video_->gcVramWatchTrailTargets[slot]);
+                    result += item;
+                }
+                result += "\n";
+            }
+        }
+        if (video_->gcPhantomCaptured) {
+            std::snprintf(item, sizeof item,
+                          "      GC first phantom access: %s %08X=%08X pc=%08X"
+                          " #%llu\n        trail (newest first):",
+                          video_->gcPhantomWrite ? "W" : "R",
+                          video_->gcPhantomAddress, video_->gcPhantomValue,
+                          video_->gcPhantomPc,
+                          static_cast<unsigned long long>(
+                              video_->gcPhantomInstruction));
+            result += item;
+            for (std::size_t back = 0; back < video_->gcPhantomTraceCount;
+                 ++back) {
+                std::snprintf(item, sizeof item, " %08X>%08X#%llu",
+                              video_->gcPhantomTracePcs[back],
+                              video_->gcPhantomTraceTargets[back],
+                              static_cast<unsigned long long>(
+                                  video_->gcPhantomTraceInstructions[back]));
+                result += item;
+            }
+            result += "\n        regs gr64-127:";
+            for (u32 index = 64; index < 128u; ++index) {
+                std::snprintf(item, sizeof item, "%s%08X",
+                              (index % 16u) == 0 ? "\n          " : " ",
+                              video_->gcPhantomRegisters[index]);
+                result += item;
+            }
+            result += "\n        regs lr0-63:";
+            for (u32 index = 128; index < 192u; ++index) {
+                std::snprintf(item, sizeof item, "%s%08X",
+                              (index % 16u) == 0 ? "\n          " : " ",
+                              video_->gcPhantomRegisters[index]);
+                result += item;
+            }
+            result += '\n';
+        }
+        if (video_->gcDoorbellTraceCount != 0) {
+            std::snprintf(item, sizeof item,
+                          "      GC doorbell bus-master ring (%zu):",
+                          video_->gcDoorbellTraceCount);
+            result += item;
+            for (std::size_t index = 0;
+                 index < video_->gcDoorbellTraceCount; ++index) {
+                std::snprintf(item, sizeof item, " %s%08X@%08X#%llu",
+                              video_->gcDoorbellTraceWrites[index] ? "W" : "R",
+                              video_->gcDoorbellTraceValues[index],
+                              video_->gcDoorbellTracePcs[index],
+                              static_cast<unsigned long long>(
+                                  video_->gcDoorbellTraceInstructions[index]));
+                result += item;
+            }
+            result += '\n';
+        }
         result += "      data read regions:";
         for (std::size_t region = 0;
              region < video_->gcReadRegionCounts.size(); ++region) {
