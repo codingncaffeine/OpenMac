@@ -3371,6 +3371,10 @@ void IifxMachine::diagnosticSetGcVramWatch(u32 offset) {
     video_->setGcVramWatch(offset);
 }
 
+void IifxMachine::diagnosticSetGcDataFastPath(bool enabled) {
+    video_->setGcDataFastPathEnabled(enabled);
+}
+
 void IifxMachine::diagnosticSetGcRegisterWatch(u16 physicalIndex) {
     video_->gcSetProcessorRegisterWatch(physicalIndex);
 }
@@ -3607,6 +3611,10 @@ std::string IifxMachine::diagnosticReport() const {
                       video_->gcProcessorFaulted()
                           ? video_->gcProcessorFaultReason().c_str() : "");
         result += item;
+        if (video_->gcDataFastPathArmed())
+            result += "      GC data fast path ARMED: the region/site/first-N "
+                      "read-write rings below saw only slow-path accesses "
+                      "(--no-gc-fast-path for a full-fidelity run)\n";
         std::snprintf(item, sizeof item,
                       "      GC interrupt facility: timer-expiries=%llu "
                       "timer-interrupts=%llu timer-writes=%llu "

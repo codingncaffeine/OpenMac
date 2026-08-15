@@ -127,6 +127,7 @@ public:
     }
 
     void reset() {
+        dropGcDataWindows();
         mode_ = 0x80;
         page_ = 0;
         control_ = 0x0042;             // display transfer on, RGB packing off
@@ -847,11 +848,13 @@ public:
         gcCpu_.setDiagnosticProfileRange(first, last);
     }
     void setGcPcTapRange(u32 first, u32 last) {
+        dropGcDataWindows();
         gcPcTapFirst_ = first;
         gcPcTapLast_ = last;
         gcPcTapCount = 0;
     }
     void setGcAddrTapRange(u32 first, u32 last, bool writesOnly = false) {
+        dropGcDataWindows();
         gcAddrTapFirst_ = first;
         gcAddrTapLast_ = last;
         gcAddrTapWritesOnly_ = writesOnly;
@@ -1123,8 +1126,18 @@ public:
     std::size_t gcVramWatchCount = 0;
     void setGcVramWatch(u32 offset) {
         gcVramWatchOffset_ = offset;
+        dropGcDataWindows();
         gcVramWatchCount = 0;
     }
+    // Switch the Am29000 direct data windows off for a run that wants the
+    // slow path's first-N diagnostic rings to see every access.  Emulated
+    // state is identical either way; only the host cost and those rings
+    // differ.
+    void setGcDataFastPathEnabled(bool enabled) {
+        gcDataFastPathEnabled_ = enabled;
+        if (!enabled) dropGcDataWindows();
+    }
+    bool gcDataFastPathArmed() const { return gcDataWindowsInstalled_; }
     void gcNoteVramWatch(u32 firstByte, u32 lastByte, u32 value) {
         if (gcVramWatchOffset_ < firstByte || gcVramWatchOffset_ > lastByte ||
             gcVramWatchCount >= kGcVramWatchEntries)
@@ -1620,6 +1633,98 @@ private:
                                                         : gcExpansionDram_.data());
     }
 
+    // Direct data windows on the Am29000 (see Am29000::DataWindow): the
+    // plain card memories whose accesses have no effect beyond the bytes
+    // and the counted access totals.  Nothing is registered while
+    // something wants to see every access -- an MFB cache fill (each data
+    // read also supplies a cache line to SRAM), a pc/address tap, a VRAM
+    // watch -- or while the fast path is switched off for a full-fidelity
+    // diagnostic run.  Registered from the data slow path whenever allowed;
+    // cleared where one of those conditions arises and on checkpoint load.
+    // The first-N diagnostic rings fed from the slow path (pointer/frame-
+    // buffer/work-buffer read traces, write sites, region counts) see only
+    // slow-path accesses while the windows are armed; the report says so.
+    bool gcDataFastPathAllowed() const {
+        return gcDataFastPathEnabled_ && genuineGc_ && !gcCacheFillActive_ &&
+               gcPcTapLast_ == 0 && gcAddrTapLast_ == 0 &&
+               gcVramWatchOffset_ == 0xFFFFFFFFu && !gcDram_.empty() &&
+               !gcExpansionDram_.empty();
+    }
+    void dropGcDataWindows() {
+        gcDataWindowsInstalled_ = false;
+        gcCpu_.clearDataWindows();
+    }
+    void installGcDataWindows() {
+        if (gcDataWindowsInstalled_) return;
+        if (!gcDataFastPathAllowed()) return;
+        using Window = Am29000::DataWindow;
+        using Counter = Am29000::DataCounter;
+        const Counter dataRead{&gcDataReads_, 1u};
+        const Counter dataWrite{&gcDataWrites_, 1u};
+        // Expansion DRAM: local $4D and the RDNC loopback $9D (GCOS's heap).
+        Window window;
+        window.base = kGcProcessorExpansionDramBase;
+        window.size = kGcExpansionDramBytes;
+        window.data = gcExpansionDram_.data();
+        window.writable = true;
+        window.readCounters = {dataRead};
+        window.writeCounters = {dataWrite};
+        gcCpu_.setDataWindow(0, window);
+        window.base = 0x9D000000u;
+        gcCpu_.setDataWindow(1, window);
+        // The two-megabyte data DRAM at $4C (kernel data, page maps).
+        window = Window{};
+        window.base = kGcProcessorDramBase;
+        window.size = kGcDramBytes;
+        window.data = gcDram_.data();
+        window.writable = true;
+        window.readCounters = {dataRead};
+        window.writeCounters = {dataWrite};
+        gcCpu_.setDataWindow(2, window);
+        // The instruction SRAM's data-side alias: a plain store while no
+        // cache fill is armed (the fetch windows read the same array).
+        window = Window{};
+        window.base = kGcProcessorDataSramBase;
+        window.size = kGcSramBytes;
+        window.data = gcSram_.data();
+        window.writable = true;
+        window.readCounters = {dataRead};
+        window.writeCounters = {dataWrite};
+        gcCpu_.setDataWindow(3, window);
+        // The frame buffer on the processor data bus: reads only -- a write
+        // feeds the display counters and the VRAM watch on the slow path.
+        window = Window{};
+        window.base = kGcProcessorVramBase;
+        window.size = kGcVramBytes;
+        window.data = vram_.data();
+        window.writable = false;
+        window.readCounters = {dataRead};
+        gcCpu_.setDataWindow(4, window);
+        // The $9C loopback: the shared low 64 KiB of DRAM (the IPC block
+        // GCOS's idle loop polls) and then the frame buffer, read-only.
+        // Through readSuper/writeSuper each of the four bytes counts.
+        window = Window{};
+        window.base = kSuperSlotBase + kGcVramOffset;
+        window.size = kGcSharedDramBytes;
+        window.data = gcDram_.data();
+        window.writable = true;
+        window.readCounters = {dataRead, Counter{&reads, 4u},
+                               Counter{&superReads, 4u}};
+        window.writeCounters = {dataWrite, Counter{&writes, 4u}};
+        gcCpu_.setDataWindow(5, window);
+        window = Window{};
+        window.base = kSuperSlotBase + kGcVramOffset + kGcSharedDramBytes;
+        window.size = kGcVramBytes - kGcSharedDramBytes;
+        window.data = vram_.data() + kGcSharedDramBytes;
+        window.writable = false;
+        window.readCounters = {dataRead, Counter{&reads, 4u},
+                               Counter{&superReads, 4u}};
+        gcCpu_.setDataWindow(6, window);
+        gcDataWindowsInstalled_ = true;
+    }
+    bool gcDataWindowsInstalled_ = false;
+    bool gcDataFastPathEnabled_ = true;
+
     u32 gcReadInstruction(u32 address, bool translated) {
         ++gcInstructionReads_;
         static_cast<void>(translated);
@@ -1671,6 +1776,7 @@ private:
     }
 
     u32 gcReadData(u32 address, bool inputOutput) {
+        installGcDataWindows();
         const u32 tapPc = gcCpu_.instructionPc();
         if ((gcPcTapLast_ != 0 && tapPc >= gcPcTapFirst_ &&
              tapPc <= gcPcTapLast_) ||
@@ -1957,6 +2063,7 @@ private:
     }
 
     void gcWriteData(u32 address, u32 value, bool inputOutput) {
+        installGcDataWindows();
         ++gcDataWrites_;
         const u32 writePc = gcCpu_.instructionPc();
         if (((gcPcTapLast_ != 0 && writePc >= gcPcTapFirst_ &&
@@ -2153,6 +2260,7 @@ private:
                 if (value != 0) gcMacRequest_ = true;
             } else if (address == 0x44000088u) {
                 gcCacheFillActive_ = value != 0;
+                if (gcCacheFillActive_) dropGcDataWindows();
                 if (!gcCacheFillActive_) gcCacheFillWordsRemaining_ = 0;
                 // GCOS raises this latch around its context-switch
                 // register-file restore ($02001FA8/$02001FD0 bracket).

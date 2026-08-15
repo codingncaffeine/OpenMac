@@ -441,7 +441,16 @@ bool Am29000::trapsUnalignedDataAccess(u32 address, u32 option,
 u32 Am29000::read_data_value(u32 address, u32 option, bool setBytePointer,
                              bool inputOutput) {
     const auto readWord = [this, inputOutput](u32 byteAddress) {
-        return m_data.read_dword(byteAddress & ~3u, inputOutput);
+        const u32 aligned = byteAddress & ~3u;
+        // Plain memory registered by the board is read in place; the
+        // callback path is for everything with a side effect.
+        if (DataWindow* window = findDataWindow(aligned, false)) {
+            bumpDataCounters(window->readCounters);
+            const u8* word = window->data + (aligned - window->base);
+            return (u32(word[0]) << 24) | (u32(word[1]) << 16) |
+                   (u32(word[2]) << 8) | u32(word[3]);
+        }
+        return m_data.read_dword(aligned, inputOutput);
     };
     const auto readByte = [&](u32 byteAddress) {
         const u32 lane = byteAddress & 3u;
@@ -501,12 +510,34 @@ void Am29000::write_data_value(u32 address, u32 value, u32 option,
         const u32 lane = byteAddress & 3u;
         const u32 shift = (m_cfg & CFG_BO) != 0
             ? lane * 8u : (3u - lane) * 8u;
+        if (DataWindow* window = findDataWindow(aligned, true)) {
+            // The slow path peeks the old word (a counted read) and writes
+            // the merged word back; in place that is one byte, with the
+            // same counters.  Host arrays hold big-endian words: bits 31..24
+            // are byte 0, so the lane's byte index is 3 - shift / 8.
+            bumpDataCounters(window->readCounters);
+            bumpDataCounters(window->writeCounters);
+            window->data[(aligned - window->base) + (3u - shift / 8u)] = byte;
+            return;
+        }
         const u32 oldWord = peekData
             ? peekData(aligned, inputOutput)
             : m_data.read_dword(aligned, inputOutput);
         const u32 newWord = (oldWord & ~(0xFFu << shift)) |
                             (u32(byte) << shift);
         m_data.write_dword(aligned, newWord, inputOutput);
+    };
+    const auto writeWord = [this, inputOutput](u32 aligned, u32 word) {
+        if (DataWindow* window = findDataWindow(aligned, true)) {
+            bumpDataCounters(window->writeCounters);
+            u8* bytes = window->data + (aligned - window->base);
+            bytes[0] = static_cast<u8>(word >> 24);
+            bytes[1] = static_cast<u8>(word >> 16);
+            bytes[2] = static_cast<u8>(word >> 8);
+            bytes[3] = static_cast<u8>(word);
+            return;
+        }
+        m_data.write_dword(aligned, word, inputOutput);
     };
 
     // With CFG.DW set a sub-word store replicates the LOW byte or
@@ -544,7 +575,7 @@ void Am29000::write_data_value(u32 address, u32 value, u32 option,
         }
         return;
     default:
-        m_data.write_dword(address & ~3u, value, inputOutput);
+        writeWord(address & ~3u, value);
         return;
     }
 }

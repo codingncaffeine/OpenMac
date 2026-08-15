@@ -43,6 +43,46 @@ public:
     void clearFetchWindows() {
         for (auto& window : fetchWindows_) window = FetchWindow{};
     }
+    // Direct data windows: physical ranges of plain memory backed by
+    // contiguous big-endian host arrays, so an ordinary LOAD/STORE that
+    // lands in one is a bounds check and a byte-swapped access instead of
+    // the readData/peekData/writeData callbacks.  A window is only ever
+    // registered while the board's model can promise the access has no side
+    // effect beyond the bytes and the listed counters: the board clears the
+    // table the moment that stops being true (an MFB cache fill armed, a
+    // diagnostic tap or watch armed, a checkpoint loaded) and its slow path
+    // re-registers when allowed again.  Every word-sized access that resolves
+    // in a window adds each counter's `add` -- the counters the slow path
+    // would have bumped (the board's serialized access totals), so a state
+    // file is byte-identical with or without the fast path.  A sub-word
+    // store's read-modify-write bumps the read counters as its slow-path
+    // peek would.  Purely a host-side fast path; no emulated state.
+    struct DataCounter {
+        u64* value = nullptr;
+        u32 add = 0;
+    };
+    struct DataWindow {
+        u32 base = 0;
+        u32 size = 0;
+        u8* data = nullptr;
+        bool writable = false;
+        std::array<DataCounter, 3> readCounters{};
+        std::array<DataCounter, 3> writeCounters{};
+    };
+    static constexpr std::size_t kDataWindows = 8;
+    void setDataWindow(std::size_t index, const DataWindow& window) {
+        if (index >= kDataWindows) return;
+        dataWindows_[index] = window;
+    }
+    void clearDataWindows() {
+        for (auto& window : dataWindows_) window = DataWindow{};
+        lastDataWindow_ = 0;
+    }
+    bool dataWindowsArmed() const {
+        for (const auto& window : dataWindows_)
+            if (window.data) return true;
+        return false;
+    }
     // Vector fetches are physical data-memory cycles with distinct STAT
     // signalling on the Am29000 bus.  Cards such as Dolphin use that signal
     // to select a small MFB vector store rather than ordinary data SRAM.
@@ -393,6 +433,35 @@ private:
     DataSpace m_data{this};
     std::array<u32, 256> m_r{};
     std::array<FetchWindow, kFetchWindows> fetchWindows_{};
+    std::array<DataWindow, kDataWindows> dataWindows_{};
+    std::size_t lastDataWindow_ = 0;
+    // The window holding physical word `address` (aligned), or nullptr.
+    // The last window hit is tried first: GCOS's loops stay in one memory.
+    DataWindow* findDataWindow(u32 address, bool write) {
+        {
+            DataWindow& window = dataWindows_[lastDataWindow_];
+            const u32 offset = address - window.base;
+            if (window.data && offset < window.size &&
+                (!write || window.writable))
+                return &window;
+        }
+        for (std::size_t index = 0; index < dataWindows_.size(); ++index) {
+            DataWindow& window = dataWindows_[index];
+            const u32 offset = address - window.base;
+            if (window.data && offset < window.size &&
+                (!write || window.writable)) {
+                lastDataWindow_ = index;
+                return &window;
+            }
+        }
+        return nullptr;
+    }
+    static void bumpDataCounters(const std::array<DataCounter, 3>& counters) {
+        for (const DataCounter& counter : counters) {
+            if (!counter.value) break;
+            *counter.value += counter.add;
+        }
+    }
     // The window the last fetch hit is tried first: code runs for long
     // stretches inside one memory (GCOS in the D expansion DRAM, the kernel
     // in SRAM), and it is the last-registered window that GCOS lives in.

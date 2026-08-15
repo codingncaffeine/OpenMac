@@ -874,6 +874,7 @@ private:
     template <typename Io>
     static void visitVideo(Io& io, IifxNuBusVideo& video, u32 stateVersion) {
         section(io, fourcc('V', 'I', 'D', '9'));
+        if (io.applying()) video.dropGcDataWindows();   // host pointers; re-registered lazily
         io.sparse(video.vram_, IifxNuBusVideo::kGcVramBytes);
         io.u16v(video.mode_); io.u16v(video.page_);
         io.u64v(video.reads); io.u64v(video.romReads);

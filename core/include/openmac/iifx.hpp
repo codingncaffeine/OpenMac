@@ -147,6 +147,10 @@ public:
     void diagnosticSetGcDoorbellWatch(u32 address);
     // Record card-side writes covering one physical VRAM byte offset.
     void diagnosticSetGcVramWatch(u32 offset);
+    // Run the Am29000 data path without its direct memory windows so the
+    // card model's first-N diagnostic rings see every access (emulated
+    // state is identical either way; only host cost and those rings differ).
+    void diagnosticSetGcDataFastPath(bool enabled);
     // Watch one PHYSICAL Am29000 register (0-255) for writes.
     void diagnosticSetGcRegisterWatch(u16 physicalIndex);
     // Snapshot one ARCHITECTURAL register (0-127 gr, 128-255 lr through the
