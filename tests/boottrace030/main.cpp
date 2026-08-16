@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
@@ -248,7 +249,7 @@ int main(int argc, char** argv) {
                      "usage: openmac_trace030 <IIfx.ROM> [frames] [disk.img] [ram-mb] [floppy.img] [no-video|no-frame|frame.ppm] [input-frame dx dy] [--shutdown] [--expect-finder|--expect-app name] [--stop-on-milestone] [--native-storage] [--video-rom card.bin] [--dump-iops prefix]\n"
                      "       structured trace: --hw-trace file.jsonl [--structured-only] [--stop-on-trace] [--trace-capacity n] [--trace-post n] [--trace-mask n] [--trace-sources via,oss,biu] [--trace-address-range hex:hex] [--trace-cycle n] [--trace-pc hex --trace-pc-hits n]\n"
                      "       IOP flight/trigger: --trace-iop-flight n [--trace-iop-operation hex] [--trace-iop-block n] [--trace-iop-hits n]\n"
-                     "       replay: --load-state file.iifxstate [--save-state file.iifxstate] [--save-disk file.img] [--disk2 file.img [--disk2-read-only] [--save-disk2 file.img]] [--load-pram file [--pram-poke hex-offset:hex-byte]] [--checkpoint-cycle n] [--stop-after-checkpoint] [--verify-replay instructions] [--trace-gc-pc hex] [--trace-gc-pc-hits n] [--profile-pc-range hex:hex] [--profile-pc-limit n] [--key-at-frame n hex-adb-code up|down] [--disasm-live hex count] [--poke16 hex:value] [--invalidate-data-cache hex:size] [--dump-memory hex:size] [--dump-logical-memory hex:size] [--dump-binary hex size file] [--dump-gc-dram hex-offset hex-size file] [--dump-gc-binary hex-offset hex-size file] [--dump-gc-sram hex-offset hex-size file]\n"
+                     "       replay: --load-state file.iifxstate [--save-state file.iifxstate] [--save-disk file.img] [--disk2 file.img [--disk2-read-only] [--save-disk2 file.img]] [--cd disc.iso] [--cd-attach] [--cd-at-frame n disc.iso]... [--eject-cd-at-frame n]... [--load-pram file [--pram-poke hex-offset:hex-byte]] [--checkpoint-cycle n] [--stop-after-checkpoint] [--verify-replay instructions] [--trace-gc-pc hex] [--trace-gc-pc-hits n] [--profile-pc-range hex:hex] [--profile-pc-limit n] [--key-at-frame n hex-adb-code up|down] [--disasm-live hex count] [--poke16 hex:value] [--invalidate-data-cache hex:size] [--dump-memory hex:size] [--dump-logical-memory hex:size] [--dump-binary hex size file] [--dump-gc-dram hex-offset hex-size file] [--dump-gc-binary hex-offset hex-size file] [--dump-gc-sram hex-offset hex-size file]\n"
                      "       media/input timing: [--floppy-at-frame n file.img]... [--eject-floppy-at-frame n]... [--input-at-frame n dx dy up|down]... [--milestone-timeout name:frames]\n"
                      "       trigger capture: --checkpoint-on-trigger file.iifxstate [--checkpoint-at-pc hex file.iifxstate]\n"
                      "       boot display capture: --frame-timeline prefix first-frame last-frame\n"
@@ -362,6 +363,11 @@ int main(int argc, char** argv) {
         std::vector<u8> image;
     };
     std::vector<FloppyEvent> floppyEvents;
+    // CD-ROM: attached before the run (and a disc put in), or a disc inserted
+    // / taken out at a frame; the frame events use the same shape as floppies.
+    const char* cdPath = nullptr;
+    bool cdAttach = false;
+    std::vector<FloppyEvent> cdEvents;
     struct InputEvent {
         int frame = 0;
         int dx = 0;
@@ -612,6 +618,22 @@ int main(int argc, char** argv) {
             event.frame = std::atoi(argv[++index]);
             event.eject = true;
             floppyEvents.push_back(std::move(event));
+        }
+        else if (option == "--cd" && index + 1 < argc)
+            cdPath = argv[++index];
+        else if (option == "--cd-attach")
+            cdAttach = true;
+        else if (option == "--cd-at-frame" && index + 2 < argc) {
+            FloppyEvent event;
+            event.frame = std::atoi(argv[++index]);
+            event.path = argv[++index];
+            cdEvents.push_back(std::move(event));
+        }
+        else if (option == "--eject-cd-at-frame" && index + 1 < argc) {
+            FloppyEvent event;
+            event.frame = std::atoi(argv[++index]);
+            event.eject = true;
+            cdEvents.push_back(std::move(event));
         }
         else if (option == "--input-at-frame" && index + 4 < argc) {
             InputEvent event;
@@ -973,6 +995,39 @@ int main(int argc, char** argv) {
         }
         mac.insertHardDisk2(std::move(disk2), disk2ReadOnly);
     }
+    // The CD drive's own lines (insert/refuse, driver install, mount, eject)
+    // are the gate signal for a disc test: printed whatever the budgets and
+    // --quiet say, and from before the disc goes in.
+    mac.onDiag = [](const char* message) {
+        if (std::strncmp(message, "cd:", 3) == 0) std::printf("DEVICE %s\n", message);
+    };
+    if (cdAttach || cdPath) mac.attachCdRom(true, 3);
+    if (cdPath) {
+        std::vector<u8> disc = loadFile(cdPath);
+        if (disc.empty()) {
+            std::fprintf(stderr, "cannot read CD image: %s\n", cdPath);
+            return 2;
+        }
+        if (!mac.insertCd(std::move(disc))) {
+            std::fprintf(stderr, "CD image refused: %s\n", cdPath);
+            return 2;
+        }
+        std::printf("cd inserted: %s\n", cdPath);
+    }
+    for (FloppyEvent& event : cdEvents) {
+        if (event.eject) {
+            std::printf("cd eject staged at frame %d\n", event.frame);
+            continue;
+        }
+        event.image = loadFile(event.path.c_str());
+        if (event.image.empty()) {
+            std::fprintf(stderr, "cannot read deferred CD image: %s\n",
+                         event.path.c_str());
+            return 2;
+        }
+        std::printf("cd staged: %s at frame %d\n", event.path.c_str(),
+                    event.frame);
+    }
 
     if (argc >= 6 && std::string(argv[5]) != "no-video" &&
         std::string(argv[5]) != "-" && std::string(argv[5]) != "none") {
@@ -1189,6 +1244,10 @@ int main(int argc, char** argv) {
     int scsiBudget = 120;
     int rtcBudget = 400000;
     mac.onDiag = [&](const char* message) {
+        if (std::strncmp(message, "cd:", 3) == 0) {
+            std::printf("DEVICE %s\n", message);
+            return;
+        }
         if (structuredOnly || quiet) return;
         const bool iop = std::string(message).find("IOP ") != std::string::npos;
         const bool nubus = std::string(message).find("NuBus9") != std::string::npos;
@@ -1514,7 +1573,11 @@ int main(int argc, char** argv) {
 
     if (structuredOnly || quiet) {
         mac.setLegacyAccessLogEnabled(false);
-        mac.onDiag = {};
+        // The CD drive's lines stay: they are the gate signal for a disc test.
+        mac.onDiag = [](const char* message) {
+            if (std::strncmp(message, "cd:", 3) == 0)
+                std::printf("DEVICE %s\n", message);
+        };
         // A trap watch is an explicitly requested probe: keep the exception
         // hook (its other prints already honour quiet).
         if (!watchedTrapEnabled) mac.cpu().onException = {};
@@ -1792,6 +1855,19 @@ int main(int argc, char** argv) {
             }
         } samplerStop{hostSampler, hostProfile, frameLoopStart, frames};
         for (int frame = 0; frame < frames; ++frame) {
+            for (FloppyEvent& event : cdEvents) {
+                if (event.frame != frame) continue;
+                if (event.eject) {
+                    mac.ejectCd();
+                    std::printf("cd eject requested at frame=%d\n", frame);
+                    continue;
+                }
+                const int accepted = mac.insertCd(std::move(event.image));
+                std::printf("cd inserted at frame=%d: %s (%s)\n", frame,
+                            event.path.c_str(),
+                            accepted ? "accepted" : "REFUSED");
+                if (!accepted) return 2;
+            }
             for (FloppyEvent& event : floppyEvents) {
                 if (event.frame != frame) continue;
                 if (event.eject) {

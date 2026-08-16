@@ -337,6 +337,21 @@ OMAC_API void    omac_fx_detach_harddisk2(OMacFx*);
 OMAC_API size_t  omac_fx_harddisk2_data(OMacFx*, uint8_t* out, size_t cap);
 OMAC_API int     omac_fx_harddisk2_booted(OMacFx*);
 OMAC_API int     omac_fx_unmount_harddisk2(OMacFx*);
+/* CD-ROM on the IIfx: an AppleCD-class target on the SCSI bus (ID 3 by
+   default) plus a ".AppleCD" driver the machine installs once the System is
+   up, so a disc mounts without Apple's CD-ROM software (which a stock 7.1
+   disk lacks). Takes the same images as the Quadra's drive: .iso, .toast, raw
+   MODE1 .bin, Apple-partitioned or bare HFS masters; an ISO-9660-only disc is
+   accepted but the guest cannot mount it without Foreign File Access. Insert
+   returns 1 if the drive took the disc; the guest may eject it (drag to the
+   Trash), so poll _cd_present rather than trusting the last insert. Attaching
+   the drive puts the target on the bus for good; a checkpoint taken with it
+   loads only into a machine that has it. */
+OMAC_API void    omac_fx_attach_cd(OMacFx*, int attached, int scsi_id);
+OMAC_API int     omac_fx_cd_attached(OMacFx*);
+OMAC_API int     omac_fx_insert_cd(OMacFx*, const uint8_t* img, size_t len);
+OMAC_API void    omac_fx_eject_cd(OMacFx*);
+OMAC_API int     omac_fx_cd_present(OMacFx*);
 OMAC_API size_t  omac_fx_pram_save(OMacFx*, uint8_t* out, size_t cap);
 OMAC_API int     omac_fx_pram_load(OMacFx*, const uint8_t* data, size_t len,
                                     uint32_t add_seconds);

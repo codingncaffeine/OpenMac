@@ -301,6 +301,7 @@ private:
         out.insert(out.end(), d, d + len);
     }
 
+    friend class IifxStateCodec;
     bool attached_ = false;
     int  id_ = 3;              // Apple's factory default CD-ROM bus ID
     std::vector<u8> media_;

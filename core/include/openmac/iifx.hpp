@@ -21,6 +21,7 @@ class Rtc;
 class Ncr5380;
 class IifxScsiDma;
 class ScsiDisk;
+class ScsiCdRom;
 class Scc8530;
 class Asc;
 class Oss;
@@ -108,6 +109,20 @@ public:
     // Flush and unmount ONLY drive 5's volume, leaving the boot disk alone.
     // Returns true once the volume is off line (or was never mounted).
     bool unmountHardDisk2();
+
+    // CD-ROM: an AppleCD-class SCSI target (ID 3) the front end attaches, the
+    // same surface as the Quadra. The System installs no CD driver of its own,
+    // so once it is up the machine installs a ".AppleCD" DRVR whose Prime is
+    // served here, straight out of the disc image at its Apple_HFS partition
+    // (see installCdDriver). Read-only. The target is put on the bus at the
+    // first attach, so a machine without a drive keeps the bus topology every
+    // existing checkpoint was taken with.
+    void attachCdRom(bool attached, int busId = 3);
+    bool cdRomAttached() const;
+    // Returns 1 when the drive took the disc, 0 when the file was refused.
+    int insertCd(std::vector<u8> image);
+    void ejectCd();
+    bool cdPresent() const;
 
     // Internal FDHD/SuperDrive. Raw 400K/800K/1.44 MB media and DiskCopy 4.2
     // or MacBinary wrappers are accepted. The wrappers are retained so sector
@@ -295,6 +310,23 @@ private:
     void announceHardDisk();
     bool volumeMountedFor(u16 drive);
     bool driveInQueue(u16 drive);
+    // The CD drive and its installed driver (mirrors the Quadra's).
+    void installCdDriver();
+    void mountCdVolume();
+    void completeCdEject();
+    void serveCdPrime();
+    void serveCdCtlStatus(bool status);
+    u32 cdDrvr_ = 0, cdPrimePc_ = 0, cdCtlPc_ = 0, cdStatusPc_ = 0;
+    u32 cdStatus_ = 0;              // the DrvSts the drive queue points into
+    s16 cdRefNum_ = 0;
+    u16 cdDrive_ = 0;               // 0 until AddDrive has taken
+    u32 cdHfsOffset_ = 0;           // the disc's HFS partition, in bytes
+    bool cdMountPending_ = false;
+    int cdMountTries_ = 0;
+    int cdInstallTries_ = 0;
+    bool cdEjectPending_ = false;   // front-end eject, run at a frame edge
+    int cdEjectTries_ = 0;
+    bool cdOnBus_ = false;          // the target has been added to the 5380
     bool markHardDiskClean();
     u32 guestPtr(u32 address) const;
     static bool floppyGeometry(std::vector<u8>& image);
@@ -340,6 +372,7 @@ private:
     std::unique_ptr<Ncr5380> scsi_;
     std::unique_ptr<IifxScsiDma> scsiDma_;
     std::unique_ptr<ScsiDisk> disk_;
+    std::unique_ptr<ScsiCdRom> cdrom_;
     std::unique_ptr<Asc> sound_;
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<IifxAdbBus> adbBus_;

@@ -761,6 +761,23 @@ OMAC_API int omac_fx_unmount_harddisk2(OMacFx* m)
     return (m && m->mac.unmountHardDisk2()) ? 1 : 0;
 }
 
+OMAC_API void omac_fx_attach_cd(OMacFx* m, int attached, int scsi_id)
+{
+    if (m) m->mac.attachCdRom(attached != 0, scsi_id);
+}
+
+OMAC_API int omac_fx_cd_attached(OMacFx* m) { return m && m->mac.cdRomAttached() ? 1 : 0; }
+
+OMAC_API int omac_fx_insert_cd(OMacFx* m, const uint8_t* img, size_t len)
+{
+    if (!m || !img || !len) return 0;
+    return m->mac.insertCd(std::vector<u8>(img, img + len));
+}
+
+OMAC_API void omac_fx_eject_cd(OMacFx* m) { if (m) m->mac.ejectCd(); }
+
+OMAC_API int omac_fx_cd_present(OMacFx* m) { return m && m->mac.cdPresent() ? 1 : 0; }
+
 OMAC_API size_t omac_fx_pram_save(OMacFx* m, uint8_t* out, size_t cap)
 {
     return m ? m->mac.savePram(out, static_cast<u32>(cap)) : 0;

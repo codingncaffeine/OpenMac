@@ -3,6 +3,8 @@
 #include "../rtc.hpp"
 #include "../scsi.hpp"
 #include "../scsiimage.hpp"
+#include "../cdmedia.hpp"
+#include "../scsicd.hpp"
 #include "../via.hpp"
 #include "../adb.hpp"
 #include "../dc42.hpp"
@@ -155,6 +157,7 @@ IifxMachine::IifxMachine(std::vector<u8> rom, const Config& config)
       scsi_(std::make_unique<Ncr5380>()),
       scsiDma_(std::make_unique<IifxScsiDma>(*scsi_)),
       disk_(std::make_unique<ScsiDisk>()),
+      cdrom_(std::make_unique<ScsiCdRom>()),
       sound_(std::make_unique<Asc>()),
       adb_(std::make_unique<AdbTransceiver>()),
       adbBus_(std::make_unique<IifxAdbBus>(*adb_)),
@@ -631,6 +634,15 @@ void IifxMachine::wireDevices() {
     scc_->onDiag = [this](const char* message) {
         if (onDiag && deviceTrafficDiag_) onDiag(message);
     };
+    // With the PC: whether a command came from the ROM's boot scan or from a
+    // driver in RAM is the first question about a disc that will not mount,
+    // and the target itself cannot know.
+    cdrom_->onDiag = [this](const char* message) {
+        if (!onDiag) return;
+        char b[220];
+        std::snprintf(b, sizeof b, "%s (pc %08X)", message, cpu_.pc);
+        onDiag(b);
+    };
     disk_->onBlockIo = [this](bool write, u32 lba, const u8*, u32 length) {
         if (!onDiag) return;
         char message[96];
@@ -840,6 +852,13 @@ void IifxMachine::tickDevices(int cpuCycles) {
         via_->setCA2(true);
         via_->setCA2(false);
         announceHardDisk();
+        // The CD's driver goes in on the same clock and for the same reason:
+        // there is no unit table to install into until the System has built
+        // one. Eject before mount, so a disc swapped at the host is unmounted
+        // before its replacement is announced.
+        if (cdrom_->attachedState() && !cdDrvr_) installCdDriver();
+        if (cdEjectPending_) completeCdEject();
+        else if (cdMountPending_) mountCdVolume();
     }
 
     framePhase_ += static_cast<u64>(cpuCycles) * kFrameNumerator;
@@ -1040,6 +1059,54 @@ int IifxMachine::stepInstruction() {
         hardwareTrace_.record(std::move(event));
     }
     if (onStep) onStep(cpu_.pc);
+    // The installed CD driver's entry points, whichever storage mode the
+    // machine runs in: no guest code ever serves these.
+    if (cdPrimePc_ && cpu_.pc == cdPrimePc_) {
+        inDiskDriver_ = true;
+        try {
+            serveCdPrime();
+        } catch (const BusFault& fault) {
+            if (onDiag) {
+                char message[112];
+                std::snprintf(message, sizeof message,
+                              "cd prime FAULT pb=%08X addr=%08X (f %u)",
+                              cpu_.a[0], fault.addr,
+                              static_cast<unsigned>(frameCounter_));
+                onDiag(message);
+            }
+            cpu_.d[0] = static_cast<u32>(static_cast<s32>(-36));
+            cpu_.pc = read32(0x08FCu);
+            cpu_.a[0] = cpu_.pc;
+        }
+        inDiskDriver_ = false;
+        flushPendingTicks();
+        tickDevices(40);
+        return 40;
+    }
+    if ((cdCtlPc_ && cpu_.pc == cdCtlPc_) ||
+        (cdStatusPc_ && cpu_.pc == cdStatusPc_)) {
+        const bool status = cdStatusPc_ && cpu_.pc == cdStatusPc_;
+        inDiskDriver_ = true;
+        try {
+            serveCdCtlStatus(status);
+        } catch (const BusFault& fault) {
+            if (onDiag) {
+                char message[112];
+                std::snprintf(message, sizeof message,
+                              "cd ctl/status FAULT pb=%08X addr=%08X (f %u)",
+                              cpu_.a[0], fault.addr,
+                              static_cast<unsigned>(frameCounter_));
+                onDiag(message);
+            }
+            cpu_.d[0] = static_cast<u32>(static_cast<s32>(-36));
+            cpu_.pc = read32(0x08FCu);
+            cpu_.a[0] = cpu_.pc;
+        }
+        inDiskDriver_ = false;
+        flushPendingTicks();
+        tickDevices(40);
+        return 40;
+    }
     if (!nativeStorage_ && diskPrimePc_ && cpu_.pc == diskPrimePc_) {
         inDiskDriver_ = true;
         try {
@@ -2713,6 +2780,379 @@ void IifxMachine::recordHardwareMilestone(const std::string& name) {
 bool IifxMachine::writeHardwareTraceJsonl(const std::string& path) const {
     std::ofstream output(path, std::ios::binary);
     return output && hardwareTrace_.writeJsonl(output);
+}
+
+// ---- CD-ROM ------------------------------------------------------------
+// The drive is an AppleCD-class SCSI target; the disc it holds is served by
+// a driver this machine installs into the running System, because the
+// System installs none of its own (the Apple CD-ROM extension is not on a
+// stock 7.1 disk, and even where it is, it claims only Apple mechanisms).
+// This is the Quadra's design, moved over whole: install once the System is
+// up, mount through _MountVol, serve Prime from the flat image at the disc's
+// Apple_HFS partition, unmount before the host takes the disc back.
+
+void IifxMachine::attachCdRom(bool attached, int busId) {
+    // The target joins the bus at the FIRST attach so a machine that never
+    // has a drive keeps the one-target topology every existing checkpoint
+    // records; a checkpoint taken with the drive on the bus needs the drive
+    // on the bus to load, which is the same rule the disks follow.
+    if (attached && !cdOnBus_) {
+        scsi_->addTarget(cdrom_.get());
+        cdOnBus_ = true;
+    }
+    cdrom_->setAttached(attached, busId);
+    if (onDiag) {
+        char b[64];
+        std::snprintf(b, sizeof b, "cd: drive %s (SCSI ID %d)",
+                      attached ? "attached" : "detached", busId & 7);
+        onDiag(b);
+    }
+}
+
+bool IifxMachine::cdRomAttached() const { return cdrom_->attachedState(); }
+
+int IifxMachine::insertCd(std::vector<u8> image) {
+    cd::Medium m = cd::normalize(std::move(image));
+    if (onDiag) {
+        char b[240];
+        std::snprintf(b, sizeof b, "cd: %s%s", m.ok ? "inserted -- " : "refused: ",
+                      m.desc);
+        onDiag(b);
+    }
+    if (!m.ok) return 0;
+    if (!cdrom_->attachedState()) attachCdRom(true, 3);
+    cdrom_->insert(std::move(m.data));
+    // Where the volume starts on this disc, and the drive's own view of it.
+    cdHfsOffset_ = cd::findHfsPartition(cdrom_->media());
+    if (onDiag) {
+        char b[128];
+        if (!cd::hasHfsVolume(cdrom_->media()))
+            std::snprintf(b, sizeof b,
+                          "cd: no HFS volume on this disc -- the guest needs "
+                          "Foreign File Access to mount an ISO 9660 disc");
+        else
+            std::snprintf(b, sizeof b, "cd: HFS volume at byte %u", cdHfsOffset_);
+        onDiag(b);
+    }
+    if (cdStatus_) write8(cdStatus_ + 3, 1);          // dsDiskInPlace
+    cdMountPending_ = true;
+    cdMountTries_ = 0;
+    return 1;
+}
+
+// The front end's Eject only STAGES: the disc has a volume mounted on it, and
+// taking the medium out from under one leaves the guest holding a volume with
+// nothing behind it -- offLinErr forever. completeCdEject unmounts first, on
+// the emulation thread, at the second tick.
+void IifxMachine::ejectCd() {
+    if (!cdrom_->discPresent()) return;
+    cdEjectPending_ = true;
+}
+
+bool IifxMachine::cdPresent() const { return cdrom_->discPresent(); }
+
+// Build the .AppleCD driver in the System heap and hand it to the Device
+// Manager. Its Open/Prime/Control/Status entry points are four addresses this
+// machine watches; when the guest's Device Manager jumps to one, stepInstruction
+// serves the request in C++ and returns through jIODone -- the same shape as
+// the hard disk's Prime hook, so the guest's DCE, queue and completion path
+// stay its own and only the transfer is ours.
+void IifxMachine::installCdDriver() {
+    if (cdDrvr_ || inDiskDriver_ || hardDiskMountInFlight_) return;
+    if (read32(0x0358u) == 0) return;                 // System never came up
+    if (read32(0x0360u) == 0xFFFFFFFFu) return;       // FS queue not built
+    if (read8(0x0360u) & 1u) return;                  // FSBusy: a file op is running
+    if ((cpu_.getSR() & 0x0700u) != 0) return;        // mid-interrupt: not now
+    if (++cdInstallTries_ > 30) return;
+
+    // Find the slot BEFORE allocating anything: the unit table is not built
+    // until the System is well under way, and an attempt that gives up after
+    // the allocation leaks a block of the System heap every time it retries.
+    const u32 uTable = guestPtr(read32(0x011Cu));
+    const u32 units = read16(0x01D2u);                // UnitNtryCnt
+    u32 unit = 0;
+    for (u32 i = 32; i < units && i < 128; ++i) {     // 0-31 are Apple's
+        if (uTable + i * 4u + 3u >= ram_.size()) break;
+        if (read32(uTable + i * 4u) == 0) { unit = i; break; }
+    }
+    if (!uTable || !unit) return;                     // not yet; try again later
+
+    hardDiskMountInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+
+    // DRVR header: flags, delay, event mask, menu, then the five entry-point
+    // offsets, then the name as a Pascal string. Our entry points are stubs the
+    // guest never actually executes, but they have to BE somewhere.
+    const u32 kHeader = 0x1C;                         // header + ".AppleCD" + pad
+    cpu_.d[0] = kHeader + 0x20;
+    u32 drvr = 0;
+    if (execute68kTrap(0xA71Eu)) drvr = guestPtr(cpu_.a[0]);   // _NewPtr,Sys,Clear
+    if (!drvr) {
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        hardDiskMountInFlight_ = false;
+        return;
+    }
+    // dReadEnable | dWritEnable | dCtlEnable | dStatEnable | dNeedLock.
+    write16(drvr + 0x00, 0x4F00);                     // drvrFlags
+    write16(drvr + 0x02, 0);                          // drvrDelay
+    write16(drvr + 0x04, 0);                          // drvrEMask
+    write16(drvr + 0x06, 0);                          // drvrMenu
+    write16(drvr + 0x08, u16(kHeader + 0x00));        // drvrOpen
+    write16(drvr + 0x0A, u16(kHeader + 0x08));        // drvrPrime
+    write16(drvr + 0x0C, u16(kHeader + 0x10));        // drvrCtl
+    write16(drvr + 0x0E, u16(kHeader + 0x18));        // drvrStatus
+    write16(drvr + 0x10, u16(kHeader + 0x00));        // drvrClose -> the Open stub
+    const char* name = "\010.AppleCD";
+    for (int i = 0; i < 9; ++i) write8(drvr + 0x12 + u32(i), u8(name[i]));
+    // Prime, Control and Status are QUEUED calls: they finish through IODone,
+    // so a stub that jumps there is a correct driver on its own and nothing is
+    // stranded if the hook ever misses.
+    for (u32 off : {0x08u, 0x10u, 0x18u}) {
+        const u32 at = drvr + kHeader + off;
+        write16(at + 0, 0x7000);                      // MOVEQ #0,D0
+        write16(at + 2, 0x2078); write16(at + 4, 0x08FC);   // MOVEA.L $08FC.W,A0
+        write16(at + 6, 0x4ED0);                      // JMP (A0)
+    }
+    // Open and Close are NOT: they are immediate calls and must RTS with the
+    // result in D0. Sending them through IODone completes a request nobody
+    // queued and wrecks the trap table a little later.
+    {
+        const u32 at = drvr + kHeader + 0x00;
+        write16(at + 0, 0x7000);                      // MOVEQ #0,D0
+        write16(at + 2, 0x4E75);                      // RTS
+        write16(at + 4, 0x4E71); write16(at + 6, 0x4E71);   // NOP NOP (padding)
+    }
+    cdDrvr_ = drvr;
+    cdPrimePc_ = drvr + kHeader + 0x08;
+    cdCtlPc_ = drvr + kHeader + 0x10;
+    cdStatusPc_ = drvr + kHeader + 0x18;
+
+    // Into the unit table by hand rather than through _DrvrInstall (which
+    // guesses a refNum and writes over whatever is there when the guess is
+    // wrong). The unit table holds HANDLES to device control entries, so the
+    // DCE is a relocatable block -- locked, since the Device Manager keeps
+    // pointers into it.
+    const s16 refNum = static_cast<s16>(~unit);
+    cdRefNum_ = refNum;
+    cpu_.d[0] = 50;                                   // AuxDCE
+    u32 dceH = 0;
+    if (execute68kTrap(0xA722u)) dceH = cpu_.a[0];    // _NewHandle,Sys,Clear
+    if (dceH) { cpu_.a[0] = dceH; execute68kTrap(0xA029u); }   // _HLock
+    const u32 dce = dceH ? guestPtr(read32(guestPtr(dceH))) : 0;
+    if (!dce) {
+        cdDrvr_ = cdPrimePc_ = cdCtlPc_ = cdStatusPc_ = 0;
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        hardDiskMountInFlight_ = false;
+        if (onDiag) onDiag("cd: no memory for the driver's control entry");
+        return;
+    }
+    write32(dce + 0x00, drvr);                        // dCtlDriver (a pointer)
+    write16(dce + 0x04, u16(0x4F00 | 0x0020));        // dCtlFlags | dOpened
+    write16(dce + 0x18, static_cast<u16>(refNum));    // dCtlRefNum
+    write32(uTable + unit * 4u, dceH);
+
+    // The drive itself: a DrvSts the drive queue links through, then AddDrive.
+    cpu_.d[0] = 22;                                   // SIZEOF DrvSts
+    cdStatus_ = 0;
+    if (execute68kTrap(0xA71Eu)) cdStatus_ = guestPtr(cpu_.a[0]);   // _NewPtr,Sys,Clear
+    if (cdStatus_) {
+        write8(cdStatus_ + 2, 0x80);                  // dsWriteProt: locked
+        write8(cdStatus_ + 3, cdrom_->discPresent() ? 1 : 0);   // dsDiskInPlace
+        write8(cdStatus_ + 4, 1);                     // dsInstalled
+        write8(cdStatus_ + 5, 1);                     // dsSides
+        cdDrive_ = 6;                                 // past the two SCSI seats
+        cpu_.d[0] = (u32(cdDrive_) << 16) | u16(refNum);
+        cpu_.a[0] = cdStatus_ + 6;                    // the DrvQEl itself
+        execute68kTrap(0xA04Eu);                      // _AddDrive
+        cdMountPending_ = cdrom_->discPresent();
+        cdMountTries_ = 0;
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    hardDiskMountInFlight_ = false;
+    if (onDiag) {
+        char b[144];
+        std::snprintf(b, sizeof b,
+                      "cd: .AppleCD installed at unit %u (refNum %d), drive %u, "
+                      "Prime at %08X", unit, refNum, cdDrive_, cdPrimePc_);
+        onDiag(b);
+    }
+}
+
+// Announce the disc the way a real drive's driver does: a disk-inserted event
+// with the drive number in the message. The Event Manager mounts the volume
+// when the running application takes the event, and the Finder -- which
+// learns of new volumes from exactly that event -- draws its icon. A direct
+// _MountVol (the hard disks' recovery path) mounts the volume too, but the
+// Finder never hears of it until it happens to rescan; it stays here as the
+// fallback for a System where nothing is pumping events yet.
+void IifxMachine::mountCdVolume() {
+    if (!cdMountPending_ || !cdDrive_) return;
+    if (inDiskDriver_ || hardDiskMountInFlight_) return;
+    if (read32(0x0358u) == 0) return;                 // System never came up
+    if (read8(0x0360u) & 1u) return;                  // FSBusy
+    if ((cpu_.getSR() & 0x0700u) != 0) return;        // mid-interrupt
+    if (volumeMountedFor(cdDrive_)) { cdMountPending_ = false; return; }
+    if (++cdMountTries_ > 15) { cdMountPending_ = false; return; }
+    hardDiskMountInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    s16 res = -108;
+    const bool viaEvent = cdMountTries_ == 1;         // one event, then patience
+    if (viaEvent) {
+        cpu_.a[0] = 7;                                // diskEvt
+        cpu_.d[0] = cdDrive_;                         // message: the drive
+        if (execute68kTrap(0xA02Fu))                  // _PostEvent
+            res = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
+    } else if (cdMountTries_ >= 6) {
+        if (!hardDiskMountPb_) {
+            cpu_.d[0] = 80;
+            if (execute68kTrap(0xA71Eu))              // _NewPtr,Sys,Clear
+                hardDiskMountPb_ = guestPtr(cpu_.a[0]);
+        }
+        if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
+            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
+            write16(hardDiskMountPb_ + 22u, cdDrive_);   // ioVRefNum = the drive
+            cpu_.a[0] = hardDiskMountPb_;
+            if (execute68kTrap(0xA00Fu))              // _MountVol
+                res = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
+        }
+        if (res == 0 || res == -55) cdMountPending_ = false;   // mounted, or already
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    hardDiskMountInFlight_ = false;
+    if (onDiag && (viaEvent || cdMountTries_ >= 6)) {
+        char b[96];
+        std::snprintf(b, sizeof b, viaEvent ? "cd: disk-inserted event for drive %u -> %d"
+                                            : "cd: mount drive %u -> %d",
+                      cdDrive_, res);
+        onDiag(b);
+    }
+}
+
+void IifxMachine::completeCdEject() {
+    if (!cdEjectPending_) return;
+    if (inDiskDriver_ || hardDiskMountInFlight_) return;
+    if (cdDrive_ && read32(0x0358u) != 0 && !(read8(0x0360u) & 1u) &&
+        (cpu_.getSR() & 0x0700u) == 0 && volumeMountedFor(cdDrive_)) {
+        hardDiskMountInFlight_ = true;
+        u32 sd[8], sa[8];
+        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+        if (!hardDiskMountPb_) {
+            cpu_.d[0] = 80;
+            if (execute68kTrap(0xA71Eu))              // _NewPtr,Sys,Clear
+                hardDiskMountPb_ = guestPtr(cpu_.a[0]);
+        }
+        s16 un = -1;
+        if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
+            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
+            write16(hardDiskMountPb_ + 22u, cdDrive_);   // ioVRefNum
+            cpu_.a[0] = hardDiskMountPb_;
+            if (execute68kTrap(0xA00Eu))              // _UnmountVol
+                un = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
+        }
+        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+        hardDiskMountInFlight_ = false;
+        if (un != 0) {
+            // The guest is still using it (an open file, an application running
+            // off the disc). A real drive refuses too; try again next tick.
+            if (onDiag && cdEjectTries_ == 0) {
+                char b[80];
+                std::snprintf(b, sizeof b,
+                              "cd: the guest is still using the disc (%d)", un);
+                onDiag(b);
+            }
+            if (++cdEjectTries_ < 20) return;
+        }
+    }
+    cdEjectPending_ = false;
+    cdEjectTries_ = 0;
+    cdrom_->eject();
+    cdHfsOffset_ = 0;
+    cdMountPending_ = false;
+    if (cdStatus_) write8(cdStatus_ + 3, 0);          // dsDiskInPlace
+    if (onDiag) onDiag("cd: disc taken out by the host");
+}
+
+// The CD driver's Prime: read-only, served straight out of the disc image at
+// the HFS partition's offset. A CD is addressed by the File Manager in 512-byte
+// logical blocks whatever the drive's own sector size is, and the image is a
+// flat byte run, so the translation is one addition.
+void IifxMachine::serveCdPrime() {
+    const u32 pb = guestPtr(cpu_.a[0]);
+    const u32 dce = guestPtr(cpu_.a[1]);
+    const u16 trap = read16(pb + 0x06);
+    const u32 buf = guestPtr(read32(pb + 0x20));
+    const u32 req = read32(pb + 0x24);
+    const u16 posMode = read16(pb + 0x2C);
+    const u32 posOff = read32(pb + 0x2E);
+    const u32 dctlPos = read32(dce + 0x10);
+    const std::vector<u8>& disc = cdrom_->media();
+    const u32 volSize = disc.size() > cdHfsOffset_
+                            ? static_cast<u32>(disc.size()) - cdHfsOffset_ : 0;
+
+    u32 pos = dctlPos;
+    switch (posMode & 3) {
+    case 1: pos = posOff; break;                                   // fsFromStart
+    case 2: pos = volSize + posOff; break;                         // fsFromLEOF
+    case 3: pos = dctlPos + posOff; break;                         // fsFromMark
+    default: break;                                                // fsAtMark
+    }
+    s16 result = 0;
+    u32 done = 0;
+    if (!cdrom_->discPresent() || volSize == 0) {
+        result = -65;                                  // offLinErr
+    } else if (trap & 1) {
+        result = -44;                                  // wPrErr: it is a CD
+    } else if (pos >= volSize) {
+        result = -39;                                  // eofErr
+    } else {
+        u32 n = req;
+        if (pos + n > volSize) { n = volSize - pos; result = -39; }
+        const u32 at = cdHfsOffset_ + pos;
+        for (u32 i = 0; i < n; ++i) write8(buf + i, disc[at + i]);
+        done = n;
+    }
+    write32(pb + 0x28, done);                          // ioActCount
+    write32(dce + 0x10, pos + done);                   // dCtlPosition
+    write16(pb + 0x10, static_cast<u16>(result));      // ioResult
+    cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+    const u32 target = read32(0x08FCu);                // jIODone
+    cpu_.a[0] = target;
+    cpu_.pc = target;
+}
+
+// Control and Status for the CD. The one that matters is csCode 7, Eject: the
+// Finder's drag-to-Trash and Special > Eject Disk both come through here, and a
+// drive that answers "done" without letting go leaves an icon on a disc the
+// host has already taken back.
+void IifxMachine::serveCdCtlStatus(bool status) {
+    const u32 pb = guestPtr(cpu_.a[0]);
+    const u16 csCode = read16(pb + 0x1A);
+    s16 result = 0;
+    if (!status) {
+        switch (csCode) {
+        case 7:                                        // Eject
+            cdrom_->eject();
+            cdHfsOffset_ = 0;
+            if (cdStatus_) write8(cdStatus_ + 3, 0);   // dsDiskInPlace
+            if (onDiag) onDiag("cd: the guest ejected the disc");
+            break;
+        case 21: case 22:                              // icon / drive info
+            result = -17;                              // controlErr: not ours
+            break;
+        default:
+            break;                                     // verify, format, tag: fine
+        }
+    } else if (csCode == 8) {                          // DriveStatus
+        if (cdStatus_)
+            for (u32 i = 0; i < 22; ++i) write8(pb + 0x1C + i, read8(cdStatus_ + i));
+    }
+    write16(pb + 0x10, static_cast<u16>(result));      // ioResult
+    cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
+    const u32 target = read32(0x08FCu);                // jIODone
+    cpu_.a[0] = target;
+    cpu_.pc = target;
 }
 
 u64 IifxMachine::deterministicStateHash() const {

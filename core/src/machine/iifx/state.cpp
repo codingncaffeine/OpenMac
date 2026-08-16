@@ -4,6 +4,7 @@
 #include "../iwm.hpp"
 #include "../rtc.hpp"
 #include "../scsi.hpp"
+#include "../scsicd.hpp"
 #include "../sony.hpp"
 #include "../via.hpp"
 #include "../quadra/easc.hpp"
@@ -29,7 +30,7 @@ namespace openmac {
 
 namespace {
 
-constexpr u32 kStateVersion = 17;
+constexpr u32 kStateVersion = 18;
 constexpr u32 kEndianMarker = 0x12345678u;
 constexpr u32 kPageBytes = 4096;
 constexpr u64 kMaxMediaBytes = 1024ull * 1024ull * 1024ull;
@@ -1081,6 +1082,35 @@ private:
             machine.pendingTickCycles_ = 0;
         }
         if (io.applying()) machine.deviceTouched_ = false;
+        // The CD-ROM's installed driver (format 18): where its stubs live and
+        // the drive/mount bookkeeping, plus the target's SCSI-visible state.
+        // The disc itself is host media (like the second seat's image) and
+        // the drive's presence on the bus is host configuration; both are
+        // supplied again by whoever loads the file, and the HFS offset is
+        // recomputed from the disc at insertion.
+        if (stateVersion >= 18) {
+            io.u32v(machine.cdDrvr_); io.u32v(machine.cdPrimePc_);
+            io.u32v(machine.cdCtlPc_); io.u32v(machine.cdStatusPc_);
+            io.u32v(machine.cdStatus_);
+            u16 cdRefNum = std::bit_cast<u16>(machine.cdRefNum_);
+            io.u16v(cdRefNum);
+            if (io.applying()) machine.cdRefNum_ = std::bit_cast<s16>(cdRefNum);
+            io.u16v(machine.cdDrive_);
+            io.boolv(machine.cdMountPending_); io.intv(machine.cdMountTries_);
+            io.intv(machine.cdInstallTries_); io.boolv(machine.cdEjectPending_);
+            io.intv(machine.cdEjectTries_);
+            ScsiCdRom& cd = *machine.cdrom_;
+            io.u32v(cd.blockSize_); io.u8v(cd.senseKey_); io.u8v(cd.asc_);
+            io.boolv(cd.unitAttention_); io.boolv(cd.prevented_);
+            io.boolv(cd.ejectRequest_); io.boolv(cd.modeSelectPending_);
+        } else if (io.applying()) {
+            machine.cdDrvr_ = machine.cdPrimePc_ = 0;
+            machine.cdCtlPc_ = machine.cdStatusPc_ = 0;
+            machine.cdStatus_ = 0; machine.cdRefNum_ = 0; machine.cdDrive_ = 0;
+            machine.cdMountPending_ = false;
+            machine.cdMountTries_ = machine.cdInstallTries_ = 0;
+            machine.cdEjectPending_ = false; machine.cdEjectTries_ = 0;
+        }
 
         io.sparse(machine.floppy_, kMaxSmallBlob);
         io.sparse(machine.floppyEjected_, kMaxSmallBlob);
