@@ -706,6 +706,7 @@ void IifxMachine::reset() {
     hardDiskMountDelay_ = 0;
     hardDiskMountResult_ = static_cast<s16>(-32768);
     injectedTrapTimeouts_ = 0;
+    injectedTrapStaleLines_ = 0;
     diskPrimePc_ = 0;
     diskCtlPc_ = 0;
     diskStatusPc_ = 0;
@@ -1742,8 +1743,7 @@ bool IifxMachine::shutdownHardDisk() {
     bool marked = false;
     if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
         auto call = [this](u16 trap) -> s16 {
-            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
-            write16(hardDiskMountPb_ + 22u, 4);       // ioVRefNum = drive 4
+            primeMountPb(4);
             cpu_.a[0] = hardDiskMountPb_;
             if (!execute68kTrap(trap)) return -36;    // ioErr
             return static_cast<s16>(cpu_.d[0] & 0xFFFFu);
@@ -1780,6 +1780,22 @@ bool IifxMachine::execute68kTrap(u16 trap) {
     const u8 saved0 = read8(scratch);
     const u8 saved1 = read8(scratch + 1u);
     write16(scratch, trap);
+    // Host stores bypass the 68030's caches, and neither cache snoops. The
+    // instruction cache keeps the last trap word fetched here; the data cache
+    // keeps the last word the ROM's trap dispatcher READ here -- and it is
+    // that data read which selects the trap, so a line left over from the
+    // previous injection runs THAT trap with this one's registers (measured
+    // in the CD driver install: the dispatcher read a stale _NewHandle for
+    // both the _HLock and the _NewPtr that followed it, so the DCE was never
+    // locked and the DrvSts went into a 22-byte handle's master pointer, and
+    // then a stale _AddDrive ran in place of the _PostEvent -- a drive queue
+    // element at address 7. Result: _MountVol -56 forever and a boot stuck
+    // at Welcome). Both entries go before every injection, and again after
+    // the bytes are put back, or the Finder reads our trap word as its own
+    // ApplScratch. The count of entries dropped here is the proof the guard
+    // is live (a boot with a disc drops several).
+    injectedTrapStaleLines_ += cpu_.invalidateInstructionCache030(scratch, 2) +
+                               cpu_.invalidateDataCache030(scratch, 2);
     const u32 savedPc = cpu_.pc;
     const u16 savedSr = cpu_.getSR();
     cpu_.pc = scratch;
@@ -1804,7 +1820,18 @@ bool IifxMachine::execute68kTrap(u16 trap) {
     cpu_.setSR(savedSr);
     write8(scratch, saved0);
     write8(scratch + 1u, saved1);
+    cpu_.invalidateInstructionCache030(scratch, 2);
+    cpu_.invalidateDataCache030(scratch, 2);
     return completed;
+}
+
+void IifxMachine::primeMountPb(u16 drive) {
+    for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
+    write16(hardDiskMountPb_ + 22u, drive);           // ioVRefNum = the drive
+    // The ROM read this block through the data cache on the previous call
+    // (its ioVRefNum for another drive, its ioResult): host stores do not
+    // update those lines, so a stale hit would mount that drive again.
+    cpu_.invalidateDataCache030(hardDiskMountPb_, 80);
 }
 
 bool IifxMachine::driveInQueue(u16 drive) {
@@ -1874,8 +1901,7 @@ void IifxMachine::announceHardDisk() {
     const auto mountDrive = [this](u16 drive) -> s16 {
         s16 result = -108;                              // memFullErr fallback
         if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
-            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
-            write16(hardDiskMountPb_ + 22u, drive);     // ioVRefNum = the drive
+            primeMountPb(drive);
             cpu_.a[0] = hardDiskMountPb_;
             if (execute68kTrap(0xA00Fu))                // _MountVol
                 result = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
@@ -1995,8 +2021,7 @@ bool IifxMachine::unmountHardDisk2() {
     s16 flushed = -108, unmounted = -108;
     if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
         auto call = [this](u16 trap) -> s16 {
-            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
-            write16(hardDiskMountPb_ + 22u, 5);       // ioVRefNum = drive 5
+            primeMountPb(5);
             cpu_.a[0] = hardDiskMountPb_;
             if (!execute68kTrap(trap)) return -36;    // ioErr
             return static_cast<s16>(cpu_.d[0] & 0xFFFFu);
@@ -2814,7 +2839,7 @@ bool IifxMachine::cdRomAttached() const { return cdrom_->attachedState(); }
 int IifxMachine::insertCd(std::vector<u8> image) {
     cd::Medium m = cd::normalize(std::move(image));
     if (onDiag) {
-        char b[240];
+        char b[272];                    // "cd: refused: " + the 240-byte desc
         std::snprintf(b, sizeof b, "cd: %s%s", m.ok ? "inserted -- " : "refused: ",
                       m.desc);
         onDiag(b);
@@ -2834,7 +2859,10 @@ int IifxMachine::insertCd(std::vector<u8> image) {
             std::snprintf(b, sizeof b, "cd: HFS volume at byte %u", cdHfsOffset_);
         onDiag(b);
     }
-    if (cdStatus_) write8(cdStatus_ + 3, 1);          // dsDiskInPlace
+    if (cdStatus_) {                                  // dsDiskInPlace
+        write8(cdStatus_ + 3, 1);
+        cpu_.invalidateDataCache030(cdStatus_, 22);
+    }
     cdMountPending_ = true;
     cdMountTries_ = 0;
     return 1;
@@ -2927,6 +2955,10 @@ void IifxMachine::installCdDriver() {
     cdPrimePc_ = drvr + kHeader + 0x08;
     cdCtlPc_ = drvr + kHeader + 0x10;
     cdStatusPc_ = drvr + kHeader + 0x18;
+    // The block was cleared by the guest's own stores a moment ago; its
+    // header and code are ours -- take them out of the data cache.
+    cpu_.invalidateDataCache030(drvr, kHeader + 0x20);
+    cpu_.invalidateInstructionCache030(drvr, kHeader + 0x20);
 
     // Into the unit table by hand rather than through _DrvrInstall (which
     // guesses a refNum and writes over whatever is there when the guess is
@@ -2951,6 +2983,8 @@ void IifxMachine::installCdDriver() {
     write16(dce + 0x04, u16(0x4F00 | 0x0020));        // dCtlFlags | dOpened
     write16(dce + 0x18, static_cast<u16>(refNum));    // dCtlRefNum
     write32(uTable + unit * 4u, dceH);
+    cpu_.invalidateDataCache030(dce, 50);
+    cpu_.invalidateDataCache030(uTable + unit * 4u, 4);
 
     // The drive itself: a DrvSts the drive queue links through, then AddDrive.
     cpu_.d[0] = 22;                                   // SIZEOF DrvSts
@@ -2961,6 +2995,7 @@ void IifxMachine::installCdDriver() {
         write8(cdStatus_ + 3, cdrom_->discPresent() ? 1 : 0);   // dsDiskInPlace
         write8(cdStatus_ + 4, 1);                     // dsInstalled
         write8(cdStatus_ + 5, 1);                     // dsSides
+        cpu_.invalidateDataCache030(cdStatus_, 22);
         cdDrive_ = 6;                                 // past the two SCSI seats
         cpu_.d[0] = (u32(cdDrive_) << 16) | u16(refNum);
         cpu_.a[0] = cdStatus_ + 6;                    // the DrvQEl itself
@@ -2980,12 +3015,15 @@ void IifxMachine::installCdDriver() {
 }
 
 // Announce the disc the way a real drive's driver does: a disk-inserted event
-// with the drive number in the message. The Event Manager mounts the volume
-// when the running application takes the event, and the Finder -- which
-// learns of new volumes from exactly that event -- draws its icon. A direct
-// _MountVol (the hard disks' recovery path) mounts the volume too, but the
-// Finder never hears of it until it happens to rescan; it stays here as the
-// fallback for a System where nothing is pumping events yet.
+// with the drive number in the message and 0 in the high word. When the
+// application in front takes it (GetNextEvent -> SystemEvent, ROM $4081C7FC),
+// the ROM itself calls _MountVol on the drive and stores the result in the
+// high word; the Finder learns of the volume from that event and draws its
+// icon (measured: icon within five frames; a volume mounted from here without
+// the event stays off the desktop). Before any application has launched --
+// a disc in the drive at cold boot -- nobody is pumping events, so mount it
+// directly like the hard disks; the Finder enumerates the volumes it finds
+// when it starts.
 void IifxMachine::mountCdVolume() {
     if (!cdMountPending_ || !cdDrive_) return;
     if (inDiskDriver_ || hardDiskMountInFlight_) return;
@@ -2997,22 +3035,27 @@ void IifxMachine::mountCdVolume() {
     hardDiskMountInFlight_ = true;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    // CurApName is a Pascal string once _Launch has run an application (the
+    // Finder included); until then it holds whatever the RAM test left.
+    const u8 apName = read8(0x0910u);
+    const bool eventLoop = apName != 0 && apName <= 31;
     s16 res = -108;
-    const bool viaEvent = cdMountTries_ == 1;         // one event, then patience
-    if (viaEvent) {
+    if (eventLoop) {
         cpu_.a[0] = 7;                                // diskEvt
         cpu_.d[0] = cdDrive_;                         // message: the drive
         if (execute68kTrap(0xA02Fu))                  // _PostEvent
             res = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
-    } else if (cdMountTries_ >= 6) {
+        // Posted once; the OS owns it from here. evtNotEnb (an application
+        // that masked disk events out) is retried next second.
+        if (res == 0) cdMountPending_ = false;
+    } else {
         if (!hardDiskMountPb_) {
             cpu_.d[0] = 80;
             if (execute68kTrap(0xA71Eu))              // _NewPtr,Sys,Clear
                 hardDiskMountPb_ = guestPtr(cpu_.a[0]);
         }
         if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
-            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
-            write16(hardDiskMountPb_ + 22u, cdDrive_);   // ioVRefNum = the drive
+            primeMountPb(cdDrive_);
             cpu_.a[0] = hardDiskMountPb_;
             if (execute68kTrap(0xA00Fu))              // _MountVol
                 res = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
@@ -3021,10 +3064,11 @@ void IifxMachine::mountCdVolume() {
     }
     for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     hardDiskMountInFlight_ = false;
-    if (onDiag && (viaEvent || cdMountTries_ >= 6)) {
+    if (onDiag) {
         char b[96];
-        std::snprintf(b, sizeof b, viaEvent ? "cd: disk-inserted event for drive %u -> %d"
-                                            : "cd: mount drive %u -> %d",
+        std::snprintf(b, sizeof b,
+                      eventLoop ? "cd: disk-inserted event for drive %u -> %d"
+                                : "cd: mount drive %u -> %d",
                       cdDrive_, res);
         onDiag(b);
     }
@@ -3045,8 +3089,7 @@ void IifxMachine::completeCdEject() {
         }
         s16 un = -1;
         if (hardDiskMountPb_ && hardDiskMountPb_ + 80u <= ram_.size()) {
-            for (u32 i = 0; i < 80; ++i) write8(hardDiskMountPb_ + i, 0);
-            write16(hardDiskMountPb_ + 22u, cdDrive_);   // ioVRefNum
+            primeMountPb(cdDrive_);
             cpu_.a[0] = hardDiskMountPb_;
             if (execute68kTrap(0xA00Eu))              // _UnmountVol
                 un = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
@@ -3070,7 +3113,10 @@ void IifxMachine::completeCdEject() {
     cdrom_->eject();
     cdHfsOffset_ = 0;
     cdMountPending_ = false;
-    if (cdStatus_) write8(cdStatus_ + 3, 0);          // dsDiskInPlace
+    if (cdStatus_) {                                  // dsDiskInPlace
+        write8(cdStatus_ + 3, 0);
+        cpu_.invalidateDataCache030(cdStatus_, 22);
+    }
     if (onDiag) onDiag("cd: disc taken out by the host");
 }
 
@@ -3111,11 +3157,16 @@ void IifxMachine::serveCdPrime() {
         if (pos + n > volSize) { n = volSize - pos; result = -39; }
         const u32 at = cdHfsOffset_ + pos;
         for (u32 i = 0; i < n; ++i) write8(buf + i, disc[at + i]);
+        cpu_.invalidateDataCache030(buf, n);
         done = n;
     }
     write32(pb + 0x28, done);                          // ioActCount
     write32(dce + 0x10, pos + done);                   // dCtlPosition
     write16(pb + 0x10, static_cast<u16>(result));      // ioResult
+    // Host writes bypass the 68030's data cache: the File Manager reads the
+    // block, the result and the mark through it.
+    cpu_.invalidateDataCache030(pb, 0x40u);
+    cpu_.invalidateDataCache030(dce, 0x20u);
     cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
     const u32 target = read32(0x08FCu);                // jIODone
     cpu_.a[0] = target;
@@ -3135,7 +3186,10 @@ void IifxMachine::serveCdCtlStatus(bool status) {
         case 7:                                        // Eject
             cdrom_->eject();
             cdHfsOffset_ = 0;
-            if (cdStatus_) write8(cdStatus_ + 3, 0);   // dsDiskInPlace
+            if (cdStatus_) {                           // dsDiskInPlace
+                write8(cdStatus_ + 3, 0);
+                cpu_.invalidateDataCache030(cdStatus_, 22);
+            }
             if (onDiag) onDiag("cd: the guest ejected the disc");
             break;
         case 21: case 22:                              // icon / drive info
@@ -3149,12 +3203,17 @@ void IifxMachine::serveCdCtlStatus(bool status) {
             for (u32 i = 0; i < 22; ++i) write8(pb + 0x1C + i, read8(cdStatus_ + i));
     }
     write16(pb + 0x10, static_cast<u16>(result));      // ioResult
+    cpu_.invalidateDataCache030(pb, 0x40u);         // csParam + ioResult
     cpu_.d[0] = static_cast<u32>(static_cast<s32>(result));
     const u32 target = read32(0x08FCu);                // jIODone
     cpu_.a[0] = target;
     cpu_.pc = target;
 }
 
+// The machine as of its last device flush: cycles, CPU registers and the
+// storage devices' visible state. Frame boundaries are flush points, so a
+// hash taken after runFrame() is exact; a caller stepping single instructions
+// flushes first (flushPendingTicks()) if it wants the devices caught up.
 u64 IifxMachine::deterministicStateHash() const {
     u64 hash = 1469598103934665603ull;
     hash = hashWord(hash, totalCycles_);
@@ -3578,6 +3637,24 @@ u32 IifxMachine::read32(u32 addr) {
         }
     }
     return (static_cast<u32>(read16(addr)) << 16) | read16(addr + 2);
+}
+
+u8 IifxMachine::peek8(u32 addr) const {
+    if (addr < 0x40000000u) {
+        if (overlay_) return rom_[addr & romMask_];
+        if (addr < ram_.size()) return ram_[addr];
+        return 0xFF;
+    }
+    if (addr < 0x50000000u) return rom_[addr & romMask_];
+    return 0xFF;                             // devices are not for peeking
+}
+
+u16 IifxMachine::peek16(u32 addr) const {
+    return static_cast<u16>((static_cast<u16>(peek8(addr)) << 8) | peek8(addr + 1));
+}
+
+u32 IifxMachine::peek32(u32 addr) const {
+    return (static_cast<u32>(peek16(addr)) << 16) | peek16(addr + 2);
 }
 
 u8 IifxMachine::read8CacheInhibited(u32 addr) {
@@ -4771,12 +4848,13 @@ std::string IifxMachine::diagnosticReport() const {
         char item[256];
         std::snprintf(item, sizeof item,
                       "  hard disk bytes=%zu pending=%d mounted=%d pb=%08X "
-                      "tries=%u result=%d trap-timeouts=%u\n"
+                      "tries=%u result=%d trap-timeouts=%u stale-cache-drops=%u\n"
                       "    HFS offset=%u bytes=%u driver=%08X reads=%u writes=%u\n",
                       hardDisk_.size(), hardDiskMountPending_ ? 1 : 0,
                       hardDiskMounted_ ? 1 : 0, hardDiskMountPb_,
                       hardDiskMountTries_, hardDiskMountResult_,
-                      injectedTrapTimeouts_, hfsImageOffset_, hfsVolumeBytes_,
+                      injectedTrapTimeouts_, injectedTrapStaleLines_,
+                      hfsImageOffset_, hfsVolumeBytes_,
                       diskPrimePc_, hardDiskReadCount_, hardDiskWriteCount_);
         result += item;
     }

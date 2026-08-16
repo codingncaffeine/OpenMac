@@ -1023,7 +1023,7 @@ Machine::InsertVerdict Machine::insertCd(std::vector<u8> image) {
     cd::Medium m = cd::normalize(std::move(image));
     std::snprintf(cdMediumText_, sizeof cdMediumText_, "%s", m.desc);
     if (onDiag) {
-        char b[240];
+        char b[272];                    // "cd: refused: " + the 240-byte desc
         std::snprintf(b, sizeof b, "cd: %s%s", m.ok ? "inserted — " : "refused: ",
                       m.desc);
         onDiag(b);

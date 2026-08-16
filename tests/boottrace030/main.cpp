@@ -129,7 +129,7 @@ void dumpMemory(IifxMachine& mac, u32 address, u32 size, const char* label) {
     for (u32 offset = 0; offset < size; offset += 16) {
         std::printf("  %08X ", address + offset);
         for (u32 column = 0; column < 16 && offset + column < size; ++column)
-            std::printf(" %02X", mac.read8(address + offset + column));
+            std::printf(" %02X", mac.peek8(address + offset + column));
         std::printf("\n");
     }
 }
@@ -143,7 +143,7 @@ void dumpLogicalMemory(IifxMachine& mac, u32 address, u32 size,
             try {
                 const u32 logical = address + offset + column;
                 const u32 physical = mac.cpu().diagnosticTranslate(logical);
-                std::printf(" %02X", mac.read8(physical));
+                std::printf(" %02X", mac.peek8(physical));
             } catch (...) {
                 std::printf(" ??");
             }
@@ -160,10 +160,10 @@ void dumpLogicalMemory(IifxMachine& mac, u32 address, u32 size,
 
 bool applicationIs(IifxMachine& mac, const std::string& name) {
     if (name.empty() || name.size() > 31u ||
-        mac.read8(0x02E0u) != static_cast<u8>(name.size()))
+        mac.peek8(0x02E0u) != static_cast<u8>(name.size()))
         return false;
     for (std::size_t index = 0; index < name.size(); ++index)
-        if (mac.read8(0x02E1u + static_cast<u32>(index)) !=
+        if (mac.peek8(0x02E1u + static_cast<u32>(index)) !=
             static_cast<u8>(name[index]))
             return false;
     return true;
@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
                      "       media/input timing: [--floppy-at-frame n file.img]... [--eject-floppy-at-frame n]... [--input-at-frame n dx dy up|down]... [--milestone-timeout name:frames]\n"
                      "       trigger capture: --checkpoint-on-trigger file.iifxstate [--checkpoint-at-pc hex file.iifxstate]\n"
                      "       boot display capture: --frame-timeline prefix first-frame last-frame\n"
-                     "       trap probe: --watch-trap hex-opcode [--watch-trap hex-opcode]... [--watch-trap-limit n]\n"
+                     "       trap probe: --watch-trap hex-opcode [--watch-trap hex-opcode]... [--watch-trap-limit n] [--watch-byte hex-address]... [--watch-pc hex-address]...\n"
                      "       concise output/artifacts: --quiet [--cpu-state] [--media-summary] [--dump-audio sound.wav] [--expect-startup-chime] [--no-gc-fast-path] [--no-tick-batching]\n"
                      "       omit floppy.img and use 'no-video' for a headless machine\n"
                      "       add [input-frame] [mouse-dx] [mouse-dy] to inject motion\n"
@@ -422,6 +422,8 @@ int main(int argc, char** argv) {
     int frameTimelineFirst = 0;
     int frameTimelineLast = -1;
     std::vector<u16> watchedTraps;
+    std::vector<u32> watchedBytes;      // low-memory bytes shown on every WATCH-TRAP line
+    std::vector<u32> watchedPcs;        // --watch-pc: report when the 68030 reaches these
     bool watchedTrapEnabled = false;
     u64 watchedTrapLimit = 32;
     for (int index = 2; index < argc; ++index) {
@@ -810,6 +812,22 @@ int main(int argc, char** argv) {
             watchedTraps.push_back(static_cast<u16>(value));
             watchedTrapEnabled = true;
         }
+        else if (option == "--watch-pc" && index + 1 < argc) {
+            const u64 value = parseU64(argv[++index]);
+            if (value > 0xFFFFFFFFu) {
+                std::fprintf(stderr, "--watch-pc requires a 32-bit address\n");
+                return 2;
+            }
+            watchedPcs.push_back(static_cast<u32>(value));
+        }
+        else if (option == "--watch-byte" && index + 1 < argc) {
+            const u64 value = parseU64(argv[++index]);
+            if (value > 0xFFFFFFFFu) {
+                std::fprintf(stderr, "--watch-byte requires a 32-bit address\n");
+                return 2;
+            }
+            watchedBytes.push_back(static_cast<u32>(value));
+        }
         else if (option == "--watch-trap-limit" && index + 1 < argc) {
             watchedTrapLimit = parseU64(argv[++index]);
             if (watchedTrapLimit == 0) {
@@ -951,7 +969,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < count; ++i) {
             std::string instruction;
             const int bytes = dbg::disasm(
-                [&](u32 address) { return mac.read16(address); }, pc, instruction);
+                [&](u32 address) { return mac.peek16(address); }, pc, instruction);
             std::printf("%08X  %s\n", pc, instruction.c_str());
             pc += static_cast<u32>(bytes);
         }
@@ -1171,7 +1189,7 @@ int main(int argc, char** argv) {
             try {
                 // onException reports the bus address of the trapping
                 // instruction, matching the existing disassembly hook below.
-                opcode = mac.read16(pc);
+                opcode = mac.peek16(pc);
             } catch (...) {
                 // The CPU will take the architected fetch fault. A diagnostic
                 // watch must not replace it with a host-side failure.
@@ -1187,6 +1205,8 @@ int main(int argc, char** argv) {
                                 static_cast<unsigned long long>(mac.totalCycles()),
                                 opcode, pc, mac.cpu().a[7], mac.cpu().d[0],
                                 mac.cpu().a[0]);
+                    for (const u32 address : watchedBytes)
+                        std::printf(" [%06X]=%02X", address, mac.peek8(address));
                     // OS traps carry a parameter block in A0: show ioRefNum,
                     // csCode and the first csParam words (Device Manager
                     // layout) so a Control/Status conversation reads at a
@@ -1196,7 +1216,7 @@ int main(int argc, char** argv) {
                             std::printf(" pb+18:");
                             for (u32 offset = 0x18u; offset < 0x28u; offset += 2u)
                                 std::printf(" %04X",
-                                            mac.read16(mac.cpu().a[0] + offset));
+                                            mac.peek16(mac.cpu().a[0] + offset));
                         } catch (...) {
                         }
                     }
@@ -1212,7 +1232,7 @@ int main(int argc, char** argv) {
         }
         std::string instruction;
         try {
-            dbg::disasm([&](u32 address) { return mac.read16(address); }, pc,
+            dbg::disasm([&](u32 address) { return mac.peek16(address); }, pc,
                         instruction);
         } catch (const BusFault&) {
             instruction = "<unreadable>";
@@ -1276,7 +1296,24 @@ int main(int argc, char** argv) {
     int gcSenseBudget = 12;
     int videoDriverBudget = 128;
     bool pcCheckpointSaved = false;
+    u64 watchedPcHits = 0;
     mac.onStep = [&](u32 pc) {
+        if (!watchedPcs.empty() &&
+            std::find(watchedPcs.begin(), watchedPcs.end(), pc) != watchedPcs.end()) {
+            ++watchedPcHits;
+            if (watchedPcHits <= watchedTrapLimit) {
+                std::printf("WATCH-PC hit=%llu frame=%llu cycle=%llu pc=%08X sp=%08X "
+                            "d0=%08X d1=%08X d2=%08X a0=%08X a1=%08X",
+                            static_cast<unsigned long long>(watchedPcHits),
+                            static_cast<unsigned long long>(mac.frameCount()),
+                            static_cast<unsigned long long>(mac.totalCycles()), pc,
+                            mac.cpu().a[7], mac.cpu().d[0], mac.cpu().d[1], mac.cpu().d[2],
+                            mac.cpu().a[0], mac.cpu().a[1]);
+                for (const u32 address : watchedBytes)
+                    std::printf(" [%06X]=%02X", address, mac.peek8(address));
+                std::printf("\n");
+            }
+        }
         if (pcCheckpointPath && !pcCheckpointSaved &&
             pc == pcCheckpointAddress) {
             std::string error;
@@ -1305,7 +1342,7 @@ int main(int argc, char** argv) {
         if (structuredOnly || quiet) return;
         try {
             const u32 physical = mac.cpu().diagnosticTranslate(pc);
-            if (mac.read16(physical) == 0x4E70u) {
+            if (mac.peek16(physical) == 0x4E70u) {
                 std::printf("%12llu CPU-RESET pc=%08X physical=%08X sr=%04X\n",
                             static_cast<unsigned long long>(mac.totalCycles()),
                             pc, physical, mac.cpu().getSR());
@@ -1354,8 +1391,8 @@ int main(int argc, char** argv) {
             u16 selector = 0xFFFFu;
             u32 csParam = 0xFFFFFFFFu;
             try {
-                selector = mac.read16(mac.cpu().a[0] + 0x1Au);
-                csParam = mac.read32(mac.cpu().a[0] + 0x1Cu);
+                selector = mac.peek16(mac.cpu().a[0] + 0x1Au);
+                csParam = mac.peek32(mac.cpu().a[0] + 0x1Cu);
             } catch (...) {}
             std::printf("%12llu VIDEO-DRIVER pc=%08X D0=%08X A0=%08X "
                         "A1=%08X A2=%08X/%08X A3=%08X/%08X "
@@ -1375,15 +1412,15 @@ int main(int argc, char** argv) {
                         "trap=%04X buf=%08X req=%u act=%u mode=%04X pos=%u "
                         "storage=%u\n",
                         static_cast<unsigned long long>(mac.totalCycles()), pc,
-                        mac.cpu().d[0], pb, dce, mac.read16(pb + 6),
-                        mac.read32(pb + 0x20), mac.read32(pb + 0x24),
-                        mac.read32(pb + 0x28), mac.read16(pb + 0x2C),
-                        mac.read32(pb + 0x2E), mac.read32(dce + 0x14));
+                        mac.cpu().d[0], pb, dce, mac.peek16(pb + 6),
+                        mac.peek32(pb + 0x20), mac.peek32(pb + 0x24),
+                        mac.peek32(pb + 0x28), mac.peek16(pb + 0x2C),
+                        mac.peek32(pb + 0x2E), mac.peek32(dce + 0x14));
             if (pc == 0x00006274u) {
-                const u32 buffer = mac.read32(pb + 0x20);
+                const u32 buffer = mac.peek32(pb + 0x20);
                 std::printf("  SCSI-PRIME buffer:");
                 for (u32 i = 0; i < 16; ++i)
-                    std::printf(" %02X", mac.read8(buffer + i));
+                    std::printf(" %02X", mac.peek8(buffer + i));
                 std::printf("\n");
             }
         }
@@ -1392,7 +1429,7 @@ int main(int argc, char** argv) {
             --generatedDriverBudget;
             std::string instruction;
             try {
-                dbg::disasm([&](u32 address) { return mac.read16(address); }, pc,
+                dbg::disasm([&](u32 address) { return mac.peek16(address); }, pc,
                             instruction);
             } catch (...) {
                 instruction = "<unreadable>";
@@ -1420,7 +1457,7 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(mac.totalCycles()), pc,
                         mac.cpu().d[0], mac.cpu().d[1], mac.cpu().d[4],
                         mac.cpu().d[5], mac.cpu().d[6], mac.cpu().a[2],
-                        mac.read32(0x016Au), mac.read16(0x0B0Eu));
+                        mac.peek32(0x016Au), mac.peek16(0x0B0Eu));
         }
         if (pc == 0x4086C51Cu || pc == 0x4086C522u || pc == 0x4086C54Cu ||
             pc == 0x0086C51Cu || pc == 0x0086C522u || pc == 0x0086C54Cu) {
@@ -1429,7 +1466,7 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(mac.totalCycles()), pc,
                         mac.cpu().d[1], mac.cpu().d[3], mac.cpu().d[4],
                         mac.cpu().d[5], mac.cpu().a[2], mac.cpu().a[3],
-                        mac.cpu().a[4], mac.read8(mac.cpu().a[4]));
+                        mac.cpu().a[4], mac.peek8(mac.cpu().a[4]));
         }
         if (sonyEventBudget > 0 &&
             (pc == 0x4086C988u || pc == 0x0086C988u ||
@@ -1455,7 +1492,7 @@ int main(int argc, char** argv) {
             --osDefaultTrace;
             std::string instruction;
             try {
-                dbg::disasm([&](u32 address) { return mac.read16(address); }, pc,
+                dbg::disasm([&](u32 address) { return mac.peek16(address); }, pc,
                             instruction);
             } catch (...) {
                 instruction = "<unreadable>";
@@ -1482,8 +1519,8 @@ int main(int argc, char** argv) {
             --scsiFlowBudget;
             u32 stack0 = 0, stack4 = 0;
             try {
-                stack0 = mac.read32(mac.cpu().a[7]);
-                stack4 = mac.read32(mac.cpu().a[7] + 4u);
+                stack0 = mac.peek32(mac.cpu().a[7]);
+                stack4 = mac.peek32(mac.cpu().a[7] + 4u);
             } catch (...) {
                 // A diagnostic probe must not affect the architected access.
             }
@@ -1565,7 +1602,7 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(mac.totalCycles()), pc,
                         mac.cpu().d[0], mac.cpu().d[1], mac.cpu().d[2],
                         mac.cpu().d[3], mac.cpu().a[0], mac.cpu().a[1],
-                        mac.read8(0x00005111u), mac.read8(0x00005112u));
+                        mac.peek8(0x00005111u), mac.peek8(0x00005112u));
             if (pc == 0x40804DE4u)
                 dumpMemory(mac, mac.cpu().a[0], 24, "IOP PBControl block");
         }
@@ -1904,11 +1941,11 @@ int main(int argc, char** argv) {
             for (MouseGoto& target : mouseGotos) {
                 if (target.done || frame < target.frame) continue;
                 const int guestV = static_cast<int>(
-                    static_cast<int16_t>((mac.read8(0x830u) << 8) |
-                                         mac.read8(0x831u)));
+                    static_cast<int16_t>((mac.peek8(0x830u) << 8) |
+                                         mac.peek8(0x831u)));
                 const int guestH = static_cast<int>(
-                    static_cast<int16_t>((mac.read8(0x832u) << 8) |
-                                         mac.read8(0x833u)));
+                    static_cast<int16_t>((mac.peek8(0x832u) << 8) |
+                                         mac.peek8(0x833u)));
                 const int dx = target.x - guestH;
                 const int dy = target.y - guestV;
                 if (dx == 0 && dy == 0) {
@@ -2025,12 +2062,12 @@ int main(int argc, char** argv) {
             std::string instruction;
             try {
                 const int bytes = dbg::disasm(
-                    [&](u32 address) { return mac.read16(address); }, pc,
+                    [&](u32 address) { return mac.peek16(address); }, pc,
                     instruction);
                 std::printf("  %08X ", pc);
                 for (int word = 0; word < 5; ++word) {
                     if (word * 2 < bytes)
-                        std::printf(" %04X", mac.read16(
+                        std::printf(" %04X", mac.peek16(
                             pc + static_cast<u32>(word * 2)));
                     else
                         std::printf("     ");
@@ -2050,39 +2087,39 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(mac.cpu().crp),
                 static_cast<unsigned long long>(mac.cpu().srp030),
                 mac.cpu().tt0, mac.cpu().tt1);
-    const u32 adbOp = mac.read32(0x000005F0u);
-    const u32 adbGlobals = mac.read32(0x00000CF8u);
+    const u32 adbOp = mac.peek32(0x000005F0u);
+    const u32 adbGlobals = mac.peek32(0x00000CF8u);
     std::printf("  low-memory ADBOp=%08X ADBGlobals=%08X PBControl=%08X "
-                "ADBBase=%08X\n", adbOp, adbGlobals, mac.read32(0x0000061Cu),
-                mac.read32(0x000001D4u));
+                "ADBBase=%08X\n", adbOp, adbGlobals, mac.peek32(0x0000061Cu),
+                mac.peek32(0x000001D4u));
     std::printf("  low-memory mouse V=%04X H=%04X raw=%02X %02X %02X %02X\n",
-                mac.read16(0x00000828u), mac.read16(0x0000082Au),
-                mac.read8(0x00000828u), mac.read8(0x00000829u),
-                mac.read8(0x0000082Au), mac.read8(0x0000082Bu));
+                mac.peek16(0x00000828u), mac.peek16(0x0000082Au),
+                mac.peek8(0x00000828u), mac.peek8(0x00000829u),
+                mac.peek8(0x0000082Au), mac.peek8(0x0000082Bu));
     try {
         const u32 tickPhysical = mac.cpu().diagnosticTranslate(0x0000016Au);
         std::printf("  low-memory TickCount physical=%08X value=%08X "
                     "raw-at-016A=%08X\n",
-                    tickPhysical, mac.read32(tickPhysical), mac.read32(0x0000016Au));
+                    tickPhysical, mac.peek32(tickPhysical), mac.peek32(0x0000016Au));
     } catch (...) {
         std::printf("  low-memory TickCount=<unmapped>\n");
     }
     if (adbGlobals >= 0x1000u && adbGlobals < config.ramSize - 0x1B8u)
         dumpMemory(mac, adbGlobals + 0x130u, 0x60u, "ADB globals");
-    const u32 driveQueue = mac.read32(0x030Au);
+    const u32 driveQueue = mac.peek32(0x030Au);
     std::printf("  boot globals BootDrive=%04X ROM85=%04X DrvQHead=%08X\n",
-                mac.read16(0x0210u), mac.read16(0x028Eu), driveQueue);
-    u32 scsiGlobals = mac.read32(0x0C0Cu);
+                mac.peek16(0x0210u), mac.peek16(0x028Eu), driveQueue);
+    u32 scsiGlobals = mac.peek32(0x0C0Cu);
     if (scsiGlobals >= config.ramSize)
         scsiGlobals &= 0x00FFFFFFu;
     if (scsiGlobals && scsiGlobals + 0x80u < config.ramSize) {
         std::printf("  SCSI globals=%08X controller=%08X dmaRead=%08X "
                     "dmaWrite=%08X dataOffset=%08X flags=%08X\n",
-                    scsiGlobals, mac.read32(scsiGlobals + 0x40u),
-                    mac.read32(scsiGlobals + 0x44u),
-                    mac.read32(scsiGlobals + 0x48u),
-                    mac.read32(scsiGlobals + 0x4Cu),
-                    mac.read32(scsiGlobals + 0x20u));
+                    scsiGlobals, mac.peek32(scsiGlobals + 0x40u),
+                    mac.peek32(scsiGlobals + 0x44u),
+                    mac.peek32(scsiGlobals + 0x48u),
+                    mac.peek32(scsiGlobals + 0x4Cu),
+                    mac.peek32(scsiGlobals + 0x20u));
     }
     if (driveQueue >= 4 && driveQueue < config.ramSize - 32)
         dumpLogicalMemory(mac, driveQueue - 4, 32, "IIfx Sony drive record");
@@ -2098,26 +2135,26 @@ int main(int argc, char** argv) {
         driveEntry = ramPointer(driveEntry);
         if (driveEntry < 3 || driveEntry + 12 >= config.ramSize) break;
         std::printf(" [drive=%u ref=%d fsid=%04X inPlace=%d entry=%08X]",
-                    mac.read16(driveEntry + 6),
-                    static_cast<s16>(mac.read16(driveEntry + 8)),
-                    mac.read16(driveEntry + 10),
-                    static_cast<s8>(mac.read8(driveEntry - 3)), driveEntry);
-        driveEntry = mac.read32(driveEntry);
+                    mac.peek16(driveEntry + 6),
+                    static_cast<s16>(mac.peek16(driveEntry + 8)),
+                    mac.peek16(driveEntry + 10),
+                    static_cast<s8>(mac.peek8(driveEntry - 3)), driveEntry);
+        driveEntry = mac.peek32(driveEntry);
     }
     std::printf("\n  volume queue:");
-    u32 volume = mac.read32(0x0358u);
+    u32 volume = mac.peek32(0x0358u);
     for (int count = 0; count < 8 && volume && volume != 0xFFFFFFFFu; ++count) {
         volume = ramPointer(volume);
         if (volume + 80 >= config.ramSize) break;
         char name[28]{};
-        const int length = std::min<int>(mac.read8(volume + 44), 27);
+        const int length = std::min<int>(mac.peek8(volume + 44), 27);
         for (int i = 0; i < length; ++i)
-            name[i] = static_cast<char>(mac.read8(volume + 45 + i));
+            name[i] = static_cast<char>(mac.peek8(volume + 45 + i));
         std::printf(" [drive=%d ref=%d sig=%04X name=\"%s\"]",
-                    static_cast<s16>(mac.read16(volume + 72)),
-                    static_cast<s16>(mac.read16(volume + 74)),
-                    mac.read16(volume + 8), name);
-        volume = mac.read32(volume);
+                    static_cast<s16>(mac.peek16(volume + 72)),
+                    static_cast<s16>(mac.peek16(volume + 74)),
+                    mac.peek16(volume + 8), name);
+        volume = mac.peek32(volume);
     }
     std::printf("\n");
     const u8 driverSignature[] = {0x45, 0xFA, 0x00, 0x52, 0x26, 0x28, 0x00, 0x08};
@@ -2126,7 +2163,7 @@ int main(int argc, char** argv) {
          ++address) {
         bool match = true;
         for (u32 byte = 0; byte < sizeof driverSignature; ++byte)
-            match &= mac.read8(address + byte) == driverSignature[byte];
+            match &= mac.peek8(address + byte) == driverSignature[byte];
         if (match) { driverAddress = address; break; }
     }
     std::printf("  generated SCSI driver image=%08X\n", driverAddress);
@@ -2145,7 +2182,7 @@ int main(int argc, char** argv) {
         const u32 pc = mac.cpu().recentPc(back);
         std::string instruction;
         try {
-            dbg::disasm([&](u32 address) { return mac.read16(address); }, pc,
+            dbg::disasm([&](u32 address) { return mac.peek16(address); }, pc,
                         instruction);
         } catch (const BusFault&) {
             instruction = "<unreadable>";
@@ -2165,7 +2202,7 @@ int main(int argc, char** argv) {
     for (const BinaryMemoryDump& dump : binaryMemoryDumps) {
         std::vector<u8> bytes(dump.size);
         for (u32 offset = 0; offset < dump.size; ++offset)
-            bytes[offset] = mac.read8(dump.address + offset);
+            bytes[offset] = mac.peek8(dump.address + offset);
         saveBinary(bytes, dump.path);
     }
     for (const BinaryMemoryDump& dump : gcDataMemoryDumps) {
@@ -2305,25 +2342,25 @@ int main(int argc, char** argv) {
             return low24 < config.ramSize ? low24 : address;
         };
         std::printf("media summary: drives");
-        u32 drive = mac.read32(0x030Au);
+        u32 drive = mac.peek32(0x030Au);
         for (int count = 0; count < 8 && drive && drive != 0xFFFFFFFFu; ++count) {
             drive = ramPointer(drive);
             if (drive < 3 || drive + 12 >= config.ramSize) break;
-            std::printf(" [%u:%d]", mac.read16(drive + 6),
-                        static_cast<s8>(mac.read8(drive - 3)));
-            drive = mac.read32(drive);
+            std::printf(" [%u:%d]", mac.peek16(drive + 6),
+                        static_cast<s8>(mac.peek8(drive - 3)));
+            drive = mac.peek32(drive);
         }
         std::printf(" volumes");
-        u32 volume = mac.read32(0x0358u);
+        u32 volume = mac.peek32(0x0358u);
         for (int count = 0; count < 8 && volume && volume != 0xFFFFFFFFu; ++count) {
             volume = ramPointer(volume);
             if (volume + 80 >= config.ramSize) break;
             char name[28]{};
-            const int length = std::min<int>(mac.read8(volume + 44), 27);
+            const int length = std::min<int>(mac.peek8(volume + 44), 27);
             for (int index = 0; index < length; ++index)
-                name[index] = static_cast<char>(mac.read8(volume + 45 + index));
-            std::printf(" [%d:%s]", static_cast<s16>(mac.read16(volume + 72)), name);
-            volume = mac.read32(volume);
+                name[index] = static_cast<char>(mac.peek8(volume + 45 + index));
+            std::printf(" [%d:%s]", static_cast<s16>(mac.peek16(volume + 72)), name);
+            volume = mac.peek32(volume);
         }
         std::printf("\n");
     }
@@ -2381,7 +2418,7 @@ int main(int argc, char** argv) {
         for (std::size_t index = 0; index < shown; ++index) {
             std::string instruction;
             try {
-                dbg::disasm([&](u32 address) { return mac.read16(address); },
+                dbg::disasm([&](u32 address) { return mac.peek16(address); },
                             sites[index].second, instruction);
             } catch (...) {
                 instruction = "<unreadable>";

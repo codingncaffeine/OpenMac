@@ -637,15 +637,36 @@ void M68040::writeCached030(u32 addr, u32 value, int size, u32 fc) {
     }
 }
 
-void M68040::invalidateDataCache030(u32 logical, u32 bytes) {
-    if (!is68030() || bytes == 0) return;
+u32 M68040::invalidateDataCache030(u32 logical, u32 bytes) {
+    if (!is68030() || bytes == 0) return 0;
+    u32 dropped = 0;
     const u64 end = static_cast<u64>(logical) + bytes;
     for (u64 at = logical & ~3u; at < end; at += 4) {
         const u32 address = static_cast<u32>(at);
         CacheLine030& line = dataCache030_[(address >> 4) & 15u];
-        if (line.tag == (address >> 8))
-            line.valid &= static_cast<u8>(~(1u << ((address >> 2) & 3u)));
+        const u8 bit = static_cast<u8>(1u << ((address >> 2) & 3u));
+        if (line.tag == (address >> 8) && (line.valid & bit)) {
+            line.valid &= static_cast<u8>(~bit);
+            ++dropped;
+        }
     }
+    return dropped;
+}
+
+u32 M68040::invalidateInstructionCache030(u32 logical, u32 bytes) {
+    if (!is68030() || bytes == 0) return 0;
+    u32 dropped = 0;
+    const u64 end = static_cast<u64>(logical) + bytes;
+    for (u64 at = logical & ~3u; at < end; at += 4) {
+        const u32 address = static_cast<u32>(at);
+        CacheLine030& line = instructionCache030_[(address >> 4) & 15u];
+        const u8 bit = static_cast<u8>(1u << ((address >> 2) & 3u));
+        if (line.tag == (address >> 8) && (line.valid & bit)) {
+            line.valid &= static_cast<u8>(~bit);
+            ++dropped;
+        }
+    }
+    return dropped;
 }
 
 // ---------------------------------------------------------------- bus access

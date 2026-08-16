@@ -157,8 +157,13 @@ public:
     // A device or compatibility bridge changed logical memory without going
     // through a CPU data write.  Real DMA users have to manage the IIfx caches;
     // the ROM-driver bridges use this to model their CPU-copy completion and
-    // keep a previously read buffer from returning stale cache data.
-    void invalidateDataCache030(u32 logical, u32 bytes);
+    // keep a previously read buffer from returning stale cache data. Both
+    // return how many valid entries they dropped -- the count of times a
+    // stale line would otherwise have been served.
+    u32 invalidateDataCache030(u32 logical, u32 bytes);
+    // Code a host bridge wrote into logical memory: a 68030 does not snoop
+    // its instruction cache, so a stale line would run the previous bytes.
+    u32 invalidateInstructionCache030(u32 logical, u32 bytes);
 
 private:
     friend struct CpuOps040;

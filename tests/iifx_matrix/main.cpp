@@ -155,6 +155,11 @@ int main(int argc, char** argv) {
             }
             const bool milestone = machine.read32(0x1000u) == 0x4D415452u &&
                                    machine.read32(0x1004u) == 0x49580001u;
+            // Devices tick in batches (IifxMachine::kTickBatchCycles): after
+            // single-stepping, the cycles of the last few instructions are
+            // still banked. Catch the devices up so the hash below is of the
+            // machine at this instant, as the baseline was recorded.
+            machine.flushPendingTicks();
             machine.recordHardwareMilestone("matrix-boot");
 
             // The checkpoint must still serialize, but its bytes are not a

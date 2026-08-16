@@ -82,7 +82,9 @@ public:
 
     M68030& cpu() { return cpu_; }
     const M68030& cpu() const { return cpu_; }
-    u64 totalCycles() const { return totalCycles_; }
+    // Cycles executed so far, including any still banked for the next device
+    // flush (see setTickBatching): the truthful count between flushes.
+    u64 totalCycles() const { return totalCycles_ + static_cast<u64>(pendingTickCycles_); }
     u64 frameCount() const { return frameCounter_; }
     bool overlayActive() const { return overlay_; }
     bool poweredOff() const;
@@ -285,6 +287,13 @@ public:
     u8 read8CacheInhibited(u32 addr) override;
     u16 read16CacheInhibited(u32 addr) override;
     u32 read32CacheInhibited(u32 addr) override;
+    // Side-effect-free reads for diagnostics: RAM and ROM by content, no
+    // cache bookkeeping, no cycle penalty, no device access (I/O and NuBus
+    // space read as $FF). A watch that reads through the bus charges the FMC
+    // miss penalty and changes the run it is watching; these never do.
+    u8 peek8(u32 addr) const;
+    u16 peek16(u32 addr) const;
+    u32 peek32(u32 addr) const;
     bool cacheable(u32 addr) const override;
     bool readBurst32(u32 firstAddr, u32 out[4]) override;
     int takeCyclePenalty() override;
@@ -307,6 +316,10 @@ private:
     void serveDiskPrime();
     void serveDiskCtlStatus(bool status);
     bool execute68kTrap(u16 trap);
+    // The host-written parameter block behind every injected File Manager
+    // call: cleared, ioVRefNum set to the drive, and taken out of the 68030's
+    // data cache -- host stores bypass it, the ROM reads the block through it.
+    void primeMountPb(u16 drive);
     void announceHardDisk();
     bool volumeMountedFor(u16 drive);
     bool driveInQueue(u16 drive);
@@ -408,6 +421,7 @@ private:
     u32 hardDiskMountDelay_ = 0;
     s16 hardDiskMountResult_ = static_cast<s16>(-32768);
     u32 injectedTrapTimeouts_ = 0;
+    u32 injectedTrapStaleLines_ = 0;   // cache entries an injection had to drop (diagnostic)
     u64 totalCycles_ = 0;
     u64 frameCounter_ = 0;
     u64 viaPhase_ = 0;
