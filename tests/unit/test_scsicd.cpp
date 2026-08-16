@@ -201,15 +201,66 @@ TEST_CASE("cd media containers normalize to the flat run the drive serves") {
         CHECK(m.data[2048] == 1);
         CHECK(m.data[2 * 2048 + 5] == 7);
     }
-    SUBCASE("MODE2 is refused with its nature named") {
+    SUBCASE("raw 2352 MODE2 takes the user data behind the XA subheader") {
+        std::vector<u8> f(2 * 2352u, 0);
+        static const u8 sync[12] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+        for (int s = 0; s < 2; ++s) {
+            std::memcpy(f.data() + s * 2352, sync, 12);
+            f[s * 2352 + 15] = 2;   // MODE2
+            for (int i = 0; i < 2048; ++i)
+                f[s * 2352 + 24 + i] = static_cast<u8>(0x40 + s + i);
+        }
+        auto m = cd::normalize(f);
+        REQUIRE(m.ok);
+        REQUIRE(m.data.size() == 2 * 2048u);
+        CHECK(m.data[0] == 0x40);
+        CHECK(m.data[2048 + 3] == 0x44);
+        CHECK(std::string(m.desc).find("MODE2") != std::string::npos);
+    }
+    SUBCASE("raw 2448 (subchannel behind every sector) is framed by its stride") {
+        std::vector<u8> f(2 * 2448u, 0);
+        static const u8 sync[12] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+        for (int s = 0; s < 2; ++s) {
+            std::memcpy(f.data() + s * 2448, sync, 12);
+            f[s * 2448 + 15] = 1;
+            f[s * 2448 + 16] = static_cast<u8>(0x70 + s);
+        }
+        auto m = cd::normalize(f);
+        REQUIRE(m.ok);
+        REQUIRE(m.data.size() == 2 * 2048u);
+        CHECK(m.data[0] == 0x70);
+        CHECK(m.data[2048] == 0x71);
+        CHECK(std::string(m.desc).find("2448") != std::string::npos);
+    }
+    SUBCASE("MODE0 raw sectors are refused with their nature named") {
         std::vector<u8> f(2352, 0);
         static const u8 sync[12] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
                                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
         std::memcpy(f.data(), sync, 12);
-        f[15] = 2;
+        f[15] = 0;
         auto m = cd::normalize(f);
         CHECK_FALSE(m.ok);
-        CHECK(std::string(m.desc).find("MODE2") != std::string::npos);
+        CHECK(std::string(m.desc).find("MODE0") != std::string::npos);
+    }
+    SUBCASE("MODE2/2336 (no sync) is found by the layout behind the subheader") {
+        std::vector<u8> f(20 * 2336u, 0);
+        std::memcpy(f.data() + 16 * 2336 + 8 + 1, "CD001", 5);
+        f[8] = 0x11;                                     // user byte 0 of sector 0
+        auto m = cd::normalize(f);
+        REQUIRE(m.ok);
+        REQUIRE(m.data.size() == 20 * 2048u);
+        CHECK(m.data[0] == 0x11);
+        CHECK(std::memcmp(m.data.data() + 16 * 2048 + 1, "CD001", 5) == 0);
+        CHECK(std::string(m.desc).find("2336") != std::string::npos);
+    }
+    SUBCASE("HFS Plus is refused by name") {
+        std::vector<u8> f(4 * 512u, 0);
+        f[1024] = 'H'; f[1025] = '+';
+        auto m = cd::normalize(f);
+        CHECK_FALSE(m.ok);
+        CHECK(std::string(m.desc).find("HFS Plus") != std::string::npos);
     }
     SUBCASE("Apple-partitioned and bare HFS masters pass through flat") {
         std::vector<u8> apm(4 * 512u, 0);
@@ -223,6 +274,157 @@ TEST_CASE("cd media containers normalize to the flat run the drive serves") {
     SUBCASE("something else is refused") {
         CHECK_FALSE(cd::normalize(std::vector<u8>(4096, 0xAB)).ok);
     }
+}
+
+
+// ---- UDIF (.dmg) --------------------------------------------------------
+namespace {
+
+void be32at(std::vector<u8>& v, std::size_t at, u32 x) {
+    v[at] = u8(x >> 24); v[at + 1] = u8(x >> 16); v[at + 2] = u8(x >> 8); v[at + 3] = u8(x);
+}
+void be64at(std::vector<u8>& v, std::size_t at, u64 x) {
+    be32at(v, at, static_cast<u32>(x >> 32));
+    be32at(v, at + 4, static_cast<u32>(x));
+}
+std::string base64(const std::vector<u8>& in) {
+    static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    std::size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const u32 v = (u32(in[i]) << 16) | (u32(in[i + 1]) << 8) | in[i + 2];
+        out += t[(v >> 18) & 63]; out += t[(v >> 12) & 63];
+        out += t[(v >> 6) & 63]; out += t[v & 63];
+    }
+    if (i + 1 == in.size()) {
+        const u32 v = u32(in[i]) << 16;
+        out += t[(v >> 18) & 63]; out += t[(v >> 12) & 63]; out += "==";
+    } else if (i + 2 == in.size()) {
+        const u32 v = (u32(in[i]) << 16) | (u32(in[i + 1]) << 8);
+        out += t[(v >> 18) & 63]; out += t[(v >> 12) & 63]; out += t[(v >> 6) & 63]; out += '=';
+    }
+    return out;
+}
+
+// A zlib stream produced by an INDEPENDENT DEFLATE implementation (.NET's
+// DeflateStream), decompressing to 512 bytes of
+// "OpenPowerMac reads discs. " x19 + "OpenPowerMac reads".
+const u8 kZlib512[] = {
+    0x78, 0x9c, 0xf3, 0x2f, 0x48, 0xcd, 0x0b, 0xc8, 0x2f, 0x4f, 0x2d,
+    0xf2, 0x4d, 0x4c, 0x56, 0x28, 0x4a, 0x4d, 0x4c, 0x29, 0x56, 0x48,
+    0xc9, 0x2c, 0x4e, 0x2e, 0xd6, 0x53, 0xf0, 0x1f, 0x95, 0x51, 0x18,
+    0xfe, 0x61, 0x00, 0x00, 0xaf, 0x71, 0xb9, 0x39};
+
+std::vector<u8> zlibPlain512() {
+    std::string t;
+    for (int k = 0; k < 19; ++k) t += "OpenPowerMac reads discs. ";
+    t += "OpenPowerMac reads";
+    return std::vector<u8>(t.begin(), t.end());
+}
+
+// A UDIF whose device is: sector 0 = the zlib text, sector 1 = a raw
+// pattern, sector 2 = a zero chunk (its bytes 0..1 are where an HFS master's
+// 'BD' lives -- put there through a raw chunk instead when wanted), then a
+// hole to the koly sector count.
+std::vector<u8> buildUdif(bool hfsMaster, u32 zlibType = 0x80000005u) {
+    std::vector<u8> fork(kZlib512, kZlib512 + sizeof kZlib512);
+    std::vector<u8> rawSec(512, 0);
+    for (u32 j = 0; j < 512; ++j) rawSec[j] = static_cast<u8>(j * 5 + 9);
+    fork.insert(fork.end(), rawSec.begin(), rawSec.end());
+    std::vector<u8> mdb(512, 0);
+    if (hfsMaster) { mdb[0] = 'B'; mdb[1] = 'D'; }
+    fork.insert(fork.end(), mdb.begin(), mdb.end());
+
+    std::vector<u8> mish(204 + 5 * 40, 0);
+    be32at(mish, 0, 0x6D697368u);          // 'mish'
+    be32at(mish, 4, 1);
+    be64at(mish, 8, 0);                    // first sector of this table
+    be64at(mish, 16, 3);                   // sectors the chunks below cover
+    be64at(mish, 24, 0);                   // data offset
+    be32at(mish, 200, 5);
+    auto chunk = [&](u32 idx, u32 type, u64 sec, u64 cnt, u64 off, u64 len) {
+        const std::size_t at = 204 + idx * 40;
+        be32at(mish, at, type);
+        be64at(mish, at + 8, sec);
+        be64at(mish, at + 16, cnt);
+        be64at(mish, at + 24, off);
+        be64at(mish, at + 32, len);
+    };
+    chunk(0, 0x7FFFFFFEu, 0, 0, 0, 0);                             // comment
+    chunk(1, zlibType, 0, 1, 0, sizeof kZlib512);                  // zlib (or a refused codec)
+    chunk(2, 0x00000001u, 1, 1, sizeof kZlib512, 512);             // raw
+    chunk(3, hfsMaster ? 0x00000001u : 0x00000000u, 2, 1,
+          sizeof kZlib512 + 512, hfsMaster ? 512 : 0);             // raw MDB / zero
+    chunk(4, 0xFFFFFFFFu, 3, 0, 0, 0);                             // terminator
+
+    const std::string xml =
+        "<?xml version=\"1.0\"?><plist><dict><key>resource-fork</key>"
+        "<dict><key>blkx</key><array><dict><key>Data</key><data>\n" +
+        base64(mish) + "\n</data></dict></array></dict></dict></plist>";
+
+    std::vector<u8> file(fork);
+    file.insert(file.end(), xml.begin(), xml.end());
+    std::vector<u8> koly(512, 0);
+    std::memcpy(koly.data(), "koly", 4);
+    be32at(koly, 4, 4);                    // version
+    be32at(koly, 8, 512);                  // header size
+    be64at(koly, 24, 0);                   // data fork offset
+    be64at(koly, 32, fork.size());
+    be64at(koly, 216, fork.size());        // XML offset
+    be64at(koly, 224, xml.size());
+    be64at(koly, 492, 4);                  // device sectors, hole included
+    file.insert(file.end(), koly.begin(), koly.end());
+    return file;
+}
+
+} // namespace
+
+TEST_CASE("zlib inflate: an independent compressor's stream comes back exact") {
+    std::vector<u8> out;
+    REQUIRE(cd::zlibInflate(kZlib512, sizeof kZlib512, out, 512));
+    CHECK(out == zlibPlain512());
+    // The 1-byte classic: zlib.compress(b"a") -- fixed Huffman.
+    static const u8 kA[] = {0x78, 0x9c, 0x4b, 0x04, 0x00, 0x00, 0x62, 0x00, 0x62};
+    REQUIRE(cd::zlibInflate(kA, sizeof kA, out, 16));
+    REQUIRE(out.size() == 1);
+    CHECK(out[0] == 'a');
+    // A stored block, hand-made: header, BFINAL+BTYPE=00, LEN/NLEN, bytes, adler32.
+    static const u8 kStored[] = {0x78, 0x01, 0x01, 0x03, 0x00, 0xFC, 0xFF, 'h', 'i', '!',
+                                 0x02, 0x2E, 0x00, 0xF3};
+    REQUIRE(cd::zlibInflate(kStored, sizeof kStored, out, 16));
+    CHECK(std::string(out.begin(), out.end()) == "hi!");
+    // A wrong checksum is refused: a trusted defect makes silently wrong sectors.
+    u8 bad[sizeof kA]; std::memcpy(bad, kA, sizeof kA); bad[sizeof kA - 1] ^= 1;
+    CHECK_FALSE(cd::zlibInflate(bad, sizeof bad, out, 16));
+}
+
+TEST_CASE("UDIF dmg: zlib, raw, zero and hole chunks land, and the disc inside is seen") {
+    const std::vector<u8> file = buildUdif(false);
+    REQUIRE(cd::isUdif(file));
+    std::vector<u8> device;
+    std::string why;
+    REQUIRE_MESSAGE(cd::udifDecode(file, device, why), why);
+    REQUIRE(device.size() == 4 * 512u);
+    CHECK(std::memcmp(device.data(), zlibPlain512().data(), 512) == 0);
+    for (u32 j = 0; j < 512; ++j) REQUIRE(device[512 + j] == static_cast<u8>(j * 5 + 9));
+    for (u32 j = 1024; j < 2048; ++j) REQUIRE(device[j] == 0);
+    // Through normalize: the text is not a disc, so it is refused -- but with
+    // the UDIF named, so the person knows the container was understood.
+    auto m = cd::normalize(file);
+    CHECK_FALSE(m.ok);
+    CHECK(std::string(m.desc).find("UDIF") != std::string::npos);
+    // With an HFS master inside, the drive takes it and serves the device.
+    const std::vector<u8> hfsDmg = buildUdif(true);
+    auto h = cd::normalize(hfsDmg);
+    REQUIRE_MESSAGE(h.ok, h.desc);
+    CHECK(h.data.size() == 4 * 512u);
+    CHECK(h.data[1024] == 'B');
+    CHECK(std::string(h.desc).find("UDIF") != std::string::npos);
+    CHECK(std::string(h.desc).find("HFS CD master") != std::string::npos);
+    // A codec this decoder does not carry is refused by name.
+    auto b = cd::normalize(buildUdif(true, 0x80000006u));
+    CHECK_FALSE(b.ok);
+    CHECK(std::string(b.desc).find("bzip2") != std::string::npos);
 }
 
 // A drive that answers every page code with page 01 is telling the same lie an
@@ -300,4 +502,35 @@ TEST_CASE("the HFS partition is found where an Apple CD master puts it") {
     std::vector<u8> isoOnly(256 * 1024, 0);
     isoOnly[0] = 'E'; isoOnly[1] = 'R';
     CHECK(QuadraMachine::findHfsPartition(isoOnly) == 0);
+}
+
+// The same finder serves both machines from cdmedia.hpp, and hasHfsVolume is
+// the question the IIfx asks before it promises the user a mount: a partition
+// map with an Apple_HFS entry whose volume actually carries the MDB signature,
+// or a bare master -- but not an ISO-only disc, whose byte 1024 is nothing.
+TEST_CASE("cd::findHfsPartition and hasHfsVolume agree with the Quadra's finder") {
+    std::vector<u8> apm(256 * 1024, 0);
+    apm[0] = 'E'; apm[1] = 'R';
+    auto entry = [&](std::size_t blk, const char* type, u32 start) {
+        u8* p = apm.data() + blk * 512;
+        p[0] = 'P'; p[1] = 'M';
+        p[8] = u8(start >> 24); p[9] = u8(start >> 16);
+        p[10] = u8(start >> 8); p[11] = u8(start);
+        std::memcpy(p + 48, type, std::strlen(type) + 1);
+    };
+    entry(1, "Apple_partition_map", 1);
+    entry(2, "Apple_HFS", 128);
+    CHECK(cd::findHfsPartition(apm) == QuadraMachine::findHfsPartition(apm));
+    CHECK(cd::findHfsPartition(apm) == 128u * 512u);
+    CHECK_FALSE(cd::hasHfsVolume(apm));            // the partition is empty
+    apm[128 * 512 + 1024] = 'B'; apm[128 * 512 + 1025] = 'D';
+    CHECK(cd::hasHfsVolume(apm));
+
+    std::vector<u8> bare(64 * 1024, 0);
+    CHECK_FALSE(cd::hasHfsVolume(bare));
+    bare[1024] = 'B'; bare[1025] = 'D';
+    CHECK(cd::hasHfsVolume(bare));
+
+    std::vector<u8> tiny(600, 0);                  // shorter than the MDB
+    CHECK_FALSE(cd::hasHfsVolume(tiny));
 }

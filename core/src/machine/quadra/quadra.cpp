@@ -1434,19 +1434,7 @@ void QuadraMachine::serveDiskPrime(int unit) {
 // Reference: Inside Macintosh: Devices, "The SCSI Manager" (partition map), and
 // the same walk in BasiliskII/src/cdrom.cpp.
 u32 QuadraMachine::findHfsPartition(const std::vector<u8>& disc) {
-    for (std::size_t blk = 0; blk < 64; ++blk) {
-        const std::size_t at = blk * 512;
-        if (at + 512 > disc.size()) break;
-        const u8* m = disc.data() + at;
-        if (m[0] != 0x50 || m[1] != 0x4D) continue;            // 'PM'
-        // pmPartName at +16, pmParType at +48, both C strings in 32 bytes.
-        const char* type = reinterpret_cast<const char*>(m + 48);
-        if (std::strncmp(type, "Apple_HFS", 32) != 0) continue;
-        const u32 start = (u32(m[8]) << 24) | (u32(m[9]) << 16) |
-                          (u32(m[10]) << 8) | m[11];           // pmPyPartStart
-        return start * 512u;
-    }
-    return 0;   // a bare HFS master, or a disc with no HFS on it at all
+    return cd::findHfsPartition(disc);   // shared with the IIfx (cdmedia.hpp)
 }
 
 // Build the .AppleCD driver in the System heap and hand it to the Device
