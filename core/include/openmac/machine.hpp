@@ -493,7 +493,7 @@ private:
     std::unique_ptr<ScsiDisk> disk2_;   // second disk target (SCSI ID 1)
     std::unique_ptr<ScsiCdRom> cdrom_;
     std::unique_ptr<ScsiEthernet> netdev_;
-    char cdMediumText_[224] = {0};
+    char cdMediumText_[240] = {0};       // holds a whole cd::Medium::desc
     std::unique_ptr<Iwm> iwm_;
     // Internal (drive 1) and external (drive 2) Sony mechanisms. The Classic ships
     // one internal SuperDrive; the external port is empty unless a drive is added.
