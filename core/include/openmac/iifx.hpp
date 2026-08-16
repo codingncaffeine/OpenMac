@@ -168,6 +168,9 @@ public:
     bool diagnosticIsmFirmwareAlive() const;
     bool diagnosticFloppyServiceReady() const { return floppyServiceReady_; }
     bool diagnosticFloppyMounted();
+    // Ask the guest's Gestalt Manager (an injected _Gestalt): the response in
+    // `response`, the OSErr returned. False when the trap could not run.
+    bool diagnosticGestalt(u32 selector, u32& response, s16& err);
     u64 diagnosticMediaEventId() const { return activeMediaEventId_; }
     u32 diagnosticGcProcessorPc() const;
     u64 diagnosticGcProcessorInstructions() const;

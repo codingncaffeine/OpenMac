@@ -1219,6 +1219,22 @@ bool IifxMachine::diagnosticIsmFirmwareAlive() const {
     return ismIop_->firmwareAlive();
 }
 
+bool IifxMachine::diagnosticGestalt(u32 selector, u32& response, s16& err) {
+    response = 0;
+    err = -1;
+    if (read32(0x0358u) == 0 || inDiskDriver_ || hardDiskMountInFlight_) return false;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    cpu_.d[0] = selector;
+    const bool ok = execute68kTrap(0xA1ADu);                 // _Gestalt
+    if (ok) {
+        err = static_cast<s16>(cpu_.d[0] & 0xFFFFu);
+        response = cpu_.a[0];
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    return ok;
+}
+
 bool IifxMachine::diagnosticFloppyMounted() {
     return volumeMountedFor(1);
 }

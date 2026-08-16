@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
                      "usage: openmac_trace030 <IIfx.ROM> [frames] [disk.img] [ram-mb] [floppy.img] [no-video|no-frame|frame.ppm] [input-frame dx dy] [--shutdown] [--expect-finder|--expect-app name] [--stop-on-milestone] [--native-storage] [--video-rom card.bin] [--dump-iops prefix]\n"
                      "       structured trace: --hw-trace file.jsonl [--structured-only] [--stop-on-trace] [--trace-capacity n] [--trace-post n] [--trace-mask n] [--trace-sources via,oss,biu] [--trace-address-range hex:hex] [--trace-cycle n] [--trace-pc hex --trace-pc-hits n]\n"
                      "       IOP flight/trigger: --trace-iop-flight n [--trace-iop-operation hex] [--trace-iop-block n] [--trace-iop-hits n]\n"
-                     "       replay: --load-state file.iifxstate [--save-state file.iifxstate] [--save-disk file.img] [--disk2 file.img [--disk2-read-only] [--save-disk2 file.img]] [--cd disc.iso] [--cd-attach] [--cd-at-frame n disc.iso]... [--eject-cd-at-frame n]... [--load-pram file [--pram-poke hex-offset:hex-byte]] [--checkpoint-cycle n] [--stop-after-checkpoint] [--verify-replay instructions] [--trace-gc-pc hex] [--trace-gc-pc-hits n] [--profile-pc-range hex:hex] [--profile-pc-limit n] [--key-at-frame n hex-adb-code up|down] [--disasm-live hex count] [--poke16 hex:value] [--invalidate-data-cache hex:size] [--dump-memory hex:size] [--dump-logical-memory hex:size] [--dump-binary hex size file] [--dump-gc-dram hex-offset hex-size file] [--dump-gc-binary hex-offset hex-size file] [--dump-gc-sram hex-offset hex-size file]\n"
+                     "       replay: --load-state file.iifxstate [--save-state file.iifxstate] [--save-disk file.img] [--disk2 file.img [--disk2-read-only] [--save-disk2 file.img]] [--cd disc.iso] [--cd-attach] [--cd-at-frame n disc.iso]... [--eject-cd-at-frame n]... [--load-pram file [--pram-poke hex-offset:hex-byte]] [--checkpoint-cycle n] [--stop-after-checkpoint] [--verify-replay instructions] [--trace-gc-pc hex] [--trace-gc-pc-hits n] [--profile-pc-range hex:hex] [--profile-pc-limit n] [--key-at-frame n hex-adb-code up|down] [--disasm-live hex count] [--poke16 hex:value] [--invalidate-data-cache hex:size] [--dump-memory hex:size] [--dump-logical-memory hex:size] [--gestalt selector] [--dump-binary hex size file] [--dump-gc-dram hex-offset hex-size file] [--dump-gc-binary hex-offset hex-size file] [--dump-gc-sram hex-offset hex-size file]\n"
                      "       media/input timing: [--floppy-at-frame n file.img]... [--eject-floppy-at-frame n]... [--input-at-frame n dx dy up|down]... [--milestone-timeout name:frames]\n"
                      "       trigger capture: --checkpoint-on-trigger file.iifxstate [--checkpoint-at-pc hex file.iifxstate]\n"
                      "       boot display capture: --frame-timeline prefix first-frame last-frame\n"
@@ -401,6 +401,7 @@ int main(int argc, char** argv) {
     std::vector<LiveDisassembly> liveDisassemblies;
     struct MemoryRange { u32 address; u32 size; bool logical; };
     std::vector<MemoryRange> memoryDumps;
+    std::vector<u32> gestaltSelectors;  // --gestalt 'fpu ' or hex: asked of the guest at the end
     std::vector<MemoryRange> dataCacheInvalidations;
     struct BinaryMemoryDump { u32 address; u32 size; std::string path; };
     std::vector<BinaryMemoryDump> binaryMemoryDumps;
@@ -703,6 +704,22 @@ int main(int argc, char** argv) {
                 return 2;
             }
             liveDisassemblies.push_back({address, count});
+        }
+        else if (option == "--gestalt" && index + 1 < argc) {
+            const std::string text = argv[++index];
+            u32 selector = 0;
+            if (text.size() == 4) {
+                for (char ch : text)
+                    selector = (selector << 8) | static_cast<u8>(ch);
+            } else {
+                const u64 value = parseU64(text.c_str());
+                if (value > 0xFFFFFFFFu) {
+                    std::fprintf(stderr, "--gestalt takes a four-character selector or a 32-bit value\n");
+                    return 2;
+                }
+                selector = static_cast<u32>(value);
+            }
+            gestaltSelectors.push_back(selector);
         }
         else if ((option == "--dump-memory" ||
                   option == "--dump-logical-memory") && index + 1 < argc) {
@@ -2191,6 +2208,15 @@ int main(int argc, char** argv) {
     }
     }
 
+    for (const u32 selector : gestaltSelectors) {
+        u32 response = 0;
+        s16 err = 0;
+        const bool ran = mac.diagnosticGestalt(selector, response, err);
+        std::printf("GESTALT '%c%c%c%c' (%08X): %s err=%d response=%08X (%u)\n",
+                    static_cast<char>((selector >> 24) & 0x7F), static_cast<char>((selector >> 16) & 0x7F),
+                    static_cast<char>((selector >> 8) & 0x7F), static_cast<char>(selector & 0x7F),
+                    selector, ran ? "ran" : "could not run", err, response, response);
+    }
     for (const MemoryRange& range : memoryDumps) {
         if (range.logical)
             dumpLogicalMemory(mac, range.address, range.size,

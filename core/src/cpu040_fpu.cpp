@@ -857,21 +857,35 @@ int CpuOps040::opFScc(M68040& c, u16 op) {
 
 // FSAVE/FRESTORE: with the whole instruction set executing natively there is
 // never a mid-instruction exception state to externalize, so FSAVE produces
-// the NULL frame until the FPU has been touched and the 4-byte IDLE frame
-// after; FRESTORE accepts NULL (resets the FPU) and skips any sized frame.
+// the NULL frame until the FPU has been touched and an IDLE frame after;
+// FRESTORE accepts NULL (resets the FPU) and skips any sized frame.
+//
+// The IDLE frame's first word is how a Macintosh tells its FPU apart: the
+// System's Gestalt/SysEnvirons probe does FNOP, FSAVE -(SP) and compares the
+// word with $1F18/$3F18 (68881) and $1F38/$3F38 (68882) -- anything else is
+// "no FPU". A 68030 machine therefore gets the 68882's 60-byte IDLE frame
+// (version $1F, 56 bytes of internal state after the format long); the 68040
+// keeps its own version-$41 frame.
 int CpuOps040::opFSave(M68040& c, u16 op) {
     if (!flag(c, kS040)) return privilegeViolation(c);
     const int mode = (op >> 3) & 7, reg = op & 7;
-    // NULL frame: a single zero long. IDLE: version $41, format $00.
-    const u32 frame = c.fpuUsed_ ? 0x41000000u : 0u;
+    const bool idle = c.fpuUsed_;
+    const bool m882 = c.is68030();
+    // NULL: a single zero long. IDLE: 68882 = $1F38 + 56 bytes; 68040 = $41
+    // version, format $00 (a single long).
+    const u32 head = !idle ? 0u : (m882 ? 0x1F380000u : 0x41000000u);
+    const u32 body = (idle && m882) ? 56u : 0u;
+    u32 at;
     if (mode == 4) {
-        c.a[reg] -= 4;
-        c.wr32(c.a[reg], frame);
+        c.a[reg] -= 4 + body;
+        at = c.a[reg];
     } else {
-        c.wr32(calcEA(c, mode, reg, 2), frame);
+        at = calcEA(c, mode, reg, 2);
     }
+    c.wr32(at, head);
+    for (u32 offset = 4; offset < 4 + body; offset += 4) c.wr32(at + offset, 0);
     if (c.is68030())
-        return (c.fpuUsed_ ? 100 : 16) + eaCalcTime030(c, eaIndex(mode, reg));
+        return (idle ? 100 : 16) + eaCalcTime030(c, eaIndex(mode, reg));
     return 4;
 }
 

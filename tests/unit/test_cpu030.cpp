@@ -208,6 +208,34 @@ TEST_CASE("030 uses external MC68882 operation and operand-format timings") {
     CHECK(f.run({0xF210, 0x6800}) == 52);         // FMOVE.X FP0,(A0)
 }
 
+TEST_CASE("030 FSAVE answers the Macintosh FPU probe as a 68882") {
+    // The System's Gestalt/SysEnvirons code: FNOP, FSAVE -(SP), then the
+    // frame's first word decides -- $1F18/$3F18 = 68881, $1F38/$3F38 = 68882,
+    // anything else = no FPU (which is what a 68040-shaped frame said here).
+    Fix030 f;
+    f.cpu.a[7] = 0x8000;
+    f.run({0xF317});                       // FSAVE (A7): untouched FPU -> NULL
+    CHECK(f.bus.read32(0x8000) == 0);
+
+    f.run({0xF280, 0x0000});               // FNOP: the FPU has been touched
+    f.run({0xF327});                       // FSAVE -(A7)
+    CHECK(f.cpu.a[7] == 0x8000 - 60);      // 68882 IDLE frame: 60 bytes
+    CHECK(f.bus.read16(0x8000 - 60) == 0x1F38);
+    CHECK(f.bus.read16(0x8000 - 60 + 2) == 0);
+
+    f.run({0xF35F});                       // FRESTORE (A7)+ skips the frame
+    CHECK(f.cpu.a[7] == 0x8000);
+    f.run({0xF327});                       // still IDLE afterwards
+    CHECK(f.bus.read16(0x8000 - 60) == 0x1F38);
+
+    f.cpu.a[7] = 0x8000;
+    f.bus.write32(0x8000, 0);
+    f.run({0xF35F});                       // FRESTORE of a NULL frame resets it
+    CHECK(f.cpu.a[7] == 0x8004);
+    f.run({0xF327});
+    CHECK(f.bus.read32(0x8004 - 4) == 0);
+}
+
 TEST_CASE("030 instruction cache retains code until CAAR-selected invalidation") {
     Fix030 f;
     f.bus.write32(4 * 4, 0x00000800);       // illegal-instruction vector
