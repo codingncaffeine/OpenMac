@@ -551,13 +551,68 @@ public sealed class IifxEmulator : IEmulator
         }
     }
 
-    public bool CdRomAttached => false;
-    public string? CdPath => null;
-    public void SetCdRomAttached(bool attached) { }
-    public bool InsertCd(string path) => false;
-    public void EjectCd() { }
-    public bool CdPresent => false;
-    public string CdMediumNote() => "No SCSI CD-ROM is attached to this IIfx configuration.";
+    // ---- CD-ROM (AppleCD-class target on the SCSI bus; the machine installs
+    // its own .AppleCD driver, so no Apple CD-ROM software is needed) ----
+    public bool CdRomAttached { get; private set; }
+    public string? CdPath { get; private set; }
+
+    public void SetCdRomAttached(bool attached)
+    {
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_fx_attach_cd(_h, attached ? 1 : 0, 3); }
+        CdRomAttached = attached;
+        if (!attached) EjectCd();
+    }
+
+    public bool InsertCd(string path)
+    {
+        if (_h == IntPtr.Zero) return false;
+        // A .cue is a text sheet naming the real data file; load that one.
+        string mediaPath = path;
+        if (Path.GetExtension(path).Equals(".cue", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(
+                    File.ReadAllText(path), "FILE\\s+\"([^\"]+)\"",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (m.Success)
+                    mediaPath = Path.Combine(Path.GetDirectoryName(path) ?? "", m.Groups[1].Value);
+            }
+            catch { return false; }
+        }
+        byte[] img;
+        try { img = File.ReadAllBytes(mediaPath); }
+        catch { return false; }
+        int ok;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) return false;
+            if (Native.omac_fx_cd_attached(_h) == 0) Native.omac_fx_attach_cd(_h, 1, 3);
+            ok = Native.omac_fx_insert_cd(_h, img, (nuint)img.Length);
+        }
+        if (ok == 0) return false;
+        CdRomAttached = true;
+        CdPath = path;
+        Log.Line($"[core] IIfx CD: {Path.GetFileName(path)}");
+        return true;
+    }
+
+    public void EjectCd()
+    {
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_fx_eject_cd(_h); }
+        CdPath = null;
+    }
+
+    public bool CdPresent
+    {
+        get { lock (_sync) return _h != IntPtr.Zero && Native.omac_fx_cd_present(_h) != 0; }
+    }
+
+    public string CdMediumNote() =>
+        "The SCSI CD-ROM takes .iso/.cdr/.toast masters (ISO 9660, Apple-partitioned or bare HFS), "
+        + "raw-sector .bin/.cue/.mdf (MODE1 or MODE2, 2352/2336/2448 bytes) and Disk Utility .dmg "
+        + "(UDIF, zlib). An HFS disc mounts on the desktop once the System is up; an ISO-9660-only "
+        + "disc needs Foreign File Access in the guest. The ROM does not boot from a CD.";
 
     public string DiagnosticReport()
     {

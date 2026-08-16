@@ -615,8 +615,10 @@ public sealed class QuadraEmulator : IEmulator
     }
 
     public string CdMediumNote() =>
-        "The SCSI CD-ROM takes a raw ISO or Apple-partitioned disc image. The 7.1 install CD is "
-        + "readable, but the ROM does not auto-boot a CD — boot a floppy, then mount the disc.";
+        "The SCSI CD-ROM takes .iso/.cdr/.toast masters (ISO 9660, Apple-partitioned or bare HFS), "
+        + "raw-sector .bin/.cue/.mdf (MODE1 or MODE2, 2352/2336/2448 bytes) and Disk Utility .dmg "
+        + "(UDIF, zlib). An HFS disc mounts on the desktop once the System is up; an ISO-9660-only "
+        + "disc needs Foreign File Access in the guest. The ROM does not boot from a CD.";
 
     public string DiagnosticReport()
     {

@@ -658,9 +658,12 @@ public partial class MainWindow : Window
             }
             if (!string.IsNullOrEmpty(_settings.ModelLastHardDisk) && File.Exists(_settings.ModelLastHardDisk))
                 _emulator.AttachHardDisk(_settings.ModelLastHardDisk!);
-            if (_settings.IsQuadra)
+            if (_settings.IsQuadra || _settings.IsIifx)
             {
-                // Mount a remembered SCSI CD so it is present for the scan.
+                // Mount a remembered SCSI CD so it is present for the scan (the
+                // Quadra) or as soon as the System is up (the IIfx installs its
+                // own driver). A remembered attached-but-empty drive rides too.
+                if (_settings.CdRomAttached) _emulator.SetCdRomAttached(true);
                 if (!string.IsNullOrEmpty(_settings.LastCd) && File.Exists(_settings.LastCd) &&
                     !_emulator.InsertCd(_settings.LastCd!))
                 {
@@ -1048,7 +1051,7 @@ public partial class MainWindow : Window
     private void InsertCd_Click(object sender, RoutedEventArgs e)
     {
         if (FilePicker.Open(this, _settings, FilePicker.Cd, "Insert CD Image",
-                "CD image (*.iso;*.toast;*.bin;*.cue;*.img;*.dsk)|*.iso;*.toast;*.bin;*.cue;*.img;*.dsk|"
+                "CD image (*.iso;*.cdr;*.toast;*.dmg;*.bin;*.cue;*.mdf;*.nrg;*.img;*.dsk)|*.iso;*.cdr;*.toast;*.dmg;*.bin;*.cue;*.mdf;*.nrg;*.img;*.dsk|"
                 + "All files (*.*)|*.*",
                 _settings.LastCd) is { } path)
         {
@@ -1327,7 +1330,7 @@ public partial class MainWindow : Window
     // disk. Extensions only break the tie between shapes that are byte-identical
     // on purpose: an HFS master could be a CD or an HD, and .iso/.toast/.cue say
     // which was meant.
-    private static readonly string[] CdOnlyExtensions = { ".iso", ".toast", ".cue" };
+    private static readonly string[] CdOnlyExtensions = { ".iso", ".toast", ".cue", ".cdr", ".mdf", ".nrg" };
 
     // Loose Mac files — the archives and encodings the StuffIt-era tools open:
     // native .sit/.sea, BinHex, Compact Pro, and the DOS-side .zip/.lha the
@@ -1633,11 +1636,24 @@ public partial class MainWindow : Window
             if (fs.Read(head, 0, 16) == 16 &&
                 head[0] == 0x00 && head[1] == 0xFF && head[11] == 0x00 &&
                 head[2] == 0xFF && head[10] == 0xFF)
-                return true;   // raw 2352 sync pattern
-            if (fs.Length >= 17L * 2048)
+                return true;   // raw 2352/2448 sync pattern (MODE1 or MODE2)
+            // Disk Utility's UDIF (.dmg): a 'koly' trailer in the last 512 bytes.
+            // The CD drive is the one place that decodes it (chunked, zlib).
+            if (fs.Length >= 512)
             {
+                byte[] koly = new byte[4];
+                fs.Seek(fs.Length - 512, SeekOrigin.Begin);
+                if (fs.Read(koly, 0, 4) == 4 &&
+                    koly[0] == 'k' && koly[1] == 'o' && koly[2] == 'l' && koly[3] == 'y')
+                    return true;
+            }
+            // An ISO 9660 / High Sierra descriptor at sector 16 -- in plain 2048
+            // framing, or behind the 8-byte subheader of a 2336-byte MODE2 image.
+            foreach (var (stride, dataOff) in new[] { (2048L, 0L), (2336L, 8L) })
+            {
+                if (fs.Length < 17L * stride) continue;
                 byte[] pvd = new byte[16];
-                fs.Seek(16L * 2048, SeekOrigin.Begin);
+                fs.Seek(16L * stride + dataOff, SeekOrigin.Begin);
                 if (fs.Read(pvd, 0, 16) == 16)
                 {
                     if (pvd[1] == 'C' && pvd[2] == 'D' && pvd[3] == '0' &&
