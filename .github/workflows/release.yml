@@ -18,6 +18,7 @@ jobs:
     runs-on: windows-latest
     env:
       TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,23 +43,51 @@ jobs:
             if (-not (Test-Path "publish/$file")) { throw "publish/$file is missing" }
           }
 
+      # The previous release is launched first, the same way, as a control: it
+      # is known to run, so if it fails too the runner cannot host the app and
+      # the check says nothing about this build. A crash dumps the Application
+      # event log, where the runtime writes the exception.
       - name: The app starts and loads the core
         shell: pwsh
         run: |
-          $app = Start-Process -FilePath publish/OpenMac.exe -PassThru
-          Start-Sleep -Seconds 20
-          $log = Join-Path $env:APPDATA 'OpenMac/openmac.log'
-          if (Test-Path $log) { Get-Content $log | Write-Host }
-          if ($app.HasExited) { throw "OpenMac.exe exited on its own (code $($app.ExitCode))" }
-          if (-not ((Test-Path $log) -and (Select-String -Path $log -Pattern 'backend: native core' -Quiet))) {
-            throw 'the app started without the native core'
+          function Test-Launch([string]$exe, [string]$label) {
+            $logDir = Join-Path $env:APPDATA 'OpenMac'
+            Remove-Item -Recurse -Force $logDir -ErrorAction SilentlyContinue
+            $started = Get-Date
+            $app = Start-Process -FilePath $exe -PassThru
+            Start-Sleep -Seconds 20
+            $log = Join-Path $logDir 'openmac.log'
+            Write-Host "---- $label app log"
+            if (Test-Path $log) { Get-Content $log | Write-Host } else { Write-Host '(no log written)' }
+            $ok = $true
+            if ($app.HasExited) {
+              Write-Host ("---- {0} exited on its own (code 0x{1:X8})" -f $label, $app.ExitCode)
+              Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $started } -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProviderName -in '.NET Runtime', 'Application Error', 'Windows Error Reporting' } |
+                ForEach-Object { Write-Host "---- event: $($_.ProviderName)"; Write-Host $_.Message }
+              $ok = $false
+            } else {
+              if (-not ((Test-Path $log) -and (Select-String -Path $log -Pattern 'backend: native core' -Quiet))) {
+                Write-Host "---- $label started without the native core"
+                $ok = $false
+              }
+              Stop-Process -Id $app.Id -Force
+            }
+            return $ok
           }
-          Stop-Process -Id $app.Id -Force
+
+          $previous = gh release list --exclude-drafts --limit 1 --json tagName -q '.[0].tagName'
+          gh release download $previous --pattern '*win-x64.zip' --dir control
+          Expand-Archive (Get-ChildItem control/*.zip | Select-Object -First 1).FullName -DestinationPath control/app
+          $controlExe = (Get-ChildItem control/app -Recurse -Filter OpenMac.exe | Select-Object -First 1).FullName
+
+          $controlOk = Test-Launch $controlExe "control $previous"
+          $candidateOk = Test-Launch 'publish/OpenMac.exe' $env:TAG
+          if (-not $controlOk) { throw "the control release $previous does not start on this runner either, so the check cannot judge $env:TAG" }
+          if (-not $candidateOk) { throw "$env:TAG does not start" }
 
       - name: Zip and attach to the release
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           $version = $env:TAG.TrimStart('v')
           $zip = "OpenMac-$version-win-x64.zip"
