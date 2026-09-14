@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.25)
+
+# Link the C++ runtime statically with MSVC. openmac_c.dll ships beside the app
+# in a zip with no installer, and a DLL linked to the shared runtime needs the
+# Visual C++ Redistributable on the PC -- without it the core fails to load and
+# the app falls back to its stub. Every target, fetched dependencies included,
+# uses the same runtime so they link together.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 project(OpenMac VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)

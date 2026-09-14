@@ -28,4 +28,24 @@
     </None>
   </ItemGroup>
 
+  <!-- The .NET 11 preview SDK leaves ijwhost.dll out of a self-contained publish.
+       WPF's DirectWriteForwarder.dll is a mixed-mode assembly that loads it, so
+       without it the published app dies before its first window (0xE0434352,
+       FileNotFoundException for DirectWriteForwarder.dll) on any PC where no
+       installed .NET happens to supply one. Put the host pack's copy in the
+       publish set, and refuse to publish without it. -->
+  <Target Name="PublishIjwHost"
+          BeforeTargets="ComputeResolvedFilesToPublishList;_ComputeFilesToBundle"
+          Condition="'$(SelfContained)' == 'true'">
+    <PropertyGroup>
+      <IjwHostPath>$(NetCoreRoot)packs\Microsoft.NETCore.App.Host.$(RuntimeIdentifier)\$(BundledNETCoreAppPackageVersion)\runtimes\$(RuntimeIdentifier)\native\ijwhost.dll</IjwHostPath>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(IjwHostPath)')"
+           Text="ijwhost.dll was not found at $(IjwHostPath); a self-contained publish without it cannot start." />
+    <ItemGroup>
+      <ResolvedFileToPublish Include="$(IjwHostPath)" RelativePath="ijwhost.dll"
+                             CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
 </Project>

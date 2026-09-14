@@ -36,55 +36,38 @@ jobs:
       - name: Publish the app
         run: dotnet publish gui -c Release -r win-x64 --self-contained true -o publish
 
+      # ijwhost.dll is on the list because the SDK leaves it out of a
+      # self-contained publish, and WPF cannot start without it.
       - name: The published tree carries the emulator
         shell: pwsh
         run: |
-          foreach ($file in 'OpenMac.exe', 'openmac_c.dll') {
+          foreach ($file in 'OpenMac.exe', 'openmac_c.dll', 'ijwhost.dll', 'DirectWriteForwarder.dll') {
             if (-not (Test-Path "publish/$file")) { throw "publish/$file is missing" }
           }
 
-      # The previous release is launched first, the same way, as a control: it
-      # is known to run, so if it fails too the runner cannot host the app and
-      # the check says nothing about this build. A crash dumps the Application
-      # event log, where the runtime writes the exception.
+      # The runner has no .NET on the DLL search path for the app, so a publish
+      # missing a native dependency fails here the way it would on a clean PC.
+      # A crash prints the runtime's entry from the Application event log.
       - name: The app starts and loads the core
         shell: pwsh
         run: |
-          function Test-Launch([string]$exe, [string]$label) {
-            $logDir = Join-Path $env:APPDATA 'OpenMac'
-            Remove-Item -Recurse -Force $logDir -ErrorAction SilentlyContinue
-            $started = Get-Date
-            $app = Start-Process -FilePath $exe -PassThru
-            Start-Sleep -Seconds 20
-            $log = Join-Path $logDir 'openmac.log'
-            Write-Host "---- $label app log"
-            if (Test-Path $log) { Get-Content $log | Write-Host } else { Write-Host '(no log written)' }
-            $ok = $true
-            if ($app.HasExited) {
-              Write-Host ("---- {0} exited on its own (code 0x{1:X8})" -f $label, $app.ExitCode)
-              Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $started } -ErrorAction SilentlyContinue |
-                Where-Object { $_.ProviderName -in '.NET Runtime', 'Application Error', 'Windows Error Reporting' } |
-                ForEach-Object { Write-Host "---- event: $($_.ProviderName)"; Write-Host $_.Message }
-              $ok = $false
-            } else {
-              if (-not ((Test-Path $log) -and (Select-String -Path $log -Pattern 'backend: native core' -Quiet))) {
-                Write-Host "---- $label started without the native core"
-                $ok = $false
-              }
-              Stop-Process -Id $app.Id -Force
-            }
-            return $ok
+          $logDir = Join-Path $env:APPDATA 'OpenMac'
+          Remove-Item -Recurse -Force $logDir -ErrorAction SilentlyContinue
+          $started = Get-Date
+          $app = Start-Process -FilePath publish/OpenMac.exe -PassThru
+          Start-Sleep -Seconds 20
+          $log = Join-Path $logDir 'openmac.log'
+          if (Test-Path $log) { Get-Content $log | Write-Host } else { Write-Host '(no log written)' }
+          if ($app.HasExited) {
+            Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $started } -ErrorAction SilentlyContinue |
+              Where-Object { $_.ProviderName -eq '.NET Runtime' } |
+              ForEach-Object { Write-Host $_.Message }
+            throw ("OpenMac.exe exited on its own (code 0x{0:X8})" -f $app.ExitCode)
           }
-
-          $previous = gh release list --exclude-drafts --limit 1 --json tagName -q '.[0].tagName'
-          gh release download $previous --pattern '*win-x64.zip' --dir control
-          Expand-Archive (Get-ChildItem control/*.zip | Select-Object -First 1).FullName -DestinationPath control/app
-          $controlExe = (Get-ChildItem control/app -Recurse -Filter OpenMac.exe | Select-Object -First 1).FullName
-
-          $controlOk = Test-Launch $controlExe "control $previous"
-          $candidateOk = Test-Launch 'publish/OpenMac.exe' $env:TAG
-          if (-not $controlOk) { throw "the control release $previous does not start on this runner either, so the check cannot judge $env:TAG" }
-          if (-not $candidateOk) { throw "$env:TAG does not start" }
+          if (-not ((Test-Path $log) -and (Select-String -Path $log -Pattern 'backend: native core' -Quiet))) {
+            throw 'the app started without the native core'
+          }
+          Stop-Process -Id $app.Id -Force
 
       - name: Zip and attach to the release
         shell: pwsh
