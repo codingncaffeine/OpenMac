@@ -1,0 +1,66 @@
+name: Release build
+
+# Builds the Windows download for a release that already exists (a draft is
+# fine) and attaches it. Run it from the Actions tab with the release's tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the release to build and attach the Windows zip to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows-zip:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Build the native core
+        run: |
+          cmake -S . -B build -DOPENMAC_BUILD_SHELL=OFF -DOPENMAC_BUILD_TESTS=OFF
+          cmake --build build --config Release --parallel --target openmac_c
+
+      - name: Publish the app
+        run: dotnet publish gui -c Release -r win-x64 --self-contained true -o publish
+
+      - name: The published tree carries the emulator
+        shell: pwsh
+        run: |
+          foreach ($file in 'OpenMac.exe', 'openmac_c.dll') {
+            if (-not (Test-Path "publish/$file")) { throw "publish/$file is missing" }
+          }
+
+      - name: The app starts and loads the core
+        shell: pwsh
+        run: |
+          $app = Start-Process -FilePath publish/OpenMac.exe -PassThru
+          Start-Sleep -Seconds 20
+          $log = Join-Path $env:APPDATA 'OpenMac/openmac.log'
+          if (Test-Path $log) { Get-Content $log | Write-Host }
+          if ($app.HasExited) { throw "OpenMac.exe exited on its own (code $($app.ExitCode))" }
+          if (-not ((Test-Path $log) -and (Select-String -Path $log -Pattern 'backend: native core' -Quiet))) {
+            throw 'the app started without the native core'
+          }
+          Stop-Process -Id $app.Id -Force
+
+      - name: Zip and attach to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          $zip = "OpenMac-$version-win-x64.zip"
+          Compress-Archive -Path publish/* -DestinationPath $zip
+          gh release upload $env:TAG $zip --clobber
