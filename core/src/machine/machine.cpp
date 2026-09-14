@@ -84,11 +84,12 @@ Machine::Machine(std::vector<u8> rom, const Config& cfg)
     drive0_->image = &floppy_;
     drive1_->installed = false;
     driveBay2_->installed = false;   // the Classic has one internal drive
-    // Report an 800K double-sided mechanism, not a SuperDrive, until the SWIM's
-    // ISM/MFM path exists. Drive status line $A is what the ROM asks: answering
-    // "SuperDrive" sends its .Sony driver down the MFM path and it stalls before
-    // it ever spins the motor. Answering "plain GCR drive" makes it proceed.
-    drive0_->superDrive = false;
+    // The Classic's internal mechanism is an FDHD SuperDrive, and drive status
+    // line $A identifies one by reading high. The ROM's drive-present check at
+    // $43F7AA skips a connected drive that answers it low, so a mechanism
+    // reported as anything else is never looked at: the boot scan finds no
+    // floppy and the Mac shows the flashing question mark with a disk in it.
+    drive0_->superDrive = true;
     ramMask_ = cfg.ramSize - 1;
     // ROM sizes are powers of two (Classic: 512K); mirror across its window.
     u32 rs = 1;
@@ -767,10 +768,10 @@ void Machine::setExternalDriveAttached(bool on) {
     } else {
         drive1_->image = &floppy2_;
         // The same mechanism as the internal one: an 800K/1.4 MB double-sided
-        // drive. Status line $A has to read high, or the drive-present check at
-        // $43F7AA skips a connected drive outright.
+        // SuperDrive. Status line $A has to read high, or the drive-present
+        // check at $43F7AA skips a connected drive outright.
         drive1_->doubleSided = true;
-        drive1_->superDrive = false;
+        drive1_->superDrive = true;
     }
     drive1_->installed = on;
     if (onDiag) onDiag(on ? "sony: external drive attached" : "sony: external drive removed");
