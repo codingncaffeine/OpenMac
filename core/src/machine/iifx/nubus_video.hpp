@@ -2526,8 +2526,10 @@ private:
             for (const Branch& b : branches) {
                 const auto it = labels.find(b.target);
                 if (it == labels.end()) throw std::logic_error("missing driver label");
+                // A 68k displacement counts from the address of the
+                // displacement word itself, not from the word after it.
                 const std::int64_t delta = static_cast<std::int64_t>(it->second) -
-                                           static_cast<std::int64_t>(b.displacement + 2);
+                                           static_cast<std::int64_t>(b.displacement);
                 if (delta < -32768 || delta > 32767)
                     throw std::logic_error("driver branch overflow");
                 const u16 d = static_cast<u16>(static_cast<std::int16_t>(delta));
@@ -2538,7 +2540,7 @@ private:
                 const auto it = labels.find(p.target);
                 if (it == labels.end()) throw std::logic_error("missing driver PC-relative label");
                 const std::int64_t delta = static_cast<std::int64_t>(it->second) -
-                                           static_cast<std::int64_t>(p.displacement + 2);
+                                           static_cast<std::int64_t>(p.displacement);
                 if (delta < -32768 || delta > 32767)
                     throw std::logic_error("driver PC-relative displacement overflow");
                 const u16 d = static_cast<u16>(static_cast<std::int16_t>(delta));
