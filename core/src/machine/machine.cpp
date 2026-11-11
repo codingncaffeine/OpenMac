@@ -46,7 +46,6 @@ constexpr u64 kRomBootFloppySeat = 2400;
 constexpr int kARdCmd = 2;        // low byte of ioTrap for a Read
 constexpr int kSonyRefNum = -5;   // .Sony driver reference number
 constexpr int kHdRefNum   = -2;   // hard disk's own driver refNum (unit-table alias)
-constexpr u16 kTrapNewPtrSysClear = 0xA71E;
 constexpr u16 kTrapAddDrive = 0xA04E;
 constexpr u16 kTrapInsTime = 0xA058;
 constexpr u16 kTrapPostEvent = 0xA02F;
@@ -891,10 +890,6 @@ void Machine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     hd2_ = std::move(image);
     hd2Mounted_ = false;
     hd2MountTries_ = 0;
-    // Keep the param block we already own. A drop box republishes this seat
-    // once per dropped file, and re-running the allocation each time leaks 80
-    // bytes of the guest's system heap per drop.
-    if (hd2MountPb_ == 0) hd2Installed_ = false;
     // Same wrapping as the first disk, but this copy of the driver answers for
     // SCSI ID 1, adds drive 5, and installs at unit 33 (the real-world SCSI
     // slot for ID 1), so the two instances never collide.
@@ -934,10 +929,10 @@ bool Machine::flushVolumes() {
     if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
         return false;                                  // FS queue not built
     if ((cpu_.getSR() & 0x0700) != 0) return false;    // mid-interrupt
-    if (hdMountPb_ == 0 && hd2MountPb_ == 0) return false;
-    const u32 pb = hdMountPb_ ? hdMountPb_ : hd2MountPb_;
+    if (!hdInstalled_ && !hd2Installed_) return false;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    const u32 pb = stackParamBlock();
     bool any = false;
     // Every drive the machine can be serving. A drive with no volume answers an
     // error and costs one trap.
@@ -970,17 +965,18 @@ bool Machine::unmountSecondDisk() {
     if (hd2_.empty()) return true;
     if (!hd2Mounted_) return true;                     // never mounted / already gone
     if (inSony_) return false;                         // inside our own driver
-    if (hd2MountPb_ == 0) return true;                 // nothing was ever mounted
+    if (!hd2Installed_) return true;                   // nothing was ever mounted
     if (read8(0x0360) & 1) return false;               // FSBusy: a file op is running
     if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
         return true;                                   // FS queue not built
     if ((cpu_.getSR() & 0x0700) != 0) return false;    // mid-interrupt: not now
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    const u32 pb = stackParamBlock();
     auto call = [&](u16 trap) -> s16 {
-        for (u32 i = 0; i < 80; ++i) write8(hd2MountPb_ + i, 0);
-        write16(hd2MountPb_ + ioVRefNum, 5);           // drive 5
-        cpu_.a[0] = hd2MountPb_;
+        for (u32 i = 0; i < 80; ++i) write8(pb + i, 0);
+        write16(pb + ioVRefNum, 5);                    // drive 5
+        cpu_.a[0] = pb;
         execute68kTrap(trap);
         return static_cast<s16>(cpu_.d[0] & 0xFFFF);
     };
@@ -1890,10 +1886,31 @@ void Machine::installHardDisk() {
     if (hdInstalled_ || hd_.empty()) return;
     hdInstalled_ = true;
     hdDriveNum_ = 4;
-    cpu_.d[0] = 80;                          // a param block for _MountVol
-    execute68kTrap(kTrapNewPtrSysClear);
-    hdMountPb_ = cpu_.a[0];
     hdAutoMount_ = true;
+}
+
+// A parameter block for an injected File Manager call, carved out of the
+// interrupted program's stack the way an interrupt handler's locals are. The
+// callers save every register before the injection and put them back after it,
+// A7 included, so the block is gone again when they do.
+//
+// It used to come from the system heap, allocated by an injected _NewPtr at
+// whatever instruction a frame boundary happened to fall on. An allocation can
+// compact the heap, and nothing running at that instruction had agreed to
+// memory moving: the Resource Manager and the File Manager's own callers hold
+// dereferenced, unlocked handles across reads, because a read never moves
+// memory. When the allocation fell inside such a stretch the block being read
+// into moved, the data landed where it used to be, and the System went on to
+// use whatever the RAM test had left in the new place -- an address error at
+// $40E4CA with A3 = $DB6DB6DB under the Installer disk, a "can't load patch
+// resource" sad Mac under Disk Tools. Which boots did that was decided by where
+// frame 1620, or a later multiple of 60, fell: a floppy that was write
+// protected, or had not been unmounted cleanly, shifted it into one.
+u32 Machine::stackParamBlock() {
+    const u32 pb = (cpu_.a[7] - 80) & ~1u;
+    cpu_.a[7] = pb;
+    for (u32 i = 0; i < 80; ++i) write8(pb + i, 0);
+    return pb;
 }
 
 // These three only ever see the hard disk: trySonyTrap checks the drive number
@@ -2004,18 +2021,15 @@ void Machine::runFrame() {
     // frame 900): a disk 2 present now gets its driver loaded by the scan.
     if (frameCounter_ == 900) bootHadHd2_ = !hd2_.empty();
 
-    // Arrange the hard disk's mount once the System is far enough along to
-    // allocate from the system heap. This used to force the .Sony driver open
-    // first, because the drive registration hung off that driver's Open; the
-    // disk's own driver registers the drive now, so there is nothing to open and
-    // nothing to alias.
+    // Arrange the hard disk's mount once the System is far enough along. This
+    // used to force the .Sony driver open first, because the drive registration
+    // hung off that driver's Open; the disk's own driver registers the drive
+    // now, so there is nothing to open and nothing to alias. It touches nothing
+    // in the guest: the mount below brings its own parameter block.
     if (!hd_.empty() && !hdInstalled_ && systemUp && frameCounter_ > 1600 &&
         (frameCounter_ % 60) == 0 &&
         read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
-        u32 sd[8], sa[8];
-        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
         installHardDisk();
-        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
         if (onDiag) {
             char b[96];
             std::snprintf(b, sizeof b, "hd: drive %d set up for mounting", hdDriveNum_);
@@ -2033,22 +2047,17 @@ void Machine::runFrame() {
     if (!hd2_.empty() && !hd2Installed_ && systemUp && frameCounter_ > 2400 &&
         (frameCounter_ % 60) == 30 &&
         read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
-        u32 sd[8], sa[8];
-        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
         hd2Installed_ = true;
-        cpu_.d[0] = 80;
-        execute68kTrap(kTrapNewPtrSysClear);
-        hd2MountPb_ = cpu_.a[0];
-        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     }
-    if (hd2Installed_ && hd2MountPb_ != 0 && !hd2Mounted_ && !hd2_.empty() &&
+    if (hd2Installed_ && !hd2Mounted_ && !hd2_.empty() &&
         systemUp && hd2MountTries_ < 15 && (frameCounter_ % 90) == 45 && !inSony_ &&
         (read8(0x0360) & 1) == 0 &&
         (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) != 0xFFFFFFFFu)) {
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-        write16(hd2MountPb_ + ioVRefNum, 5);          // drive 5
-        cpu_.a[0] = hd2MountPb_;
+        const u32 pb = stackParamBlock();
+        write16(pb + ioVRefNum, 5);                   // drive 5
+        cpu_.a[0] = pb;
         execute68kTrap(kTrapMountVol);
         const u16 r = static_cast<u16>(cpu_.d[0] & 0xFFFF);
         ++hd2MountTries_;
@@ -2080,7 +2089,7 @@ void Machine::runFrame() {
     // Neither side moves again: the machine sits on the happy Mac forever, with
     // the disk it was waiting for never read. Waiting for an idle moment costs
     // at most another 90 frames.
-    if (hdAutoMount_ && hdDriveNum_ != 0 && hdMountPb_ != 0 && !hdMounted_ &&
+    if (hdAutoMount_ && hdDriveNum_ != 0 && !hdMounted_ &&
         systemUp && diskEvtPosts_ < 15 && (frameCounter_ % 90) == 0 && !inSony_ &&
         (read8(0x0360) & 1) == 0 &&
         (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) != 0xFFFFFFFFu)) {
@@ -2090,8 +2099,9 @@ void Machine::runFrame() {
         // otherwise clobber D0-D7/A0-A6 and the System would fault on resume.
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-        write16(hdMountPb_ + ioVRefNum, static_cast<u16>(hdDriveNum_));
-        cpu_.a[0] = hdMountPb_;
+        const u32 pb = stackParamBlock();
+        write16(pb + ioVRefNum, static_cast<u16>(hdDriveNum_));
+        cpu_.a[0] = pb;
         execute68kTrap(kTrapMountVol);                 // _MountVol drive hdDriveNum_
         diskEvtResult_ = cpu_.d[0] & 0xFFFF;           // OSErr from _MountVol
         ++diskEvtPosts_;

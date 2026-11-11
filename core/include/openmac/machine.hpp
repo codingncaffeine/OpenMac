@@ -371,6 +371,7 @@ private:
     void flushFloppyTrack();       // ...the internal drive's, which the host persists
     void ismService(SonyDrive& d); // move bytes between the ISM FIFO and the surface
     void installHardDisk();       // give the hard disk its deferred mount
+    u32 stackParamBlock();        // an 80-byte parameter block on the guest's stack
     int sonyPrime(u32 pb, u32 dce);
     int sonyControl(u32 pb, u32 dce);
     int sonyStatus(u32 pb, u32 dce);
@@ -447,8 +448,7 @@ private:
     // machine-side _MountVol injection that drive 4 grew for mid-session
     // attaches, staggered against it and under the same File-Manager-idle
     // gates.
-    bool hd2Installed_ = false;    // mount param block allocated
-    u32 hd2MountPb_ = 0;
+    bool hd2Installed_ = false;    // the second disk's deferred mount is set up
     bool hd2Mounted_ = false;
     u32 hd2MountTries_ = 0;
     bool bootHadHd2_ = false;      // disk 2 present when the boot scan ran
@@ -457,7 +457,6 @@ private:
     bool hdInstalled_ = false;     // the hard disk's deferred mount is set up
     int hdDriveNum_ = 0;
     u32 hdReads_ = 0, hdWrites_ = 0;   // block-I/O counters (feasibility probe)
-    u32 hdMountPb_ = 0;                // system-heap param block for _MountVol
     u32 diskEvtPosts_ = 0;             // mount attempts
     u32 diskEvtResult_ = 0xFFFFFFFFu;  // last _MountVol OSErr
     bool hdMounted_ = false;           // volume mounted OK; stop retrying
