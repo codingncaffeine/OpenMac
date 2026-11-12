@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
                      "       media/input timing: [--floppy-at-frame n file.img]... [--eject-floppy-at-frame n]... [--input-at-frame n dx dy up|down]... [--milestone-timeout name:frames]\n"
                      "       trigger capture: --checkpoint-on-trigger file.iifxstate [--checkpoint-at-pc hex file.iifxstate]\n"
                      "       boot display capture: --frame-timeline prefix first-frame last-frame\n"
-                     "       trap probe: --watch-trap hex-opcode [--watch-trap hex-opcode]... [--watch-trap-limit n] [--watch-byte hex-address]... [--watch-pc hex-address]...\n"
+                     "       trap probe: --watch-trap hex-opcode [--watch-trap hex-opcode]... [--watch-trap-limit n] [--trap-log n] [--watch-byte hex-address]... [--watch-pc hex-address]...\n"
                      "       concise output/artifacts: --quiet [--cpu-state] [--media-summary] [--dump-audio sound.wav] [--expect-startup-chime] [--no-gc-fast-path] [--no-tick-batching]\n"
                      "       omit floppy.img and use 'no-video' for a headless machine\n"
                      "       add [input-frame] [mouse-dx] [mouse-dy] to inject motion\n"
@@ -427,6 +427,7 @@ int main(int argc, char** argv) {
     std::vector<u32> watchedPcs;        // --watch-pc: report when the 68030 reaches these
     bool watchedTrapEnabled = false;
     u64 watchedTrapLimit = 32;
+    int trapLogBudget = 12;
     for (int index = 2; index < argc; ++index) {
         const std::string option = argv[index];
         if (option == "--structured-only")
@@ -819,6 +820,12 @@ int main(int argc, char** argv) {
             frameTimelineFirst = std::atoi(argv[++index]);
             frameTimelineLast = std::atoi(argv[++index]);
         }
+        else if (option == "--trap-log" && index + 1 < argc) {
+            // How many A-line traps the unfiltered exception log prints
+            // (default 12); raise it to read a stretch of guest code by the
+            // system calls it makes.
+            trapLogBudget = static_cast<int>(parseU64(argv[++index]));
+        }
         else if (option == "--watch-trap" && index + 1 < argc) {
             const u64 value = parseU64(argv[++index]);
             if (value > 0xFFFFu) {
@@ -1198,7 +1205,7 @@ int main(int argc, char** argv) {
     }
 
     int exceptionBudget = 48;
-    int trapBudget = 12;
+    int trapBudget = trapLogBudget;
     u64 watchedTrapHits = 0;
     mac.cpu().onException = [&](int vector, u32 pc) {
         if (vector == 10 && watchedTrapEnabled) {
