@@ -10,6 +10,25 @@
 //                    [--mouse-at FRAME DX DY BUTTON]... [--key-at FRAME CODE down|up]...
 //                    [--floppy FILE] [--floppy-writable] [--save-floppy OUT]
 //                    [--floppy-at FRAME FILE]... [--eject-floppy-at FRAME]...
+//                    [--harddisk FILE] [--harddisk2 FILE] [--save-harddisk OUT]
+//                    [--cd FILE] [--eject-cd-at FRAME] [--guest-restart-at FRAME]
+//                    [--gestalt] [--slots] [--shutdown] [--profile FROM TO]
+//                    [--beep-at FRAME] [--guest-power-off-at FRAME]
+//                    [--dropbox DIR] [--dropbox-guest-read FILE] [--drivers]
+//                    [--harddisk2-external] [--net]
+//                    [--floppy-trace FRAME COUNT] [--dump-audio OUT.wav]
+// The sound output is always summarized: how many samples came out and each
+// stretch of anything but silence (stretches end after 0.2 s of silence),
+// with its length and loudest sample. Sound made inside a guest call the
+// tool runs (--beep-at) arrives in one piece of at most 8192 samples.
+// --harddisk2-external puts the second disk on the external SCSI bus; --net
+// attaches the SCSI Ethernet adapter there (ID 4).
+// --dropbox builds a volume from a host folder and puts it on the second
+// hard-disk seat, as the front end's drop box does; --dropbox-guest-read has
+// the guest read one of its files back at the end. --drivers lists the
+// guest's unit table.
+// --profile counts instructions per 256-byte page of code between two frames
+// and lists the busiest pages: where a machine that looks hung spends its time.
 //
 // --pram-byte changes one byte of parameter RAM after --pram is loaded (the
 // stored video mode is byte $48). --hashes prints the distinct pictures seen
@@ -20,6 +39,8 @@
 // Exit code 0 = ran to the end; 1 = the CPU halted; 2 = bad arguments.
 
 #include "openmac/quadra950.hpp"
+
+#include "../common/tracetools.hpp"
 
 #include <algorithm>
 #include <array>
@@ -46,6 +67,15 @@ std::vector<u8> readFile(const std::string& path) {
 int main(int argc, char** argv) {
     std::string romPath, shotPath, pramIn, pramOut, display, floppyPath, floppyOut;
     bool floppyWritable = false;
+    std::string hdPath, hd2Path, hdOut, cdPath, dropBoxDir, dropBoxGuestRead;
+    bool showDrivers = false, netAttach = false;
+    int floppyTraceAt = -1, floppyTraceCount = 0;
+    std::string wavPath;
+    std::vector<u8> audio, audioChunk;
+    int ejectCdAt = -1, guestRestartAt = -1, beepAt = -1, guestPowerOffAt = -1;
+    bool askGestalt = false, doShutdown = false, askSlots = false;
+    int profileFrom = -1, profileTo = -1;
+    std::map<u32, u64> profile;
     std::vector<std::pair<int, std::string>> floppyEvents;   // frame, file ("" = the host's Eject)
     Quadra950Machine::Config cfg;
     int frames = 600;
@@ -87,6 +117,25 @@ int main(int argc, char** argv) {
             i += 4;
             inputs.push_back(in);
         }
+        else if (a == "--harddisk" && i + 1 < argc) hdPath = argv[++i];
+        else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
+        else if (a == "--save-harddisk" && i + 1 < argc) hdOut = argv[++i];
+        else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
+        else if (a == "--eject-cd-at" && i + 1 < argc) ejectCdAt = std::atoi(argv[++i]);
+        else if (a == "--guest-restart-at" && i + 1 < argc) guestRestartAt = std::atoi(argv[++i]);
+        else if (a == "--profile" && i + 2 < argc) { profileFrom = std::atoi(argv[++i]); profileTo = std::atoi(argv[++i]); }
+        else if (a == "--gestalt") askGestalt = true;
+        else if (a == "--slots") askSlots = true;
+        else if (a == "--beep-at" && i + 1 < argc) beepAt = std::atoi(argv[++i]);
+        else if (a == "--guest-power-off-at" && i + 1 < argc) guestPowerOffAt = std::atoi(argv[++i]);
+        else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
+        else if (a == "--dropbox-guest-read" && i + 1 < argc) dropBoxGuestRead = argv[++i];
+        else if (a == "--drivers") showDrivers = true;
+        else if (a == "--harddisk2-external") cfg.secondDiskExternal = true;
+        else if (a == "--net") netAttach = true;
+        else if (a == "--dump-audio" && i + 1 < argc) wavPath = argv[++i];
+        else if (a == "--floppy-trace" && i + 2 < argc) { floppyTraceAt = std::atoi(argv[++i]); floppyTraceCount = std::atoi(argv[++i]); }
+        else if (a == "--shutdown") doShutdown = true;
         else if (a == "--floppy-at" && i + 2 < argc) {
             const int at = std::atoi(argv[++i]);
             floppyEvents.emplace_back(at, argv[++i]);
@@ -122,6 +171,7 @@ int main(int argc, char** argv) {
     }
 
     Quadra950Machine mac(std::move(rom), cfg);
+    if (netAttach) mac.attachNet(true);
     if (!display.empty()) {
         if (!mac.setDisplay(display.c_str())) {
             std::fprintf(stderr, "no display named '%s'\n", display.c_str());
@@ -144,6 +194,8 @@ int main(int argc, char** argv) {
     u32 currentTest = 0;
     int watchBudget = 60;
     mac.cpu().onStep = [&](u32 pc) {
+        if (profileFrom >= 0 && static_cast<int>(lastFrame) >= profileFrom && static_cast<int>(lastFrame) < profileTo)
+            ++profile[pc >> 8];
         for (u32 w : watchPcs) {
             if (pc != w || watchBudget <= 0) continue;
             --watchBudget;
@@ -171,6 +223,35 @@ int main(int argc, char** argv) {
         // and goes to --save-floppy at the end.
         const bool ok = mac.insertFloppy(readFile(floppyPath), !floppyWritable);
         std::printf("floppy %s: %s\n", floppyPath.c_str(), ok ? "inserted" : "NOT a floppy image");
+        if (!ok) return 2;
+    }
+    // Disk files are read into memory and never written; --save-harddisk
+    // writes the first disk as it stands at the end.
+    if (!hdPath.empty()) {
+        std::vector<u8> hd = readFile(hdPath);
+        if (hd.empty()) { std::fprintf(stderr, "cannot read disk: %s\n", hdPath.c_str()); return 2; }
+        std::printf("hard disk %s: attached (%zu MB)\n", hdPath.c_str(), hd.size() >> 20);
+        mac.insertHardDisk(std::move(hd));
+    }
+    if (!hd2Path.empty()) {
+        std::vector<u8> hd = readFile(hd2Path);
+        if (hd.empty()) { std::fprintf(stderr, "cannot read disk: %s\n", hd2Path.c_str()); return 2; }
+        std::printf("second hard disk %s: attached (%zu MB)\n", hd2Path.c_str(), hd.size() >> 20);
+        mac.insertHardDisk2(std::move(hd), false);
+    }
+    if (!dropBoxDir.empty()) {
+        std::string why;
+        std::vector<u8> volume = tracetools::buildFolderVolume(dropBoxDir, why);
+        if (volume.empty()) { std::fprintf(stderr, "dropbox: build FAILED: %s\n", why.c_str()); return 2; }
+        mac.insertHardDisk2(std::move(volume), false);
+        std::printf("dropbox: %s built and attached\n", dropBoxDir.c_str());
+    }
+    if (!cdPath.empty()) {
+        std::vector<u8> cd = readFile(cdPath);
+        if (cd.empty()) { std::fprintf(stderr, "cannot read disc: %s\n", cdPath.c_str()); return 2; }
+        mac.attachCdRom(true, 3);
+        const bool ok = mac.insertCd(std::move(cd)) != 0;
+        std::printf("cd %s: %s\n", cdPath.c_str(), ok ? "in the drive" : "REFUSED");
         if (!ok) return 2;
     }
     if (!pramIn.empty()) {
@@ -209,6 +290,23 @@ int main(int argc, char** argv) {
             floppyIn = !floppyIn;
             if (!floppyIn) std::printf("floppy left the drive by frame %d\n", f);
         }
+        if (floppyTraceAt == f) mac.floppyTrace = floppyTraceCount;
+        if (ejectCdAt == f) {
+            mac.ejectCd();
+            std::printf("cd eject asked for at frame %d\n", f);
+        }
+        if (guestRestartAt >= 0 && f >= guestRestartAt && mac.guestRestart()) {
+            std::printf("guest restart at frame %d\n", f);
+            guestRestartAt = -1;
+        }
+        if (guestPowerOffAt >= 0 && f >= guestPowerOffAt && mac.guestPowerOff()) {
+            std::printf("guest asked to switch off at frame %d\n", f);
+            guestPowerOffAt = -1;
+        }
+        if (beepAt >= 0 && f >= beepAt && mac.systemBeep()) {
+            std::printf("alert sound asked for at frame %d\n", f);
+            beepAt = -1;
+        }
         for (const auto& [at, file] : floppyEvents) {
             if (at != f) continue;
             if (file.empty()) {
@@ -227,9 +325,13 @@ int main(int argc, char** argv) {
             else mac.keyEvent(static_cast<u8>(in.a), in.b != 0);
         }
         mac.runFrame();
+        audioChunk.clear();
+        mac.drainAudio(audioChunk);
+        audio.insert(audio.end(), audioChunk.begin(), audioChunk.end());
         // The verdict hook costs a call per instruction; the ROM runs its
         // self-tests once, so it comes off when they are through.
-        if (testsRun >= 5 && watchPcs.empty() && mac.cpu().onStep) mac.cpu().onStep = nullptr;
+        if (testsRun >= 5 && watchPcs.empty() && (profileFrom < 0 || f >= profileTo) && mac.cpu().onStep)
+            mac.cpu().onStep = nullptr;
         if (hashFrom >= 0 && f >= hashFrom && (f - hashFrom) % hashStep == 0) ++hashes[screenHash()];
         if (mac.cpu().halted) { halted = true; std::printf("CPU HALTED in frame %d\n", f); break; }
         if (mac.powerDownRequested) { std::printf("the guest switched the machine off in frame %d\n", f); break; }
@@ -314,6 +416,93 @@ int main(int argc, char** argv) {
         } catch (const BusFault&) {
         }
         std::printf("guest: application '%s', volumes [%s]\n", pascal(0x0910, 31).c_str(), volumes.c_str());
+    }
+    {
+        constexpr double rate = 22255.0;
+        constexpr std::size_t gap = 4451;            // 0.2 s of silence ends a stretch
+        std::printf("sound: %zu samples in %u frames\n", audio.size(), lastFrame + 1);
+        std::size_t start = 0, last = 0;
+        int peak = 0, shown = 0;
+        bool in = false;
+        const auto close = [&] {
+            if (!in) return;
+            in = false;
+            if (++shown > 12) return;
+            std::printf("sound heard: %.2f to %.2f s, %zu samples, loudest %d of 127\n",
+                        static_cast<double>(start) / rate, static_cast<double>(last + 1) / rate, last - start + 1, peak);
+        };
+        for (std::size_t k = 0; k < audio.size(); ++k) {
+            if (audio[k] == 0x80) {
+                if (in && k - last > gap) close();
+                continue;
+            }
+            if (!in) { in = true; start = k; peak = 0; }
+            last = k;
+            const int level = audio[k] > 0x80 ? audio[k] - 0x80 : 0x80 - audio[k];
+            if (level > peak) peak = level;
+        }
+        close();
+        if (shown > 12) std::printf("sound heard: %d stretches in all\n", shown);
+    }
+    // The clock in the microcontroller against the System's own (Time, $020C).
+    try {
+        std::printf("clock: the System's Time is %u s, %.1f s of machine time have passed\n", mac.read32(0x020C),
+                    static_cast<double>(mac.totalCycles()) / 33333333.0);
+    } catch (const BusFault&) {
+    }
+    if (!wavPath.empty()) {
+        // PCM, 8 bits unsigned, one channel, at the machine's 22.25 kHz.
+        std::ofstream wav(wavPath, std::ios::binary);
+        const u32 n = static_cast<u32>(audio.size()), rate = 22255;
+        const auto le32 = [&](u32 v) { for (int k = 0; k < 4; ++k) wav.put(static_cast<char>(v >> (8 * k))); };
+        const auto le16 = [&](u32 v) { for (int k = 0; k < 2; ++k) wav.put(static_cast<char>(v >> (8 * k))); };
+        wav.write("RIFF", 4); le32(36 + n); wav.write("WAVEfmt ", 8); le32(16); le16(1); le16(1);
+        le32(rate); le32(rate); le16(1); le16(8); wav.write("data", 4); le32(n);
+        wav.write(reinterpret_cast<const char*>(audio.data()), static_cast<std::streamsize>(n));
+        std::printf("sound saved: %s (%u samples)\n", wavPath.c_str(), n);
+    }
+    if (!hdPath.empty() || !cdPath.empty() || netAttach)
+        std::printf("storage: hard disk %u reads, %u writes; SCSI commands: internal bus %u, external bus %u\n",
+                    mac.hdReads(), mac.hdWrites(), mac.scsiCommands(0), mac.scsiCommands(1));
+    if (!profile.empty()) {
+        std::vector<std::pair<u64, u32>> pages;
+        u64 total = 0;
+        for (const auto& [page, count] : profile) { pages.emplace_back(count, page); total += count; }
+        std::sort(pages.rbegin(), pages.rend());
+        std::printf("profile, frames %d to %d, %llu instructions:\n", profileFrom, profileTo,
+                    static_cast<unsigned long long>(total));
+        for (std::size_t k = 0; k < pages.size() && k < 14; ++k)
+            std::printf("   %08X-%02X  %5.1f%%\n", pages[k].second << 8, 0xFF,
+                        100.0 * static_cast<double>(pages[k].first) / static_cast<double>(total));
+    }
+    if (askGestalt) {
+        // What the System itself answers: machine type, System version, CPU, memory.
+        for (const char* code : {"mach", "sysv", "proc", "fpu ", "ram ", "lram", "addr"}) {
+            const u32 selector = (static_cast<u32>(static_cast<u8>(code[0])) << 24) |
+                                 (static_cast<u32>(static_cast<u8>(code[1])) << 16) |
+                                 (static_cast<u32>(static_cast<u8>(code[2])) << 8) | static_cast<u8>(code[3]);
+            u32 response = 0;
+            const s32 err = mac.gestaltQuery(selector, response);
+            std::printf("gestalt '%s' -> err %d resp %08X (%u)\n", code, err, response, response);
+        }
+    }
+    if (askSlots) {
+        // What the Slot Manager found at startup: one line per slot resource.
+        std::vector<MacHostServices::SlotResource> list;
+        if (!mac.slotResources(list)) std::printf("slots: the guest could not be asked now\n");
+        for (const auto& r : list)
+            std::printf("slot %X resource %3u: category %u type %u software %u hardware %u\n", r.slot, r.id,
+                        r.category, r.type, r.drvrSw, r.drvrHw);
+        std::printf("slots: %zu resources\n", list.size());
+    }
+    if (showDrivers) tracetools::printDrivers(mac, mac.ramBytes());
+    if (!dropBoxGuestRead.empty()) tracetools::reportGuestRead(mac, dropBoxGuestRead);
+    if (doShutdown) std::printf("shutdown volumes: %s\n", mac.shutdownVolumes() ? "unmounted" : "nothing to do");
+    if (!hdOut.empty()) {
+        const std::vector<u8>& image = mac.hardDiskImage();
+        std::ofstream out(hdOut, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
+        std::printf("hard disk saved: %s (%zu bytes)\n", hdOut.c_str(), image.size());
     }
     if (!floppyOut.empty()) {
         const std::vector<u8>& sectors = mac.floppySectors();

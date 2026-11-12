@@ -620,6 +620,33 @@ bool MacHostServices::guestRestart() {
     return true;
 }
 
+bool MacHostServices::guestPowerOff() {
+    if (inDriver_ || announceInFlight_) return false;
+    if (read32(0x0358) == 0 || (read8(0x0360) & 1)) return false;   // no System / FSBusy
+    if ((hcpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt
+    if (addressingModeSwapped()) return false;
+    const u32 scratch = 0x0A78;
+    write16(scratch, 0x3F3C);                         // MOVE.W #1,-(SP)
+    write16(scratch + 2, 0x0001);                     //   sdPowerOff
+    write16(scratch + 4, 0xA895);                     // _ShutDown
+    hcpu_.pc = scratch;
+    return true;
+}
+
+bool MacHostServices::systemBeep() {
+    if (inDriver_ || announceInFlight_) return false;
+    if (read32(0x0358) == 0 || (read8(0x0360) & 1)) return false;   // no System / FSBusy
+    if ((hcpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt
+    if (!leaveSwappedAddressingMode()) return false;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = hcpu_.d[i]; sa[i] = hcpu_.a[i]; }
+    hcpu_.a[7] -= 2;
+    write16(hcpu_.a[7], 30);                          // duration, in ticks
+    execute68kTrap(0xA9C8);                           // _SysBeep
+    for (int i = 0; i < 8; ++i) { hcpu_.d[i] = sd[i]; hcpu_.a[i] = sa[i]; }
+    return true;
+}
+
 void MacHostServices::execute68kTrap(u16 trap) {
     // ApplScratch, the twelve low-memory bytes reserved for applications. The
     // Classic put this word at the top of RAM, which works on a machine with
@@ -666,6 +693,30 @@ s32 MacHostServices::gestaltQuery(u32 selector, u32& response) {
     response = hcpu_.a[0];
     for (int i = 0; i < 8; ++i) { hcpu_.d[i] = sd[i]; hcpu_.a[i] = sa[i]; }
     return err;
+}
+
+bool MacHostServices::slotResources(std::vector<SlotResource>& out) {
+    out.clear();
+    if (!leaveSwappedAddressingMode()) return false;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = hcpu_.d[i]; sa[i] = hcpu_.a[i]; }
+    // The Slot Manager's parameter block (56 bytes), on the guest's stack:
+    // spCategory +40, spCType +42, spDrvrSW +44, spDrvrHW +46, spSlot +49,
+    // spID +50, spExtDev +51. SNextSRsrc (selector $14) starts after the
+    // resource named by slot, ID and external device and fills in the next.
+    hcpu_.a[7] -= 64;
+    const u32 pb = hcpu_.a[7];
+    for (u32 i = 0; i < 64; ++i) write8(pb + i, 0);
+    for (int guard = 0; guard < 64; ++guard) {
+        hcpu_.a[0] = pb;
+        hcpu_.d[0] = 0x14;
+        execute68kTrap(0xA06E);                   // _SlotManager
+        if (static_cast<s16>(hcpu_.d[0] & 0xFFFF) != 0) break;
+        out.push_back(SlotResource{read8(pb + 49), read8(pb + 50), read16(pb + 40), read16(pb + 42),
+                                   read16(pb + 44), read16(pb + 46)});
+    }
+    for (int i = 0; i < 8; ++i) { hcpu_.d[i] = sd[i]; hcpu_.a[i] = sa[i]; }
+    return true;
 }
 
 // A drive that has sat in the queue since the ROM scan never gets mounted:

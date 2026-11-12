@@ -72,10 +72,22 @@ public:
 
     // Test entry: make the guest call ShutDwnStart (restart). False = not now.
     bool guestRestart();
+    // Test entry: make the guest call ShutDwnPower, what the Finder's Shut
+    // Down ends in. False = not now.
+    bool guestPowerOff();
+    // Test entry: have the guest play its alert sound (SysBeep) by running
+    // the trap on the guest CPU. False = not now.
+    bool systemBeep();
     // Ask the guest's Gestalt a question by running the trap on the guest
     // CPU. Headless diagnosis only: the answer is whatever the System's own
     // table holds. Returns the OSErr; the response lands in `response`.
     s32 gestaltQuery(u32 selector, u32& response);
+    // Every slot resource the guest's Slot Manager knows, in its own order
+    // (SNextSRsrc from slot 0 until it reports no more), by running the trap
+    // on the guest CPU. Headless diagnosis only, like gestaltQuery. False =
+    // the addressing mode did not allow a call just now.
+    struct SlotResource { u8 slot, id; u16 category, type, drvrSw, drvrHw; };
+    bool slotResources(std::vector<SlotResource>& out);
     u32 hdReads() const { return hdReadCount_; }
     u32 hdWrites() const { return hdWriteCount_; }
     void traceHdRequests(int n) { hdTraceBudget_ = n; }

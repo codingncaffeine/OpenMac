@@ -10,6 +10,7 @@
 #include "../../core/src/machine/dc42.hpp"
 #include "../../core/src/machine/macbinary.hpp"
 #include "instacomp.hpp"
+#include "../common/tracetools.hpp"
 
 #include <algorithm>
 
@@ -39,52 +40,6 @@ u32 parseFourcc(const char* text) {
            (static_cast<u32>(static_cast<u8>(text[1])) << 16) |
            (static_cast<u32>(static_cast<u8>(text[2])) << 8) |
            static_cast<u32>(static_cast<u8>(text[3]));
-}
-
-// ---- drop box ---------------------------------------------------------
-// The front end walks a host folder and hands each file to the volume
-// builder; this is the same walk, so a headless run exercises the code path
-// the GUI takes rather than a convenient approximation of it.
-
-std::pair<u32, u32> inferTypeCreator(const std::string& ext) {
-    std::string e;
-    for (char c : ext) e += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (e == ".txt" || e == ".text" || e == ".md") return {0x54455854u, 0x74747874u};
-    if (e == ".sit") return {0x53495444u, 0x53495421u};
-    if (e == ".sea") return {0x4150504Cu, 0x61757374u};
-    if (e == ".cpt") return {0x50414354u, 0x43504354u};
-    if (e == ".hqx") return {0x54455854u, 0x426E4871u};
-    if (e == ".zip") return {0x5A495020u, 0x5A495020u};
-    if (e == ".lha" || e == ".lzh") return {0x4C484120u, 0x4C415243u};
-    return {0x3F3F3F3Fu, 0x3F3F3F3Fu};
-}
-
-void addFolderTree(hfs::VolumeBuilder& b, u32 parent,
-                   const std::filesystem::path& dir) {
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-        const std::string name = e.path().filename().string();
-        if (name == "_openmac-removed") continue;
-        if (e.is_directory(ec)) {
-            const u32 id = b.addDir(parent, name);
-            if (id) addFolderTree(b, id, e.path());
-        } else if (e.is_regular_file(ec)) {
-            std::vector<u8> data = loadFile(e.path().string().c_str());
-            const auto [type, creator] = inferTypeCreator(e.path().extension().string());
-            b.addFile(parent, name, type, creator, 0, std::move(data), {});
-        }
-    }
-}
-
-std::vector<u8> buildFolderVolume(const std::string& folder, std::string& why) {
-    std::filesystem::path p(folder);
-    std::string vol = p.filename().string();
-    if (vol.empty()) vol = "Drop Box";
-    hfs::VolumeBuilder b(vol);
-    addFolderTree(b, 2, p);
-    std::vector<u8> img = b.build(0);
-    if (img.empty()) why = b.why();
-    return img;
 }
 
 void writeBmp(const char* path, const std::vector<u32>& px, int w, int h) {
@@ -1403,7 +1358,7 @@ int main(int argc, char** argv) {
     // LoadRom. Without a driver there is nothing to read the volume with.
     if (!dropBoxDir.empty()) {
         std::string why;
-        std::vector<u8> vol = buildFolderVolume(dropBoxDir, why);
+        std::vector<u8> vol = tracetools::buildFolderVolume(dropBoxDir, why);
         if (vol.empty()) {
             std::fprintf(stderr, "dropbox: build FAILED: %s\n", why.c_str());
             return 2;
@@ -1706,7 +1661,7 @@ int main(int argc, char** argv) {
                                     ec ? " (COPY FAILED)" : "");
                     }
                     std::string why;
-                    std::vector<u8> vol = buildFolderVolume(dropBoxDir, why);
+                    std::vector<u8> vol = tracetools::buildFolderVolume(dropBoxDir, why);
                     if (vol.empty())
                         std::printf("dropbox: rebuild FAILED: %s\n", why.c_str());
                     else {
@@ -1779,52 +1734,7 @@ int main(int argc, char** argv) {
     }
 
     if (showDrivers) {
-        // UTableBase $011C, UnitNtryCnt $01D2. Each entry is a handle to a DCE;
-        // dCtlFlags bit 6 says whether dCtlDriver is a handle or a pointer, and
-        // the DRVR's name is a Pascal string 18 bytes into its header.
-        const u32 ramTop = static_cast<u32>(ramMb) * 1024u * 1024u;
-        // A driver lives in RAM or in the ROM; reading anywhere else would be a
-        // device access, and an instrument must not touch the machine.
-        const auto readable = [&](u32 a, u32 len) {
-            return (a && a + len < ramTop) ||
-                   (a >= 0x40800000u && a + len < 0x40900000u);
-        };
-        // A master pointer carries the Memory Manager's locked/purgeable marks
-        // in its high byte, and every DCE in this table is a locked one. Strip
-        // them the way the machine's own guestPtr does -- only when the raw
-        // value is not already a real address, because above 16 MB it can be.
-        const auto deref = [&](u32 p) {
-            if (!p || p + 3 < ramTop) return p;
-            const u32 stripped = p & 0x00FFFFFFu;
-            return stripped + 3 < ramTop ? stripped : p;
-        };
-        const u32 utab = mac.read32(0x011C);
-        const u32 count = mac.read16(0x01D2);
-        std::printf("\n-- drivers (unit table %08X, %u entries) --\n", utab, count);
-        for (u32 i = 0; i < count && readable(utab + i * 4, 4); ++i) {
-            const u32 h = mac.read32(utab + i * 4);
-            if (!h) continue;                       // an empty slot is normal
-            const u32 dce = deref(readable(h, 4) ? mac.read32(h) : 0);
-            const u16 flags = readable(dce, 26) ? mac.read16(dce + 4) : 0;
-            u32 drvr = readable(dce, 26) ? deref(mac.read32(dce + 0)) : 0;
-            // dCtlDriver is a handle when dRAMBased is set and a pointer when
-            // it is not -- and the flag is the only thing that says which.
-            if (drvr && (flags & 0x0040))
-                drvr = deref(readable(drvr, 4) ? mac.read32(drvr) : 0);
-            std::string name = "?";
-            if (readable(drvr, 20)) {
-                const u8 len = mac.read8(drvr + 18);
-                if (len && len <= 31 && readable(drvr + 19, len)) {
-                    name.clear();
-                    for (u8 k = 0; k < len; ++k)
-                        name += char(mac.read8(drvr + 19 + k));
-                }
-            }
-            std::printf("  unit %2u  refNum %5d  h %08X  dce %08X  flags %04X  "
-                        "drvr %08X  %s\n",
-                        i, static_cast<int>(static_cast<s16>(~u16(i))), h, dce,
-                        flags, drvr, name.c_str());
-        }
+        tracetools::printDrivers(mac, static_cast<u32>(ramMb) * 1024u * 1024u);
     }
 
     for (const auto& L : disasmLive) {
@@ -2450,28 +2360,7 @@ int main(int argc, char** argv) {
         // the volume and the guest being able to fetch them are two different
         // claims, and only this one tests the second.
         if (!dropBoxGuestRead.empty()) {
-            std::vector<u8> want = loadFile(dropBoxGuestRead.c_str());
-            std::string base = std::filesystem::path(dropBoxGuestRead).filename().string();
-            std::vector<u8> got;
-            std::string why;
-            if (!mac.readFileThroughGuest(base, got, why)) {
-                std::printf("GUEST READ FAILED: '%s' -- %s\n", base.c_str(), why.c_str());
-            } else if (got.size() != want.size()) {
-                std::printf("GUEST READ MISMATCH: '%s' is %zu bytes to the guest, "
-                            "%zu on the host\n", base.c_str(), got.size(), want.size());
-            } else {
-                std::size_t diff = 0, firstAt = 0;
-                for (std::size_t k = 0; k < got.size(); ++k)
-                    if (got[k] != want[k]) { if (!diff) firstAt = k; ++diff; }
-                if (diff)
-                    std::printf("GUEST READ MISMATCH: '%s' same length but %zu bytes "
-                                "differ, first at offset %zu (block %zu)\n",
-                                base.c_str(), diff, firstAt, firstAt / 512);
-                else
-                    std::printf("GUEST READ OK: '%s' %zu bytes, byte-for-byte identical "
-                                "read through the guest's own File Manager\n",
-                                base.c_str(), got.size());
-            }
+            tracetools::reportGuestRead(mac, dropBoxGuestRead);
         }
     }
     return 0;
