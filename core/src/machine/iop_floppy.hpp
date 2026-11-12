@@ -229,11 +229,14 @@ public:
 private:
     bool highDensity() const { return media_.size() == 1474560u; }
 
-    template <typename... Args>
-    void say(const char* format, Args... args) {
+    void say(const char* text) {
+        if (onDiag) onDiag(text);
+    }
+    template <typename First, typename... Rest>
+    void say(const char* format, First first, Rest... rest) {
         if (!onDiag) return;
         char message[160];
-        std::snprintf(message, sizeof message, format, args...);
+        std::snprintf(message, sizeof message, format, first, rest...);
         onDiag(message);
     }
 
