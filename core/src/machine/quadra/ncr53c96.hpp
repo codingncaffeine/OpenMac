@@ -211,6 +211,20 @@ public:
             // manager starts the next chunk; the LAST chunk's interrupt
             // comes from the status-phase transition below instead.
             if (chunkLeft_ == 0 && dataPos_ < data_.size()) raise(0x10);
+            // An odd count leaves its last byte where the 16-bit port
+            // cannot hand it over. The chip has taken the whole count
+            // from the target, so that byte sits in the FIFO, DRQ is
+            // down, and the interrupt comes now -- already showing the
+            // status phase if the byte was the last of the data. The
+            // manager reads it out of the FIFO register afterwards (an
+            // unaligned 2048-byte block goes as 1 + 2047).
+            else if (chunkLeft_ == 1 && dataPos_ < data_.size()) {
+                fifoPush(data_[dataPos_++]);
+                chunkLeft_ = 0;
+                dmaActive_ = false;
+                if (dataPos_ >= data_.size()) phase_ = kStatus;
+                raise(0x10);
+            }
         }
         finishDataIfDone();
         return v;
@@ -539,22 +553,65 @@ private:
                     // reports done BEFORE the host drains the bytes -- the
                     // manager polls TC, then bursts the FIFO's worth out
                     // through the pseudo-DMA port.
-                    chunkLeft_ = counter_;
-                    counter_ = 0;
-                    tcZero_ = true;
+                    const u32 avail = static_cast<u32>(data_.size() - dataPos_);
+                    if (counter_ <= avail) {
+                        chunkLeft_ = counter_;
+                        counter_ = 0;
+                        tcZero_ = true;
+                    } else {
+                        // The target ran out before the count did (a reply
+                        // shorter than the allocation length: a READ TOC
+                        // asked for 48 bytes that has 20). What it sent
+                        // waits in the FIFO, the counter keeps the
+                        // shortfall so terminal count is NOT reached, and
+                        // the move to the status phase interrupts at once.
+                        // Reporting terminal count here leaves the
+                        // manager's 16-byte burst loop waiting forever for
+                        // a full FIFO. (A remainder too long for the FIFO
+                        // drains through the port as before.)
+                        if (avail <= kFifoSize - fifoCount()) {
+                            while (dataPos_ < data_.size())
+                                fifoPush(data_[dataPos_++]);
+                            counter_ -= avail;
+                            tcZero_ = false;
+                            chunkLeft_ = 0;
+                            dmaActive_ = false;
+                            phase_ = kStatus;
+                            raise(0x10);
+                        } else {
+                            chunkLeft_ = counter_;
+                            counter_ = 0;
+                            tcZero_ = true;
+                        }
+                    }
                 } else if (dataPos_ < data_.size()) {
                     // Non-DMA receive: exactly ONE byte lands in the FIFO
-                    // and every byte interrupts (bus service). The phase
-                    // flips to status only once the last byte is consumed,
-                    // so the next transfer-info reports the change.
+                    // and every byte interrupts (bus service). The target
+                    // moves on the moment its last byte is acknowledged, so
+                    // that byte's interrupt already shows the status phase
+                    // while the byte itself still waits in the FIFO. Holding
+                    // data-in until one more transfer-info makes the
+                    // manager's SCSIComplete find a data phase to drain and
+                    // report scComplPhaseErr for a transfer that was whole.
                     fifoPush(data_[dataPos_++]);
+                    if (dataPos_ >= data_.size()) {
+                        dmaActive_ = false;
+                        phase_ = kStatus;
+                    }
                     raise(0x10);
                 }
                 finishDataIfDone();
             } else if (phase_ == kDataOut) {
+                // Whatever already sits in the FIFO goes out first, DMA or
+                // not: the manager sends a short parameter list (a MODE
+                // SELECT page) as two bytes written to the FIFO and the rest
+                // through the pseudo-DMA port, with the counter covering
+                // only the DMA part. Leaving the FIFO bytes behind strands
+                // the transfer two bytes short of what the target expects,
+                // and the bus never reaches the status phase.
+                while (fifoCount() > 0 && writeBuf_.size() < writeExpect_)
+                    writeBuf_.push_back(fifoPop());
                 if (!dma) {
-                    while (fifoCount() > 0 && writeBuf_.size() < writeExpect_)
-                        writeBuf_.push_back(fifoPop());
                     // FIFO emptied with more expected: the target REQs the
                     // next byte -- transfer complete, bus service.
                     if (writeBuf_.size() < writeExpect_) raise(0x10);
