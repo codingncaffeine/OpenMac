@@ -9,7 +9,7 @@ public sealed class Settings
     public int RamMB { get; set; } = 4;
     public bool BootRomDisk { get; set; }
 
-    /// <summary>Which machine the GUI runs: "classic", "iifx" or "quadra650". Each model
+    /// <summary>Which machine the GUI runs: "classic", "iifx", "quadra650" or "quadra950". Each model
     /// remembers its own ROM, floppy and hard disk — they are not interchangeable.</summary>
     public string Model { get; set; } = "classic";
     public string? LastRomIifx { get; set; }
@@ -27,17 +27,41 @@ public sealed class Settings
     /// this is how a resolution is chosen. Empty means the default 13-inch.</summary>
     public string? MonitorQuadra { get; set; }
 
+    public string? LastRomQuadra950 { get; set; }
+    public string? LastFloppyQuadra950 { get; set; }
+    public string? LastHardDiskQuadra950 { get; set; }
+    public int RamMBQuadra950 { get; set; } = 8;
+    /// <summary>Video RAM fitted in the Quadra 950: 1 MB as shipped, or 2 MB
+    /// with the sockets filled (which is what the deeper color modes need).</summary>
+    public int VramMBQuadra950 { get; set; } = 2;
+    public string? MonitorQuadra950 { get; set; }
+
+    /// <summary>Either Quadra: the two share one backend.</summary>
     [System.Text.Json.Serialization.JsonIgnore]
-    public bool IsQuadra => Model == "quadra650";
+    public bool IsQuadra => Model == "quadra650" || Model == "quadra950";
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsQuadra950 => Model == "quadra950";
+    /// <summary>The monitor on the current Quadra's video port.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? ModelMonitor
+    {
+        get => IsQuadra950 ? MonitorQuadra950 : MonitorQuadra;
+        set
+        {
+            if (IsQuadra950) MonitorQuadra950 = value;
+            else MonitorQuadra = value;
+        }
+    }
     [System.Text.Json.Serialization.JsonIgnore]
     public bool IsIifx => Model == "iifx";
     [System.Text.Json.Serialization.JsonIgnore]
     public string? ModelLastRom
     {
-        get => IsIifx ? LastRomIifx : IsQuadra ? LastRomQuadra : LastRom;
+        get => IsIifx ? LastRomIifx : IsQuadra950 ? LastRomQuadra950 : IsQuadra ? LastRomQuadra : LastRom;
         set
         {
             if (IsIifx) LastRomIifx = value;
+            else if (IsQuadra950) LastRomQuadra950 = value;
             else if (IsQuadra) LastRomQuadra = value;
             else LastRom = value;
         }
@@ -45,10 +69,11 @@ public sealed class Settings
     [System.Text.Json.Serialization.JsonIgnore]
     public string? ModelLastHardDisk
     {
-        get => IsIifx ? LastHardDiskIifx : IsQuadra ? LastHardDiskQuadra : LastHardDisk;
+        get => IsIifx ? LastHardDiskIifx : IsQuadra950 ? LastHardDiskQuadra950 : IsQuadra ? LastHardDiskQuadra : LastHardDisk;
         set
         {
             if (IsIifx) LastHardDiskIifx = value;
+            else if (IsQuadra950) LastHardDiskQuadra950 = value;
             else if (IsQuadra) LastHardDiskQuadra = value;
             else LastHardDisk = value;
         }
@@ -56,16 +81,17 @@ public sealed class Settings
     [System.Text.Json.Serialization.JsonIgnore]
     public string? ModelLastFloppy
     {
-        get => IsIifx ? LastFloppyIifx : IsQuadra ? LastFloppyQuadra : LastFloppy;
+        get => IsIifx ? LastFloppyIifx : IsQuadra950 ? LastFloppyQuadra950 : IsQuadra ? LastFloppyQuadra : LastFloppy;
         set
         {
             if (IsIifx) LastFloppyIifx = value;
+            else if (IsQuadra950) LastFloppyQuadra950 = value;
             else if (IsQuadra) LastFloppyQuadra = value;
             else LastFloppy = value;
         }
     }
     [System.Text.Json.Serialization.JsonIgnore]
-    public int ModelRamMB => IsIifx ? RamMBIifx : IsQuadra ? RamMBQuadra : RamMB;
+    public int ModelRamMB => IsIifx ? RamMBIifx : IsQuadra950 ? RamMBQuadra950 : IsQuadra ? RamMBQuadra : RamMB;
 
     public int Scale { get; set; } = 2;              // 0 = fit, else fixed multiplier
     public string? LastRom { get; set; }

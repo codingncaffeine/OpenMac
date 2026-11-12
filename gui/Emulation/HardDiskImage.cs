@@ -16,7 +16,11 @@ public static class HardDiskImage
     // 80 and 160 MB are the two period-typical IIfx choices (and the latter is
     // the largest internal drive Apple specified). Keep broader sizes for the
     // other OpenMac models as well.
-    public static readonly int[] CommonSizesMB = { 20, 40, 80, 160, 240, 500 };
+    public static readonly int[] CommonSizesMB = { 20, 40, 80, 160, 240, 500, 1024 };
+
+    /// <summary>How a size reads in a list. 1 GB is the largest disk the
+    /// Quadra 950 takes and is offered for that machine only.</summary>
+    public static string SizeLabel(int mb) => mb == 1024 ? "1 GB (Quadra 950 only)" : $"{mb} MB";
 
     /// <summary>
     /// Write a hard-disk image of <paramref name="sizeMB"/> megabytes to

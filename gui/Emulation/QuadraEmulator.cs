@@ -4,8 +4,8 @@ using System.Threading;
 namespace OpenMac.Gui.Emulation;
 
 /// <summary>
-/// The Quadra 650 backend: drives the C++ 68040 machine through the omac_q_*
-/// surface of openmac_c.dll. Same threading shape as <see cref="NativeEmulator"/>:
+/// The Quadra backend, for the Quadra 650 and the Quadra 950 (<see cref="Is950"/>):
+/// drives the C++ 68040 machine through the omac_q_* surface of openmac_c.dll. Same threading shape as <see cref="NativeEmulator"/>:
 /// a dedicated frame loop paced at the vertical rate produces frames and audio;
 /// the UI polls <see cref="TryGetFrame"/>. Media beyond the SCSI hard disk
 /// (floppies, CD, folder disks, networking) is not on this machine yet — those
@@ -37,7 +37,19 @@ public sealed class QuadraEmulator : IEmulator
             yield return (name, w, h);
         }
     }
-    public string BackendName => "native-quadra";
+    /// <summary>The Quadra 950 instead of the Quadra 650. Fixed for the life
+    /// of the backend: the window makes a new one when the model changes.</summary>
+    public bool Is950 { get; init; }
+    /// <summary>Video RAM fitted in the Quadra 950 (1 or 2 MB); takes effect
+    /// at the next ROM load.</summary>
+    public int VramMB { get; set; } = 2;
+    private string MachineName => Is950 ? "Quadra 950" : "Quadra 650";
+    private string PramKey => Is950 ? "quadra950" : "quadra";
+    /// <summary>True once the Quadra 950 has shut down and switched itself
+    /// off. It stays dark until the ROM is loaded again.</summary>
+    public bool PoweredOff { get; private set; }
+
+    public string BackendName => Is950 ? "native-quadra950" : "native-quadra";
     public bool IsRealCore => true;
 
     public bool IsRomLoaded => _h != IntPtr.Zero;
@@ -89,7 +101,10 @@ public sealed class QuadraEmulator : IEmulator
         lock (_sync)
         {
             Destroy();
-            _h = Native.omac_q_create(rom, (nuint)rom.Length, (uint)ramMB);
+            _h = Is950
+                ? Native.omac_q_create_model(rom, (nuint)rom.Length, 1, (uint)ramMB, (uint)VramMB)
+                : Native.omac_q_create(rom, (nuint)rom.Length, (uint)ramMB);
+            PoweredOff = false;
             if (_h == IntPtr.Zero)
                 throw new InvalidOperationException("Quadra core failed to initialize (bad ROM or size?)");
             // Put the battery back before the machine runs a single frame. The
@@ -97,7 +112,7 @@ public sealed class QuadraEmulator : IEmulator
             // the System; blank PRAM means the ROM writes defaults over it and
             // every setting the user made last session is gone -- which is how
             // a machine with 136 MB fitted kept booting in 24-bit mode.
-            byte[]? pram = PramStore.Load("quadra", out uint pramAge);
+            byte[]? pram = PramStore.Load(PramKey, out uint pramAge);
             if (pram is not null && Native.omac_q_pram_load(_h, pram, (nuint)pram.Length, pramAge) != 0)
                 Log.Line($"[core] parameter RAM restored ({pramAge}s since it was saved)");
             // Plug the monitor in before the machine runs a single frame: the
@@ -123,8 +138,9 @@ public sealed class QuadraEmulator : IEmulator
         HardDiskAttached = false;
         HardDiskPath = null;
         _seat?.Cancel();   // a republish in flight belonged to the old machine
-        Log.Line($"[core] Quadra 650 created — {ramMB} MB, ROM {Path.GetFileName(path)}, "
-                 + $"monitor {Monitor ?? "13-inch RGB"} ({_screenW}x{_screenH})");
+        Log.Line($"[core] {MachineName} created — {ramMB} MB, ROM {Path.GetFileName(path)}, "
+                 + $"monitor {Monitor ?? "13-inch RGB"} ({_screenW}x{_screenH})"
+                 + (Is950 ? $", {VramMB} MB video RAM" : ""));
     }
 
     public void Reset()
@@ -281,8 +297,10 @@ public sealed class QuadraEmulator : IEmulator
     public string MediumNote(int drive) =>
         drive == 0
             ? "The internal SuperDrive takes a 400K/800K/1.44 MB dump or a DiskCopy 4.2 / MacBinary image. "
-              + "System 7.5 boots the Quadra 650 (7.1 needs a System Enabler this build doesn't carry)."
-            : "The Quadra 650 has one internal floppy drive; there is no external drive port on this machine.";
+              + (Is950
+                  ? "A disk that is not a startup disk is ejected when the machine starts; put it in once the Finder is up."
+                  : "System 7.5 boots the Quadra 650 (7.1 needs a System Enabler this build doesn't carry).")
+            : $"The {MachineName} has one internal floppy drive; there is no external drive port on this machine.";
 
     public void SetExternalDrive(bool attached) { }
     public bool InsertExternalFloppy(string path) => false;
@@ -295,11 +313,26 @@ public sealed class QuadraEmulator : IEmulator
     // menus keep offering to eject a drive with nothing in it.
     public bool ConsumeDiskStateChanged()
     {
-        bool present;
+        bool present, off;
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return false;
             present = Native.omac_q_floppy_present(_h) != 0;
+            off = Is950 && Native.omac_q_powered_off(_h) != 0;
+        }
+        if (off != PoweredOff)
+        {
+            // Shut Down on the Quadra 950 ends in the machine switching itself
+            // off. The System has flushed its disks by then; put them back in
+            // their files now rather than waiting for the window to close.
+            PoweredOff = off;
+            if (off)
+            {
+                Log.Line("[power] the Quadra 950 has shut down");
+                WriteBackHardDisk();
+                SavePram();
+            }
+            if (present == _lastFloppyPresent) return true;
         }
         if (present == _lastFloppyPresent) return false;
         _lastFloppyPresent = present;
@@ -727,7 +760,7 @@ public sealed class QuadraEmulator : IEmulator
             blob = new byte[size];
             if (Native.omac_q_pram_save(_h, blob, size) == 0) return;
         }
-        PramStore.Save("quadra", blob);
+        PramStore.Save(PramKey, blob);
     }
 
     public void Dispose()

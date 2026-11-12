@@ -146,9 +146,16 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr omac_version();
 
-    // ---- Quadra 650 (separate opaque handle; omac_q_* in capi.h) ----
+    // ---- Quadra 650 and Quadra 950 (one opaque handle; omac_q_* in capi.h) ----
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr omac_q_create(byte[] rom, nuint romLen, uint ramMb);
+
+    // model: 0 = Quadra 650, 1 = Quadra 950 (vramMb 1 or 2 counts there only).
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr omac_q_create_model(byte[] rom, nuint romLen, int model, uint ramMb, uint vramMb);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_powered_off(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_q_destroy(IntPtr h);
