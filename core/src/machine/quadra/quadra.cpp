@@ -1454,6 +1454,7 @@ void QuadraMachine::installCdDriver() {
         return;                                       // FS queue not built
     if (read8(0x0360) & 1) return;                    // FSBusy: a file op is running
     if ((cpu_.getSR() & 0x0700) != 0) return;         // mid-interrupt: not now
+    if (addressingModeSwapped()) return;              // not now
     if (++cdInstallTries_ > 30) return;
 
     // Find the slot BEFORE allocating anything: the unit table is not built
@@ -1587,6 +1588,7 @@ void QuadraMachine::mountCdVolume() {
     if (read32(0x0358) == 0) return;                  // System never came up
     if (read8(0x0360) & 1) return;                    // FSBusy
     if ((cpu_.getSR() & 0x0700) != 0) return;         // mid-interrupt
+    if (addressingModeSwapped()) return;              // not now
     if (volumeMountedFor(cdDrive_)) { cdMountPending_ = false; return; }
     if (++cdMountTries_ > 15) { cdMountPending_ = false; return; }
     announceInFlight_ = true;
@@ -1735,6 +1737,30 @@ void QuadraMachine::serveDiskCtlStatus(int unit, bool status) {
 // scratch cell at the top of RAM, the PC points at it, and stepping continues
 // until control returns to the following word (the dispatcher adjusts the
 // return PC past the A-line). The Classic's proven injection shape.
+// A System running in 24-bit mode swaps the MMU to 32-bit for short stretches
+// and back (QuickDraw does it around every access to the frame buffer); a
+// 32-bit System does the reverse for 24-bit code. A trap injected inside such
+// a stretch runs the Memory Manager under the wrong translation: in the 24-bit
+// case its master pointers carry flags in the top byte and stop being
+// addresses. MMU32Bit ($0CB2) is the mode the MMU is in now; MMFlags ($1EFC)
+// bit 0 is the mode the System started in. The IIfx has the same guard, and
+// the measurement behind it.
+bool QuadraMachine::addressingModeSwapped() {
+    const bool now32 = read8(0x0CB2) != 0;
+    const bool system32 = (read8(0x1EFC) & 1) != 0;
+    return now32 != system32;
+}
+
+// For the injections that cannot be put off to a later frame: let the guest
+// run until it has swapped back.
+bool QuadraMachine::leaveSwappedAddressingMode() {
+    for (int guard = 0; guard < 4000000 && addressingModeSwapped() && !cpu_.halted;
+         ++guard) {
+        stepInstruction();
+    }
+    return !addressingModeSwapped();
+}
+
 void QuadraMachine::execute68kTrap(u16 trap) {
     // ApplScratch, the twelve low-memory bytes reserved for applications. The
     // Classic put this word at the top of RAM, which works on a machine with
@@ -1772,6 +1798,7 @@ void QuadraMachine::execute68kTrap(u16 trap) {
 }
 
 s32 QuadraMachine::gestaltQuery(u32 selector, u32& response) {
+    if (!leaveSwappedAddressingMode()) { response = 0; return -1; }
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
     cpu_.d[0] = selector;
@@ -1793,6 +1820,7 @@ void QuadraMachine::announceHardDisks() {
     if (read32(0x0358) == 0) return;              // no live VCB: System not up
     if (read8(0x0360) & 1) return;                // FSBusy: a file op is running
     if ((cpu_.getSR() & 0x0700) != 0) return;     // mid-interrupt: not now
+    if (addressingModeSwapped()) return;              // not now
     // Never from inside a driver request we are serving: the guest's own
     // driver call is still in flight and a nested File Manager call there is
     // the re-entrancy the Classic learned to refuse.
@@ -1917,6 +1945,7 @@ bool QuadraMachine::shutdownVolumes() {
     if (read32(0x0358) == 0) return false;            // System never came up
     if ((((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) == 0xFFFFFFFFu))
         return false;                                 // FS queue not built
+    if (!leaveSwappedAddressingMode()) return false;
     announceInFlight_ = true;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
@@ -1986,6 +2015,7 @@ bool QuadraMachine::unmountSecondDisk() {
         return true;                                  // FS queue not built
     if (read8(0x0360) & 1) return false;              // FSBusy: a file op is running
     if ((cpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt: not now
+    if (addressingModeSwapped()) return false;        // not now
     if (!volumeMountedFor(5)) return true;            // already off line
     announceInFlight_ = true;
     u32 sd[8], sa[8];
@@ -2037,6 +2067,7 @@ bool QuadraMachine::readFileThroughGuest(const std::string& name,
     }
     if (read8(0x0360) & 1) { why = "the File Manager is busy"; return false; }
     if (name.empty() || name.size() > 31) { why = "bad name"; return false; }
+    if (!leaveSwappedAddressingMode()) { why = "busy"; return false; }
 
     constexpr u32 kChunk = 32768;
     announceInFlight_ = true;
@@ -2480,6 +2511,7 @@ void QuadraMachine::completeFloppyEject() {
     if (!floppyEjectPending_) return;
     if (inDriver_ || announceInFlight_) return;
     if ((cpu_.getSR() & 0x0700) != 0) return;         // mid-interrupt
+    if (addressingModeSwapped()) return;              // not now
     // Before the System is up there is no volume to unmount and no File
     // Manager to ask -- just take the disk.
     const bool fsUp =

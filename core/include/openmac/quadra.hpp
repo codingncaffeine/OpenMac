@@ -300,6 +300,10 @@ private:
 
     void servePrime();
     void execute68kTrap(u16 trap);
+    // True while the MMU is in the other addressing mode from the one the
+    // System started in; no trap is injected then.
+    bool addressingModeSwapped();
+    bool leaveSwappedAddressingMode();
     void announceHardDisks();
     // The on-disk SCSI driver's Prime, served in C++ (see the definition).
     // A pointer handed over by the guest can carry Memory Manager flag bits in
