@@ -15,7 +15,7 @@
 #include "../macbinary.hpp"
 #include "../quadra/scc.hpp"
 #include "asc.hpp"
-#include "iop.hpp"
+#include "../iop.hpp"
 #include "adb_bus.hpp"
 #include "nubus_video.hpp"
 #include "oss.hpp"
@@ -151,8 +151,8 @@ IifxMachine::IifxMachine(std::vector<u8> rom, const Config& config)
       via_(std::make_unique<Via6522>()),
       rtc_(std::make_unique<Rtc>()),
       oss_(std::make_unique<Oss>()),
-      sccIop_(std::make_unique<IifxIop>()),
-      ismIop_(std::make_unique<IifxIop>()),
+      sccIop_(std::make_unique<IoProcessor>()),
+      ismIop_(std::make_unique<IoProcessor>()),
       scc_(std::make_unique<Scc8530>()),
       scsi_(std::make_unique<Ncr5380>()),
       scsiDma_(std::make_unique<IifxScsiDma>(*scsi_)),
@@ -216,24 +216,24 @@ void IifxMachine::wireDevices() {
             write32(address, value);
         });
 
-    const auto traceIopMailbox = [this](IifxIop& iop, const char* name,
+    const auto traceIopMailbox = [this](IoProcessor& iop, const char* name,
                                         bool isIsm) {
         return [this, &iop, name, isIsm](bool host, u16 address, u8 value) {
-            const bool send = address >= IifxIop::SendState &&
-                              address < IifxIop::SendState + IifxIop::ChannelCount;
-            const bool receive = address >= IifxIop::RecvState &&
-                                 address < IifxIop::RecvState + IifxIop::ChannelCount;
+            const bool send = address >= IoProcessor::SendState &&
+                              address < IoProcessor::SendState + IoProcessor::ChannelCount;
+            const bool receive = address >= IoProcessor::RecvState &&
+                                 address < IoProcessor::RecvState + IoProcessor::ChannelCount;
             if (!send && !receive) return;
-            if (value != IifxIop::MsgNew && value != IifxIop::MsgComplete)
+            if (value != IoProcessor::MsgNew && value != IoProcessor::MsgComplete)
                 return;
             const int channel = static_cast<int>(address -
-                (send ? IifxIop::SendState : IifxIop::RecvState));
+                (send ? IoProcessor::SendState : IoProcessor::RecvState));
             const u16 message = static_cast<u16>(
-                (send ? IifxIop::SendMsg : IifxIop::RecvMsg) +
-                channel * IifxIop::MessageSize);
+                (send ? IoProcessor::SendMsg : IoProcessor::RecvMsg) +
+                channel * IoProcessor::MessageSize);
 
-            std::array<u8, IifxIop::MessageSize> payload{};
-            for (int index = 0; index < IifxIop::MessageSize; ++index)
+            std::array<u8, IoProcessor::MessageSize> payload{};
+            for (int index = 0; index < IoProcessor::MessageSize; ++index)
                 payload[static_cast<std::size_t>(index)] = iop.ram(
                     static_cast<u16>(message + index));
             const auto be32 = [&payload](int offset) {
@@ -263,7 +263,7 @@ void IifxMachine::wireDevices() {
             // snapshot. A command edge can then be read without finding the
             // earlier mailbox record in a very busy trace.
             if (isIsm && host && send && channel == 1 &&
-                value == IifxIop::MsgNew && blockOperation) {
+                value == IoProcessor::MsgNew && blockOperation) {
                 traceFloppyBlock_ = block;
                 traceFloppyTrack_ = expectedTrack;
                 traceFloppySide_ = expectedSide;
@@ -284,13 +284,13 @@ void IifxMachine::wireDevices() {
                 for (int index = 0; index < 5; ++index)
                     event.value |= static_cast<u64>(payload[
                         static_cast<std::size_t>(index)]) << ((4 - index) * 8);
-                event.mailbox.length = IifxIop::MessageSize;
+                event.mailbox.length = IoProcessor::MessageSize;
                 event.mailbox.operation = operation;
                 event.mailbox.channel = static_cast<u8>(channel);
                 if (host) event.mailbox.flags |= 1u << 0;
                 if (send) event.mailbox.flags |= 1u << 1;
-                if (value == IifxIop::MsgNew) event.mailbox.flags |= 1u << 2;
-                if (value == IifxIop::MsgComplete) event.mailbox.flags |= 1u << 3;
+                if (value == IoProcessor::MsgNew) event.mailbox.flags |= 1u << 2;
+                if (value == IoProcessor::MsgComplete) event.mailbox.flags |= 1u << 3;
                 if (blockOperation) event.mailbox.flags |= 1u << 4;
                 event.mailbox.result = operationResult;
                 event.mailbox.ramAddress = ramAddress;
@@ -303,14 +303,14 @@ void IifxMachine::wireDevices() {
                 std::snprintf(event.detail.data(), event.detail.size(),
                               "%s %s ch%d %s by %s", name,
                               send ? "send" : "recv", channel,
-                              value == IifxIop::MsgNew ? "new" : "complete",
+                              value == IoProcessor::MsgNew ? "new" : "complete",
                               host ? "host" : "firmware");
                 hardwareTrace_.record(std::move(event));
             }
 
             const HardwareTraceConfig& traceConfig = hardwareTrace_.config();
             if (isIsm && host && send && channel == 1 &&
-                value == IifxIop::MsgNew && !hardwareTrace_.triggered() &&
+                value == IoProcessor::MsgNew && !hardwareTrace_.triggered() &&
                 (traceConfig.triggerIopOperation != 0xFFFFFFFFu ||
                  traceConfig.triggerIopBlock != 0xFFFFFFFFu) &&
                 (traceConfig.triggerIopOperation == 0xFFFFFFFFu ||
@@ -335,7 +335,7 @@ void IifxMachine::wireDevices() {
             // Freezing here preserves the phase/handshake accesses that made
             // the downloaded firmware reach that impossible conclusion.
             if (isIsm && !host && receive && channel == 1 &&
-                value == IifxIop::MsgNew && iop.ram(message) == 1u) {
+                value == IoProcessor::MsgNew && iop.ram(message) == 1u) {
                 if (!floppyPresent())
                     protocolAssertion(1ull << 23,
                         HardwareTraceSource::IsmIop, TraceSwim | TraceIop,
@@ -350,7 +350,7 @@ void IifxMachine::wireDevices() {
             }
 
             if (isIsm && host && receive && channel == 1 &&
-                value == IifxIop::MsgComplete) {
+                value == IoProcessor::MsgComplete) {
                 const u8 event = iop.ram(message);
                 const u16 replyWord = static_cast<u16>(
                     (static_cast<u16>(iop.ram(message + 2)) << 8) |
@@ -385,7 +385,7 @@ void IifxMachine::wireDevices() {
             // Track when its initial mechanism poll has completed so later
             // host insertions can assert the physical SWITCHED latch.
             if (isIsm && !host && send && channel == 1 &&
-                value == IifxIop::MsgComplete) {
+                value == IoProcessor::MsgComplete) {
                 // An explicitly requested cycle/PC trigger owns the trace;
                 // the opportunistic floppy-error trigger must not freeze a
                 // capture aimed at something else.
@@ -410,7 +410,7 @@ void IifxMachine::wireDevices() {
                     char diagnosticPayload[192];
                     int used = std::snprintf(diagnosticPayload, sizeof diagnosticPayload,
                                              "IOP ISM initialize reply:");
-                    for (int index = 0; index < IifxIop::MessageSize &&
+                    for (int index = 0; index < IoProcessor::MessageSize &&
                          used > 0 && used < static_cast<int>(sizeof diagnosticPayload); ++index) {
                         used += std::snprintf(diagnosticPayload + used,
                             sizeof diagnosticPayload - static_cast<std::size_t>(used),
@@ -429,7 +429,7 @@ void IifxMachine::wireDevices() {
                 std::snprintf(text, sizeof text,
                     "IOP %s %s ch%d %s by %s: %02X %02X %02X %02X %02X %02X %02X %02X",
                     name, send ? "send" : "recv", channel,
-                    value == IifxIop::MsgNew ? "new" : "complete",
+                    value == IoProcessor::MsgNew ? "new" : "complete",
                     host ? "host" : "firmware", iop.ram(message + 0),
                     iop.ram(message + 1), iop.ram(message + 2),
                     iop.ram(message + 3), iop.ram(message + 4),
@@ -437,12 +437,12 @@ void IifxMachine::wireDevices() {
                     iop.ram(message + 7));
                 onDiag(text);
                 if (isIsm && channel == 1 &&
-                    ((receive && !host && value == IifxIop::MsgNew) ||
-                     (receive && host && value == IifxIop::MsgComplete))) {
+                    ((receive && !host && value == IoProcessor::MsgNew) ||
+                     (receive && host && value == IoProcessor::MsgComplete))) {
                     char diagnosticPayload[224];
                     int used = std::snprintf(diagnosticPayload, sizeof diagnosticPayload,
                                              "IOP ISM channel-1 payload:");
-                    for (int index = 0; index < IifxIop::MessageSize &&
+                    for (int index = 0; index < IoProcessor::MessageSize &&
                          used > 0 && used < static_cast<int>(sizeof diagnosticPayload); ++index) {
                         used += std::snprintf(diagnosticPayload + used,
                             sizeof diagnosticPayload - static_cast<std::size_t>(used),
@@ -1506,7 +1506,7 @@ u8 IifxMachine::swimAccess(u8 offset, bool write, u8 value) {
 
 std::vector<u8> IifxMachine::iopRamImage(bool ism) const {
     std::vector<u8> image(0x8000u);
-    const IifxIop& iop = ism ? *ismIop_ : *sccIop_;
+    const IoProcessor& iop = ism ? *ismIop_ : *sccIop_;
     for (u32 address = 0; address < image.size(); ++address)
         image[address] = iop.ram(static_cast<u16>(address));
     return image;
@@ -2351,7 +2351,7 @@ HardwareTraceEvent IifxMachine::makeTraceEvent(
     // next request arrives.
     if (ismIop_) {
         constexpr u16 message = static_cast<u16>(
-            IifxIop::SendMsg + IifxIop::MessageSize);
+            IoProcessor::SendMsg + IoProcessor::MessageSize);
         const u8 operation = ismIop_->ram(message);
         if (operation >= 0x0Au && operation <= 0x0Cu) {
             const u32 block =
@@ -2370,7 +2370,7 @@ HardwareTraceEvent IifxMachine::makeTraceEvent(
         }
     }
 
-    const IifxIop& iop = source == HardwareTraceSource::SccIop
+    const IoProcessor& iop = source == HardwareTraceSource::SccIop
         ? *sccIop_ : *ismIop_;
     event.iop.pc = iop.cpu().pc;
     event.iop.opcode = iop.cpu().lastOpcode;
@@ -2734,20 +2734,20 @@ void IifxMachine::checkHardwareProtocols() {
     }
 
     for (int iopIndex = 0; iopIndex < 2; ++iopIndex) {
-        IifxIop& iop = iopIndex ? *ismIop_ : *sccIop_;
+        IoProcessor& iop = iopIndex ? *ismIop_ : *sccIop_;
         if (iop.firmwareAlive()) {
-            for (int channel = 0; channel < IifxIop::ChannelCount; ++channel) {
+            for (int channel = 0; channel < IoProcessor::ChannelCount; ++channel) {
                 const u8 send = iop.ram(static_cast<u16>(
-                    IifxIop::SendState + channel));
+                    IoProcessor::SendState + channel));
                 const u8 receive = iop.ram(static_cast<u16>(
-                    IifxIop::RecvState + channel));
+                    IoProcessor::RecvState + channel));
                 // The ROM's power-on IOP SRAM test leaves unused message
                 // state bytes at $FF.  The IOP Manager ERS defines 0..3 for
                 // configured messages, but $FF is therefore a legitimate
                 // unconfigured sentinel and must not be diagnosed as a live
                 // protocol transition.
                 const auto invalidMailboxState = [](u8 state) {
-                    return state != 0xFFu && state > IifxIop::MsgComplete;
+                    return state != 0xFFu && state > IoProcessor::MsgComplete;
                 };
                 if (invalidMailboxState(send) ||
                     invalidMailboxState(receive)) {
@@ -4122,43 +4122,43 @@ std::string IifxMachine::diagnosticReport() const {
                   sccIop_->status(), sccIop_->address(), sccIop_->hostReads,
                   sccIop_->hostWrites, sccIop_->ramReads, sccIop_->ramWrites,
                   sccIop_->mailboxCommands,
-                  sccIop_->ram(IifxIop::SendMax),
-                  sccIop_->ram(IifxIop::SendState + 0),
-                  sccIop_->ram(IifxIop::SendState + 1),
-                  sccIop_->ram(IifxIop::SendState + 2),
-                  sccIop_->ram(IifxIop::SendState + 3),
-                  sccIop_->ram(IifxIop::SendState + 4),
-                  sccIop_->ram(IifxIop::SendState + 5),
-                  sccIop_->ram(IifxIop::SendState + 6),
-                  sccIop_->ram(IifxIop::RecvMax),
-                  sccIop_->ram(IifxIop::RecvState + 0),
-                  sccIop_->ram(IifxIop::RecvState + 1),
-                  sccIop_->ram(IifxIop::RecvState + 2),
-                  sccIop_->ram(IifxIop::RecvState + 3),
-                  sccIop_->ram(IifxIop::RecvState + 4),
-                  sccIop_->ram(IifxIop::RecvState + 5),
-                  sccIop_->ram(IifxIop::RecvState + 6),
-                  sccIop_->ram(IifxIop::Alive),
+                  sccIop_->ram(IoProcessor::SendMax),
+                  sccIop_->ram(IoProcessor::SendState + 0),
+                  sccIop_->ram(IoProcessor::SendState + 1),
+                  sccIop_->ram(IoProcessor::SendState + 2),
+                  sccIop_->ram(IoProcessor::SendState + 3),
+                  sccIop_->ram(IoProcessor::SendState + 4),
+                  sccIop_->ram(IoProcessor::SendState + 5),
+                  sccIop_->ram(IoProcessor::SendState + 6),
+                  sccIop_->ram(IoProcessor::RecvMax),
+                  sccIop_->ram(IoProcessor::RecvState + 0),
+                  sccIop_->ram(IoProcessor::RecvState + 1),
+                  sccIop_->ram(IoProcessor::RecvState + 2),
+                  sccIop_->ram(IoProcessor::RecvState + 3),
+                  sccIop_->ram(IoProcessor::RecvState + 4),
+                  sccIop_->ram(IoProcessor::RecvState + 5),
+                  sccIop_->ram(IoProcessor::RecvState + 6),
+                  sccIop_->ram(IoProcessor::Alive),
                   ismIop_->status(), ismIop_->address(), ismIop_->hostReads,
                   ismIop_->hostWrites, ismIop_->ramReads, ismIop_->ramWrites,
                   ismIop_->mailboxCommands,
-                  ismIop_->ram(IifxIop::SendMax),
-                  ismIop_->ram(IifxIop::SendState + 0),
-                  ismIop_->ram(IifxIop::SendState + 1),
-                  ismIop_->ram(IifxIop::SendState + 2),
-                  ismIop_->ram(IifxIop::SendState + 3),
-                  ismIop_->ram(IifxIop::SendState + 4),
-                  ismIop_->ram(IifxIop::SendState + 5),
-                  ismIop_->ram(IifxIop::SendState + 6),
-                  ismIop_->ram(IifxIop::RecvMax),
-                  ismIop_->ram(IifxIop::RecvState + 0),
-                  ismIop_->ram(IifxIop::RecvState + 1),
-                  ismIop_->ram(IifxIop::RecvState + 2),
-                  ismIop_->ram(IifxIop::RecvState + 3),
-                  ismIop_->ram(IifxIop::RecvState + 4),
-                  ismIop_->ram(IifxIop::RecvState + 5),
-                  ismIop_->ram(IifxIop::RecvState + 6),
-                  ismIop_->ram(IifxIop::Alive),
+                  ismIop_->ram(IoProcessor::SendMax),
+                  ismIop_->ram(IoProcessor::SendState + 0),
+                  ismIop_->ram(IoProcessor::SendState + 1),
+                  ismIop_->ram(IoProcessor::SendState + 2),
+                  ismIop_->ram(IoProcessor::SendState + 3),
+                  ismIop_->ram(IoProcessor::SendState + 4),
+                  ismIop_->ram(IoProcessor::SendState + 5),
+                  ismIop_->ram(IoProcessor::SendState + 6),
+                  ismIop_->ram(IoProcessor::RecvMax),
+                  ismIop_->ram(IoProcessor::RecvState + 0),
+                  ismIop_->ram(IoProcessor::RecvState + 1),
+                  ismIop_->ram(IoProcessor::RecvState + 2),
+                  ismIop_->ram(IoProcessor::RecvState + 3),
+                  ismIop_->ram(IoProcessor::RecvState + 4),
+                  ismIop_->ram(IoProcessor::RecvState + 5),
+                  ismIop_->ram(IoProcessor::RecvState + 6),
+                  ismIop_->ram(IoProcessor::Alive),
                   video_->genuineGc() ? "8*24 GC" : "synthetic",
                   video_->mode(), video_->bitsPerPixel(),
                   static_cast<unsigned long long>(video_->reads),

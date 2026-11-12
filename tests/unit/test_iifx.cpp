@@ -9,7 +9,7 @@
 #include "../../core/src/machine/iifx/adb_bus.hpp"
 #include "../../core/src/machine/iifx/am29000.hpp"
 #include "../../core/src/machine/iifx/asc.hpp"
-#include "../../core/src/machine/iifx/iop.hpp"
+#include "../../core/src/machine/iop.hpp"
 #include "../../core/src/machine/iifx/nubus_video.hpp"
 #include "../../core/src/machine/quadra/scc.hpp"
 
@@ -1795,8 +1795,8 @@ TEST_CASE("IIfx protocol trace asserts undefined IOP mailbox state") {
         setAddress(address);
         mac.write8(base + 8, value);
     };
-    put(IifxIop::Alive, 0xFF);                     // firmware initialized
-    put(IifxIop::SendState, 0x7F);                 // outside Idle..Complete
+    put(IoProcessor::Alive, 0xFF);                     // firmware initialized
+    put(IoProcessor::SendState, 0x7F);                 // outside Idle..Complete
 
     HardwareTraceConfig trace;
     trace.capacity = 64;
@@ -1823,9 +1823,9 @@ TEST_CASE("IIfx protocol trace permits unconfigured FF IOP mailboxes") {
         setAddress(address);
         mac.write8(base + 8, value);
     };
-    put(IifxIop::Alive, 0xFF);
-    put(IifxIop::SendState, 0xFF);
-    put(IifxIop::RecvState, 0xFF);
+    put(IoProcessor::Alive, 0xFF);
+    put(IoProcessor::SendState, 0xFF);
+    put(IoProcessor::RecvState, 0xFF);
 
     HardwareTraceConfig trace;
     trace.capacity = 64;

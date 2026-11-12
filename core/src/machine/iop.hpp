@@ -1,10 +1,12 @@
 #pragma once
 
-// Apple 343S1021 Peripheral Interface Controller used twice on the Macintosh
-// IIfx.  Its NCR 65CX02 core executes firmware downloaded by the 68030 into
-// 32 KiB of shared SRAM.  The ASIC adds a host window, a 16-bit timer, two
-// byte-DMA channels, interrupt latches, two GPIO outputs and a sixteen-byte
-// peripheral window (SCC in one PIC, SWIM in the other).
+// Apple 343S1021 Peripheral Interface Controller, used twice on the Macintosh
+// IIfx and twice on the Quadra 900 and 950.  Its NCR 65CX02 core executes
+// firmware the main processor downloads into 32 KiB of shared SRAM.  The ASIC
+// adds a host window, a 16-bit timer, two byte-DMA channels, interrupt
+// latches, two GPIO outputs and a sixteen-byte peripheral window (SCC in one
+// PIC, SWIM in the other).  The two clocks are the board's: the main
+// processor's, in whose cycles tick() is counted, and the PIC's own.
 
 #include "openmac/r65c02.hpp"
 #include "openmac/types.hpp"
@@ -16,7 +18,7 @@ namespace openmac {
 
 class IifxStateCodec;
 
-class IifxIop {
+class IoProcessor {
 public:
     static constexpr int ChannelCount = 8;
     static constexpr int MessageSize = 32;
@@ -45,7 +47,8 @@ public:
     static constexpr u8 MsgReceived = 2;
     static constexpr u8 MsgComplete = 3;
 
-    IifxIop();
+    // Defaults are the IIfx: a 40 MHz 68030 and the 15.6672 MHz I/O clock.
+    explicit IoProcessor(u64 mainCpuHz = 40000000, u64 picClockHz = 15667200);
 
     std::function<u8(u32)> bypassRead;
     std::function<void(u32, u8)> bypassWrite;
@@ -142,6 +145,9 @@ private:
     void updateCpuIrq();
     void changed();
 
+    u64 mainCpuHz_;
+    u64 picClockHz_;
+    u64 iopCpuHz_;      // the 65CX02 runs at an eighth of the PIC clock
     std::array<u8, 0x8000> ram_{};
     R65C02 cpu_;
     u16 address_ = 0;

@@ -6,9 +6,6 @@ namespace openmac {
 
 namespace {
 
-constexpr u64 kMainCpuHz = 40000000;
-constexpr u64 kPicClockHz = 15667200;
-constexpr u64 kIopCpuHz = kPicClockHz / 8;
 constexpr u8 kDmaEnable = 0x01;
 constexpr u8 kDmaRequest = 0x02;
 constexpr u8 kDmaDirection = 0x04;
@@ -16,13 +13,14 @@ constexpr u8 kEnableOther = 0x08;
 
 } // namespace
 
-IifxIop::IifxIop() {
+IoProcessor::IoProcessor(u64 mainCpuHz, u64 picClockHz)
+    : mainCpuHz_(mainCpuHz), picClockHz_(picClockHz), iopCpuHz_(picClockHz / 8) {
     cpu_.read = [this](u16 address) { return cpuRead(address); };
     cpu_.write = [this](u16 address, u8 value) { cpuWrite(address, value); };
     reset();
 }
 
-void IifxIop::reset() {
+void IoProcessor::reset() {
     ram_.fill(0);
     address_ = 0;
     status_ = DmaInactive;
@@ -41,14 +39,14 @@ void IifxIop::reset() {
     changed();
 }
 
-u8 IifxIop::status() const {
+u8 IoProcessor::status() const {
     // PINT (D6) and /REQ (D7) are meaningful to the host only while the PIC
     // has selected peripheral bypass. In normal operation D7 reads high.
     return bypassed() ? static_cast<u8>(status_ | Bypass)
                       : static_cast<u8>((status_ & 0x3Fu) | DmaInactive);
 }
 
-u8 IifxIop::read(u32 offset) {
+u8 IoProcessor::read(u32 offset) {
     ++hostReads;
     const u32 reg = offset & 0x3Fu;
     if (reg < 2) return static_cast<u8>(address_ >> 8);
@@ -65,7 +63,7 @@ u8 IifxIop::read(u32 offset) {
     return 0xFF;
 }
 
-void IifxIop::write(u32 offset, u8 value) {
+void IoProcessor::write(u32 offset, u8 value) {
     ++hostWrites;
     const u32 reg = offset & 0x3Fu;
     if (reg < 2) {
@@ -86,7 +84,7 @@ void IifxIop::write(u32 offset, u8 value) {
     }
 }
 
-void IifxIop::writeStatus(u8 value) {
+void IoProcessor::writeStatus(u8 value) {
     const bool release = (value & Run) != 0;
     if ((value & Int0) != 0) status_ &= static_cast<u8>(~Int0);
     if ((value & Int1) != 0) status_ &= static_cast<u8>(~Int1);
@@ -107,7 +105,7 @@ void IifxIop::writeStatus(u8 value) {
     changed();
 }
 
-u8 IifxIop::cpuRead(u16 address) {
+u8 IoProcessor::cpuRead(u16 address) {
     if (address < 0x8000u) return ram_[address];
     if (address < 0xF000u) return ram_[address - 0x8000u];
     if (address >= 0xF800u) return ram_[address - 0x8000u];
@@ -133,7 +131,7 @@ u8 IifxIop::cpuRead(u16 address) {
     }
 }
 
-void IifxIop::cpuWrite(u16 address, u8 value) {
+void IoProcessor::cpuWrite(u16 address, u8 value) {
     if (address < 0x8000u) {
         ram_[address] = value;
         if (onSharedWrite) onSharedWrite(hostMemoryAccess_, address, value);
@@ -197,7 +195,7 @@ void IifxIop::cpuWrite(u16 address, u8 value) {
     }
 }
 
-u8 IifxIop::timerRead(u8 offset) {
+u8 IoProcessor::timerRead(u8 offset) {
     u16 count = timerLatch_;
     if ((offset & 2u) == 0) {
         if (timerTicks_ >= 0)
@@ -211,7 +209,7 @@ u8 IifxIop::timerRead(u8 offset) {
                          : static_cast<u8>(count);
 }
 
-void IifxIop::timerWrite(u8 offset, u8 value) {
+void IoProcessor::timerWrite(u8 offset, u8 value) {
     if (offset & 1u) {
         timerLatch_ = static_cast<u16>((timerLatch_ & 0x00FFu) |
                                        (static_cast<u16>(value) << 8));
@@ -225,7 +223,7 @@ void IifxIop::timerWrite(u8 offset, u8 value) {
     }
 }
 
-u8 IifxIop::dmaRead(u8 offset) const {
+u8 IoProcessor::dmaRead(u8 offset) const {
     const DmaChannel& channel = dma_[(offset >> 3) & 1u];
     switch (offset & 7u) {
     case 0: return channel.control;
@@ -237,7 +235,7 @@ u8 IifxIop::dmaRead(u8 offset) const {
     }
 }
 
-void IifxIop::dmaWrite(u8 offset, u8 value) {
+void IoProcessor::dmaWrite(u8 offset, u8 value) {
     const int index = (offset >> 3) & 1u;
     DmaChannel& channel = dma_[static_cast<std::size_t>(index)];
     switch (offset & 7u) {
@@ -265,7 +263,7 @@ void IifxIop::dmaWrite(u8 offset, u8 value) {
     if (onDmaWrite) onDmaWrite(index, static_cast<u8>(offset & 7u), value);
 }
 
-void IifxIop::setPeripheralInterrupt(bool level) {
+void IoProcessor::setPeripheralInterrupt(bool level) {
     if (level) {
         status_ |= HardwareInt;
         if (!bypassed()) setInterrupt(PeripheralInterrupt);
@@ -276,7 +274,7 @@ void IifxIop::setPeripheralInterrupt(bool level) {
     changed();
 }
 
-void IifxIop::setDmaRequest(int channel, bool level) {
+void IoProcessor::setDmaRequest(int channel, bool level) {
     if (channel < 0 || channel >= 2) return;
     DmaChannel& dma = dma_[static_cast<std::size_t>(channel)];
     const bool changedLevel = dma.request != level;
@@ -286,7 +284,7 @@ void IifxIop::setDmaRequest(int channel, bool level) {
     if (changedLevel && onDmaRequestEdge) onDmaRequestEdge(channel, level);
 }
 
-void IifxIop::dmaBeat() {
+void IoProcessor::dmaBeat() {
     for (int index = 0; index < 2; ++index) {
         DmaChannel& channel = dma_[static_cast<std::size_t>(index)];
         if (!(channel.control & kDmaEnable) || !channel.request ||
@@ -316,7 +314,7 @@ void IifxIop::dmaBeat() {
     }
 }
 
-void IifxIop::advanceAsic(u64 ticks) {
+void IoProcessor::advanceAsic(u64 ticks) {
     if (timerTicks_ >= 0) {
         timerTicks_ -= static_cast<s64>(ticks);
         while (timerTicks_ <= 0) {
@@ -341,43 +339,43 @@ void IifxIop::advanceAsic(u64 ticks) {
     }
 }
 
-void IifxIop::tick(int mainCpuCycles) {
+void IoProcessor::tick(int mainCpuCycles) {
     if (mainCpuCycles <= 0) return;
-    asicPhase_ += static_cast<u64>(mainCpuCycles) * kPicClockHz;
-    const u64 asicTicks = asicPhase_ / kMainCpuHz;
-    asicPhase_ %= kMainCpuHz;
+    asicPhase_ += static_cast<u64>(mainCpuCycles) * picClockHz_;
+    const u64 asicTicks = asicPhase_ / mainCpuHz_;
+    asicPhase_ %= mainCpuHz_;
     if (asicTicks) advanceAsic(asicTicks);
 
     if (!resetHeld_) {
         cpuPhase_ += static_cast<s64>(mainCpuCycles) *
-                     static_cast<s64>(kIopCpuHz);
-        while (cpuPhase_ >= static_cast<s64>(kMainCpuHz)) {
+                     static_cast<s64>(iopCpuHz_);
+        while (cpuPhase_ >= static_cast<s64>(mainCpuHz_)) {
             const u16 instructionPc = cpu_.pc;
             const int used = cpu_.step();
             cpuCycles_ += static_cast<u64>(used);
             cpuPhase_ -= static_cast<s64>(used) *
-                         static_cast<s64>(kMainCpuHz);
+                         static_cast<s64>(mainCpuHz_);
             if (onInstruction)
                 onInstruction(instructionPc, cpu_.lastOpcode, cpu_);
         }
     }
 }
 
-void IifxIop::setInterrupt(int which) {
+void IoProcessor::setInterrupt(int which) {
     interruptFlags_ |= static_cast<u8>(1u << which);
     updateCpuIrq();
 }
 
-void IifxIop::clearInterrupt(int which) {
+void IoProcessor::clearInterrupt(int which) {
     interruptFlags_ &= static_cast<u8>(~(1u << which));
     updateCpuIrq();
 }
 
-void IifxIop::updateCpuIrq() {
+void IoProcessor::updateCpuIrq() {
     cpu_.setIrq((interruptMask_ & interruptFlags_) != 0);
 }
 
-void IifxIop::changed() {
+void IoProcessor::changed() {
     if (onInterruptChange) onInterruptChange();
 }
 

@@ -11,7 +11,7 @@
 #include "../quadra/scc.hpp"
 #include "adb_bus.hpp"
 #include "asc.hpp"
-#include "iop.hpp"
+#include "../iop.hpp"
 #include "nubus_video.hpp"
 #include "oss.hpp"
 #include "scsi_dma.hpp"
@@ -593,7 +593,7 @@ private:
     }
 
     template <typename Io>
-    static void visitIop(Io& io, IifxIop& iop, u32 tag) {
+    static void visitIop(Io& io, IoProcessor& iop, u32 tag) {
         section(io, tag);
         io.bytes(iop.ram_.data(), iop.ram_.size());
         visitR65(io, iop.cpu_);
