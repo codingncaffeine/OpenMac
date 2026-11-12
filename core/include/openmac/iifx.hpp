@@ -319,6 +319,10 @@ private:
     void serveDiskPrime();
     void serveDiskCtlStatus(bool status);
     bool execute68kTrap(u16 trap);
+    // True while the MMU is in the other addressing mode from the one the
+    // System started in; no trap is injected then.
+    bool addressingModeSwapped();
+    bool leaveSwappedAddressingMode();
     // The host-written parameter block behind every injected File Manager
     // call: cleared, ioVRefNum set to the drive, and taken out of the 68030's
     // data cache -- host stores bypass it, the ROM reads the block through it.

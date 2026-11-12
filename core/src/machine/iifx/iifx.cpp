@@ -1223,6 +1223,7 @@ bool IifxMachine::diagnosticGestalt(u32 selector, u32& response, s16& err) {
     response = 0;
     err = -1;
     if (read32(0x0358u) == 0 || inDiskDriver_ || hardDiskMountInFlight_) return false;
+    if (!leaveSwappedAddressingMode()) return false;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
     cpu_.d[0] = selector;
@@ -1741,6 +1742,7 @@ bool IifxMachine::shutdownHardDisk() {
         return false;
     if (!volumeMountedFor(4)) return false;
     if (read32(0x0360u) == 0xFFFFFFFFu) return false;  // FS queue not built
+    if (!leaveSwappedAddressingMode()) return false;
 
     hardDiskMountInFlight_ = true;
     u32 savedD[8], savedA[8];
@@ -1786,6 +1788,33 @@ bool IifxMachine::shutdownHardDisk() {
     }
     hardDiskMountInFlight_ = false;
     return flushed == 0 && (unmounted == 0 || marked || disk_->readOnly);
+}
+
+// A System running in 24-bit mode swaps the MMU to 32-bit for short stretches
+// and back (QuickDraw does it around every access to a frame buffer in super
+// slot space, so with the 8•24 GC it happens on every draw); a 32-bit System
+// does the reverse for 24-bit code. A trap injected inside such a stretch runs
+// the Memory Manager under the wrong translation: in the 24-bit case its
+// master pointers carry flags in the top byte and stop being addresses, the
+// first one it follows is a bus error, and the System Error handler faults the
+// same way until the stack is gone. MMU32Bit ($0CB2) is the mode the MMU is in
+// now; MMFlags ($1EFC) bit 0 is the mode the System started in.
+bool IifxMachine::addressingModeSwapped() {
+    const bool now32 = read8(0x0CB2u) != 0;
+    const bool system32 = (read8(0x1EFCu) & 1u) != 0;
+    return now32 != system32;
+}
+
+// For the injections that cannot be put off to a later frame: let the guest
+// run until it has swapped back. The stretches are a few hundred
+// instructions; the bound only stops a guest that never returns.
+bool IifxMachine::leaveSwappedAddressingMode() {
+    int guard = 4000000;
+    while (addressingModeSwapped() && guard-- > 0 && !cpu_.halted &&
+           !poweredOff()) {
+        stepInstruction();
+    }
+    return !addressingModeSwapped();
 }
 
 bool IifxMachine::execute68kTrap(u16 trap) {
@@ -1887,6 +1916,7 @@ void IifxMachine::announceHardDisk() {
     if ((read8(0x0360u) & 1u) != 0) return;             // File Manager busy
     if (read32(0x0360u) == 0xFFFFFFFFu) return;         // queue not built
     if ((cpu_.getSR() & 0x0700u) != 0) return;          // mid-interrupt
+    if (addressingModeSwapped()) return;                // not this frame
 
     // Give startup one full second to mount the fixed disk itself. If it was
     // present before the Event Manager came online, the insertion announce is
@@ -2021,6 +2051,7 @@ bool IifxMachine::unmountHardDisk2() {
     if (read32(0x0360u) == 0xFFFFFFFFu) return true;           // FS queue not built
     if ((read8(0x0360u) & 1u) != 0) return false;              // FSBusy: not now
     if ((cpu_.getSR() & 0x0700u) != 0) return false;           // mid-interrupt
+    if (addressingModeSwapped()) return false;                 // not now
     if (!volumeMountedFor(5)) return true;                     // already off line
 
     hardDiskMountInFlight_ = true;
@@ -2907,6 +2938,7 @@ void IifxMachine::installCdDriver() {
     if (read32(0x0360u) == 0xFFFFFFFFu) return;       // FS queue not built
     if (read8(0x0360u) & 1u) return;                  // FSBusy: a file op is running
     if ((cpu_.getSR() & 0x0700u) != 0) return;        // mid-interrupt: not now
+    if (addressingModeSwapped()) return;              // not now
     if (++cdInstallTries_ > 30) return;
 
     // Find the slot BEFORE allocating anything: the unit table is not built
@@ -3046,6 +3078,7 @@ void IifxMachine::mountCdVolume() {
     if (read32(0x0358u) == 0) return;                 // System never came up
     if (read8(0x0360u) & 1u) return;                  // FSBusy
     if ((cpu_.getSR() & 0x0700u) != 0) return;        // mid-interrupt
+    if (addressingModeSwapped()) return;              // not now
     if (volumeMountedFor(cdDrive_)) { cdMountPending_ = false; return; }
     if (++cdMountTries_ > 15) { cdMountPending_ = false; return; }
     hardDiskMountInFlight_ = true;
@@ -3093,6 +3126,7 @@ void IifxMachine::mountCdVolume() {
 void IifxMachine::completeCdEject() {
     if (!cdEjectPending_) return;
     if (inDiskDriver_ || hardDiskMountInFlight_) return;
+    if (addressingModeSwapped()) return;              // not now
     if (cdDrive_ && read32(0x0358u) != 0 && !(read8(0x0360u) & 1u) &&
         (cpu_.getSR() & 0x0700u) == 0 && volumeMountedFor(cdDrive_)) {
         hardDiskMountInFlight_ = true;
