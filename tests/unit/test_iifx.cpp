@@ -6,7 +6,7 @@
 
 #include "../../core/src/machine/adb.hpp"
 #include "../../core/src/machine/dc42.hpp"
-#include "../../core/src/machine/iifx/adb_bus.hpp"
+#include "../../core/src/machine/adb_bus.hpp"
 #include "../../core/src/machine/iifx/am29000.hpp"
 #include "../../core/src/machine/iifx/asc.hpp"
 #include "../../core/src/machine/iop.hpp"
@@ -65,13 +65,13 @@ std::vector<u8> gcDeclarationRom() {
 }
 
 // Drive one host-to-device ADB command using the pulse widths emitted by the
-// genuine IIfx ISM firmware. IifxAdbBus accepts the PIC's 1.9584 MHz cycle
+// genuine IIfx ISM firmware. AdbBus accepts the PIC's 1.9584 MHz cycle
 // counter and converts it to its exact 2 MHz wire timebase.
 u64 cyclesForBusTicks(u64 ticks) {
     return (ticks * 612u + 624u) / 625u;
 }
 
-void adbCommand(IifxAdbBus& bus, u64& cycles, u8 command) {
+void adbCommand(AdbBus& bus, u64& cycles, u8 command) {
     const auto advance = [&](u64 ticks) {
         cycles += cyclesForBusTicks(ticks);
     };
@@ -1420,7 +1420,7 @@ TEST_CASE("IIfx queues input for the physical ADB firmware and clocks audio") {
 TEST_CASE("IIfx physical ADB serializer answers firmware-width Talk pulses") {
     AdbTransceiver devices;
     devices.reset();
-    IifxAdbBus bus(devices);
+    AdbBus bus(devices);
     u64 cycles = 0;
 
     adbCommand(bus, cycles, 0x2F);               // keyboard Talk register 3

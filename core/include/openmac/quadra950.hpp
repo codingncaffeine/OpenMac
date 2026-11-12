@@ -37,6 +37,8 @@ class Scc8530;
 class Easc;
 class Ncr53c96;
 class Dafb;
+class AdbTransceiver;
+class AdbBus;
 
 class Quadra950Machine final : public IBus040, public MacHostServices {
 public:
@@ -68,6 +70,12 @@ public:
     // Takes effect at the next start: the ROM reads the sense lines once.
     bool setDisplay(const char* name);
     void setMonitorSense(u32 grounded, u32 pairs);
+
+    // Keyboard and mouse on the Apple Desktop Bus: a raw ADB key code going
+    // down or up; mouse movement in counts since the last call, with the
+    // button's state.
+    void keyEvent(u8 adbCode, bool down);
+    void mouseEvent(int dx, int dy, bool button);
 
     int screenWidth() const;
     int screenHeight() const;
@@ -131,6 +139,8 @@ private:
     std::unique_ptr<Easc> easc_;
     std::unique_ptr<Ncr53c96> scsi0_;    // internal bus
     std::unique_ptr<Ncr53c96> scsi1_;    // external bus
+    std::unique_ptr<AdbTransceiver> adb_;
+    std::unique_ptr<AdbBus> adbBus_;
     std::unique_ptr<Dafb> dafb_;
     M68040 cpu_;
 

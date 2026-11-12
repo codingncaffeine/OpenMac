@@ -2,6 +2,8 @@
 
 #include "openmac/quadra.hpp"
 
+#include "../adb.hpp"
+#include "../adb_bus.hpp"
 #include "../iop.hpp"
 #include "../quadra/dafb.hpp"
 #include "../quadra/easc.hpp"
@@ -79,6 +81,8 @@ Quadra950Machine::Quadra950Machine(std::vector<u8> rom, const Config& cfg)
       easc_(std::make_unique<Easc>()),
       scsi0_(std::make_unique<Ncr53c96>()),
       scsi1_(std::make_unique<Ncr53c96>()),
+      adb_(std::make_unique<AdbTransceiver>()),
+      adbBus_(std::make_unique<AdbBus>(*adb_)),
       dafb_(std::make_unique<Dafb>(Dafb::Variant::Standalone, cfg.vramMb == 1 ? 0x100000u : 0x200000u)),
       cpu_(*this) {
     ram_.assign(memctl_->flatBytes(), 0);
@@ -158,13 +162,19 @@ void Quadra950Machine::wireDevices() {
         scc_->write(static_cast<u32>(reg & 3u) * 2u, value);
     };
     sccIop_->onInterruptChange = [this] { updateIpl(); };
-    // The floppy/ADB processor's peripherals arrive with the keyboard, mouse
-    // and floppy: until then the SWIM reads as an open bus and the ADB line
-    // idles high.
+    // The floppy/ADB processor. Its first general-purpose pin pair is the
+    // ADB wire, as on the IIfx: the output goes through an inverter onto the
+    // open-collector line and the input samples the line (dossier, "I/O
+    // processors"). The floppy chip arrives with the floppy drives: until
+    // then it reads as an open bus.
     swimIop_->peripheralRead = [](u8) { return static_cast<u8>(0xFF); };
     swimIop_->peripheralWrite = [](u8, u8) {};
-    swimIop_->gpioRead = [] { return static_cast<u8>(0xFF); };
-    swimIop_->gpioWrite = [](int, bool) {};
+    swimIop_->gpioRead = [this] {
+        return static_cast<u8>(0xFE | (adbBus_->readLine(swimIop_->cpuCycles()) ? 1 : 0));
+    };
+    swimIop_->gpioWrite = [this](int pin, bool level) {
+        if (pin == 0) adbBus_->hostDrive(!level, swimIop_->cpuCycles());
+    };
     swimIop_->onInterruptChange = [this] {
         via2_->setCA2(!swimIop_->irqAsserted());
         updateIpl();
@@ -233,6 +243,8 @@ void Quadra950Machine::reset() {
     egret_->reset();
     sccIop_->reset();
     swimIop_->reset();
+    adb_->reset();
+    adbBus_->reset();
     dafb_->reset();
     dafbIrq_ = false;
     resetPeripherals();
@@ -575,6 +587,9 @@ bool Quadra950Machine::setDisplay(const char* name) {
     return false;
 }
 
+void Quadra950Machine::keyEvent(u8 adbCode, bool down) { adb_->injectKey(adbCode, down); }
+void Quadra950Machine::mouseEvent(int dx, int dy, bool button) { adb_->injectMouse(dx, dy, button); }
+
 int Quadra950Machine::screenWidth() const { return dafb_->width(); }
 int Quadra950Machine::screenHeight() const { return dafb_->height(); }
 void Quadra950Machine::renderScreen(u32* argbOut) const { dafb_->render(argbOut); }
@@ -651,6 +666,9 @@ std::string Quadra950Machine::diagnosticReport() const {
         sccIop_->running() ? "running" : "held", sccIop_->bypassed() ? " bypass" : "", sccIop_->status(),
         swimIop_->running() ? "running" : "held", swimIop_->firmwareAlive() ? " alive" : "",
         swimIop_->status());
+    add("   ADB: %llu commands, %llu replies, %llu resets, last command %02X",
+        static_cast<unsigned long long>(adbBus_->commands()), static_cast<unsigned long long>(adbBus_->replies()),
+        static_cast<unsigned long long>(adbBus_->resets()), adbBus_->lastCommand());
     add("   video %dx%d %d bpp base=%05X stride=%u depthCtl=%02X", dafb_->width(), dafb_->height(), dafb_->bpp(),
         dafb_->fbBase(), dafb_->strideBytes(), dafb_->depthCtlRaw());
     add("   video RAM %u KB; programmed raster %dx%d%s, pixel clock %u Hz, %u.%03u scans a second%s",

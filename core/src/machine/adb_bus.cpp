@@ -1,6 +1,6 @@
 #include "adb_bus.hpp"
 
-#include "../adb.hpp"
+#include "adb.hpp"
 
 namespace openmac {
 
@@ -21,11 +21,11 @@ constexpr u64 kServiceRequest = 300;     // 150 us
 
 } // namespace
 
-IifxAdbBus::IifxAdbBus(AdbTransceiver& devices) : devices_(devices) {
+AdbBus::AdbBus(AdbTransceiver& devices) : devices_(devices) {
     reset();
 }
 
-void IifxAdbBus::reset() {
+void AdbBus::reset() {
     receiveState_ = ReceiveState::Idle;
     hostReleased_ = deviceReleased_ = wireHigh_ = true;
     deviceSending_ = false;
@@ -41,13 +41,13 @@ void IifxAdbBus::reset() {
     lastCommand_ = 0;
 }
 
-u64 IifxAdbBus::busTicks(u64 iopCpuCycles) {
+u64 AdbBus::busTicks(u64 iopCpuCycles) {
     // The PIC clock is 15.6672 MHz and the 65C02 receives clock/8 =
     // 1.9584 MHz.  2,000,000 / 1,958,400 reduces exactly to 625 / 612.
     return (iopCpuCycles * 625u) / 612u;
 }
 
-void IifxAdbBus::hostDrive(bool released, u64 iopCpuCycles) {
+void AdbBus::hostDrive(bool released, u64 iopCpuCycles) {
     const u64 tick = busTicks(iopCpuCycles);
     advance(tick);
     if (hostReleased_ == released) return;
@@ -70,7 +70,7 @@ void IifxAdbBus::hostDrive(bool released, u64 iopCpuCycles) {
     }
 }
 
-bool IifxAdbBus::readLine(u64 iopCpuCycles) {
+bool AdbBus::readLine(u64 iopCpuCycles) {
     advance(busTicks(iopCpuCycles));
     if (deviceSending_) {
         ++replySamples_;
@@ -79,7 +79,7 @@ bool IifxAdbBus::readLine(u64 iopCpuCycles) {
     return wireHigh_;
 }
 
-void IifxAdbBus::advance(u64 now) {
+void AdbBus::advance(u64 now) {
     if (now < now_) now = now_;
     while (nextEvent_ < events_.size() && events_[nextEvent_].tick <= now) {
         const LineEvent event = events_[nextEvent_++];
@@ -92,19 +92,19 @@ void IifxAdbBus::advance(u64 now) {
     now_ = now;
 }
 
-void IifxAdbBus::setDeviceLine(bool released, bool final) {
+void AdbBus::setDeviceLine(bool released, bool final) {
     deviceReleased_ = released;
     if (final) deviceSending_ = false;
     updateWire();
 }
 
-void IifxAdbBus::updateWire() {
+void AdbBus::updateWire() {
     // Device-generated edges are consumed by the PIC through readLine(); they
     // must not be fed back into the host-command decoder.
     wireHigh_ = hostReleased_ && deviceReleased_;
 }
 
-void IifxAdbBus::hostEdge(bool level, u64 now) {
+void AdbBus::hostEdge(bool level, u64 now) {
     const u64 duration = now - lastEdge_;
     lastEdge_ = now;
 
@@ -159,7 +159,7 @@ void IifxAdbBus::hostEdge(bool level, u64 now) {
     }
 }
 
-void IifxAdbBus::finishCommand(u64 now) {
+void AdbBus::finishCommand(u64 now) {
     const u8 command = shift_;
     lastCommand_ = command;
     ++commands_;
@@ -201,7 +201,7 @@ void IifxAdbBus::finishCommand(u64 now) {
     }
 }
 
-void IifxAdbBus::finishListenByte(u64) {
+void AdbBus::finishListenByte(u64) {
     if (listenBytes_ < static_cast<int>(lastListen_.size()))
         lastListen_[static_cast<std::size_t>(listenBytes_)] = shift_;
     devices_.cpuShiftOut(shift_);
@@ -218,7 +218,7 @@ void IifxAdbBus::finishListenByte(u64) {
     receiveState_ = ReceiveState::Idle;
 }
 
-void IifxAdbBus::scheduleReply(u64 now, const u8* bytes, int count) {
+void AdbBus::scheduleReply(u64 now, const u8* bytes, int count) {
     events_.clear();
     nextEvent_ = 0;
     deviceReleased_ = true;
@@ -248,7 +248,7 @@ void IifxAdbBus::scheduleReply(u64 now, const u8* bytes, int count) {
     replyBytes_ += static_cast<u64>(count);
 }
 
-void IifxAdbBus::scheduleServiceRequest(u64 now) {
+void AdbBus::scheduleServiceRequest(u64 now) {
     events_.clear();
     nextEvent_ = 0;
     deviceSending_ = true;

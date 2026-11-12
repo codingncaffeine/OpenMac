@@ -26,7 +26,7 @@ class Scc8530;
 class Asc;
 class Oss;
 class IoProcessor;
-class IifxAdbBus;
+class AdbBus;
 class AdbTransceiver;
 class IifxNuBusVideo;
 class Iwm;
@@ -395,7 +395,7 @@ private:
     std::unique_ptr<ScsiCdRom> cdrom_;
     std::unique_ptr<Asc> sound_;
     std::unique_ptr<AdbTransceiver> adb_;
-    std::unique_ptr<IifxAdbBus> adbBus_;
+    std::unique_ptr<AdbBus> adbBus_;
     std::unique_ptr<Iwm> swim_;
     std::unique_ptr<SonyDrive> floppyDrive_;
     std::unique_ptr<IifxNuBusVideo> video_;

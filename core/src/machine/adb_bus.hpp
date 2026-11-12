@@ -1,6 +1,8 @@
 #pragma once
 
-// Bit-serial Apple Desktop Bus as connected to GPIO0 of the IIfx ISM PIC.
+// Bit-serial Apple Desktop Bus as connected to the first general-purpose pin
+// pair of the floppy/ADB I/O processor (the IIfx's "ISM PIC"; the Quadra 900
+// and 950 wire theirs the same way).
 //
 // The PIC drives an open-collector wire through an inverter and samples the
 // same wire on GPIN0.  Time is supplied in 65C02 cycles; internally it is
@@ -19,13 +21,13 @@ namespace openmac {
 class AdbTransceiver;
 class IifxStateCodec;
 
-class IifxAdbBus {
+class AdbBus {
 public:
-    explicit IifxAdbBus(AdbTransceiver& devices);
+    explicit AdbBus(AdbTransceiver& devices);
 
     void reset();
 
-    // `released` is the electrical state after the IIfx board inverter:
+    // `released` is the electrical state after the board's inverter:
     // true releases the wire high, false pulls it low.
     void hostDrive(bool released, u64 iopCpuCycles);
     bool readLine(u64 iopCpuCycles);

@@ -18,7 +18,7 @@ add_library(openmac_core STATIC
     src/cpu040_fpu.cpp
     src/hardware_trace.cpp
     src/r65c02.cpp
-    src/machine/iifx/adb_bus.cpp
+    src/machine/adb_bus.cpp
     src/machine/iifx/am29000.cpp
     src/machine/iop.cpp
     src/machine/iifx/iifx.cpp

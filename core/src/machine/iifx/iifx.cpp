@@ -16,7 +16,7 @@
 #include "../quadra/scc.hpp"
 #include "asc.hpp"
 #include "../iop.hpp"
-#include "adb_bus.hpp"
+#include "../adb_bus.hpp"
 #include "nubus_video.hpp"
 #include "oss.hpp"
 #include "scsi_dma.hpp"
@@ -160,7 +160,7 @@ IifxMachine::IifxMachine(std::vector<u8> rom, const Config& config)
       cdrom_(std::make_unique<ScsiCdRom>()),
       sound_(std::make_unique<Asc>()),
       adb_(std::make_unique<AdbTransceiver>()),
-      adbBus_(std::make_unique<IifxAdbBus>(*adb_)),
+      adbBus_(std::make_unique<AdbBus>(*adb_)),
       swim_(std::make_unique<Iwm>()),
       floppyDrive_(std::make_unique<SonyDrive>()),
       video_(std::make_unique<IifxNuBusVideo>(config.videoDeclarationRom)),

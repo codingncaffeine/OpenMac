@@ -9,7 +9,7 @@
 #include "../via.hpp"
 #include "../quadra/easc.hpp"
 #include "../quadra/scc.hpp"
-#include "adb_bus.hpp"
+#include "../adb_bus.hpp"
 #include "asc.hpp"
 #include "../iop.hpp"
 #include "nubus_video.hpp"
@@ -760,7 +760,7 @@ private:
     }
 
     template <typename Io>
-    static void visitAdbBus(Io& io, IifxAdbBus& bus) {
+    static void visitAdbBus(Io& io, AdbBus& bus) {
         section(io, fourcc('A', 'B', 'U', 'S'));
         io.enum8(bus.receiveState_); io.boolv(bus.hostReleased_);
         io.boolv(bus.deviceReleased_); io.boolv(bus.wireHigh_);
@@ -771,7 +771,7 @@ private:
         io.boundedSize(eventCount, 1024u * 1024u);
         if (io.applying()) bus.events_.resize(eventCount);
         for (std::size_t index = 0; index < eventCount; ++index) {
-            IifxAdbBus::LineEvent scratch;
+            AdbBus::LineEvent scratch;
             auto& event = io.applying() ? bus.events_[index] : scratch;
             io.u64v(event.tick); io.boolv(event.released); io.boolv(event.final);
         }

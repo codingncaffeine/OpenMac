@@ -7,6 +7,7 @@
 //                    [--display "13-inch RGB"] [--sense GROUNDED PAIRS]
 //                    [--vram 1|2] [--pram-byte OFFSET VALUE]... [--hashes FROM STEP]
 //                    [--peek ADDRESS COUNT]... [--watch-pc ADDRESS]...
+//                    [--mouse-at FRAME DX DY BUTTON]... [--key-at FRAME CODE down|up]...
 //
 // --pram-byte changes one byte of parameter RAM after --pram is loaded (the
 // stored video mode is byte $48). --hashes prints the distinct pictures seen
@@ -49,6 +50,8 @@ int main(int argc, char** argv) {
     int hashFrom = -1, hashStep = 1;
     std::vector<std::pair<u32, u32>> peeks;
     std::vector<u32> watchPcs;
+    struct Input { int frame, kind, a, b, c; };   // kind 0 = mouse (dx, dy, button), 1 = key (code, down)
+    std::vector<Input> inputs;
     std::vector<std::pair<int, int>> pramBytes;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -72,6 +75,17 @@ int main(int argc, char** argv) {
             pramBytes.emplace_back(off & 0xFF, val & 0xFF);
         }
         else if (a == "--watch-pc" && i + 1 < argc) watchPcs.push_back(static_cast<u32>(std::strtoul(argv[++i], nullptr, 0)));
+        else if (a == "--mouse-at" && i + 4 < argc) {
+            Input in{std::atoi(argv[i + 1]), 0, std::atoi(argv[i + 2]), std::atoi(argv[i + 3]), std::atoi(argv[i + 4])};
+            i += 4;
+            inputs.push_back(in);
+        }
+        else if (a == "--key-at" && i + 3 < argc) {
+            Input in{std::atoi(argv[i + 1]), 1, static_cast<int>(std::strtoul(argv[i + 2], nullptr, 0)),
+                     std::string(argv[i + 3]) == "down" ? 1 : 0, 0};
+            i += 3;
+            inputs.push_back(in);
+        }
         else if (a == "--peek" && i + 2 < argc) {
             const u32 at = static_cast<u32>(std::strtoul(argv[++i], nullptr, 0));
             peeks.emplace_back(at, static_cast<u32>(std::strtoul(argv[++i], nullptr, 0)));
@@ -171,6 +185,11 @@ int main(int argc, char** argv) {
     bool halted = false;
     for (int f = 0; f < frames; ++f) {
         lastFrame = static_cast<u32>(f);
+        for (const Input& in : inputs) {
+            if (in.frame != f) continue;
+            if (in.kind == 0) mac.mouseEvent(in.a, in.b, in.c != 0);
+            else mac.keyEvent(static_cast<u8>(in.a), in.b != 0);
+        }
         mac.runFrame();
         // The verdict hook costs a call per instruction; the ROM runs its
         // self-tests once, so it comes off when they are through.
@@ -198,6 +217,11 @@ int main(int argc, char** argv) {
         // What the guest believes about its screen: ScrnBase ($0824) and
         // ScreenRow ($0106), next to what the video chip was told.
         std::printf("   guest: ScrnBase=%08X ScreenRow=%u bytes\n", mac.read32(0x0824), mac.read16(0x0106));
+        // The pointer (Mouse $0830: vertical, horizontal), the button (MBState
+        // $0172, bit 7 clear = down) and the first key map word ($0174).
+        std::printf("   guest: pointer at %d,%d button %s, KeyMap %08X %08X\n", static_cast<s16>(mac.read16(0x0832)),
+                    static_cast<s16>(mac.read16(0x0830)), (mac.read8(0x0172) & 0x80) ? "up" : "down",
+                    mac.read32(0x0174), mac.read32(0x0178));
     }
     // One line a script can read: what the chip is set to, and what the
     // guest's main screen device says of itself (MainDevice $08A4 -> GDevice
