@@ -37,6 +37,8 @@
 
 namespace openmac {
 
+class IifxStateCodec;
+
 class IopFloppy {
 public:
     // `clockHz` is the rate of the `now` values every call takes: the
@@ -63,22 +65,28 @@ public:
 
     // ---- media ----
     // 400K, 800K or 1.44 MB of sectors, bare or inside a DiskCopy 4.2 or
-    // MacBinary file. False = not a floppy image; the disk in the drive stays.
-    bool insert(std::vector<u8> image, bool readOnly) {
+    // MacBinary file. False = not a floppy image; the disk in the drive stays,
+    // with the file format it came in. `announce` raises the mechanism's
+    // disk-changed latch; a machine whose firmware has not made its first
+    // mechanism poll yet passes false and lets that poll find the disk.
+    bool insert(std::vector<u8> image, bool readOnly, bool announce = true) {
+        const char* container = "raw image";
         std::vector<u8> mbHeader, mbResource, dcHeader, dcTags;
         if (macbinary::isMacBinary(image)) {
             macbinary::Parts parts = macbinary::split(image);
             mbHeader = std::move(parts.header);
             mbResource = std::move(parts.resource);
+            container = "MacBinary";
         }
         if (dc42::isDiskCopy(image)) {
             dc42::Parts parts = dc42::split(image);
             dcHeader = std::move(parts.header);
             dcTags = std::move(parts.tags);
+            container = "DiskCopy 4.2";
         }
         const std::size_t bytes = image.size();
         if (bytes != 409600 && bytes != 819200 && bytes != 1474560) {
-            say("floppy refused: %zu bytes; need 400K, 800K or 1.44 MB", bytes);
+            say("floppy refused: %zu bytes (%s); need 400K, 800K or 1.44 MB", bytes, container);
             return false;
         }
         flushTrack();
@@ -87,10 +95,12 @@ public:
         dcHeader_ = std::move(dcHeader);
         dcTags_ = std::move(dcTags);
         media_ = std::move(image);
+        ejected_.clear();
         readOnly_ = readOnly;
-        drive_.insert(&media_, readOnly_, highDensity(), true);
-        say("floppy: %s disk in the internal SuperDrive%s",
-            bytes == 1474560 ? "1.44 MB" : bytes == 819200 ? "800K" : "400K", readOnly ? " (write-protected)" : "");
+        drive_.insert(&media_, readOnly_, highDensity(), announce);
+        say("floppy: %s disk in the internal SuperDrive (%s%s)",
+            bytes == 1474560 ? "1.44 MB" : bytes == 819200 ? "800K" : "400K", container,
+            readOnly ? ", write-protected" : "");
         return true;
     }
 
@@ -105,16 +115,48 @@ public:
     }
 
     bool present() const { return !media_.empty(); }
+    bool readOnly() const { return readOnly_; }
     // The sectors as they are now (what is still in the track buffer written
     // back first); after an eject, the disk that came out.
     const std::vector<u8>& sectors() {
         flushTrack();
         return media_.empty() ? ejected_ : media_;
     }
+    // The same in the file format the disk came in (DiskCopy 4.2 and MacBinary
+    // wrappers put back around the sectors): what goes back to the host file.
+    std::vector<u8> fileImage() {
+        std::vector<u8> result = sectors();
+        if (result.empty()) return result;
+        if (dcHeader_.size() == dc42::kHeaderSize) {
+            dc42::Parts parts;
+            parts.header = dcHeader_;
+            parts.tags = dcTags_;
+            result = dc42::rewrap(parts, result);
+        }
+        if (mbHeader_.size() == macbinary::kHeaderSize) {
+            macbinary::Parts parts;
+            parts.header = mbHeader_;
+            parts.resource = mbResource_;
+            result = macbinary::rewrap(parts, result);
+        }
+        return result;
+    }
+    // The disk in the drive as it stands, the track buffer left alone: for a
+    // machine that also serves sector requests at driver level.
+    std::vector<u8>& media() { return media_; }
+    const std::vector<u8>& media() const { return media_; }
+    std::size_t ejectedBytes() const { return ejected_.size(); }
+
     u64 bytesRead() const { return dataBytes_; }
     u64 bytesWritten() const { return dataWrites_; }
     u32 tracksWritten() const { return trackWrites_; }
+    void clearCounters() { dataBytes_ = dataWrites_ = 0; trackWrites_ = 0; }
     int track() const { return drive_.track; }
+    Iwm& chip() { return swim_; }
+    const Iwm& chip() const { return swim_; }
+    SonyDrive& mechanism() { return drive_; }
+    const SonyDrive& mechanism() const { return drive_; }
+    bool readSynced() const { return readSynced_; }
 
     // ---- the chip, as the I/O processor's peripheral ----
     u8 access(u8 offset, bool write, u8 value, u64 now) {
@@ -136,15 +178,25 @@ public:
         swim_.readDataHigh = swim_.senseHigh;
         drive_.headUpper = driveSel;
         service(now);
+        const u8 fifoBefore = swim_.ismFifoOccupancy();
+        const u8 fifoHeadBefore = swim_.ismFifoHeadData();
         const u8 result = swim_.access(offset & 15u, write, value);
+        if (onFifoChange && swim_.ismFifoOccupancy() != fifoBefore)
+            onFifoChange(static_cast<u8>(offset & 15u), write, fifoHeadBefore, fifoBefore, swim_.ismFifoOccupancy());
         const bool newDriveSel = (swim_.ismMode() & 0x20u) != 0;
         drive_.headUpper = newDriveSel;
         service(now);
+        if (onAccess)
+            onAccess(Access{static_cast<u8>(offset & 15u), write, value, result, driveAddress, drive1Selected,
+                            drive2Selected, enabled});
 
         const bool strobe = swim_.lstrb();
         if (strobe && !lstrbPrev_ && drive1Selected && !drive2Selected) {
             const int address = swim_.driveRegister(newDriveSel);
+            const int trackBefore = drive_.track;
+            const bool stepInBefore = drive_.stepIn;
             drive_.command(address & 7, (address & 8) != 0, now);
+            if (onCommand) onCommand(address, trackBefore, stepInBefore);
         }
         lstrbPrev_ = strobe;
         drive_.tickEject(now);
@@ -156,6 +208,11 @@ public:
     // the chip. Called around every chip access and from the machine's clock.
     void service(u64 now) {
         updateTrack();
+        serviceSurface(now);
+    }
+
+    // The byte-moving half alone, on the track already loaded.
+    void serviceSurface(u64 now) {
         // Mode bits 1 and 2 are independent output enables, not a two-bit
         // drive number; the internal connector is /ENBL1.
         const bool drive1Enabled = (swim_.ismMode() & 0x82u) == 0x82u;
@@ -197,6 +254,7 @@ public:
                 swim_.ismCrcAdd(byte);
                 if (!swim_.ismPushReadByte(byte, mark)) break;
                 ++dataBytes_;
+                if (onFifoPush) onFifoPush(byte, mark);
             }
         } else {
             swim_.ismDataReady = drive_.writeReady(now);
@@ -224,9 +282,30 @@ public:
     }
 
     std::function<void(const char* message)> onDiag;
+    // After a disk has left the drive, by the guest's command or the host's.
     std::function<void()> onEject;
 
+    // Observation points for a machine's hardware trace; none changes what
+    // the drive does. One chip access, after the surface has caught up with it:
+    struct Access {
+        u8 offset;
+        bool write;
+        u8 value, result;
+        int driveAddress;                       // the mechanism register the chip's lines selected
+        bool drive1Selected, drive2Selected;    // as they were before the access
+        bool enabled;
+    };
+    std::function<void(const Access&)> onAccess;
+    // The access itself changed how many bytes the chip's FIFO holds.
+    std::function<void(u8 offset, bool write, u8 headBefore, u8 before, u8 after)> onFifoChange;
+    // A byte from the disk went into the FIFO.
+    std::function<void(u8 byte, bool mark)> onFifoPush;
+    // The chip strobed a command into the mechanism.
+    std::function<void(int address, int trackBefore, bool stepInBefore)> onCommand;
+
 private:
+    friend class IifxStateCodec;
+
     bool highDensity() const { return media_.size() == 1474560u; }
 
     void say(const char* text) {
@@ -253,7 +332,11 @@ private:
             : gcr::decodeTrack(drive_.trackData(), image, drive_.cacheTrack, image.size() > 440u * 1024u ? 2 : 1);
         drive_.clearTrackDirty();
         ++trackWrites_;
-        say("floppy: track %d side %d written back, %d sectors", drive_.cacheTrack, drive_.cacheSide, sectors);
+        if (drive_.hdMedia)
+            say("floppy: track %d side %d written back, %d sectors (mask %08X)", drive_.cacheTrack, drive_.cacheSide,
+                sectors, good);
+        else
+            say("floppy: track %d side %d written back, %d sectors", drive_.cacheTrack, drive_.cacheSide, sectors);
     }
 
     // Encode the track the head is on, if it is not the one already loaded.

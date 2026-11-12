@@ -1642,6 +1642,23 @@ TEST_CASE("IIfx refused floppy swap preserves the mounted disk and its container
     CHECK(mac.floppyForWriteBack() == diskCopy);
 }
 
+TEST_CASE("IIfx checkpoint carries the disk in the drive, not the one swapped out before it") {
+    IifxMachine mac(testRom());
+    std::vector<u8> first(1474560), second(1474560);
+    for (std::size_t i = 0; i < first.size(); ++i) {
+        first[i] = static_cast<u8>(i * 7u + 1u);
+        second[i] = static_cast<u8>(i * 13u + 5u);
+    }
+    REQUIRE(mac.insertFloppy(first) == 1);
+    const std::size_t oneDisk = mac.saveState().size();
+
+    mac.ejectFloppy();
+    CHECK(mac.floppyForWriteBack() == first);      // what came out can still be saved
+    REQUIRE(mac.insertFloppy(second) == 1);
+    CHECK(mac.floppyForWriteBack() == second);
+    CHECK(mac.saveState().size() < oneDisk + 4096u);
+}
+
 TEST_CASE("IIfx full-machine checkpoints replay cycle-for-cycle") {
     IifxMachine::Config config;
     config.ramSize = 4u * 1024u * 1024u;

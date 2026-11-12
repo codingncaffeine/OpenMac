@@ -12,6 +12,7 @@
 #include "../adb_bus.hpp"
 #include "asc.hpp"
 #include "../iop.hpp"
+#include "../iop_floppy.hpp"
 #include "nubus_video.hpp"
 #include "oss.hpp"
 #include "scsi_dma.hpp"
@@ -470,8 +471,8 @@ public:
             machine.hardDisk_.clear();
             machine.disk_->image_ = nullptr;
         }
-        machine.floppyDrive_->image = machine.floppy_.empty()
-            ? nullptr : &machine.floppy_;
+        machine.floppy_->drive_.image = machine.floppy_->media_.empty()
+            ? nullptr : &machine.floppy_->media_;
 
         machine.accessLog_.clear();
         machine.hardwareTrace_.reset();
@@ -1112,26 +1113,27 @@ private:
             machine.cdEjectPending_ = false; machine.cdEjectTries_ = 0;
         }
 
-        io.sparse(machine.floppy_, kMaxSmallBlob);
-        io.sparse(machine.floppyEjected_, kMaxSmallBlob);
-        io.sparse(machine.fdMbHeader_, kMaxSmallBlob);
-        io.sparse(machine.fdMbResource_, kMaxSmallBlob);
-        io.sparse(machine.fdDcHeader_, kMaxSmallBlob);
-        io.sparse(machine.fdDcTags_, kMaxSmallBlob);
-        io.boolv(machine.floppyReadOnly_); io.boolv(machine.floppyServiceReady_);
+        IopFloppy& floppy = *machine.floppy_;
+        io.sparse(floppy.media_, kMaxSmallBlob);
+        io.sparse(floppy.ejected_, kMaxSmallBlob);
+        io.sparse(floppy.mbHeader_, kMaxSmallBlob);
+        io.sparse(floppy.mbResource_, kMaxSmallBlob);
+        io.sparse(floppy.dcHeader_, kMaxSmallBlob);
+        io.sparse(floppy.dcTags_, kMaxSmallBlob);
+        io.boolv(floppy.readOnly_); io.boolv(machine.floppyServiceReady_);
         io.s64v(machine.floppyEventRetryCycles_);
-        io.boolv(machine.swimLstrbPrev_); io.boolv(machine.swimActionPrev_);
+        io.boolv(floppy.lstrbPrev_); io.boolv(floppy.actionPrev_);
         // A host-side skip flag, not machine state: a loaded checkpoint may
         // carry live SWIM DMA requests, so the next idle pass must clear them.
-        if (io.applying()) machine.swimDmaIdle_ = false;
-        io.boolv(machine.swimWriteMarkPrev_); io.boolv(machine.swimReadMarkPrev_);
+        if (io.applying()) floppy.dmaIdle_ = false;
+        io.boolv(floppy.writeMarkPrev_); io.boolv(floppy.readMarkPrev_);
         if (stateVersion >= 3) {
-            io.boolv(machine.swimReadSynced_);
+            io.boolv(floppy.readSynced_);
         } else if (io.applying()) {
-            machine.swimReadSynced_ = false;
+            floppy.readSynced_ = false;
         }
-        io.u16v(machine.swimCrcOut_); io.u64v(machine.swimDataBytes_);
-        io.u64v(machine.swimDataWrites_); io.u32v(machine.floppyTrackWrites_);
+        io.u16v(floppy.crcOut_); io.u64v(floppy.dataBytes_);
+        io.u64v(floppy.dataWrites_); io.u32v(floppy.trackWrites_);
         io.intv(machine.swimDiagBudget_); io.intv(machine.sonyPrimeDiagBudget_);
         if (stateVersion >= 2) {
             io.u64v(machine.mediaEventId_); io.u64v(machine.activeMediaEventId_);
@@ -1171,8 +1173,8 @@ private:
         }
         visitAdb(io, *machine.adb_);
         visitAdbBus(io, *machine.adbBus_);
-        visitSwim(io, *machine.swim_, stateVersion);
-        visitSony(io, *machine.floppyDrive_);
+        visitSwim(io, floppy.swim_, stateVersion);
+        visitSony(io, floppy.drive_);
         visitVideo(io, *machine.video_, stateVersion);
         if (stateVersion < 5 && io.applying() && machine.video_->genuineGc_) {
             const u64 reduced = machine.totalCycles_ %

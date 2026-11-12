@@ -29,8 +29,7 @@ class IoProcessor;
 class AdbBus;
 class AdbTransceiver;
 class IifxNuBusVideo;
-class Iwm;
-class SonyDrive;
+class IopFloppy;
 class IifxStateCodec;
 
 class IifxMachine final : public IBus040 {
@@ -131,8 +130,8 @@ public:
     // writes go back to the same host-file format on eject/exit.
     int insertFloppy(std::vector<u8> image, bool readOnly = false);
     void ejectFloppy();
-    bool floppyPresent() const { return !floppy_.empty(); }
-    const std::vector<u8>& floppyImage() const { return floppy_; }
+    bool floppyPresent() const;
+    const std::vector<u8>& floppyImage() const;
     std::vector<u8> floppyForWriteBack();
 
     // Front-end devices. Audio is unsigned 8-bit PCM, mono, at the ASC clock
@@ -350,7 +349,6 @@ private:
     bool markHardDiskClean();
     u32 guestPtr(u32 address) const;
     static bool floppyGeometry(std::vector<u8>& image);
-    std::vector<u8> floppyFileImage(const std::vector<u8>& sectors) const;
     u8 rawRead8(u32 addr);
     u8 rawRead8Traced(u32 addr);
     u32 rawRead32(u32 addr);
@@ -359,10 +357,7 @@ private:
     void clearFmcCache();
     bool fmcLookup(u32 addr, u32& word) const;
     void fmcMergeWrite(u32 addr, u8 value);
-    u8 swimAccess(u8 offset, bool write, u8 value = 0);
-    void updateFloppyTrack();
-    void serviceSwimSurface();
-    void flushFloppyTrack();
+    void wireFloppy();
     HardwareTraceEvent makeTraceEvent(HardwareTraceKind kind,
                                       HardwareTraceSource source,
                                       u32 categories) const;
@@ -396,8 +391,7 @@ private:
     std::unique_ptr<Asc> sound_;
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<AdbBus> adbBus_;
-    std::unique_ptr<Iwm> swim_;
-    std::unique_ptr<SonyDrive> floppyDrive_;
+    std::unique_ptr<IopFloppy> floppy_;    // the SWIM, the SuperDrive and its disk
     std::unique_ptr<IifxNuBusVideo> video_;
     M68030 cpu_;
 
@@ -457,23 +451,8 @@ private:
     u64 fmcFills_ = 0;
     u64 fmcCacheInhibited_ = 0;
 
-    std::vector<u8> floppy_;
-    std::vector<u8> floppyEjected_;
-    std::vector<u8> fdMbHeader_, fdMbResource_;
-    std::vector<u8> fdDcHeader_, fdDcTags_;
-    bool floppyReadOnly_ = false;
     bool floppyServiceReady_ = false;
     s64 floppyEventRetryCycles_ = 0;
-    bool swimLstrbPrev_ = false;
-    bool swimActionPrev_ = false;
-    bool swimDmaIdle_ = false;
-    bool swimWriteMarkPrev_ = false;
-    bool swimReadMarkPrev_ = false;
-    bool swimReadSynced_ = false;
-    u16 swimCrcOut_ = 0xFFFF;
-    u64 swimDataBytes_ = 0;
-    u64 swimDataWrites_ = 0;
-    u32 floppyTrackWrites_ = 0;
     int swimDiagBudget_ = 128;
     int sonyPrimeDiagBudget_ = 48;
     // Low-memory cursor/ADB probes are useful at boot, but the guest rewrites

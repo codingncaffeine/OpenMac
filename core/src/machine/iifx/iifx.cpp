@@ -16,6 +16,7 @@
 #include "../quadra/scc.hpp"
 #include "asc.hpp"
 #include "../iop.hpp"
+#include "../iop_floppy.hpp"
 #include "../adb_bus.hpp"
 #include "nubus_video.hpp"
 #include "oss.hpp"
@@ -161,8 +162,7 @@ IifxMachine::IifxMachine(std::vector<u8> rom, const Config& config)
       sound_(std::make_unique<Asc>()),
       adb_(std::make_unique<AdbTransceiver>()),
       adbBus_(std::make_unique<AdbBus>(*adb_)),
-      swim_(std::make_unique<Iwm>()),
-      floppyDrive_(std::make_unique<SonyDrive>()),
+      floppy_(std::make_unique<IopFloppy>(*ismIop_, kCpuHz)),
       video_(std::make_unique<IifxNuBusVideo>(config.videoDeclarationRom)),
       cpu_(*this),
       videoEnabled_(config.videoCard),
@@ -177,10 +177,6 @@ IifxMachine::IifxMachine(std::vector<u8> rom, const Config& config)
     // This ROM's GetOSDefault reads the two-byte DefOSRec at XPRAM $76; byte
     // $77 is sdOSType, whose documented Mac OS value is 1.
     rtc_->xpram()[0x77] = 1;
-    floppyDrive_->installed = true;
-    floppyDrive_->doubleSided = true;
-    floppyDrive_->superDrive = true;
-    floppyDrive_->setClockHz(kCpuHz);
 
     scsi_->addTarget(disk_.get());
     wireDevices();
@@ -376,7 +372,7 @@ void IifxMachine::wireDevices() {
                         read16(0x0144u), read32(0x014Cu), read32(0x0150u),
                         read32(0x030Au), read32(0x016Au),
                         static_cast<long long>(floppyEventRetryCycles_),
-                        floppyDrive_->diskSwitched() ? 1 : 0);
+                        floppy_->mechanism().diskSwitched() ? 1 : 0);
                     onDiag(diagnostic);
                 }
             }
@@ -609,11 +605,12 @@ void IifxMachine::wireDevices() {
         updateSccDmaRequests();
     };
     ismIop_->peripheralRead = [this](u8 offset) {
-        return swimAccess(offset, false);
+        return floppy_->access(offset, false, 0, totalCycles_);
     };
     ismIop_->peripheralWrite = [this](u8 offset, u8 value) {
-        (void)swimAccess(offset, true, value);
+        (void)floppy_->access(offset, true, value, totalCycles_);
     };
+    wireFloppy();
     // GPIO0 is the physical ADB connection on the IIfx. GPOut is inverted on
     // the logic board; GPIn samples the resulting open-collector wire.
     ismIop_->gpioRead = [this] {
@@ -663,17 +660,7 @@ void IifxMachine::wireDevices() {
         sound_->reset();
         adb_->reset();
         adbBus_->reset();
-        swim_->reset();
-        swim_->forceIsm();
-        floppyDrive_->reset();
-        if (!floppy_.empty())
-            floppyDrive_->insert(&floppy_, floppyReadOnly_,
-                                 floppy_.size() == 1474560u, false);
-        swimLstrbPrev_ = false;
-        swimActionPrev_ = false;
-        swimWriteMarkPrev_ = swimReadMarkPrev_ = false;
-        swimReadSynced_ = false;
-        swimCrcOut_ = 0xFFFF;
+        floppy_->reset();
         video_->reset();
         clearFmcCache();
         floppyServiceReady_ = false;
@@ -758,19 +745,8 @@ void IifxMachine::reset() {
     sound_->reset();
     adb_->reset();
     adbBus_->reset();
-    swim_->reset();
-    swim_->forceIsm();
-    floppyDrive_->reset();
-    if (!floppy_.empty())
-        floppyDrive_->insert(&floppy_, floppyReadOnly_,
-                             floppy_.size() == 1474560u, false);
-    swimLstrbPrev_ = false;
-    swimActionPrev_ = false;
-    swimWriteMarkPrev_ = swimReadMarkPrev_ = false;
-    swimReadSynced_ = false;
-    swimCrcOut_ = 0xFFFF;
-    swimDataBytes_ = swimDataWrites_ = 0;
-    floppyTrackWrites_ = 0;
+    floppy_->reset();
+    floppy_->clearCounters();
     swimDiagBudget_ = 128;
     lowMemoryDiagBudget_ = 96;
     video_->reset();
@@ -810,12 +786,11 @@ void IifxMachine::tickDevices(int cpuCycles) {
         via_->tick(1);
     }
 
-    updateFloppyTrack();
-    serviceSwimSurface();
+    floppy_->service(totalCycles_);
     updateSccDmaRequests();
     sccIop_->tick(cpuCycles);
     ismIop_->tick(cpuCycles);
-    serviceSwimSurface();
+    floppy_->serviceSurface(totalCycles_);
     scc_->tick(cpuCycles);
     sccIop_->setPeripheralInterrupt(scc_->irqAsserted());
 
@@ -823,7 +798,7 @@ void IifxMachine::tickDevices(int cpuCycles) {
         floppyEventRetryCycles_ -= cpuCycles;
         if (floppyEventRetryCycles_ <= 0) {
             floppyEventRetryCycles_ = 0;
-            floppyDrive_->signalMediaChange();
+            floppy_->mechanism().signalMediaChange();
             if (nativeStorage_ && onDiag) {
                 char message[128];
                 std::snprintf(message, sizeof message,
@@ -885,15 +860,16 @@ void IifxMachine::tickDevices(int cpuCycles) {
             traceLastScsiPhase_ = phase;
             traceLastScsiCommands_ = scsi_->diagCommands;
         }
-        const u8 handshake = swim_->diagnosticHandshake();
-        if (swim_->ismMode() != traceLastSwimMode_ ||
+        const Iwm& swim = floppy_->chip();
+        const u8 handshake = swim.diagnosticHandshake();
+        if (swim.ismMode() != traceLastSwimMode_ ||
             handshake != traceLastSwimHandshake_ ||
-            swim_->ismFifoOccupancy() != traceLastSwimFifo_) {
+            swim.ismFifoOccupancy() != traceLastSwimFifo_) {
             traceState(HardwareTraceKind::State, HardwareTraceSource::Swim,
                        TraceSwim | TraceIop, "SWIM state transition");
-            traceLastSwimMode_ = swim_->ismMode();
+            traceLastSwimMode_ = swim.ismMode();
             traceLastSwimHandshake_ = handshake;
-            traceLastSwimFifo_ = swim_->ismFifoOccupancy();
+            traceLastSwimFifo_ = swim.ismFifoOccupancy();
         }
     }
 }
@@ -1240,268 +1216,114 @@ bool IifxMachine::diagnosticFloppyMounted() {
     return volumeMountedFor(1);
 }
 
-void IifxMachine::flushFloppyTrack() {
-    SonyDrive& drive = *floppyDrive_;
-    if (!drive.trackDirty() || !drive.hasDisk() || drive.readOnly) {
-        drive.clearTrackDirty();
-        return;
-    }
-    std::vector<u8>& image = *drive.image;
-    u32 good = 0;
-    const int sectors = drive.hdMedia
-        ? mfm::decodeTrack(drive.trackData(), drive.trackMarks(), image,
-                           drive.cacheTrack, drive.cacheSide, &good)
-        : gcr::decodeTrack(drive.trackData(), image, drive.cacheTrack,
-                           image.size() > 440u * 1024u ? 2 : 1);
-    drive.clearTrackDirty();
-    ++floppyTrackWrites_;
-    if (onDiag) {
-        char message[128];
-        std::snprintf(message, sizeof message,
-                      "IOP SWIM track %d side %d write-back: %d sectors%s%08X",
-                      drive.cacheTrack, drive.cacheSide, sectors,
-                      drive.hdMedia ? " mask=" : "", drive.hdMedia ? good : 0u);
-        onDiag(message);
-    }
-}
-
-void IifxMachine::updateFloppyTrack() {
-    SonyDrive& drive = *floppyDrive_;
-    if (!drive.hasDisk()) return;
-    const int side = drive.headUpper ? 1 : 0;
-    if (drive.trackLoaded() && drive.cacheTrack == drive.track &&
-        drive.cacheSide == side && drive.cacheGen == drive.mediaGen)
-        return;
-
-    flushFloppyTrack();
-    const std::vector<u8>& image = *drive.image;
-    if (drive.track < 0 || drive.track >= 80) {
-        drive.invalidateTrack();
-        return;
-    }
-    if (drive.hdMedia) {
-        std::vector<u8> bytes, marks;
-        mfm::buildTrack(image, drive.track, side, bytes, marks);
-        drive.setTrackData(std::move(bytes), std::move(marks));
-    } else {
-        const int sides = image.size() > 440u * 1024u ? 2 : 1;
-        if (side >= sides) {
-            drive.invalidateTrack();
-            return;
-        }
-        drive.setTrackData(gcr::buildTrack(image, drive.track, side, sides,
-                                            sides == 2 ? 0x22 : 0x02));
-    }
-    drive.cacheTrack = drive.track;
-    drive.cacheSide = side;
-    drive.cacheGen = drive.mediaGen;
-}
-
-void IifxMachine::serviceSwimSurface() {
-    // Mode bits 1 and 2 are independent active-low output enables, not a
-    // two-bit drive selector. The first IIfx internal connector is /ENBL1.
-    const bool drive1Enabled = (swim_->ismMode() & 0x82u) == 0x82u;
-    const bool action = drive1Enabled && swim_->ismAction();
-    if (action && !swimActionPrev_) {
-        // ACTION starts the SWIM mark-search state machine.  The platter keeps
-        // rotating while the chip ignores ordinary gap bytes; it does not jump
-        // instantly to the next mark.  Preserving that elapsed gap gives the
-        // downloaded IOP firmware the real hardware's window to arm DMA before
-        // the data field reaches the head.
-        if (!swim_->ismWriting()) swimReadSynced_ = false;
-        swimCrcOut_ = 0xFFFF;
-        swimWriteMarkPrev_ = swimReadMarkPrev_ = false;
-    }
-    if (!action) swimReadSynced_ = false;
-    swimActionPrev_ = action;
-
-    if (!action || !floppyDrive_->hasDisk()) {
-        // The requests are already down after the first idle pass; the two
-        // deassertions are idempotent, so skipping them is exact.
-        if (!swimDmaIdle_) {
-            ismIop_->setDmaRequest(0, false);
-            ismIop_->setDmaRequest(1, false);
-            swimDmaIdle_ = true;
-        }
-        return;
-    }
-    swimDmaIdle_ = false;
-
-    if (!swim_->ismWriting()) {
-        while (swim_->ismFifoOccupancy() < 2u) {
-            u8 byte = 0;
-            bool mark = false;
-            if (!floppyDrive_->nextByte(totalCycles_, &byte, &mark)) break;
-            if (!swimReadSynced_) {
-                if (!mark) continue;
-                swimReadSynced_ = true;
-                swimReadMarkPrev_ = false;
-            }
-            if (mark && !swimReadMarkPrev_) swim_->ismCrcReset();
-            swimReadMarkPrev_ = mark;
-            swim_->ismCrcAdd(byte);
-            if (!swim_->ismPushReadByte(byte, mark)) break;
-            ++swimDataBytes_;
-            if (hardwareTrace_.accepts(TraceSwim | TraceIop)) {
-                HardwareTraceEvent event = makeTraceEvent(
-                    HardwareTraceKind::State, HardwareTraceSource::Swim,
-                    TraceSwim | TraceIop);
-                event.address = static_cast<u32>(floppyDrive_->bytePos());
-                event.value = byte;
-                event.auxiliary = (static_cast<u64>(mark ? 1u : 0u) << 32) |
-                                  swim_->ismFifoOccupancy();
-                std::snprintf(event.detail.data(), event.detail.size(),
-                              "SWIM FIFO push%s occupancy=%u",
-                              mark ? " mark" : "",
-                              static_cast<unsigned>(swim_->ismFifoOccupancy()));
-                hardwareTrace_.record(std::move(event));
-            }
-        }
-    } else {
-        swim_->ismDataReady = floppyDrive_->writeReady(totalCycles_);
-        if (swim_->ismWroteData || swim_->ismWroteMark) {
-            const bool mark = swim_->ismWroteMark;
-            if (mark && !swimWriteMarkPrev_) swimCrcOut_ = 0xFFFF;
-            swimWriteMarkPrev_ = mark;
-            floppyDrive_->writeByte(totalCycles_, swim_->ismWritten, mark);
-            swimCrcOut_ = mfm::crc16Update(swimCrcOut_, swim_->ismWritten);
-            swim_->ismWroteData = swim_->ismWroteMark = false;
-            ++swimDataWrites_;
-        }
-        if (swim_->ismWroteCrc) {
-            swim_->ismWroteCrc = false;
-            floppyDrive_->writeCrc(totalCycles_,
-                                   static_cast<u8>(swimCrcOut_ >> 8),
-                                   static_cast<u8>(swimCrcOut_));
-            swimDataWrites_ += 2;
-        }
-    }
-
-    // DAT1BYTE is physically wired to REQA on the IIfx SWIM PIC. Channel B is
-    // independent and must remain deasserted.
-    const bool dmaReady = swim_->ismWriting()
-        ? swim_->ismDataReady : swim_->ismFifoOccupancy() != 0;
-    ismIop_->setDmaRequest(0, dmaReady);
-    ismIop_->setDmaRequest(1, false);
-}
-
-u8 IifxMachine::swimAccess(u8 offset, bool write, u8 value) {
-    floppyDrive_->readOnly = floppyReadOnly_;
-    floppyDrive_->hdMedia = floppy_.size() == 1474560u;
-    const bool drive1Selected = (swim_->ismMode() & 0x02u) != 0;
-    const bool drive2Selected = (swim_->ismMode() & 0x04u) != 0;
-    // Figure 9-14 of Guide to the Macintosh Family Hardware shows /ENBL1
-    // and /ENBL2 wired to the two internal IIfx connectors. This model has a
-    // mechanism in connector 1 only; connector 2 therefore floats SENSE.
-    const bool enabled = swim_->ismSelected()
-        ? ((swim_->ismMode() & 0x80u) != 0 && drive1Selected)
-        : swim_->motorOn();
-    floppyDrive_->setEnabled(enabled, totalCycles_);
-
-    // The internal drive occupies SWIM device-select A.  Its fourth Sony
-    // status/command address bit is the dedicated HDSEL output on the 44-pin
-    // SWIM used here, driven by Mode bit 5.  Setup bit 0 controls only the
-    // alternate Q3/HDSEL pin used by smaller packages; gating the dedicated
-    // output on that bit shifts every firmware query to the neighbouring Sony
-    // register.  The downloaded IIfx firmware makes the wiring observable:
-    // Mode.5 + Phase $F0 reads CSTIN ($1), $F4/$FC strobes SWITCHED-reset
-    // ($9), $F7 reads high-density media ($F), and $F1 reads WRTPRT ($3).
-    const bool driveSel = (swim_->ismMode() & 0x20u) != 0;
-    const int driveAddress = swim_->driveRegister(driveSel);
-    swim_->senseHigh = floppyDrive_->sense(driveAddress, totalCycles_);
-    if (!drive1Selected || drive2Selected)
-        swim_->senseHigh = true;
-    // The IIfx mechanism returns its multiplexed status on the drive RD line,
-    // which enters SWIM as RDDATA. Its downloaded firmware samples handshake
-    // bit 2 while probing addresses $F/$E/$C/$A and indexes the resulting
-    // four-bit signature to distinguish 400K, 800K, FDHD and HD20 devices.
-    // SENSE is a separate SWIM input; mirror the physical line there as well
-    // for the controller's ordinary status-register view.
-    swim_->readDataHigh = swim_->senseHigh;
-    floppyDrive_->headUpper = driveSel;
-    updateFloppyTrack();
-    serviceSwimSurface();
-    const u8 fifoBefore = swim_->ismFifoOccupancy();
-    const u8 fifoHeadBefore = swim_->ismFifoHeadData();
-    const u8 result = swim_->access(offset & 15u, write, value);
-    const u8 fifoAfterAccess = swim_->ismFifoOccupancy();
-    if (fifoAfterAccess != fifoBefore &&
-        hardwareTrace_.accepts(TraceSwim | TraceIop)) {
+// The internal SuperDrive is the shared IopFloppy; what this machine adds is
+// its hardware trace. Each callback records at the point in a chip access
+// where the event belongs, so a trace reads in the order things happened.
+void IifxMachine::wireFloppy() {
+    floppy_->onDiag = [this](const char* message) {
+        if (onDiag) onDiag(message);
+    };
+    floppy_->onFifoPush = [this](u8 byte, bool mark) {
+        if (!hardwareTrace_.accepts(TraceSwim | TraceIop)) return;
+        const Iwm& swim = floppy_->chip();
         HardwareTraceEvent event = makeTraceEvent(
             HardwareTraceKind::State, HardwareTraceSource::Swim,
             TraceSwim | TraceIop);
-        event.address = offset & 15u;
-        event.value = fifoHeadBefore;
-        event.auxiliary = (static_cast<u64>(fifoBefore) << 32) |
-                          fifoAfterAccess;
+        event.address = static_cast<u32>(floppy_->mechanism().bytePos());
+        event.value = byte;
+        event.auxiliary = (static_cast<u64>(mark ? 1u : 0u) << 32) |
+                          swim.ismFifoOccupancy();
+        std::snprintf(event.detail.data(), event.detail.size(),
+                      "SWIM FIFO push%s occupancy=%u",
+                      mark ? " mark" : "",
+                      static_cast<unsigned>(swim.ismFifoOccupancy()));
+        hardwareTrace_.record(std::move(event));
+    };
+    floppy_->onFifoChange = [this](u8 offset, bool write, u8 headBefore,
+                                   u8 before, u8 after) {
+        if (!hardwareTrace_.accepts(TraceSwim | TraceIop)) return;
+        HardwareTraceEvent event = makeTraceEvent(
+            HardwareTraceKind::State, HardwareTraceSource::Swim,
+            TraceSwim | TraceIop);
+        event.address = offset;
+        event.value = headBefore;
+        event.auxiliary = (static_cast<u64>(before) << 32) | after;
         std::snprintf(event.detail.data(), event.detail.size(),
                       "SWIM FIFO %s occupancy=%u->%u",
-                      !write && ((offset & 15u) == 8u ||
-                                 (offset & 15u) == 9u) ? "pop" : "transition",
-                      static_cast<unsigned>(fifoBefore),
-                      static_cast<unsigned>(fifoAfterAccess));
+                      !write && (offset == 8u || offset == 9u)
+                          ? "pop" : "transition",
+                      static_cast<unsigned>(before),
+                      static_cast<unsigned>(after));
         hardwareTrace_.record(std::move(event));
-    }
-    const bool newDriveSel = (swim_->ismMode() & 0x20u) != 0;
-    floppyDrive_->headUpper = newDriveSel;
-    updateFloppyTrack();
-    serviceSwimSurface();
-
-    traceAccess(HardwareTraceSource::Swim, write, offset & 15u,
-                write ? value : result, 1, "ISM peripheral register");
-
-    if (onDiag && swimDiagBudget_-- > 0) {
-        char message[192];
-        std::snprintf(message, sizeof message,
-                      "IOP SWIM %c port=%X value=%02X result=%02X phase=%02X "
-                      "mode=%02X setup=%02X drive=%X d1=%d d2=%d sense=%d "
-                      "enabled=%d present=%d bytes=%zu",
-                      write ? 'W' : 'R', offset & 15u, value, result,
-                      static_cast<unsigned>(swim_->lines()), swim_->ismMode(),
-                      swim_->ismSetup(), driveAddress,
-                      drive1Selected ? 1 : 0, drive2Selected ? 1 : 0,
-                      swim_->senseHigh ? 1 : 0,
-                      enabled ? 1 : 0, floppyDrive_->hasDisk() ? 1 : 0,
-                      floppy_.size());
-        onDiag(message);
-    }
-
-    const bool strobe = swim_->lstrb();
-    if (strobe && !swimLstrbPrev_ && drive1Selected && !drive2Selected) {
-        const int address = swim_->driveRegister(newDriveSel);
+    };
+    floppy_->onAccess = [this](const IopFloppy::Access& access) {
+        traceAccess(HardwareTraceSource::Swim, access.write, access.offset,
+                    access.write ? access.value : access.result, 1,
+                    "ISM peripheral register");
+        if (onDiag && swimDiagBudget_-- > 0) {
+            const Iwm& swim = floppy_->chip();
+            char message[192];
+            std::snprintf(message, sizeof message,
+                          "IOP SWIM %c port=%X value=%02X result=%02X phase=%02X "
+                          "mode=%02X setup=%02X drive=%X d1=%d d2=%d sense=%d "
+                          "enabled=%d present=%d bytes=%zu",
+                          access.write ? 'W' : 'R',
+                          static_cast<unsigned>(access.offset), access.value,
+                          access.result, static_cast<unsigned>(swim.lines()),
+                          swim.ismMode(), swim.ismSetup(), access.driveAddress,
+                          access.drive1Selected ? 1 : 0,
+                          access.drive2Selected ? 1 : 0,
+                          swim.senseHigh ? 1 : 0, access.enabled ? 1 : 0,
+                          floppy_->mechanism().hasDisk() ? 1 : 0,
+                          floppy_->media().size());
+            onDiag(message);
+        }
+    };
+    floppy_->onCommand = [this](int address, int trackBefore,
+                                bool directionBefore) {
+        if (!hardwareTrace_.accepts(TraceSwim | TraceIop)) return;
+        const SonyDrive& drive = floppy_->mechanism();
         const int command = address & 7;
         const bool data = (address & 8) != 0;
-        const int trackBefore = floppyDrive_->track;
-        const bool directionBefore = floppyDrive_->stepIn;
-        floppyDrive_->command(address & 7, (address & 8) != 0,
-                              totalCycles_);
-        if (hardwareTrace_.accepts(TraceSwim | TraceIop)) {
+        HardwareTraceEvent event = makeTraceEvent(
+            HardwareTraceKind::State, HardwareTraceSource::Swim,
+            TraceSwim | TraceIop);
+        event.address = static_cast<u32>(address);
+        event.value = static_cast<u64>(command) |
+                      (static_cast<u64>(data ? 1u : 0u) << 8) |
+                      (static_cast<u64>(trackBefore & 0xFF) << 16) |
+                      (static_cast<u64>(drive.track & 0xFF) << 24);
+        event.auxiliary = (static_cast<u64>(directionBefore ? 1u : 0u) << 63) |
+                          (static_cast<u64>(drive.stepIn ? 1u : 0u) << 62) |
+                          drive.stepRemaining(totalCycles_);
+        static constexpr const char* kCommandName[8] = {
+            "DIRTN", "SWITCHED-ACK", "STEP", "FORMAT", "MOTOR",
+            "COMMAND5", "EJECT", "COMMAND7"};
+        std::snprintf(event.detail.data(), event.detail.size(),
+            "SuperDrive %s data=%u track=%d->%d direction=%s busy=%u",
+            kCommandName[command], data ? 1u : 0u, trackBefore,
+            drive.track, drive.stepIn ? "in" : "out",
+            drive.stepping(totalCycles_) ? 1u : 0u);
+        hardwareTrace_.record(std::move(event));
+    };
+    // A disk has left the drive, by the firmware's eject command or the host's.
+    floppy_->onEject = [this] {
+        if (!diagnosticFloppyMounted() && hardwareTrace_.enabled() &&
+            !hardwareTrace_.triggered())
+            triggerTrace("SuperDrive ejected media before mount");
+        activeMediaEventId_ = ++mediaEventId_;
+        if (hardwareTrace_.enabled() && !hardwareTrace_.frozen()) {
             HardwareTraceEvent event = makeTraceEvent(
-                HardwareTraceKind::State, HardwareTraceSource::Swim,
-                TraceSwim | TraceIop);
-            event.address = static_cast<u32>(address);
-            event.value = static_cast<u64>(command) |
-                          (static_cast<u64>(data ? 1u : 0u) << 8) |
-                          (static_cast<u64>(trackBefore & 0xFF) << 16) |
-                          (static_cast<u64>(floppyDrive_->track & 0xFF) << 24);
-            event.auxiliary = (static_cast<u64>(directionBefore ? 1u : 0u) << 63) |
-                              (static_cast<u64>(floppyDrive_->stepIn ? 1u : 0u) << 62) |
-                              floppyDrive_->stepRemaining(totalCycles_);
-            static constexpr const char* kCommandName[8] = {
-                "DIRTN", "SWITCHED-ACK", "STEP", "FORMAT", "MOTOR",
-                "COMMAND5", "EJECT", "COMMAND7"};
+                HardwareTraceKind::Milestone, HardwareTraceSource::Swim,
+                TraceSwim | TraceIop | TraceMilestone);
+            event.address = 2; // eject
+            event.value = floppy_->ejectedBytes();
             std::snprintf(event.detail.data(), event.detail.size(),
-                "SuperDrive %s data=%u track=%d->%d direction=%s busy=%u",
-                kCommandName[command], data ? 1u : 0u, trackBefore,
-                floppyDrive_->track, floppyDrive_->stepIn ? "in" : "out",
-                floppyDrive_->stepping(totalCycles_) ? 1u : 0u);
+                          "floppy media ejected event=%llu",
+                          static_cast<unsigned long long>(activeMediaEventId_));
             hardwareTrace_.record(std::move(event));
         }
-    }
-    swimLstrbPrev_ = strobe;
-    floppyDrive_->tickEject(totalCycles_);
-    if (floppyDrive_->takeEjectRequest()) ejectFloppy();
-    return result;
+    };
 }
 
 std::vector<u8> IifxMachine::iopRamImage(bool ism) const {
@@ -1582,48 +1404,10 @@ bool IifxMachine::floppyGeometry(std::vector<u8>& image) {
 }
 
 int IifxMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
-    const char* container = "raw image";
-    // Peel a candidate into locals.  A drive does not throw out the disk that
-    // is already in it merely because the next host file is not valid media;
-    // keeping the live wrapper state untouched until validation succeeds also
-    // means a refused swap cannot turn a DiskCopy/MacBinary disk into a raw
-    // file when it is written back later.
-    std::vector<u8> mbHeader, mbResource, dcHeader, dcTags;
-    if (macbinary::isMacBinary(image)) {
-        macbinary::Parts parts = macbinary::split(image);
-        mbHeader = std::move(parts.header);
-        mbResource = std::move(parts.resource);
-        container = "MacBinary";
-    }
-    if (dc42::isDiskCopy(image)) {
-        dc42::Parts parts = dc42::split(image);
-        dcHeader = std::move(parts.header);
-        dcTags = std::move(parts.tags);
-        container = "DiskCopy 4.2";
-    }
-    const std::size_t bytes = image.size();
-    if (bytes != 409600 && bytes != 819200 && bytes != 1474560) {
-        if (onDiag) {
-            char message[144];
-            std::snprintf(message, sizeof message,
-                          "floppy refused: %zu bytes (%s); need 400K, 800K or 1.44 MB",
-                          bytes, container);
-            onDiag(message);
-        }
+    // A disk put in before the firmware's first mechanism poll is found by
+    // that poll; afterwards the mechanism's disk-changed latch announces it.
+    if (!floppy_->insert(std::move(image), readOnly, floppyServiceReady_))
         return 0;
-    }
-
-    flushFloppyTrack();
-    fdMbHeader_ = std::move(mbHeader);
-    fdMbResource_ = std::move(mbResource);
-    fdDcHeader_ = std::move(dcHeader);
-    fdDcTags_ = std::move(dcTags);
-    floppy_ = std::move(image);
-    floppyEjected_.clear();
-    floppyReadOnly_ = readOnly;
-    floppyDrive_->insert(&floppy_, floppyReadOnly_,
-                         floppy_.size() == 1474560u,
-                         floppyServiceReady_);
     // Media present at construction is still the first physical media event.
     // reset() deliberately preserves the host-mounted image, so assign its ID
     // here where the image actually enters the mechanism.
@@ -1633,7 +1417,7 @@ int IifxMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
             HardwareTraceKind::Milestone, HardwareTraceSource::Swim,
             TraceSwim | TraceIop | TraceMilestone);
         event.address = 1; // insert
-        event.value = bytes;
+        event.value = floppy_->media().size();
         event.auxiliary = (static_cast<u64>(readOnly ? 1u : 0u) << 1) |
                           (floppyServiceReady_ ? 1u : 0u);
         std::snprintf(event.detail.data(), event.detail.size(),
@@ -1641,63 +1425,19 @@ int IifxMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
                       static_cast<unsigned long long>(activeMediaEventId_));
         hardwareTrace_.record(std::move(event));
     }
-    if (onDiag) {
-        char message[128];
-        std::snprintf(message, sizeof message,
-                      "floppy: %s disk in IIfx internal SuperDrive (%s%s)",
-                      bytes == 1474560 ? "1.44 MB" : bytes == 819200 ? "800K" : "400K",
-                      container, readOnly ? ", write-protected" : "");
-        onDiag(message);
-    }
     return 1;
 }
 
-void IifxMachine::ejectFloppy() {
-    if (floppy_.empty()) return;
-    if (!diagnosticFloppyMounted() && hardwareTrace_.enabled() &&
-        !hardwareTrace_.triggered())
-        triggerTrace("SuperDrive ejected media before mount");
-    activeMediaEventId_ = ++mediaEventId_;
-    flushFloppyTrack();
-    floppyEjected_ = std::move(floppy_);
-    floppy_.clear();
-    floppyDrive_->removeDisk();
-    if (hardwareTrace_.enabled() && !hardwareTrace_.frozen()) {
-        HardwareTraceEvent event = makeTraceEvent(
-            HardwareTraceKind::Milestone, HardwareTraceSource::Swim,
-            TraceSwim | TraceIop | TraceMilestone);
-        event.address = 2; // eject
-        event.value = floppyEjected_.size();
-        std::snprintf(event.detail.data(), event.detail.size(),
-                      "floppy media ejected event=%llu",
-                      static_cast<unsigned long long>(activeMediaEventId_));
-        hardwareTrace_.record(std::move(event));
-    }
-    if (onDiag) onDiag("floppy: disk ejected from IIfx internal SuperDrive");
-}
+void IifxMachine::ejectFloppy() { floppy_->eject(); }
 
-std::vector<u8> IifxMachine::floppyFileImage(
-    const std::vector<u8>& sectors) const {
-    std::vector<u8> result = sectors;
-    if (result.empty()) return result;
-    if (fdDcHeader_.size() == dc42::kHeaderSize) {
-        dc42::Parts parts;
-        parts.header = fdDcHeader_;
-        parts.tags = fdDcTags_;
-        result = dc42::rewrap(parts, result);
-    }
-    if (fdMbHeader_.size() == macbinary::kHeaderSize) {
-        macbinary::Parts parts;
-        parts.header = fdMbHeader_;
-        parts.resource = fdMbResource_;
-        result = macbinary::rewrap(parts, result);
-    }
-    return result;
+bool IifxMachine::floppyPresent() const { return floppy_->present(); }
+
+const std::vector<u8>& IifxMachine::floppyImage() const {
+    return floppy_->media();
 }
 
 std::vector<u8> IifxMachine::floppyForWriteBack() {
-    flushFloppyTrack();
-    return floppyFileImage(floppy_.empty() ? floppyEjected_ : floppy_);
+    return floppy_->fileImage();
 }
 
 u32 IifxMachine::guestPtr(u32 address) const {
@@ -2101,11 +1841,12 @@ void IifxMachine::serveSonyPrime() {
     const u16 posMode = read16(pb + 0x2C);
     const u32 posOffset = read32(pb + 0x2E);
     const u32 mark = read32(dce + 0x10);
+    std::vector<u8>& medium = floppy_->media();
 
     u32 position = mark;
     switch (posMode & 3) {
     case 1: position = posOffset; break;                         // fsFromStart
-    case 2: position = static_cast<u32>(floppy_.size()) + posOffset; break;
+    case 2: position = static_cast<u32>(medium.size()) + posOffset; break;
     case 3: position = mark + posOffset; break;                  // fsFromMark
     default: break;                                              // fsAtMark
     }
@@ -2121,24 +1862,24 @@ void IifxMachine::serveSonyPrime() {
                       write ? "write" : "read", position, requested, buffer);
         onDiag(message);
     }
-    if (floppy_.empty()) {
+    if (medium.empty()) {
         result = -65;                                           // offLinErr
-    } else if (write && floppyReadOnly_) {
+    } else if (write && floppy_->readOnly()) {
         result = -44;                                           // wPrErr
-    } else if (position >= floppy_.size()) {
+    } else if (position >= medium.size()) {
         result = -39;                                           // eofErr
     } else {
         u32 count = requested;
-        if (position + count > floppy_.size()) {
-            count = static_cast<u32>(floppy_.size()) - position;
+        if (position + count > medium.size()) {
+            count = static_cast<u32>(medium.size()) - position;
             result = -39;
         }
         if (write) {
             for (u32 i = 0; i < count; ++i)
-                floppy_[position + i] = read8(buffer + i);
+                medium[position + i] = read8(buffer + i);
         } else {
             for (u32 i = 0; i < count; ++i)
-                write8(buffer + i, floppy_[position + i]);
+                write8(buffer + i, medium[position + i]);
             cpu_.invalidateDataCache030(buffer, count);
         }
         actual = count;
@@ -2157,27 +1898,28 @@ void IifxMachine::serveSonyPrime() {
 void IifxMachine::serveSonyCtlStatus(bool status) {
     const u32 pb = guestPtr(cpu_.a[0]);
     const u16 code = read16(pb + 0x1A);                          // csCode
+    const std::vector<u8>& medium = floppy_->media();
     if (onDiag) {
         char message[128];
         std::snprintf(message, sizeof message,
                       "IOP .Sony bridge %s code=%u pb=%08X present=%d bytes=%zu",
                       status ? "status" : "control", code, pb,
-                      floppy_.empty() ? 0 : 1, floppy_.size());
+                      medium.empty() ? 0 : 1, medium.size());
         onDiag(message);
     }
     s16 result = 0;
     if (status) {
         if (code == 6) {                                        // format list
             write16(pb + 0x1C, 1);
-            write32(pb + 0x1E, static_cast<u32>(floppy_.size() / 512));
+            write32(pb + 0x1E, static_cast<u32>(medium.size() / 512));
         } else if (code == 8) {                                 // DriveStatus
             for (u32 i = 0; i < 30; ++i) write8(pb + 0x1C + i, 0);
-            write8(pb + 0x1E, floppyReadOnly_ ? 0x80 : 0);      // dsWriteProt
-            write8(pb + 0x1F, floppy_.empty() ? 0 : 8);         // dsDiskInPlace
+            write8(pb + 0x1E, floppy_->readOnly() ? 0x80 : 0);      // dsWriteProt
+            write8(pb + 0x1F, medium.empty() ? 0 : 8);         // dsDiskInPlace
             write8(pb + 0x20, 1);                               // dsInstalled
-            write8(pb + 0x21, floppy_.size() == 409600 ? 0 : 1);// dsSides
+            write8(pb + 0x21, medium.size() == 409600 ? 0 : 1);// dsSides
             write8(pb + 0x32, 0xFF);                            // dsMFMDrive
-            write8(pb + 0x33, floppy_.size() == 1474560 ? 0xFF : 0);
+            write8(pb + 0x33, medium.size() == 1474560 ? 0xFF : 0);
             write8(pb + 0x34, 0xFF);                            // dsTwoMegFmt
         }
     } else {
@@ -2307,38 +2049,40 @@ HardwareTraceEvent IifxMachine::makeTraceEvent(
     std::copy_n(scsi_->diagLastCdb, event.scsi.cdb.size(),
                 event.scsi.cdb.begin());
 
-    event.swim.mode = swim_->ismMode();
-    event.swim.setup = swim_->ismSetup();
-    event.swim.handshake = swim_->diagnosticHandshake();
-    event.swim.error = swim_->diagnosticError();
-    event.swim.data = swim_->ismData;
-    event.swim.lines = swim_->diagnosticLines();
-    const bool driveSel = (swim_->ismMode() & 0x20u) != 0;
-    event.swim.driveAddress = static_cast<u8>(swim_->driveRegister(driveSel));
-    if (swim_->ismAction()) event.swim.flags |= 1u << 0;
-    if (swim_->ismWriting()) event.swim.flags |= 1u << 1;
-    if (swim_->ismDataReady) event.swim.flags |= 1u << 2;
-    if (swim_->ismMarkNext) event.swim.flags |= 1u << 3;
-    if (swim_->ismCrcOk) event.swim.flags |= 1u << 4;
-    if (floppyDrive_->hasDisk()) event.swim.flags |= 1u << 5;
-    if (floppyDrive_->diskSwitched()) event.swim.flags |= 1u << 6;
-    if (floppyDrive_->motorRunning(totalCycles_)) event.swim.flags |= 1u << 7;
-    event.swim.crc = swim_->diagnosticCrc();
-    event.swim.track = static_cast<u8>(std::clamp(floppyDrive_->track, 0, 255));
-    event.swim.side = floppyDrive_->headUpper ? 1 : 0;
-    event.swim.fifoOccupancy = swim_->ismFifoOccupancy();
-    event.swim.fifoHead = swim_->ismFifoHeadData();
-    event.swim.fifoTail = swim_->ismFifoTailData();
-    event.swim.readSynced = swimReadSynced_ ? 1u : 0u;
-    event.swim.fifoHeadCrc = swim_->diagnosticFifoHeadCrc();
-    if (floppyDrive_->stepIn) event.swim.mechanismFlags |= 1u << 0;
-    if (floppyDrive_->stepping(totalCycles_))
+    const Iwm& chip = floppy_->chip();
+    const SonyDrive& mechanism = floppy_->mechanism();
+    event.swim.mode = chip.ismMode();
+    event.swim.setup = chip.ismSetup();
+    event.swim.handshake = chip.diagnosticHandshake();
+    event.swim.error = chip.diagnosticError();
+    event.swim.data = chip.ismData;
+    event.swim.lines = chip.diagnosticLines();
+    const bool driveSel = (chip.ismMode() & 0x20u) != 0;
+    event.swim.driveAddress = static_cast<u8>(chip.driveRegister(driveSel));
+    if (chip.ismAction()) event.swim.flags |= 1u << 0;
+    if (chip.ismWriting()) event.swim.flags |= 1u << 1;
+    if (chip.ismDataReady) event.swim.flags |= 1u << 2;
+    if (chip.ismMarkNext) event.swim.flags |= 1u << 3;
+    if (chip.ismCrcOk) event.swim.flags |= 1u << 4;
+    if (mechanism.hasDisk()) event.swim.flags |= 1u << 5;
+    if (mechanism.diskSwitched()) event.swim.flags |= 1u << 6;
+    if (mechanism.motorRunning(totalCycles_)) event.swim.flags |= 1u << 7;
+    event.swim.crc = chip.diagnosticCrc();
+    event.swim.track = static_cast<u8>(std::clamp(mechanism.track, 0, 255));
+    event.swim.side = mechanism.headUpper ? 1 : 0;
+    event.swim.fifoOccupancy = chip.ismFifoOccupancy();
+    event.swim.fifoHead = chip.ismFifoHeadData();
+    event.swim.fifoTail = chip.ismFifoTailData();
+    event.swim.readSynced = floppy_->readSynced() ? 1u : 0u;
+    event.swim.fifoHeadCrc = chip.diagnosticFifoHeadCrc();
+    if (mechanism.stepIn) event.swim.mechanismFlags |= 1u << 0;
+    if (mechanism.stepping(totalCycles_))
         event.swim.mechanismFlags |= 1u << 1;
-    if (floppyDrive_->motorCommanded())
+    if (mechanism.motorCommanded())
         event.swim.mechanismFlags |= 1u << 2;
-    if (floppyDrive_->enabled()) event.swim.mechanismFlags |= 1u << 3;
-    if (floppyDrive_->mfmMode()) event.swim.mechanismFlags |= 1u << 4;
-    event.swim.stepRemaining = floppyDrive_->stepRemaining(totalCycles_);
+    if (mechanism.enabled()) event.swim.mechanismFlags |= 1u << 3;
+    if (mechanism.mfmMode()) event.swim.mechanismFlags |= 1u << 4;
+    event.swim.stepRemaining = mechanism.stepRemaining(totalCycles_);
     event.swim.requestedBlock = traceFloppyBlock_;
     event.swim.expectedTrack = traceFloppyTrack_;
     event.swim.expectedSide = traceFloppySide_;
@@ -2620,8 +2364,8 @@ void IifxMachine::checkHardwareProtocols() {
         protocolAssertion(1ull << 10, HardwareTraceSource::ScsiDma,
             TraceScsi, "IIfx SCSI DMA active while NCR5380 DMA mode is clear");
 
-    const u8 swimMode = swim_->ismMode();
-    const bool swimAction = swim_->ismAction();
+    const u8 swimMode = floppy_->chip().ismMode();
+    const bool swimAction = floppy_->chip().ismAction();
     const unsigned selectedDrives = ((swimMode & 0x02u) ? 1u : 0u) +
                                     ((swimMode & 0x04u) ? 1u : 0u);
     if (swimAction && selectedDrives == 0)
@@ -2633,12 +2377,13 @@ void IifxMachine::checkHardwareProtocols() {
     if (!swimAction && (ismIop_->dmaRequest(0) || ismIop_->dmaRequest(1)))
         protocolAssertion(1ull << 13, HardwareTraceSource::Swim,
             TraceSwim | TraceIop, "SWIM DMA request asserted while ACTION is clear");
-    if ((floppyDrive_->track < 0 || floppyDrive_->track > 79) ||
-        (floppyDrive_->headUpper && !floppyDrive_->doubleSided))
+    const SonyDrive& floppyDrive = floppy_->mechanism();
+    if ((floppyDrive.track < 0 || floppyDrive.track > 79) ||
+        (floppyDrive.headUpper && !floppyDrive.doubleSided))
         protocolAssertion(1ull << 14, HardwareTraceSource::Swim,
             TraceSwim, "SuperDrive head is outside the installed mechanism geometry",
-            static_cast<u32>(floppyDrive_->track),
-            floppyDrive_->headUpper ? 1u : 0u);
+            static_cast<u32>(floppyDrive.track),
+            floppyDrive.headUpper ? 1u : 0u);
 
     // Video interrupt/cursor assertions are deliberately frame-bounded. A
     // normal slot handler acknowledges every VBL quickly; holding the level
@@ -3277,9 +3022,9 @@ u64 IifxMachine::deterministicStateHash() const {
     hash = hashWord(hash, scsiDma_->control(), 4);
     hash = hashWord(hash, scsiDma_->address(), 4);
     hash = hashWord(hash, scsiDma_->count(), 4);
-    hash = hashWord(hash, swim_->ismMode(), 1);
-    hash = hashWord(hash, swim_->diagnosticHandshake(), 1);
-    hash = hashWord(hash, swim_->diagnosticCrc(), 2);
+    hash = hashWord(hash, floppy_->chip().ismMode(), 1);
+    hash = hashWord(hash, floppy_->chip().diagnosticHandshake(), 1);
+    hash = hashWord(hash, floppy_->chip().diagnosticCrc(), 2);
     hash = hashWord(hash, ismIop_->cpu().pc, 2);
     hash = hashWord(hash, ismIop_->dmaTransfers);
     return hash;
