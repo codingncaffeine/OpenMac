@@ -23,6 +23,7 @@ add_library(openmac_core STATIC
     src/machine/iifx/iop.cpp
     src/machine/iifx/iifx.cpp
     src/machine/iifx/state.cpp
+    src/machine/hostservices.cpp
     src/machine/quadra/quadra.cpp
     src/machine/machine.cpp
     src/machine/cdmedia.cpp
