@@ -17,6 +17,7 @@
 #include "asc.hpp"
 #include "../iop.hpp"
 #include "../iop_floppy.hpp"
+#include "../iop_serial.hpp"
 #include "../adb_bus.hpp"
 #include "nubus_video.hpp"
 #include "oss.hpp"
@@ -763,14 +764,7 @@ void IifxMachine::updateIpl() {
 }
 
 void IifxMachine::updateSccDmaRequests() {
-    for (int channel = 0; channel < 2; ++channel) {
-        const u8 control = sccIop_->dmaControl(channel);
-        const bool enabled = (control & 0x01u) != 0;
-        const bool peripheralToRam = (control & 0x04u) != 0;
-        const u8 peripheral = static_cast<u8>(control >> 4);
-        sccIop_->setDmaRequest(channel,
-            enabled && scc_->dmaRequest(peripheral, peripheralToRam));
-    }
+    updateSerialDmaRequests(*sccIop_, *scc_);
 }
 
 void IifxMachine::tickDevices(int cpuCycles) {

@@ -6,6 +6,7 @@
 #include "../adb_bus.hpp"
 #include "../iop.hpp"
 #include "../iop_floppy.hpp"
+#include "../iop_serial.hpp"
 #include "../quadra/dafb.hpp"
 #include "../quadra/easc.hpp"
 #include "../quadra/ncr53c96.hpp"
@@ -164,6 +165,10 @@ void Quadra950Machine::wireDevices() {
         scc_->write(static_cast<u32>(reg & 3u) * 2u, value);
     };
     sccIop_->onInterruptChange = [this] { updateIpl(); };
+    // The SCC's two request outputs are the serial processor's DMA request
+    // lines, as on the IIfx (MAME's Quadra 900/950 board wires them the same).
+    scc_->onDmaRequestChange = [this] { updateSerialDmaRequests(*sccIop_, *scc_); };
+    sccIop_->onDmaWrite = [this](int, u8, u8) { updateSerialDmaRequests(*sccIop_, *scc_); };
     // The floppy/ADB processor. Its first general-purpose pin pair is the
     // ADB wire, as on the IIfx: the output goes through an inverter onto the
     // open-collector line and the input samples the line (dossier, "I/O
@@ -499,6 +504,7 @@ void Quadra950Machine::tickDevices(int cpuCycles) {
         }
     }
     floppy_->service(totalCycles_);
+    updateSerialDmaRequests(*sccIop_, *scc_);
     sccIop_->tick(cpuCycles);
     swimIop_->tick(cpuCycles);
     floppy_->service(totalCycles_);
@@ -679,6 +685,12 @@ std::string Quadra950Machine::diagnosticReport() const {
         sccIop_->running() ? "running" : "held", sccIop_->bypassed() ? " bypass" : "", sccIop_->status(),
         swimIop_->running() ? "running" : "held", swimIop_->firmwareAlive() ? " alive" : "",
         swimIop_->status());
+    char serial[200];
+    scc_->debugState(serial, sizeof serial);
+    out += std::string("   serial chip: ") + serial + '\n';
+    add("   serial processor DMA: A control=%02X request=%d, B control=%02X request=%d, %llu bytes moved",
+        sccIop_->dmaControl(0), sccIop_->dmaRequest(0) ? 1 : 0, sccIop_->dmaControl(1),
+        sccIop_->dmaRequest(1) ? 1 : 0, static_cast<unsigned long long>(sccIop_->dmaTransfers));
     add("   floppy: %s, head on track %d, %llu bytes read, %llu written, %u tracks written back",
         floppy_->present() ? "disk in" : "empty", floppy_->track(),
         static_cast<unsigned long long>(floppy_->bytesRead()), static_cast<unsigned long long>(floppy_->bytesWritten()),

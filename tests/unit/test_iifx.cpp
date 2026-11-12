@@ -11,6 +11,7 @@
 #include "../../core/src/machine/iifx/asc.hpp"
 #include "../../core/src/machine/iop.hpp"
 #include "../../core/src/machine/iop_floppy.hpp"
+#include "../../core/src/machine/iop_serial.hpp"
 #include "../../core/src/machine/iifx/nubus_video.hpp"
 #include "../../core/src/machine/quadra/scc.hpp"
 
@@ -1050,6 +1051,62 @@ TEST_CASE("IIfx SCC transmit readiness paces PIC byte DMA") {
     scc.tick(1150);                        // first byte finishes on the wire
     CHECK(scc.dmaRequest(2, false));
     CHECK(requestChanges == 2);
+}
+
+TEST_CASE("Serial chip behind an I/O processor: a DMA transmit moves one byte per free holding register") {
+    constexpr int count = 12;
+    IoProcessor iop;
+    Scc8530 scc;
+    iop.peripheralRead = [&](u8 reg) { return scc.read(static_cast<u32>(reg & 3u) * 2u); };
+    iop.peripheralWrite = [&](u8 reg, u8 value) { scc.write(static_cast<u32>(reg & 3u) * 2u, value); };
+
+    // Firmware for the processor: send `count` bytes from $6000 to the SCC's
+    // channel A data port (peripheral 3) on DMA channel 0, then idle.
+    const u8 program[] = {
+        0xA9, 0x00, 0x8D, 0x21, 0xF0,                       // map low
+        0xA9, 0x60, 0x8D, 0x22, 0xF0,                       // map high
+        0xA9, count, 0x8D, 0x23, 0xF0,                      // count low
+        0xA9, 0x00, 0x8D, 0x24, 0xF0,                       // count high
+        0xA9, 0x31, 0x8D, 0x20, 0xF0,                       // control: peripheral 3, to the chip, enable
+        0x4C, 0x19, 0x70};                                  // idle
+    for (std::size_t i = 0; i < sizeof program; ++i) iop.setRam(static_cast<u16>(0x7000u + i), program[i]);
+    for (int i = 0; i < count; ++i) iop.setRam(static_cast<u16>(0x6000 + i), static_cast<u8>(0x41 + i));
+    iop.setRam(0x7FFC, 0x00);                               // the 65C02's reset vector
+    iop.setRam(0x7FFD, 0x70);
+
+    const auto run = [&](int cycles, bool wired) {
+        for (int done = 0; done < cycles; done += 40) {
+            if (wired) updateSerialDmaRequests(iop, scc);
+            iop.tick(40);
+            scc.tick(40);
+        }
+    };
+    const auto sentOnA = [&] {
+        char text[200];
+        scc.debugState(text, sizeof text);
+        const std::string state(text);
+        return std::stoi(state.substr(state.rfind("sent=") + 5));
+    };
+
+    SUBCASE("with the request lines connected the bytes go out at the line's pace") {
+        scc.onDmaRequestChange = [&] { updateSerialDmaRequests(iop, scc); };
+        iop.onDmaWrite = [&](int, u8, u8) { updateSerialDmaRequests(iop, scc); };
+        iop.write(4, IoProcessor::Run);
+        run(4000, true);                                    // the program has run; a few byte times
+        CHECK(iop.dmaTransfers >= 2);                       // shift register and holding register
+        CHECK(iop.dmaTransfers <= 6);                       // and no faster than the bytes leave
+        run(count * 1150 + 4000, true);
+        CHECK(iop.dmaTransfers == count);
+        CHECK(sentOnA() == count);
+        CHECK(iop.dmaCount(0) == 0);
+        CHECK((iop.dmaControl(0) & 0x01) == 0);             // the channel switched itself off
+    }
+    SUBCASE("left unconnected nothing moves") {
+        iop.write(4, IoProcessor::Run);
+        run(count * 1150 + 8000, false);
+        CHECK(iop.dmaTransfers == 0);
+        CHECK(sentOnA() == 0);
+    }
 }
 
 TEST_CASE("IIfx NuBus video card has a slot ROM and framebuffer") {
