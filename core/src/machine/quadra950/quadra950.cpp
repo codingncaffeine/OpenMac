@@ -1,5 +1,7 @@
 #include "openmac/quadra950.hpp"
 
+#include "openmac/quadra.hpp"
+
 #include "../iop.hpp"
 #include "../quadra/dafb.hpp"
 #include "../quadra/easc.hpp"
@@ -102,6 +104,7 @@ Quadra950Machine::Quadra950Machine(std::vector<u8> rom, const Config& cfg)
     macProm_[6] = 0;
     macProm_[7] = static_cast<u8>(x ^ 0xFF);
 
+    setDisplay("13-inch RGB");
     wireDevices();
     reset();
 }
@@ -226,6 +229,10 @@ void Quadra950Machine::reset() {
     sccIop_->reset();
     swimIop_->reset();
     dafb_->reset();
+    // The sense lines come up released. This ROM reads them before it writes
+    // the drive register (the Quadra 650's writes first), and the stand-in's
+    // zeroed register means "all three held low".
+    dafb_->write(0x1C, 7);
     dafbIrq_ = false;
     resetPeripherals();
     totalCycles_ = 0;
@@ -536,6 +543,33 @@ void Quadra950Machine::runFrame() {
 }
 
 // ---- front-end surface ----------------------------------------------------------
+
+void Quadra950Machine::setMonitorSense(u32 grounded, u32 pairs) {
+    Dafb::MonitorWiring m;
+    m.grounded = static_cast<u8>(grounded & 7u);
+    m.pairs = static_cast<u8>(pairs & 7u);
+    int n = 0;
+    const QuadraMachine::DisplayInfo* list = QuadraMachine::displays(n);
+    for (int i = 0; i < n; ++i) {
+        if (list[i].grounded != static_cast<int>(m.grounded) || list[i].pairs != static_cast<int>(m.pairs))
+            continue;
+        m.width = list[i].width;
+        m.height = list[i].height;
+        break;
+    }
+    dafb_->setMonitor(m);
+}
+
+bool Quadra950Machine::setDisplay(const char* name) {
+    int n = 0;
+    const QuadraMachine::DisplayInfo* list = QuadraMachine::displays(n);
+    for (int i = 0; i < n; ++i) {
+        if (std::strcmp(list[i].name, name) != 0) continue;
+        setMonitorSense(static_cast<u32>(list[i].grounded), static_cast<u32>(list[i].pairs));
+        return true;
+    }
+    return false;
+}
 
 int Quadra950Machine::screenWidth() const { return dafb_->width(); }
 int Quadra950Machine::screenHeight() const { return dafb_->height(); }

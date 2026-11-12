@@ -4,6 +4,7 @@
 //
 //   openmac_trace950 --rom FILE [--banks A B C D] [--frames N] [--shot OUT.ppm]
 //                    [--pram FILE] [--save-pram FILE] [--log] [--report] [--tests]
+//                    [--display "13-inch RGB"]
 //
 // --banks gives the four SIMM banks in megabytes (0, 4, 8, 16, 32 or 64).
 // Exit code 0 = ran to the end; 1 = the CPU halted; 2 = bad arguments.
@@ -30,7 +31,7 @@ std::vector<u8> readFile(const std::string& path) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string romPath, shotPath, pramIn, pramOut;
+    std::string romPath, shotPath, pramIn, pramOut, display;
     Quadra950Machine::Config cfg;
     int frames = 600;
     bool log = false, report = false, tests = false;
@@ -44,6 +45,7 @@ int main(int argc, char** argv) {
         else if (a == "--shot" && i + 1 < argc) shotPath = argv[++i];
         else if (a == "--pram" && i + 1 < argc) pramIn = argv[++i];
         else if (a == "--save-pram" && i + 1 < argc) pramOut = argv[++i];
+        else if (a == "--display" && i + 1 < argc) display = argv[++i];
         else if (a == "--log") log = true;
         else if (a == "--report") report = true;
         else if (a == "--tests") tests = true;
@@ -56,6 +58,13 @@ int main(int argc, char** argv) {
     }
 
     Quadra950Machine mac(std::move(rom), cfg);
+    if (!display.empty()) {
+        if (!mac.setDisplay(display.c_str())) {
+            std::fprintf(stderr, "no display named '%s'\n", display.c_str());
+            return 2;
+        }
+        mac.reset();   // the ROM reads the sense lines at startup
+    }
     u32 lastFrame = 0;
     if (log) mac.onDiag = [&](const char* m) { std::printf("f=%u %s\n", lastFrame, m); };
     // The ROM's startup self-test loop calls each test at $46F7A (number in

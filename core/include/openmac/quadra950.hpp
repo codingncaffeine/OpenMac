@@ -61,6 +61,12 @@ public:
     bool overlayActive() const { return overlay_; }
     u32 ramBytes() const { return static_cast<u32>(ram_.size()); }
 
+    // Which display is on the video port, by the names QuadraMachine::displays
+    // lists (the 950 drives the same Apple monitors). False = no such name.
+    // Takes effect at the next start: the ROM reads the sense lines once.
+    bool setDisplay(const char* name);
+    void setMonitorSense(u32 grounded, u32 pairs);
+
     int screenWidth() const;
     int screenHeight() const;
     void renderScreen(u32* argbOut) const;
