@@ -39,6 +39,7 @@ class Ncr53c96;
 class Dafb;
 class AdbTransceiver;
 class AdbBus;
+class IopFloppy;
 
 class Quadra950Machine final : public IBus040, public MacHostServices {
 public:
@@ -70,6 +71,14 @@ public:
     // Takes effect at the next start: the ROM reads the sense lines once.
     bool setDisplay(const char* name);
     void setMonitorSense(u32 grounded, u32 pairs);
+
+    // The internal SuperDrive: 400K, 800K or 1.44 MB of sectors, bare or in
+    // a DiskCopy 4.2 or MacBinary file. False = not a floppy image.
+    bool insertFloppy(std::vector<u8> image, bool readOnly = false);
+    void ejectFloppy();
+    bool floppyPresent() const;
+    // The disk's sectors as they are now (the ejected disk's, once it is out).
+    const std::vector<u8>& floppySectors();
 
     // Keyboard and mouse on the Apple Desktop Bus: a raw ADB key code going
     // down or up; mouse movement in counts since the last call, with the
@@ -139,6 +148,7 @@ private:
     std::unique_ptr<Easc> easc_;
     std::unique_ptr<Ncr53c96> scsi0_;    // internal bus
     std::unique_ptr<Ncr53c96> scsi1_;    // external bus
+    std::unique_ptr<IopFloppy> floppy_;
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<AdbBus> adbBus_;
     std::unique_ptr<Dafb> dafb_;

@@ -5,6 +5,7 @@
 #include "../adb.hpp"
 #include "../adb_bus.hpp"
 #include "../iop.hpp"
+#include "../iop_floppy.hpp"
 #include "../quadra/dafb.hpp"
 #include "../quadra/easc.hpp"
 #include "../quadra/ncr53c96.hpp"
@@ -81,6 +82,7 @@ Quadra950Machine::Quadra950Machine(std::vector<u8> rom, const Config& cfg)
       easc_(std::make_unique<Easc>()),
       scsi0_(std::make_unique<Ncr53c96>()),
       scsi1_(std::make_unique<Ncr53c96>()),
+      floppy_(std::make_unique<IopFloppy>(*swimIop_, kCpuHz)),
       adb_(std::make_unique<AdbTransceiver>()),
       adbBus_(std::make_unique<AdbBus>(*adb_)),
       dafb_(std::make_unique<Dafb>(Dafb::Variant::Standalone, cfg.vramMb == 1 ? 0x100000u : 0x200000u)),
@@ -165,10 +167,11 @@ void Quadra950Machine::wireDevices() {
     // The floppy/ADB processor. Its first general-purpose pin pair is the
     // ADB wire, as on the IIfx: the output goes through an inverter onto the
     // open-collector line and the input samples the line (dossier, "I/O
-    // processors"). The floppy chip arrives with the floppy drives: until
-    // then it reads as an open bus.
-    swimIop_->peripheralRead = [](u8) { return static_cast<u8>(0xFF); };
-    swimIop_->peripheralWrite = [](u8, u8) {};
+    // processors"). Its peripheral is the floppy chip with the internal
+    // SuperDrive.
+    swimIop_->peripheralRead = [this](u8 offset) { return floppy_->access(offset, false, 0, totalCycles_); };
+    swimIop_->peripheralWrite = [this](u8 offset, u8 value) { (void)floppy_->access(offset, true, value, totalCycles_); };
+    floppy_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     swimIop_->gpioRead = [this] {
         return static_cast<u8>(0xFE | (adbBus_->readLine(swimIop_->cpuCycles()) ? 1 : 0));
     };
@@ -243,6 +246,7 @@ void Quadra950Machine::reset() {
     egret_->reset();
     sccIop_->reset();
     swimIop_->reset();
+    floppy_->reset();
     adb_->reset();
     adbBus_->reset();
     dafb_->reset();
@@ -494,8 +498,10 @@ void Quadra950Machine::tickDevices(int cpuCycles) {
             via1_->setCA1(pb7);
         }
     }
+    floppy_->service(totalCycles_);
     sccIop_->tick(cpuCycles);
     swimIop_->tick(cpuCycles);
+    floppy_->service(totalCycles_);
     scc_->tick(static_cast<s32>(cpuCycles));
     sccIop_->setPeripheralInterrupt(scc_->irqAsserted());
     scsi0_->tick(cpuCycles);
@@ -587,6 +593,13 @@ bool Quadra950Machine::setDisplay(const char* name) {
     return false;
 }
 
+bool Quadra950Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
+    return floppy_->insert(std::move(image), readOnly);
+}
+void Quadra950Machine::ejectFloppy() { floppy_->eject(); }
+bool Quadra950Machine::floppyPresent() const { return floppy_->present(); }
+const std::vector<u8>& Quadra950Machine::floppySectors() { return floppy_->sectors(); }
+
 void Quadra950Machine::keyEvent(u8 adbCode, bool down) { adb_->injectKey(adbCode, down); }
 void Quadra950Machine::mouseEvent(int dx, int dy, bool button) { adb_->injectMouse(dx, dy, button); }
 
@@ -666,6 +679,10 @@ std::string Quadra950Machine::diagnosticReport() const {
         sccIop_->running() ? "running" : "held", sccIop_->bypassed() ? " bypass" : "", sccIop_->status(),
         swimIop_->running() ? "running" : "held", swimIop_->firmwareAlive() ? " alive" : "",
         swimIop_->status());
+    add("   floppy: %s, head on track %d, %llu bytes read, %llu written, %u tracks written back",
+        floppy_->present() ? "disk in" : "empty", floppy_->track(),
+        static_cast<unsigned long long>(floppy_->bytesRead()), static_cast<unsigned long long>(floppy_->bytesWritten()),
+        floppy_->tracksWritten());
     add("   ADB: %llu commands, %llu replies, %llu resets, last command %02X",
         static_cast<unsigned long long>(adbBus_->commands()), static_cast<unsigned long long>(adbBus_->replies()),
         static_cast<unsigned long long>(adbBus_->resets()), adbBus_->lastCommand());

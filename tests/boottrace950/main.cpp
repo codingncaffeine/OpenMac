@@ -8,6 +8,7 @@
 //                    [--vram 1|2] [--pram-byte OFFSET VALUE]... [--hashes FROM STEP]
 //                    [--peek ADDRESS COUNT]... [--watch-pc ADDRESS]...
 //                    [--mouse-at FRAME DX DY BUTTON]... [--key-at FRAME CODE down|up]...
+//                    [--floppy FILE] [--floppy-writable] [--save-floppy OUT]
 //
 // --pram-byte changes one byte of parameter RAM after --pram is loaded (the
 // stored video mode is byte $48). --hashes prints the distinct pictures seen
@@ -42,7 +43,8 @@ std::vector<u8> readFile(const std::string& path) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string romPath, shotPath, pramIn, pramOut, display;
+    std::string romPath, shotPath, pramIn, pramOut, display, floppyPath, floppyOut;
+    bool floppyWritable = false;
     Quadra950Machine::Config cfg;
     int frames = 600;
     bool log = false, report = false, tests = false;
@@ -61,6 +63,9 @@ int main(int argc, char** argv) {
             for (std::size_t b = 0; b < 4; ++b) cfg.bankMb[b] = static_cast<u32>(std::atoi(argv[++i]));
         }
         else if (a == "--shot" && i + 1 < argc) shotPath = argv[++i];
+        else if (a == "--floppy" && i + 1 < argc) floppyPath = argv[++i];
+        else if (a == "--floppy-writable") floppyWritable = true;
+        else if (a == "--save-floppy" && i + 1 < argc) floppyOut = argv[++i];
         else if (a == "--pram" && i + 1 < argc) pramIn = argv[++i];
         else if (a == "--save-pram" && i + 1 < argc) pramOut = argv[++i];
         else if (a == "--display" && i + 1 < argc) display = argv[++i];
@@ -154,6 +159,13 @@ int main(int argc, char** argv) {
             }
         }
     };
+    if (!floppyPath.empty()) {
+        // The file given is never changed: a writable disk lives in memory
+        // and goes to --save-floppy at the end.
+        const bool ok = mac.insertFloppy(readFile(floppyPath), !floppyWritable);
+        std::printf("floppy %s: %s\n", floppyPath.c_str(), ok ? "inserted" : "NOT a floppy image");
+        if (!ok) return 2;
+    }
     if (!pramIn.empty()) {
         const std::vector<u8> blob = readFile(pramIn);
         std::printf("PRAM %s: %s\n", pramIn.c_str(),
@@ -251,6 +263,39 @@ int main(int argc, char** argv) {
         } catch (const BusFault&) {
             std::printf(" | guest: no screen device\n");
         }
+    }
+    // What the guest has running and mounted: the current application's
+    // name (CurApName $0910) and the volume names down the VCB queue ($0358).
+    {
+        const auto pascal = [&](u32 at, u32 limit) {
+            std::string text;
+            try {
+                const u32 n = mac.read8(at);
+                if (n > limit) return text;        // not a name: nothing has set it yet
+                for (u32 k = 1; k <= n; ++k) {
+                    const u8 c = mac.read8(at + k);
+                    text += (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?';
+                }
+            } catch (const BusFault&) {
+            }
+            return text;
+        };
+        std::string volumes;
+        try {
+            u32 vcb = mac.read32(0x0358);
+            for (int n = 0; n < 8 && vcb != 0 && vcb < mac.ramBytes(); ++n) {
+                volumes += (volumes.empty() ? "" : ", ") + pascal(vcb + 44, 27);
+                vcb = mac.read32(vcb);
+            }
+        } catch (const BusFault&) {
+        }
+        std::printf("guest: application '%s', volumes [%s]\n", pascal(0x0910, 31).c_str(), volumes.c_str());
+    }
+    if (!floppyOut.empty()) {
+        const std::vector<u8>& sectors = mac.floppySectors();
+        std::ofstream out(floppyOut, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(sectors.data()), static_cast<std::streamsize>(sectors.size()));
+        std::printf("floppy sectors saved: %s (%zu bytes)\n", floppyOut.c_str(), sectors.size());
     }
     for (const auto& [at, count] : peeks) {
         std::printf("peek %08X:", at);
