@@ -829,25 +829,64 @@ OMAC_API void omac_fx_poll_log(OMacFx* m, char* out, size_t cap)
 
 } // extern "C"
 
-// ---- Quadra 650 surface -----------------------------------------------------
+// ---- Quadra surface: the Quadra 650 and the Quadra 950 ----------------------
+//
+// One handle type and one function family for both. The storage half is the
+// same code on both machines (MacHostServices); what differs sits behind the
+// small accessors below.
 
 #include "openmac/quadra.hpp"
+#include "openmac/quadra950.hpp"
+
+#include <array>
+#include <memory>
 
 struct OMacQ {
-    openmac::QuadraMachine mac;
+    std::unique_ptr<openmac::QuadraMachine> q650;
+    std::unique_ptr<openmac::Quadra950Machine> q950;
     std::vector<u8> audioBuf;
     std::vector<std::string> logBuf;   // drained off the hot path by omac_q_poll_log
 
-    OMacQ(std::vector<u8> rom, uint32_t ramMB)
-        : mac(std::move(rom), openmac::QuadraMachine::Config{ramMB * 1024u * 1024u}) {
+    // The Quadra 950's RAM is four banks of equal SIMMs (4 to 64 MB each).
+    // The sizes a front end offers, as banks; anything else gets 8 MB.
+    static std::array<u32, 4> banksFor(uint32_t ramMB) {
+        switch (ramMB) {
+        case 16: return {16, 0, 0, 0};
+        case 20: return {16, 4, 0, 0};
+        case 32: return {16, 16, 0, 0};
+        case 64: return {64, 0, 0, 0};
+        case 128: return {64, 64, 0, 0};
+        case 256: return {64, 64, 64, 64};
+        default: return {4, 4, 0, 0};
+        }
+    }
+
+    OMacQ(std::vector<u8> rom, uint32_t ramMB, int model, uint32_t vramMB) {
+        if (model == 1) {
+            openmac::Quadra950Machine::Config cfg;
+            cfg.bankMb = banksFor(ramMB);
+            cfg.vramMb = vramMB == 1 ? 1 : 2;
+            q950 = std::make_unique<openmac::Quadra950Machine>(std::move(rom), cfg);
+        } else {
+            q650 = std::make_unique<openmac::QuadraMachine>(
+                std::move(rom), openmac::QuadraMachine::Config{ramMB * 1024u * 1024u});
+        }
         // The faults behind a bomb box. Without this the front end is deaf to
         // everything the guest does wrong: a "type 1" system error reached the
         // user with not one line in the log to say where it came from.
         // onDiag is deliberately NOT wired here -- this machine's device
         // channels run at frame rate (the SCC alone writes a thousand lines
         // across a boot) and would bury exactly the lines worth reading.
-        mac.cpu().onException = [this](int vector, u32 pc) { fault(vector, pc); };
+        cpu().onException = [this](int vector, u32 pc) { fault(vector, pc); };
     }
+
+    openmac::MacHostServices& hs() {
+        if (q950) return *q950;
+        return *q650;
+    }
+    openmac::M68040& cpu() { return q950 ? q950->cpu() : q650->cpu(); }
+    u8 read8(u32 addr) { return q950 ? q950->read8(addr) : q650->read8(addr); }
+    unsigned long long frameCount() const { return q950 ? q950->frameCount() : q650->frameCount(); }
 
     void log(const char* s) {
         if (logBuf.size() < 4000) logBuf.emplace_back(s);
@@ -872,7 +911,7 @@ struct OMacQ {
         if (seen >= 2) return;
         ++seen;
         --faultBudget_;
-        const openmac::M68040& c = mac.cpu();
+        const openmac::M68040& c = cpu();
         static const char* const kName[] = {
             "reset SP", "reset PC", "access fault", "address error",
             "illegal instruction", "divide by zero", "CHK", "TRAPcc/TRAPV",
@@ -883,9 +922,9 @@ struct OMacQ {
         // identity-mapped and this read goes straight to the RAM array: no
         // translation to fault in, no device to disturb.
         char who[32] = "";
-        const u32 nameLen = mac.read8(0x0910u);
+        const u32 nameLen = read8(0x0910u);
         for (u32 k = 0; k < nameLen && k < 31; ++k) {
-            const u8 ch = mac.read8(0x0911u + k);
+            const u8 ch = read8(0x0911u + k);
             who[k] = (ch >= 32 && ch < 127) ? static_cast<char>(ch) : '.';
         }
         char b[256];
@@ -893,7 +932,7 @@ struct OMacQ {
                       "[guest] %s at pc=%08X addr=%08X sr=%04X app='%s' frame=%llu",
                       vector < 10 ? kName[vector] : "exception", pc,
                       c.lastFaultAddr, c.getSR(), who,
-                      static_cast<unsigned long long>(mac.frameCount()));
+                      frameCount());
         log(b);
         // The registers name the pointer that was followed, and the ring names
         // the road in: a wild jump runs on through the weeds before it faults,
@@ -925,8 +964,8 @@ struct OMacQ {
         // one fact that explains it is which trap had no handler. Ask while
         // the evidence is still there; it costs a scan of two tables, and only
         // when the PC says something already went badly wrong.
-        if (pc < 0x1000u) {
-            const std::string health = mac.trapTableHealth();
+        if (pc < 0x1000u && q650) {
+            const std::string health = q650->trapTableHealth();
             std::size_t at = 0;
             while (at < health.size()) {
                 const std::size_t nl = health.find('\n', at);
@@ -944,27 +983,64 @@ private:
 
 extern "C" {
 
-OMAC_API OMacQ* omac_q_create(const uint8_t* rom, size_t rom_len, uint32_t ram_mb)
+// model: 0 = Quadra 650, 1 = Quadra 950. vram_mb counts on the 950 only (1 or
+// 2; 0 = 2). RAM on the 950: 8, 16, 20, 32, 64, 128 or 256 MB.
+OMAC_API OMacQ* omac_q_create_model(const uint8_t* rom, size_t rom_len, int model, uint32_t ram_mb,
+                                    uint32_t vram_mb)
 {
     if (!rom || rom_len == 0) return nullptr;
     try {
-        return new OMacQ(std::vector<u8>(rom, rom + rom_len), ram_mb ? ram_mb : 8u);
+        return new OMacQ(std::vector<u8>(rom, rom + rom_len), ram_mb ? ram_mb : 8u, model, vram_mb);
     } catch (...) {
         return nullptr;
     }
 }
 
+OMAC_API OMacQ* omac_q_create(const uint8_t* rom, size_t rom_len, uint32_t ram_mb)
+{
+    return omac_q_create_model(rom, rom_len, 0, ram_mb, 0);
+}
+
 OMAC_API void omac_q_destroy(OMacQ* m) { delete m; }
-OMAC_API void omac_q_reset(OMacQ* m) { if (m) m->mac.reset(); }
-OMAC_API void omac_q_run_frame(OMacQ* m) { if (m) m->mac.runFrame(); }
-OMAC_API int  omac_q_screen_w(OMacQ* m) { return m ? m->mac.screenWidth() : 640; }
-OMAC_API int  omac_q_screen_h(OMacQ* m) { return m ? m->mac.screenHeight() : 480; }
-OMAC_API void omac_q_render(OMacQ* m, uint32_t* argb) { if (m && argb) m->mac.renderScreen(argb); }
+OMAC_API void omac_q_reset(OMacQ* m)
+{
+    if (!m) return;
+    if (m->q950) m->q950->reset(); else m->q650->reset();
+}
+OMAC_API void omac_q_run_frame(OMacQ* m)
+{
+    if (!m) return;
+    if (m->q950) {
+        m->q950->runFrame();
+        // Shut Down: the System has flushed its volumes and asked the
+        // microcontroller to cut the power.
+        if (m->q950->powerDownRequested && !m->q950->poweredOff()) {
+            m->q950->powerOff();
+            m->log("[power] the Macintosh switched itself off (Shut Down)");
+        }
+    } else {
+        m->q650->runFrame();
+    }
+}
+OMAC_API int omac_q_powered_off(OMacQ* m) { return m && m->q950 && m->q950->poweredOff() ? 1 : 0; }
+OMAC_API int omac_q_screen_w(OMacQ* m)
+{
+    return !m ? 640 : m->q950 ? m->q950->screenWidth() : m->q650->screenWidth();
+}
+OMAC_API int omac_q_screen_h(OMacQ* m)
+{
+    return !m ? 480 : m->q950 ? m->q950->screenHeight() : m->q650->screenHeight();
+}
+OMAC_API void omac_q_render(OMacQ* m, uint32_t* argb)
+{
+    if (!m || !argb) return;
+    if (m->q950) m->q950->renderScreen(argb); else m->q650->renderScreen(argb);
+}
 
 OMAC_API size_t omac_q_drain_audio(OMacQ* m, uint8_t* out, size_t cap)
 {
     if (!m || !out || cap == 0) return 0;
-    m->mac.drainAudio(m->audioBuf);
+    if (m->q950) m->q950->drainAudio(m->audioBuf); else m->q650->drainAudio(m->audioBuf);
     const size_t n = m->audioBuf.size() < cap ? m->audioBuf.size() : cap;
     if (n) std::memcpy(out, m->audioBuf.data(), n);
     return n;
@@ -972,23 +1048,26 @@ OMAC_API size_t omac_q_drain_audio(OMacQ* m, uint8_t* out, size_t cap)
 
 OMAC_API void omac_q_mouse(OMacQ* m, int dx, int dy, int button)
 {
-    if (m) m->mac.mouseMove(dx, dy, button != 0);
+    if (!m) return;
+    if (m->q950) m->q950->mouseEvent(dx, dy, button != 0); else m->q650->mouseMove(dx, dy, button != 0);
 }
 
 OMAC_API void omac_q_key(OMacQ* m, int adb_code, int down)
 {
-    if (m) m->mac.keyEvent(static_cast<u8>(adb_code), down != 0);
+    if (!m) return;
+    if (m->q950) m->q950->keyEvent(static_cast<u8>(adb_code), down != 0);
+    else m->q650->keyEvent(static_cast<u8>(adb_code), down != 0);
 }
 
 OMAC_API void omac_q_insert_harddisk(OMacQ* m, const uint8_t* img, size_t len, int ro)
 {
-    if (m && img) m->mac.insertHardDisk(std::vector<u8>(img, img + len), ro != 0);
+    if (m && img) m->hs().insertHardDisk(std::vector<u8>(img, img + len), ro != 0);
 }
 
 OMAC_API size_t omac_q_harddisk_data(OMacQ* m, uint8_t* out, size_t cap)
 {
-    if (!m || !m->mac.hardDiskPresent()) return 0;
-    const auto& img = m->mac.hardDiskImage();
+    if (!m || !m->hs().hardDiskPresent()) return 0;
+    const auto& img = m->hs().hardDiskImage();
     if (!out) return img.size();
     if (cap < img.size()) return 0;
     std::copy(img.begin(), img.end(), out);
@@ -997,15 +1076,15 @@ OMAC_API size_t omac_q_harddisk_data(OMacQ* m, uint8_t* out, size_t cap)
 
 OMAC_API void omac_q_insert_harddisk2(OMacQ* m, const uint8_t* img, size_t len, int ro)
 {
-    if (m && img) m->mac.insertHardDisk2(std::vector<u8>(img, img + len), ro != 0);
+    if (m && img) m->hs().insertHardDisk2(std::vector<u8>(img, img + len), ro != 0);
 }
 
-OMAC_API void omac_q_detach_harddisk2(OMacQ* m) { if (m) m->mac.detachHardDisk2(); }
+OMAC_API void omac_q_detach_harddisk2(OMacQ* m) { if (m) m->hs().detachHardDisk2(); }
 
 OMAC_API size_t omac_q_harddisk2_data(OMacQ* m, uint8_t* out, size_t cap)
 {
-    if (!m || !m->mac.hardDisk2Present()) return 0;
-    const auto& img = m->mac.hardDisk2Image();
+    if (!m || !m->hs().hardDisk2Present()) return 0;
+    const auto& img = m->hs().hardDisk2Image();
     if (!out) return img.size();
     if (cap < img.size()) return 0;
     std::copy(img.begin(), img.end(), out);
@@ -1014,23 +1093,26 @@ OMAC_API size_t omac_q_harddisk2_data(OMacQ* m, uint8_t* out, size_t cap)
 
 OMAC_API int omac_q_harddisk2_booted(OMacQ* m)
 {
-    return (m && m->mac.secondDiskDriverResident()) ? 1 : 0;
+    return (m && m->hs().secondDiskDriverResident()) ? 1 : 0;
 }
 
 OMAC_API int omac_q_unmount_harddisk2(OMacQ* m)
 {
-    return (m && m->mac.unmountSecondDisk()) ? 1 : 0;
+    return (m && m->hs().unmountSecondDisk()) ? 1 : 0;
 }
 
 OMAC_API int omac_q_shutdown_volumes(OMacQ* m)
 {
-    return (m && m->mac.shutdownVolumes()) ? 1 : 0;
+    // A machine that switched itself off has done this already, and is not
+    // running to be asked again.
+    if (!m || (m->q950 && m->q950->poweredOff())) return 0;
+    return m->hs().shutdownVolumes() ? 1 : 0;
 }
 
 OMAC_API size_t omac_q_floppy_writeback(OMacQ* m, uint8_t* out, size_t cap)
 {
     if (!m) return 0;
-    const std::vector<u8> img = m->mac.floppyForWriteBack();
+    const std::vector<u8> img = m->q950 ? m->q950->floppyForWriteBack() : m->q650->floppyForWriteBack();
     if (img.empty()) return 0;
     if (!out) return img.size();
     if (cap < img.size()) return 0;
@@ -1044,19 +1126,22 @@ OMAC_API size_t omac_q_floppy_writeback(OMacQ* m, uint8_t* out, size_t cap)
 OMAC_API size_t omac_q_pram_save(OMacQ* m, uint8_t* out, size_t cap)
 {
     if (!m) return 0;
-    return m->mac.savePram(out, static_cast<uint32_t>(cap));
+    return m->q950 ? m->q950->savePram(out, static_cast<uint32_t>(cap)) : m->q650->savePram(out, static_cast<uint32_t>(cap));
 }
 
 OMAC_API int omac_q_pram_load(OMacQ* m, const uint8_t* data, size_t len,
                               uint32_t addSeconds)
 {
-    return m && m->mac.loadPram(data, static_cast<uint32_t>(len), addSeconds) ? 1 : 0;
+    if (!m) return 0;
+    const bool ok = m->q950 ? m->q950->loadPram(data, static_cast<uint32_t>(len), addSeconds)
+                            : m->q650->loadPram(data, static_cast<uint32_t>(len), addSeconds);
+    return ok ? 1 : 0;
 }
 
 OMAC_API size_t omac_q_diagnostics(OMacQ* m, char* out, size_t cap)
 {
     if (!m) return 0;
-    const std::string s = m->mac.diagnosticReport();
+    const std::string s = m->q950 ? m->q950->diagnosticReport() : m->q650->diagnosticReport();
     if (!out || cap == 0) return s.size() + 1;
     const size_t n = s.size() < cap - 1 ? s.size() : cap - 1;
     std::copy(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n), out);
@@ -1085,17 +1170,26 @@ OMAC_API void omac_q_poll_log(OMacQ* m, char* out, size_t cap)
 OMAC_API int omac_q_insert_floppy(OMacQ* m, const uint8_t* img, size_t len, int ro)
 {
     if (!m || !img) return 0;
-    return m->mac.insertFloppy(std::vector<u8>(img, img + len), ro != 0);
+    if (m->q950) return m->q950->insertFloppy(std::vector<u8>(img, img + len), ro != 0) ? 1 : 0;
+    return m->q650->insertFloppy(std::vector<u8>(img, img + len), ro != 0);
 }
 
-OMAC_API void omac_q_eject_floppy(OMacQ* m) { if (m) m->mac.ejectFloppy(); }
+OMAC_API void omac_q_eject_floppy(OMacQ* m)
+{
+    if (!m) return;
+    if (m->q950) m->q950->ejectFloppy(); else m->q650->ejectFloppy();
+}
 
-OMAC_API int omac_q_floppy_present(OMacQ* m) { return m && m->mac.floppyPresent() ? 1 : 0; }
+OMAC_API int omac_q_floppy_present(OMacQ* m)
+{
+    if (!m) return 0;
+    return (m->q950 ? m->q950->floppyPresent() : m->q650->floppyPresent()) ? 1 : 0;
+}
 
 OMAC_API size_t omac_q_floppy_data(OMacQ* m, uint8_t* out, size_t cap)
 {
-    if (!m || !m->mac.floppyPresent()) return 0;
-    const auto& img = m->mac.floppyImage();
+    if (!m || !omac_q_floppy_present(m)) return 0;
+    const auto& img = m->q950 ? m->q950->floppySectors() : m->q650->floppyImage();
     if (!out) return img.size();
     if (cap < img.size()) return 0;
     std::copy(img.begin(), img.end(), out);
@@ -1107,20 +1201,20 @@ OMAC_API size_t omac_q_floppy_data(OMacQ* m, uint8_t* out, size_t cap)
 // which is why a disc chosen in the GUI did nothing at all.
 OMAC_API void omac_q_attach_cd(OMacQ* m, int attached, int busId)
 {
-    if (m) m->mac.attachCdRom(attached != 0, busId);
+    if (m) m->hs().attachCdRom(attached != 0, busId);
 }
 
-OMAC_API int omac_q_cd_attached(OMacQ* m) { return m && m->mac.cdRomAttached() ? 1 : 0; }
+OMAC_API int omac_q_cd_attached(OMacQ* m) { return m && m->hs().cdRomAttached() ? 1 : 0; }
 
 OMAC_API int omac_q_insert_cd(OMacQ* m, const uint8_t* img, size_t len)
 {
     if (!m || !img) return 0;
-    return m->mac.insertCd(std::vector<u8>(img, img + len));
+    return m->hs().insertCd(std::vector<u8>(img, img + len));
 }
 
-OMAC_API void omac_q_eject_cd(OMacQ* m) { if (m) m->mac.ejectCd(); }
+OMAC_API void omac_q_eject_cd(OMacQ* m) { if (m) m->hs().ejectCd(); }
 
-OMAC_API int omac_q_cd_present(OMacQ* m) { return m && m->mac.cdPresent() ? 1 : 0; }
+OMAC_API int omac_q_cd_present(OMacQ* m) { return m && m->hs().cdPresent() ? 1 : 0; }
 
 // The displays the built-in video port drives. Walk index upward until this
 // returns null. Static, so a front end can build its menu before there is a
@@ -1138,7 +1232,8 @@ OMAC_API const char* omac_q_display_name(int index, int* w, int* h)
 
 OMAC_API int omac_q_set_display(OMacQ* m, const char* name)
 {
-    return (m && m->mac.setDisplay(name)) ? 1 : 0;
+    if (!m || !name) return 0;
+    return (m->q950 ? m->q950->setDisplay(name) : m->q650->setDisplay(name)) ? 1 : 0;
 }
 
 } // extern "C"

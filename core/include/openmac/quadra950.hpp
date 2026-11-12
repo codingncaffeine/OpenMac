@@ -88,6 +88,9 @@ public:
     bool floppyPresent() const;
     // The disk's sectors as they are now (the ejected disk's, once it is out).
     const std::vector<u8>& floppySectors();
+    // The same in the file format the disk came in: what goes back to the
+    // host file.
+    std::vector<u8> floppyForWriteBack();
 
     // Keyboard and mouse on the Apple Desktop Bus: a raw ADB key code going
     // down or up; mouse movement in counts since the last call, with the
@@ -122,9 +125,14 @@ public:
     bool loadPram(const u8* data, u32 len, u32 addSeconds);
     const std::array<u8, 256>& pram() const;
 
-    // The guest asked the microcontroller to switch the machine off / restart
-    // it. Cleared by the caller.
+    // The guest asked the microcontroller to switch the machine off (Shut
+    // Down). A tool may clear the flag; a front end calls powerOff() instead.
     bool powerDownRequested = false;
+    // Switched off: the machine stands still with a dark screen and no sound
+    // until reset() (power on again). The System has flushed and unmounted
+    // its volumes before it asks.
+    void powerOff() { poweredOff_ = true; }
+    bool poweredOff() const { return poweredOff_; }
 
     // What the memory controller's three boundaries currently say, in bytes.
     u32 bankBoundary(int k) const;
@@ -189,6 +197,7 @@ private:
     int scsiPortDiag_ = 16;
     bool via2Pb7_ = true;      // last level of VIA2 timer 1's output
     bool resetPending_ = false;   // the microcontroller asked for a system reset
+    bool poweredOff_ = false;
     // True when [addr, addr+n) lies in fitted RAM that sits at its own address.
     bool directRam(u32 addr, u32 n) const {
         return addr < ram_.size() && ram_.size() - addr >= n;

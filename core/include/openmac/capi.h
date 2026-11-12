@@ -215,6 +215,14 @@ OMAC_API size_t omac_net_drain(OMac*, uint8_t* out, size_t cap);
    disk that takes the same raw HFS images the Classic does. */
 typedef struct OMacQ OMacQ;
 OMAC_API OMacQ* omac_q_create(const uint8_t* rom, size_t rom_len, uint32_t ram_mb);
+/* The same handle for either Quadra. model: 0 = Quadra 650, 1 = Quadra 950.
+   vram_mb counts on the 950 only (1 or 2; 0 = 2). RAM on the 950: 8, 16, 20,
+   32, 64, 128 or 256 MB. Every omac_q_ function serves both machines. */
+OMAC_API OMacQ* omac_q_create_model(const uint8_t* rom, size_t rom_len, int model, uint32_t ram_mb,
+                                    uint32_t vram_mb);
+/* 1 once the guest has shut down and switched the machine off (Quadra 950):
+   it stands still with a dark screen until omac_q_reset. */
+OMAC_API int    omac_q_powered_off(OMacQ*);
 OMAC_API void   omac_q_destroy(OMacQ*);
 OMAC_API void   omac_q_reset(OMacQ*);
 OMAC_API void   omac_q_run_frame(OMacQ*);

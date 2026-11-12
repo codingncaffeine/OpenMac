@@ -268,6 +268,8 @@ void Quadra950Machine::resetPeripherals() {
 void Quadra950Machine::reset() {
     overlay_ = true;
     resetPending_ = false;
+    poweredOff_ = false;
+    powerDownRequested = false;
     memctl_->reset();
     for (auto& r : sonicRegs_) r = 0;
     sonicRegs_[0x29] = 6;                 // silicon revision
@@ -644,6 +646,13 @@ int Quadra950Machine::stepInstruction() {
 }
 
 void Quadra950Machine::runFrame() {
+    if (poweredOff_) {
+        // Nothing runs; a frame's worth of silence keeps the host's sound
+        // output fed.
+        if (audioOut_.size() < 8192) audioOut_.insert(audioOut_.end(), kSlicesPerFrame, 0x80);
+        ++frameCounter_;
+        return;
+    }
     const u64 target = totalCycles_ + static_cast<u64>(kSlicesPerFrame) * kCyclesPerSlice;
     while (totalCycles_ < target) {
         stepInstruction();
@@ -686,6 +695,7 @@ bool Quadra950Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
 void Quadra950Machine::ejectFloppy() { floppy_->requestEject(totalCycles_); }
 bool Quadra950Machine::floppyPresent() const { return floppy_->present(); }
 const std::vector<u8>& Quadra950Machine::floppySectors() { return floppy_->sectors(); }
+std::vector<u8> Quadra950Machine::floppyForWriteBack() { return floppy_->fileImage(); }
 
 void Quadra950Machine::keyEvent(u8 adbCode, bool down) { adb_->injectKey(adbCode, down); }
 void Quadra950Machine::mouseEvent(int dx, int dy, bool button) { adb_->injectMouse(dx, dy, button); }
@@ -698,7 +708,14 @@ u32 Quadra950Machine::scsiCommands(int bus) const { return (bus ? *scsi1_ : *scs
 
 int Quadra950Machine::screenWidth() const { return dafb_->width(); }
 int Quadra950Machine::screenHeight() const { return dafb_->height(); }
-void Quadra950Machine::renderScreen(u32* argbOut) const { dafb_->render(argbOut); }
+void Quadra950Machine::renderScreen(u32* argbOut) const {
+    if (poweredOff_) {
+        const std::size_t n = static_cast<std::size_t>(dafb_->width()) * static_cast<std::size_t>(dafb_->height());
+        for (std::size_t i = 0; i < n; ++i) argbOut[i] = 0xFF000000u;
+        return;
+    }
+    dafb_->render(argbOut);
+}
 
 Quadra950Machine::VideoState Quadra950Machine::videoState() const {
     const int bits = dafb_->bpp();
