@@ -60,6 +60,11 @@ add_executable(openmac_trace040
 )
 target_link_libraries(openmac_trace040 PRIVATE openmac_core openmac_warnings)
 
+add_executable(openmac_trace950
+    boottrace950/main.cpp
+)
+target_link_libraries(openmac_trace950 PRIVATE openmac_core openmac_warnings)
+
 add_executable(openmac_trace030
     boottrace030/main.cpp
 )
