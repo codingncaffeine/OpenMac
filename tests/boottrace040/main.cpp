@@ -1035,14 +1035,23 @@ int main(int argc, char** argv) {
     cfg.ramSize = static_cast<u32>(ramMb) * 1024u * 1024u;
     QuadraMachine mac(std::move(rom), cfg);
     auto listing = [&mac](u32 at, int count) {
-        const dbg::ReadWord rd = [&mac](u32 a) { return mac.read16(a); };
+        // Through the MMU: once the System maps memory, the address a
+        // program runs at is not where its bytes sit in physical RAM, and
+        // a listing read straight from RAM shows some other page.
+        const auto word = [&mac](u32 a) {
+            u32 p = a;
+            try { p = mac.cpu().diagnosticTranslate(a, false, true, true); }
+            catch (...) { p = a; }
+            return mac.read16(p);
+        };
+        const dbg::ReadWord rd = word;
         u32 pc = at;
         for (int n = 0; n < count; ++n) {
             std::string text;
             const int len = dbg::disasm(rd, pc, text);
             std::printf("%08X  ", pc);
             for (int w = 0; w < 5; ++w)
-                if (w * 2 < len) std::printf("%04X ", mac.read16(pc + u32(w) * 2));
+                if (w * 2 < len) std::printf("%04X ", word(pc + u32(w) * 2));
                 else std::printf("     ");
             std::printf(" %s\n", text.c_str());
             pc += static_cast<u32>(len);
