@@ -9,6 +9,7 @@
 //                    [--peek ADDRESS COUNT]... [--watch-pc ADDRESS]...
 //                    [--mouse-at FRAME DX DY BUTTON]... [--key-at FRAME CODE down|up]...
 //                    [--floppy FILE] [--floppy-writable] [--save-floppy OUT]
+//                    [--floppy-at FRAME FILE]... [--eject-floppy-at FRAME]...
 //
 // --pram-byte changes one byte of parameter RAM after --pram is loaded (the
 // stored video mode is byte $48). --hashes prints the distinct pictures seen
@@ -45,6 +46,7 @@ std::vector<u8> readFile(const std::string& path) {
 int main(int argc, char** argv) {
     std::string romPath, shotPath, pramIn, pramOut, display, floppyPath, floppyOut;
     bool floppyWritable = false;
+    std::vector<std::pair<int, std::string>> floppyEvents;   // frame, file ("" = the host's Eject)
     Quadra950Machine::Config cfg;
     int frames = 600;
     bool log = false, report = false, tests = false;
@@ -85,6 +87,11 @@ int main(int argc, char** argv) {
             i += 4;
             inputs.push_back(in);
         }
+        else if (a == "--floppy-at" && i + 2 < argc) {
+            const int at = std::atoi(argv[++i]);
+            floppyEvents.emplace_back(at, argv[++i]);
+        }
+        else if (a == "--eject-floppy-at" && i + 1 < argc) floppyEvents.emplace_back(std::atoi(argv[++i]), "");
         else if (a == "--key-at" && i + 3 < argc) {
             Input in{std::atoi(argv[i + 1]), 1, static_cast<int>(std::strtoul(argv[i + 2], nullptr, 0)),
                      std::string(argv[i + 3]) == "down" ? 1 : 0, 0};
@@ -195,8 +202,25 @@ int main(int argc, char** argv) {
     std::map<u32, int> hashes;
 
     bool halted = false;
+    bool floppyIn = mac.floppyPresent();
     for (int f = 0; f < frames; ++f) {
         lastFrame = static_cast<u32>(f);
+        if (mac.floppyPresent() != floppyIn) {
+            floppyIn = !floppyIn;
+            if (!floppyIn) std::printf("floppy left the drive by frame %d\n", f);
+        }
+        for (const auto& [at, file] : floppyEvents) {
+            if (at != f) continue;
+            if (file.empty()) {
+                mac.ejectFloppy();
+                floppyIn = mac.floppyPresent();
+                std::printf("floppy eject asked for at frame %d%s\n", f, floppyIn ? "" : " (out at once)");
+            } else {
+                const bool ok = mac.insertFloppy(readFile(file), !floppyWritable);
+                floppyIn = mac.floppyPresent();
+                std::printf("floppy %s at frame %d: %s\n", file.c_str(), f, ok ? "inserted" : "NOT a floppy image");
+            }
+        }
         for (const Input& in : inputs) {
             if (in.frame != f) continue;
             if (in.kind == 0) mac.mouseEvent(in.a, in.b, in.c != 0);

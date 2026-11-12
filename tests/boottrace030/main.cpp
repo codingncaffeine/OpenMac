@@ -1288,7 +1288,11 @@ int main(int argc, char** argv) {
     int scsiBudget = 120;
     int rtcBudget = 400000;
     mac.onDiag = [&](const char* message) {
-        if (std::strncmp(message, "cd:", 3) == 0) {
+        // The drives' own lines (insert, eject, tracks written back) are few
+        // and are what a media test is judged by: printed whatever the
+        // budgets and --quiet say.
+        if (std::strncmp(message, "cd:", 3) == 0 ||
+            std::strncmp(message, "floppy:", 7) == 0) {
             std::printf("DEVICE %s\n", message);
             return;
         }
@@ -1314,6 +1318,7 @@ int main(int argc, char** argv) {
     int scsiFlowBudget = 192;
     int osDefaultTrace = 0;
     int sonyEventBudget = 16;
+    bool floppyInDrive = mac.floppyPresent();
     int startupDriveBudget = 48;
     int generatedDriverBudget = 48;
     int generatedPrimeBudget = 32;
@@ -1634,9 +1639,10 @@ int main(int argc, char** argv) {
 
     if (structuredOnly || quiet) {
         mac.setLegacyAccessLogEnabled(false);
-        // The CD drive's lines stay: they are the gate signal for a disc test.
+        // The drives' own lines stay: they are the gate signal for a media test.
         mac.onDiag = [](const char* message) {
-            if (std::strncmp(message, "cd:", 3) == 0)
+            if (std::strncmp(message, "cd:", 3) == 0 ||
+                std::strncmp(message, "floppy:", 7) == 0)
                 std::printf("DEVICE %s\n", message);
         };
         // A trap watch is an explicitly requested probe: keep the exception
@@ -1929,12 +1935,23 @@ int main(int argc, char** argv) {
                             accepted ? "accepted" : "REFUSED");
                 if (!accepted) return 2;
             }
+            if (mac.floppyPresent() != floppyInDrive) {
+                floppyInDrive = !floppyInDrive;
+                if (!floppyInDrive && !floppyEvents.empty())
+                    std::printf("floppy left the drive by frame=%d\n", frame);
+            }
             for (FloppyEvent& event : floppyEvents) {
                 if (event.frame != frame) continue;
                 if (event.eject) {
                     mac.ejectFloppy();
-                    std::printf("floppy ejected at frame=%d\n", frame);
+                    floppyInDrive = mac.floppyPresent();
+                    std::printf("floppy eject asked for at frame=%d%s\n", frame,
+                                floppyInDrive ? "" : " (out at once)");
                     mac.recordHardwareMilestone("floppy-ejected");
+                    // What the firmware and the driver make of a media
+                    // change is the point of staging one: let it be seen.
+                    iopDeviceBudget = 400;
+                    sonyEventBudget = 16;
                     continue;
                 }
                 const int accepted = mac.insertFloppy(std::move(event.image));
@@ -1943,6 +1960,9 @@ int main(int argc, char** argv) {
                             accepted ? "accepted" : "REFUSED");
                 if (!accepted) return 2;
                 mac.recordHardwareMilestone("floppy-inserted");
+                floppyInDrive = true;
+                iopDeviceBudget = 400;
+                sonyEventBudget = 16;
             }
             if (argc >= 8 && frame + 1 == std::atoi(argv[7])) {
                 const int dx = argc >= 9 ? std::atoi(argv[8]) : 24;

@@ -75,6 +75,11 @@ public:
     // The internal SuperDrive: 400K, 800K or 1.44 MB of sectors, bare or in
     // a DiskCopy 4.2 or MacBinary file. False = not a floppy image.
     bool insertFloppy(std::vector<u8> image, bool readOnly = false);
+    // The host's Eject command: the Macintosh is asked to flush and eject
+    // the disk, which leaves the drive a second or two later (at once if the
+    // floppy processor's firmware has not noticed the disk yet; four idle
+    // seconds on if the Macintosh does not act). floppyPresent() says when
+    // it is out.
     void ejectFloppy();
     bool floppyPresent() const;
     // The disk's sectors as they are now (the ejected disk's, once it is out).

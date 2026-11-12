@@ -30,6 +30,7 @@
 #include "mfm.hpp"
 #include "sony.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <functional>
 #include <utility>
@@ -43,7 +44,7 @@ class IopFloppy {
 public:
     // `clockHz` is the rate of the `now` values every call takes: the
     // machine's own cycle counter.
-    IopFloppy(IoProcessor& iop, u64 clockHz) : iop_(iop) {
+    IopFloppy(IoProcessor& iop, u64 clockHz) : iop_(iop), clockHz_(clockHz) {
         drive_.installed = true;
         drive_.doubleSided = true;
         drive_.superDrive = true;
@@ -61,6 +62,7 @@ public:
         dmaIdle_ = false;
         writeMarkPrev_ = readMarkPrev_ = readSynced_ = false;
         crcOut_ = 0xFFFF;
+        firmwareKnowsDisk_ = false;     // it starts over and finds the disk again
     }
 
     // ---- media ----
@@ -96,6 +98,8 @@ public:
         dcTags_ = std::move(dcTags);
         media_ = std::move(image);
         ejected_.clear();
+        ejectAsked_ = false;
+        firmwareKnowsDisk_ = false;
         readOnly_ = readOnly;
         drive_.insert(&media_, readOnly_, highDensity(), announce);
         say("floppy: %s disk in the internal SuperDrive (%s%s)",
@@ -104,7 +108,11 @@ public:
         return true;
     }
 
+    // The disk leaves the drive now, whatever the Macintosh thinks: the
+    // mechanism's own eject, and the host's last resort.
     void eject() {
+        ejectAsked_ = false;
+        firmwareKnowsDisk_ = false;
         if (media_.empty()) return;
         flushTrack();
         ejected_ = std::move(media_);
@@ -113,6 +121,35 @@ public:
         say("floppy: disk ejected from the internal SuperDrive");
         if (onEject) onEject();
     }
+
+    // The host wants the disk back (the application's Eject command).
+    //
+    // This drive has no way to lose a disk except its own eject motor, and the
+    // processor's firmware relies on that: once it has taken notice of a disk
+    // it polls the disk-changed latch, not the disk-in-place line, until it
+    // has ejected the disk itself. Pulling the disk out from under it leaves
+    // it believing a disk is still there, and it then has the System eject
+    // the next disk that goes in. So the request goes through the Macintosh:
+    // the latch is raised with the disk still in place, the firmware reports
+    // a changed disk, the System flushes the volume and tells the firmware to
+    // eject, and the mechanism throws the disk out a second or two later.
+    //
+    // A disk the firmware has not touched yet is simply taken out. So is one
+    // the Macintosh has not ejected four seconds after the request or after
+    // the last byte moved to or from the disk, whichever is later (a System
+    // that is stopped, or one that never answers the firmware).
+    void requestEject(u64 now) {
+        if (media_.empty()) return;
+        if (!firmwareKnowsDisk_) {
+            eject();
+            return;
+        }
+        drive_.signalMediaChange();
+        ejectAsked_ = true;
+        ejectAskedAt_ = now;
+        say("floppy: the Macintosh was asked to eject the disk");
+    }
+    bool ejectRequested() const { return ejectAsked_; }
 
     bool present() const { return !media_.empty(); }
     bool readOnly() const { return readOnly_; }
@@ -196,6 +233,7 @@ public:
             const int trackBefore = drive_.track;
             const bool stepInBefore = drive_.stepIn;
             drive_.command(address & 7, (address & 8) != 0, now);
+            if (drive_.hasDisk()) firmwareKnowsDisk_ = true;
             if (onCommand) onCommand(address, trackBefore, stepInBefore);
         }
         lstrbPrev_ = strobe;
@@ -207,6 +245,10 @@ public:
     // Keeps the track under the head loaded and moves bytes between it and
     // the chip. Called around every chip access and from the machine's clock.
     void service(u64 now) {
+        if (ejectAsked_ && now >= std::max(ejectAskedAt_, lastTransferAt_) + 4u * clockHz_) {
+            say("floppy: the Macintosh did not eject the disk; taken out");
+            eject();
+        }
         updateTrack();
         serviceSurface(now);
     }
@@ -254,6 +296,7 @@ public:
                 swim_.ismCrcAdd(byte);
                 if (!swim_.ismPushReadByte(byte, mark)) break;
                 ++dataBytes_;
+                lastTransferAt_ = now;
                 if (onFifoPush) onFifoPush(byte, mark);
             }
         } else {
@@ -266,6 +309,7 @@ public:
                 crcOut_ = mfm::crc16Update(crcOut_, swim_.ismWritten);
                 swim_.ismWroteData = swim_.ismWroteMark = false;
                 ++dataWrites_;
+                lastTransferAt_ = now;
             }
             if (swim_.ismWroteCrc) {
                 swim_.ismWroteCrc = false;
@@ -370,6 +414,7 @@ private:
     }
 
     IoProcessor& iop_;
+    u64 clockHz_;
     Iwm swim_;
     SonyDrive drive_;
     std::vector<u8> media_;        // the sectors of the disk in the drive
@@ -386,6 +431,11 @@ private:
     u64 dataBytes_ = 0;
     u64 dataWrites_ = 0;
     u32 trackWrites_ = 0;
+    // Host-side bookkeeping for requestEject(), not machine state.
+    bool firmwareKnowsDisk_ = false;   // it has commanded the mechanism with this disk in
+    bool ejectAsked_ = false;
+    u64 ejectAskedAt_ = 0;
+    u64 lastTransferAt_ = 0;           // the last byte to or from the disk
 };
 
 } // namespace openmac

@@ -10,6 +10,7 @@
 #include "../../core/src/machine/iifx/am29000.hpp"
 #include "../../core/src/machine/iifx/asc.hpp"
 #include "../../core/src/machine/iop.hpp"
+#include "../../core/src/machine/iop_floppy.hpp"
 #include "../../core/src/machine/iifx/nubus_video.hpp"
 #include "../../core/src/machine/quadra/scc.hpp"
 
@@ -1640,6 +1641,89 @@ TEST_CASE("IIfx refused floppy swap preserves the mounted disk and its container
     CHECK(mac.insertFloppy(std::vector<u8>(12345, 0xCC)) == 0);
     CHECK(mac.floppyPresent());
     CHECK(mac.floppyForWriteBack() == diskCopy);
+}
+
+TEST_CASE("SuperDrive behind an I/O processor: the host's eject goes through the Macintosh") {
+    constexpr u64 hz = 1000000;                    // one tick a microsecond
+    IoProcessor iop;
+    IopFloppy drive(iop, hz);
+    int ejected = 0;
+    drive.onEject = [&] { ++ejected; };
+    const std::vector<u8> disk(1474560, 0x5A);
+    // What the firmware does when its poll finds a disk: drive 1 enabled,
+    // then the strobe that resets the mechanism's disk-changed latch.
+    const auto firmwareTakesNotice = [&](u64 now) {
+        (void)drive.access(7, true, 0x82, now);    // mode: motor on, drive 1
+        (void)drive.access(4, true, 0xF3, now);
+        (void)drive.access(7, true, 0x20, now);    // mode: head select high
+        (void)drive.access(4, true, 0xF4, now);    // mechanism register 9
+        (void)drive.access(4, true, 0xFC, now);    // strobe
+        (void)drive.access(4, true, 0xF4, now);
+    };
+
+    SUBCASE("a disk the firmware has not touched is taken out at once") {
+        REQUIRE(drive.insert(disk, false));
+        (void)drive.access(0xF, false, 0, 5 * hz); // reading the chip is not taking notice
+        drive.requestEject(5 * hz);
+        CHECK_FALSE(drive.present());
+        CHECK(ejected == 1);
+    }
+    SUBCASE("a disk the firmware knows: the drive reports a changed disk and keeps it") {
+        REQUIRE(drive.insert(disk, false));
+        REQUIRE(drive.mechanism().diskSwitched());
+        firmwareTakesNotice(5 * hz);
+        REQUIRE_FALSE(drive.mechanism().diskSwitched());   // the strobe arrived
+        drive.requestEject(6 * hz);
+        CHECK(drive.present());
+        CHECK(drive.ejectRequested());
+        CHECK(drive.mechanism().diskSwitched());   // what the firmware's next poll finds
+        CHECK(ejected == 0);
+
+        SUBCASE("the Macintosh ejects it: nothing is left pending") {
+            drive.eject();                         // the mechanism's own eject
+            CHECK_FALSE(drive.present());
+            CHECK_FALSE(drive.ejectRequested());
+            CHECK(ejected == 1);
+            drive.service(60 * hz);
+            CHECK(ejected == 1);
+        }
+        SUBCASE("the Macintosh does nothing: the disk comes out four seconds on") {
+            drive.service(10 * hz - 1);
+            CHECK(drive.present());
+            drive.service(10 * hz);
+            CHECK_FALSE(drive.present());
+            CHECK(ejected == 1);
+            CHECK(drive.sectors() == disk);        // and can still be saved
+        }
+        SUBCASE("another disk goes in first: the request is forgotten") {
+            REQUIRE(drive.insert(disk, false));
+            CHECK_FALSE(drive.ejectRequested());
+            drive.service(60 * hz);
+            CHECK(drive.present());
+        }
+    }
+    SUBCASE("a machine reset makes the firmware start over") {
+        REQUIRE(drive.insert(disk, false));
+        firmwareTakesNotice(5 * hz);
+        drive.reset();
+        drive.requestEject(5 * hz + 1);
+        CHECK_FALSE(drive.present());
+    }
+    SUBCASE("the disk after an eject is a new disk to the firmware") {
+        REQUIRE(drive.insert(disk, false));
+        firmwareTakesNotice(5 * hz);
+        drive.eject();
+        REQUIRE(drive.insert(disk, false));
+        drive.requestEject(6 * hz);
+        CHECK_FALSE(drive.present());
+        CHECK(ejected == 2);
+    }
+    SUBCASE("an empty drive has nothing to ask for") {
+        firmwareTakesNotice(5 * hz);
+        drive.requestEject(5 * hz + 1);
+        CHECK_FALSE(drive.ejectRequested());
+        CHECK(ejected == 0);
+    }
 }
 
 TEST_CASE("IIfx checkpoint carries the disk in the drive, not the one swapped out before it") {

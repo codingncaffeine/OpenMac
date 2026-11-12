@@ -1428,7 +1428,13 @@ int IifxMachine::insertFloppy(std::vector<u8> image, bool readOnly) {
     return 1;
 }
 
-void IifxMachine::ejectFloppy() { floppy_->eject(); }
+// The host's Eject command. With the firmware driving the drive the request
+// goes through the Macintosh (IopFloppy::requestEject); on the driver-level
+// path the ROM driver's own state is all there is, and the disk comes out.
+void IifxMachine::ejectFloppy() {
+    if (nativeStorage_) floppy_->requestEject(totalCycles_);
+    else floppy_->eject();
+}
 
 bool IifxMachine::floppyPresent() const { return floppy_->present(); }
 
@@ -1924,7 +1930,7 @@ void IifxMachine::serveSonyCtlStatus(bool status) {
         }
     } else {
         if (code == 1 || code == 21 || code == 22) result = -17; // controlErr
-        if (code == 7) ejectFloppy();                            // Eject
+        if (code == 7) floppy_->eject();                         // Eject
     }
 
     write16(pb + 0x10, static_cast<u16>(result));

@@ -596,7 +596,7 @@ bool Quadra950Machine::setDisplay(const char* name) {
 bool Quadra950Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
     return floppy_->insert(std::move(image), readOnly);
 }
-void Quadra950Machine::ejectFloppy() { floppy_->eject(); }
+void Quadra950Machine::ejectFloppy() { floppy_->requestEject(totalCycles_); }
 bool Quadra950Machine::floppyPresent() const { return floppy_->present(); }
 const std::vector<u8>& Quadra950Machine::floppySectors() { return floppy_->sectors(); }
 

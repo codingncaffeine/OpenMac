@@ -473,6 +473,11 @@ public:
         }
         machine.floppy_->drive_.image = machine.floppy_->media_.empty()
             ? nullptr : &machine.floppy_->media_;
+        // Host-side bookkeeping: a checkpoint is taken from a running
+        // machine, so its firmware counts as knowing the disk in the drive;
+        // no eject is pending.
+        machine.floppy_->firmwareKnowsDisk_ = !machine.floppy_->media_.empty();
+        machine.floppy_->ejectAsked_ = false;
 
         machine.accessLog_.clear();
         machine.hardwareTrace_.reset();
