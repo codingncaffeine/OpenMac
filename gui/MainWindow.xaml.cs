@@ -123,8 +123,14 @@ public partial class MainWindow : Window
             }
             if (settings.IsQuadra)
             {
-                Log.Line("backend: native core (openmac_c.dll), Quadra 650");
-                return new QuadraEmulator { Monitor = settings.MonitorQuadra };
+                Log.Line("backend: native core (openmac_c.dll), "
+                         + (settings.IsQuadra950 ? "Quadra 950" : "Quadra 650"));
+                return new QuadraEmulator
+                {
+                    Is950 = settings.IsQuadra950,
+                    Monitor = settings.ModelMonitor,
+                    VramMB = settings.VramMBQuadra950 == 1 ? 1 : 2,
+                };
             }
             Log.Line("backend: native core (openmac_c.dll), Macintosh Classic");
             return new NativeEmulator();
@@ -157,6 +163,7 @@ public partial class MainWindow : Window
         _settings.Save();
         _emulator = CreateBackend(_settings);
         _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
+        BuildMonitorMenu();   // each Quadra remembers its own monitor
         RebuildScreen();
         ApplyScale();
         UpdateUi();
@@ -167,6 +174,21 @@ public partial class MainWindow : Window
     private void ModelClassic_Click(object sender, RoutedEventArgs e) => SwitchModel("classic");
     private void ModelIifx_Click(object sender, RoutedEventArgs e) => SwitchModel("iifx");
     private void ModelQuadra_Click(object sender, RoutedEventArgs e) => SwitchModel("quadra650");
+    private void ModelQuadra950_Click(object sender, RoutedEventArgs e) => SwitchModel("quadra950");
+
+    /// <summary>Fit 1 or 2 MB of video RAM in the Quadra 950. The ROM sizes
+    /// video RAM while it starts, so the machine starts again.</summary>
+    private void VideoRam_Click(object sender, RoutedEventArgs e)
+    {
+        int mb = int.Parse((string)((MenuItem)sender).Tag);
+        if (_settings.VramMBQuadra950 == mb) { UpdateUi(); return; }
+        _settings.VramMBQuadra950 = mb;
+        _settings.Save();
+        Log.Line($"video RAM: {mb} MB");
+        if (_emulator is QuadraEmulator q) q.VramMB = mb;
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
+        UpdateUi();
+    }
 
     /// <summary>Fill the Monitor menu from the displays the machine can drive.
     /// Built from the core's own list so the menu cannot drift from what the
@@ -179,7 +201,7 @@ public partial class MainWindow : Window
         try
         {
             MonitorMenu.Items.Clear();
-            string current = _settings.MonitorQuadra ?? "13-inch RGB";
+            string current = _settings.ModelMonitor ?? "13-inch RGB";
             foreach (var (name, w, h) in QuadraEmulator.Displays())
             {
                 var item = new MenuItem
@@ -203,8 +225,8 @@ public partial class MainWindow : Window
     private void Monitor_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not MenuItem item || item.Tag is not string name) return;
-        if (_settings.MonitorQuadra == name) { BuildMonitorMenu(); return; }
-        _settings.MonitorQuadra = name;
+        if (_settings.ModelMonitor == name) { BuildMonitorMenu(); return; }
+        _settings.ModelMonitor = name;
         _settings.Save();
         Log.Line($"monitor: {name}");
         BuildMonitorMenu();
@@ -600,15 +622,21 @@ public partial class MainWindow : Window
                          | ((uint)bytes[2] << 8) | bytes[3];
         }
         bool looksIifx = romLen == 512 * 1024 && header == 0x4147DD77u;
-        bool rightModel = _settings.IsQuadra ? looksQuadra
+        // The two Quadras take different 1 MB ROMs; the 950's is told by its
+        // checksum, the first four bytes of the file.
+        bool looksQuadra950 = looksQuadra && header == 0x3DC27823u;
+        bool rightModel = _settings.IsQuadra950 ? looksQuadra950
+                        : _settings.IsQuadra ? looksQuadra && !looksQuadra950
                         : _settings.IsIifx ? looksIifx
                         : !looksQuadra && !looksIifx;
         if (!rightModel)
         {
-            string detected = looksQuadra ? "a Quadra-family ROM"
+            string detected = looksQuadra950 ? "the Macintosh Quadra 950 ROM (checksum 3DC27823)"
+                            : looksQuadra ? "a Quadra-family ROM"
                             : looksIifx ? "the Macintosh IIfx ROM (checksum 4147DD77)"
                             : "a Classic-family 512 KB ROM";
-            string wanted = _settings.IsQuadra ? "Macintosh Quadra 650"
+            string wanted = _settings.IsQuadra950 ? "Macintosh Quadra 950 (its ROM's checksum is 3DC27823)"
+                          : _settings.IsQuadra ? "Macintosh Quadra 650"
                           : _settings.IsIifx ? "Macintosh IIfx"
                           : "Macintosh Classic";
             string msg = $"This file looks like {detected}, but the current model is the {wanted}.\n\n"
@@ -795,6 +823,7 @@ public partial class MainWindow : Window
     {
         int ram = int.Parse((string)((MenuItem)sender).Tag);
         if (_settings.IsIifx) _settings.RamMBIifx = ram;
+        else if (_settings.IsQuadra950) _settings.RamMBQuadra950 = ram;
         else _settings.RamMBQuadra = ram;
         _settings.Save();
         if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
@@ -1739,7 +1768,7 @@ public partial class MainWindow : Window
     private void About_Click(object sender, RoutedEventArgs e) =>
         MessageBox.Show(this,
             "OpenMac\nA from-scratch Macintosh emulator for Windows.\n\n"
-            + "Macintosh Classic · Macintosh IIfx · Quadra 650\n"
+            + "Macintosh Classic · Macintosh IIfx · Quadra 650 · Quadra 950\n"
             + "68000, 68030 and 68040 machines with model-specific video, storage, input, audio and PRAM.",
             "About OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
 
@@ -1830,9 +1859,12 @@ public partial class MainWindow : Window
     {
         Overlay.Visibility = _emulator.IsRomLoaded ? Visibility.Collapsed : Visibility.Visible;
 
-        StatusState.Text = _emulator.IsRomLoaded ? "Running" : "Stopped";
+        StatusState.Text = !_emulator.IsRomLoaded ? "Stopped"
+            : _emulator is QuadraEmulator { PoweredOff: true } ? "Shut down"
+            : "Running";
         string machine = _emulator.IsRomLoaded
-            ? (_settings.IsQuadra ? "Quadra 650  •  "
+            ? (_settings.IsQuadra950 ? "Quadra 950  •  "
+               : _settings.IsQuadra ? "Quadra 650  •  "
                : _settings.IsIifx ? "Macintosh IIfx  •  " : "")
               + $"{_settings.ModelRamMB} MB"
               + (_emulator.FloppyPath is { } f ? $"  •  Floppy: {Path.GetFileName(f)}" : "")
@@ -1850,11 +1882,17 @@ public partial class MainWindow : Window
             ? $"OpenMac — {Path.GetFileName(r)}" : "OpenMac";
 
         bool q = _settings.IsQuadra;
+        bool q950 = _settings.IsQuadra950;
         bool fx = _settings.IsIifx;
         bool classic = !q && !fx;
         ModelClassicItem.IsChecked = classic;
         ModelIifxItem.IsChecked = fx;
-        ModelQuadraItem.IsChecked = q;
+        ModelQuadraItem.IsChecked = q && !q950;
+        ModelQuadra950Item.IsChecked = q950;
+        VideoRamMenu.Visibility = q950 ? Visibility.Visible : Visibility.Collapsed;
+        VideoRamMenu.IsEnabled = q950;
+        Vram1Item.IsChecked = q950 && _settings.VramMBQuadra950 == 1;
+        Vram2Item.IsChecked = q950 && _settings.VramMBQuadra950 != 1;
         IifxVideoRomItem.Visibility = fx ? Visibility.Visible : Visibility.Collapsed;
         IifxVideoRomItem.IsEnabled = fx;
         IifxVideoRomItem.Header = fx && !string.IsNullOrEmpty(_settings.VideoRomIifx)
@@ -1886,9 +1924,14 @@ public partial class MainWindow : Window
             item.IsEnabled = q || fx;
             item.IsChecked = (q || fx) && _settings.ModelRamMB == int.Parse((string)item.Tag);
         }
-        MemQ136Item.Visibility = q ? Visibility.Visible : Visibility.Collapsed;
-        MemQ136Item.IsEnabled = q;
-        MemQ136Item.IsChecked = q && _settings.RamMBQuadra == 136;
+        // The Quadra 650 tops out at 136 MB, the Quadra 950 at 256 MB (four
+        // banks of four 16 MB SIMMs).
+        MemQ136Item.Visibility = q && !q950 ? Visibility.Visible : Visibility.Collapsed;
+        MemQ136Item.IsEnabled = q && !q950;
+        MemQ136Item.IsChecked = q && !q950 && _settings.RamMBQuadra == 136;
+        MemQ256Item.Visibility = q950 ? Visibility.Visible : Visibility.Collapsed;
+        MemQ256Item.IsEnabled = q950;
+        MemQ256Item.IsChecked = q950 && _settings.RamMBQuadra950 == 256;
         MonitorMenu.IsEnabled = q;
         BootRomDiskItem.IsChecked = _settings.BootRomDisk;
         BootRomDiskItem.IsEnabled = classic;

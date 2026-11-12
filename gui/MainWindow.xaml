@@ -65,9 +65,17 @@
                     <MenuItem x:Name="ModelQuadraItem" Header="Macintosh Quadra 650"
                               Click="ModelQuadra_Click"
                               ToolTip="68040 @ 33 MHz with color DAFB video. Needs the 1 MB Quadra 650 family ROM and boots from a SCSI hard disk; each model remembers its own ROM and disk." />
+                    <MenuItem x:Name="ModelQuadra950Item" Header="Macintosh Quadra 950"
+                              Click="ModelQuadra950_Click"
+                              ToolTip="68040 @ 33 MHz, up to 256 MB of RAM, built-in video with 1 or 2 MB of video RAM (millions of colors up to 832×624). Needs the 1 MB Quadra 950 ROM (checksum 3DC27823); each model remembers its own ROM and disk." />
                 </MenuItem>
                 <MenuItem x:Name="MonitorMenu" Header="Monitor"
                           ToolTip="Which display is plugged into the video port. An Apple monitor of this era runs one resolution, so choosing the monitor chooses the resolution. The ROM senses it at startup, so the machine restarts." />
+                <MenuItem x:Name="VideoRamMenu" Header="Video RAM"
+                          ToolTip="How much video RAM the Quadra 950 has: 1 MB as it shipped, or 2 MB with the sockets filled. More video RAM gives more colors on each monitor. The machine restarts.">
+                    <MenuItem x:Name="Vram1Item" Header="1 MB" Tag="1" Click="VideoRam_Click" />
+                    <MenuItem x:Name="Vram2Item" Header="2 MB" Tag="2" Click="VideoRam_Click" />
+                </MenuItem>
                 <MenuItem x:Name="IifxVideoRomItem" Header="8•24 GC Card ROM…"
                           Click="IifxVideoRom_Click"
                           ToolTip="Choose the declaration ROM from an Apple Macintosh Display Card 8•24 GC. The IIfx restarts with the genuine slot-$9 card; OpenMac does not distribute this ROM." />
@@ -87,6 +95,7 @@
                 <MenuItem x:Name="MemFx80Item" Header="80 MB RAM" Tag="80" Click="MemoryIifx_Click" />
                 <MenuItem x:Name="MemQ128Item" Header="128 MB RAM" Tag="128" Click="MemoryLarge_Click" />
                 <MenuItem x:Name="MemQ136Item" Header="136 MB RAM (max)" Tag="136" Click="MemoryLarge_Click" />
+                <MenuItem x:Name="MemQ256Item" Header="256 MB RAM (max)" Tag="256" Click="MemoryLarge_Click" />
                 <Separator />
                 <MenuItem x:Name="BootRomDiskItem" Header="Boot from ROM Disk (Cmd-Opt-X-O)"
                           Click="BootRomDisk_Click" />
