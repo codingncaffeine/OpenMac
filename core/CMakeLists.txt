@@ -38,9 +38,9 @@ add_library(openmac_core STATIC
 target_include_directories(openmac_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(openmac_core PRIVATE openmac_warnings)
 
-# C ABI shared library (openmac_c.dll) for the .NET WPF GUI via P/Invoke.
-# Windows-only -- the GUI is Windows-only. Its Release DLL is emitted into
-# gui/native so the GUI project can copy it beside the app.
+# C ABI shared library for the .NET GUI via P/Invoke: openmac_c.dll on
+# Windows, libopenmac_c.so on Linux. It is emitted into gui/native so the GUI
+# project can copy it beside the app.
 if(WIN32)
     add_library(openmac_c SHARED src/capi.cpp)
     target_link_libraries(openmac_c PRIVATE openmac_core openmac_warnings)
@@ -48,4 +48,20 @@ if(WIN32)
     set_target_properties(openmac_c PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_SOURCE_DIR}/gui/native
         RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_SOURCE_DIR}/gui/native)
+else()
+    # The static core is linked into a shared object, so it must be position
+    # independent. Hidden visibility leaves the OMAC_API entry points as the
+    # exported surface, as on the DLL (plus the few standard-library template
+    # instances libstdc++ declares with default visibility).
+    set_target_properties(openmac_core PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    add_library(openmac_c SHARED src/capi.cpp)
+    target_link_libraries(openmac_c PRIVATE openmac_core openmac_warnings)
+    target_include_directories(openmac_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_target_properties(openmac_c PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        LIBRARY_OUTPUT_DIRECTORY $<1:${CMAKE_SOURCE_DIR}/gui/native>)
 endif()
