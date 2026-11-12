@@ -44,6 +44,7 @@ add_executable(openmac_unit
     unit/test_mfm.cpp
     unit/test_dc42.cpp
     unit/test_macbinary.cpp
+    unit/test_quadra950.cpp
 )
 target_link_libraries(openmac_unit PRIVATE openmac_core doctest::doctest openmac_warnings)
 target_link_libraries(openmac_unit PRIVATE nlohmann_json::nlohmann_json)
