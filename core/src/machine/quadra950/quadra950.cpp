@@ -641,7 +641,20 @@ std::string Quadra950Machine::diagnosticReport() const {
         sccIop_->running() ? "running" : "held", sccIop_->bypassed() ? " bypass" : "", sccIop_->status(),
         swimIop_->running() ? "running" : "held", swimIop_->firmwareAlive() ? " alive" : "",
         swimIop_->status());
-    add("   video %dx%d %d bpp", dafb_->width(), dafb_->height(), dafb_->bpp());
+    add("   video %dx%d %d bpp base=%05X stride=%u depthCtl=%02X", dafb_->width(), dafb_->height(), dafb_->bpp(),
+        dafb_->fbBase(), dafb_->strideBytes(), dafb_->depthCtlRaw());
+    std::string regs = "   video registers:";
+    for (u32 r = 0; r <= 0x2C; r += 4) {
+        std::snprintf(line, sizeof line, " %02X=%X", r, dafb_->ctlReg(static_cast<int>(r >> 2)));
+        regs += line;
+    }
+    out += regs + '\n';
+    std::string timing = "   video timing:";
+    for (u32 r = 0x00; r <= 0x68; r += 4) {
+        std::snprintf(line, sizeof line, " %02X=%X", r, dafb_->swatchReg(static_cast<int>(r >> 2)));
+        timing += line;
+    }
+    out += timing + '\n';
     return out;
 }
 
