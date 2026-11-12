@@ -1726,6 +1726,53 @@ TEST_CASE("SuperDrive behind an I/O processor: the host's eject goes through the
     }
 }
 
+TEST_CASE("SuperDrive behind an I/O processor: two bytes handed to the chip at once both reach the disk") {
+    constexpr u64 hz = 1000000;                    // 16 ticks to a high-density disk byte
+    IoProcessor iop;
+    IopFloppy drive(iop, hz);
+    REQUIRE(drive.insert(std::vector<u8>(1474560, 0), false));
+    const u64 per = drive.mechanism().cyclesPerByte();
+    REQUIRE(per == 16);
+
+    u64 now = 1000;
+    (void)drive.access(7, true, 0x82, now);        // mode: motor on, drive 1
+    (void)drive.access(4, true, 0xF2, now);        // mechanism register 4, data 0: motor on
+    (void)drive.access(4, true, 0xFA, now);        // strobe
+    (void)drive.access(4, true, 0xF2, now);
+    now += hz;                                     // up to speed
+    drive.service(now);
+    REQUIRE(drive.mechanism().motorRunning(now));
+    (void)drive.access(7, true, 0x18, now);        // mode: write, action
+    REQUIRE(drive.chip().ismWriting());
+
+    // The chip reports both FIFO slots free, so the firmware writes pairs.
+    now += 10 * per;
+    drive.service(now);
+    const std::size_t start = drive.mechanism().bytePos();
+    std::vector<u8> sent;
+    for (int pair = 0; pair < 40; ++pair) {
+        REQUIRE((drive.access(0xF, false, 0, now) & 0xC0) == 0xC0);
+        for (int k = 0; k < 2; ++k) {
+            sent.push_back(static_cast<u8>(0x21 + pair * 2 + k));
+            (void)drive.access(0, true, sent.back(), now);
+        }
+        now += 2 * per;
+        drive.service(now);
+    }
+    CHECK(drive.mechanism().writesDropped == 0);
+    CHECK(drive.bytesWritten() == sent.size());
+    const std::vector<u8>& track = drive.mechanism().trackData();
+    std::vector<u8> landed;
+    for (std::size_t i = 0; i < sent.size(); ++i) landed.push_back(track[(start + i) % track.size()]);
+    CHECK(landed == sent);                         // in order, cell after cell
+
+    // The FIFO is two deep: a third byte at the same instant has no slot.
+    (void)drive.access(0, true, 0xEE, now);
+    (void)drive.access(0, true, 0xEF, now);
+    (void)drive.access(0, true, 0xF0, now);
+    CHECK(drive.mechanism().writesDropped == 1);
+}
+
 TEST_CASE("IIfx checkpoint carries the disk in the drive, not the one swapped out before it") {
     IifxMachine mac(testRom());
     std::vector<u8> first(1474560), second(1474560);

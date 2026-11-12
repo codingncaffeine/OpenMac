@@ -434,6 +434,11 @@ public:
         return now >= lastByteAt_ + cyclesPerByte();
     }
 
+    // When the next cell comes under the head: the earliest time writeByte()
+    // takes a byte. A controller with a byte waiting behind the one being
+    // written hands it over with this time, as writeCrc() does for its second.
+    u64 nextCellAt() const { return lastByteAt_ + cyclesPerByte(); }
+
     void writeNibble(u64 now, u8 b) { writeByte(now, b, false); }
 
     // Set once anything has been written to the track under the head, so the

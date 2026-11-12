@@ -305,7 +305,15 @@ public:
                 const bool mark = swim_.ismWroteMark;
                 if (mark && !writeMarkPrev_) crcOut_ = 0xFFFF;
                 writeMarkPrev_ = mark;
-                drive_.writeByte(now, swim_.ismWritten, mark);
+                // The chip's write FIFO is two bytes deep and its handshake
+                // says so: firmware that finds both slots free hands over two
+                // bytes at once (the IIfx's does; the Quadra 950's writes one
+                // at a time). The first goes into the cell under the head,
+                // the second into the cell behind it. A third has no slot and
+                // is lost, counted by the mechanism.
+                const u64 cell = drive_.nextCellAt();
+                const bool waits = now < cell && cell <= now + drive_.cyclesPerByte();
+                drive_.writeByte(waits ? cell : now, swim_.ismWritten, mark);
                 crcOut_ = mfm::crc16Update(crcOut_, swim_.ismWritten);
                 swim_.ismWroteData = swim_.ismWroteMark = false;
                 ++dataWrites_;
@@ -313,7 +321,10 @@ public:
             }
             if (swim_.ismWroteCrc) {
                 swim_.ismWroteCrc = false;
-                drive_.writeCrc(now, static_cast<u8>(crcOut_ >> 8), static_cast<u8>(crcOut_));
+                // The two CRC bytes follow whatever is still waiting, cell
+                // after cell.
+                drive_.writeByte(std::max(now, drive_.nextCellAt()), static_cast<u8>(crcOut_ >> 8), false);
+                drive_.writeByte(drive_.nextCellAt(), static_cast<u8>(crcOut_), false);
                 dataWrites_ += 2;
             }
         }
