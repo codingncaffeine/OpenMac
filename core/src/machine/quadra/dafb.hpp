@@ -24,7 +24,8 @@
 //   - the DAC is an AC842a: its second control register reads back with the
 //     part's version in the low four bits, and with 2 MB there is room for
 //     32-bit pixels;
-//   - +$24 / +$28 hold the two SCSI chips' bus timing (stored here);
+//   - +$24 / +$28 are the two SCSI chips' bus timing, data-port wait bits
+//     and data request (see scsiDrq);
 //   - the clock generator is a DP8531 with sixteen 4-bit registers at
 //     +$300, +$310 ... +$3F0, from which the pixel clock follows.
 //
@@ -84,6 +85,20 @@ public:
     Variant variant() const { return variant_; }
     u32 vramBytes() const { return vramFitted_; }
 
+    // ---- the stand-alone chip's SCSI block ----
+    // The chip sits between the processor and the two 53C96s (bus 0 internal,
+    // bus 1 external): +$24 and +$28 hold each bus's access timing in bits
+    // 0-5, bit 7 makes a read of the bus's data port wait for the SCSI chip's
+    // data request, bit 8 does the same for a write, and bit 9 reads back the
+    // request line itself. The board asks for the line through scsiDrq and
+    // applies the two wait bits at its data ports (a wait that is never
+    // answered ends in a bus error there).
+    static constexpr u32 kScsiWaitRead = 0x080;
+    static constexpr u32 kScsiWaitWrite = 0x100;
+    static constexpr u32 kScsiRequest = 0x200;
+    std::function<bool(int bus)> scsiDrq;
+    u32 scsiControl(int bus) const { return regs_[(bus ? 0x28 : 0x24) >> 2]; }
+
     // ---- VRAM (the machine routes $F9000000+ here) ----
     // The memory controller's cell repeats its 1 MB through the 2 MB window.
     // The stand-alone chip decodes the whole window; what is not fitted reads
@@ -131,6 +146,13 @@ public:
                 return v;
             }
             if (reg == 0x2C) return (3u << 9) | (regs_[0x2C >> 2] & 0x1FFu);
+            // The stand-alone chip's two SCSI registers read back what was
+            // written with that bus's data request in bit 9: the Quadra
+            // 950's ROM polls the bit before every move through a data port.
+            if (variant_ == Variant::Standalone && (reg == 0x24 || reg == 0x28)) {
+                const int bus = reg == 0x28 ? 1 : 0;
+                return (regs_[reg >> 2] & ~kScsiRequest) | (scsiDrq && scsiDrq(bus) ? kScsiRequest : 0u);
+            }
             return regs_[reg >> 2];
         case 1:
             if (reg == 0x08) {   // IRQ status: bit0 = VBL, bit2 = cursor line

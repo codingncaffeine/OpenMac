@@ -255,6 +255,23 @@ public:
         finishDataIfDone();
     }
 
+    // One byte through a byte-wide data port (the Quadra 950's: its ROM
+    // sends the last byte of a command and the odd byte of a block that way).
+    void dma8Write(u8 v) {
+        if (cmdFeed_) {
+            selCdb_.push_back(v);
+            counterConsume(1);
+            tryFeedCdb();
+            if (onDrq) onDrq(drq());
+            return;
+        }
+        if (phase_ == kDataOut) {
+            if (writeBuf_.size() < writeExpect_) writeBuf_.push_back(v);
+            counterConsume(1);
+        }
+        finishDataIfDone();
+    }
+
     bool irqAsserted() const { return statusInt_; }
     std::function<void(bool level)> onIrq;
     std::function<void(bool level)> onDrq;

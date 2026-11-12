@@ -13,6 +13,7 @@
 #include "../quadra/scc.hpp"
 #include "../scsi.hpp"
 #include "../scsicd.hpp"
+#include "../scsinet.hpp"
 #include "../via.hpp"
 #include "egret.hpp"
 #include "memctl.hpp"
@@ -31,6 +32,7 @@
 //     +$0A000 SONIC       +$0C000 serial I/O processor
 //     +$0E000 memory controller
 //     +$0F000 SCSI 0      +$0F400 SCSI 1      (register n at +n*$10)
+//     +$0F100 SCSI 0 data port, +$0F502 SCSI 1 data port (a byte or a word)
 //     +$14000 sound       +$1E000 floppy/ADB I/O processor
 //     +$28000 NuBus controller
 //   $F900 0000 video RAM  $F980 0000 DAFB registers
@@ -87,6 +89,7 @@ Quadra950Machine::Quadra950Machine(std::vector<u8> rom, const Config& cfg)
       adb_(std::make_unique<AdbTransceiver>()),
       adbBus_(std::make_unique<AdbBus>(*adb_)),
       dafb_(std::make_unique<Dafb>(Dafb::Variant::Standalone, cfg.vramMb == 1 ? 0x100000u : 0x200000u)),
+      netdev_(std::make_unique<ScsiEthernet>()),
       cpu_(*this) {
     ram_.assign(memctl_->flatBytes(), 0);
     u32 rs = 1;
@@ -95,11 +98,12 @@ Quadra950Machine::Quadra950Machine(std::vector<u8> rom, const Config& cfg)
     romMask_ = rs - 1;
     romEntry_ = be32(&rom_[4]);
 
-    // All three devices on the internal bus for now; the external bus is
-    // present and empty.
+    // Internal bus: the drives in the machine's bays. External bus: what
+    // plugs into the connector on the back.
     scsi0_->addTarget(disk_.get());
-    scsi0_->addTarget(disk2_.get());
+    (cfg.secondDiskExternal ? *scsi1_ : *scsi0_).addTarget(disk2_.get());
     scsi0_->addTarget(cdrom_.get());
+    scsi1_->addTarget(netdev_.get());
     cdrom_->setStartupDrive(true);
 
     const u8 mac[6] = {0x08, 0x00, 0x07, 0x2A, 0x95, 0x50};
@@ -177,6 +181,23 @@ void Quadra950Machine::wireDevices() {
     swimIop_->peripheralRead = [this](u8 offset) { return floppy_->access(offset, false, 0, totalCycles_); };
     swimIop_->peripheralWrite = [this](u8 offset, u8 value) { (void)floppy_->access(offset, true, value, totalCycles_); };
     floppy_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
+    floppy_->onAccess = [this](const IopFloppy::Access& x) {
+        if (floppyTrace <= 0 || !onDiag || !x.write) return;
+        if (floppy_->chip().ismSelected() && (x.offset & 7u) < 2u) return;   // data and mark bytes
+        --floppyTrace;
+        char b[96];
+        std::snprintf(b, sizeof b, "floppy chip: %s reg %X <- %02X (mode %02X setup %02X)",
+                      floppy_->chip().ismSelected() ? "ISM" : "IWM", x.offset, x.value, floppy_->chip().ismMode(),
+                      floppy_->chip().ismSetup());
+        onDiag(b);
+    };
+    floppy_->onCommand = [this](int address, int trackBefore, bool) {
+        if (floppyTrace <= 0 || !onDiag) return;
+        --floppyTrace;
+        char b[80];
+        std::snprintf(b, sizeof b, "floppy mechanism: command %X (track %d)", address, trackBefore);
+        onDiag(b);
+    };
     swimIop_->gpioRead = [this] {
         return static_cast<u8>(0xFE | (adbBus_->readLine(swimIop_->cpuCycles()) ? 1 : 0));
     };
@@ -206,6 +227,9 @@ void Quadra950Machine::wireDevices() {
     };
     scsi0_->onIrq = scsiIrq(0);
     scsi1_->onIrq = scsiIrq(1);
+    // Data requests go to the video chip, which shows them to the ROM in
+    // its two SCSI registers (dossier, "SCSI").
+    dafb_->scsiDrq = [this](int bus) { return (bus ? *scsi1_ : *scsi0_).drq(); };
     scsi0_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     scsi1_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     dafb_->onDiag = [this](const char* s) { if (onDiag) onDiag(s); };
@@ -215,6 +239,7 @@ void Quadra950Machine::wireDevices() {
         updateIpl();
     };
     cdrom_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
+    netdev_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
 
     cpu_.onResetInstruction = [this] { resetPeripherals(); };
 }
@@ -345,6 +370,13 @@ u16 Quadra950Machine::read16(u32 addr) {
         const u32 o = addr & romMask_;
         return static_cast<u16>((rom_[o] << 8) | rom_[(o + 1) & romMask_]);
     }
+    if (addr >= 0x50000000u && addr < 0x54000000u) {
+        const int bus = scsiDataPort(addr & 0x3FFFFu);
+        if (bus >= 0) {
+            if (!scsiPortReady(bus, true, addr, 2)) return 0xFFFF;
+            return (bus ? *scsi1_ : *scsi0_).dma16Read();
+        }
+    }
     try {
         const u16 hi = read8(addr);
         return static_cast<u16>((hi << 8) | read8(addr + 1));
@@ -358,6 +390,13 @@ void Quadra950Machine::write16(u32 addr, u16 value) {
         ram_[addr] = static_cast<u8>(value >> 8);
         ram_[addr + 1] = static_cast<u8>(value);
         return;
+    }
+    if (addr >= 0x50000000u && addr < 0x54000000u) {
+        const int bus = scsiDataPort(addr & 0x3FFFFu);
+        if (bus >= 0) {
+            if (scsiPortReady(bus, false, addr, 2)) (bus ? *scsi1_ : *scsi0_).dma16Write(value);
+            return;
+        }
     }
     try {
         write8(addr, static_cast<u8>(value >> 8));
@@ -425,6 +464,40 @@ void Quadra950Machine::write32(u32 addr, u32 value) {
     }
 }
 
+// ---- SCSI data ports ------------------------------------------------------------
+//
+// Each SCSI chip's data moves through a port beside its registers: $F100 for
+// the internal chip, $F502 for the external one, a byte or a word at a time
+// (the ROM's transfer loops use MOVE.B and MOVE.W; dossier, "SCSI"). The
+// video chip watches the SCSI chip's data request for the port: with the
+// bus's wait bit set an access is held until the request comes and ends in a
+// bus error when it does not; with the bit clear the access goes through
+// unchecked, and the ROM polls the request itself first. The targets here
+// answer at once, so a request that is not up when the port is touched will
+// not come: the held access faults right away, and an unchecked one moves
+// nothing.
+
+int Quadra950Machine::scsiDataPort(u32 off) const {
+    if (off == 0x0F100u || off == 0x0F101u) return 0;
+    if (off == 0x0F502u || off == 0x0F503u) return 1;
+    return -1;
+}
+
+bool Quadra950Machine::scsiPortReady(int bus, bool read, u32 addr, int size) {
+    if ((bus ? *scsi1_ : *scsi0_).drq()) return true;
+    const u32 wait = read ? Dafb::kScsiWaitRead : Dafb::kScsiWaitWrite;
+    if (dafb_->scsiControl(bus) & wait) throw BusFault{addr, read, size};
+    ++scsiBlindMisses_;
+    if (onDiag && scsiPortDiag_ > 0) {
+        --scsiPortDiag_;
+        char b[80];
+        std::snprintf(b, sizeof b, "SCSI %d data port %s with no data request (unchecked)", bus,
+                      read ? "read" : "written");
+        onDiag(b);
+    }
+    return false;
+}
+
 // ---- I/O window -----------------------------------------------------------------
 
 u8 Quadra950Machine::ioRead8(u32 off, u32 addr) {
@@ -439,6 +512,10 @@ u8 Quadra950Machine::ioRead8(u32 off, u32 addr) {
     if (off >= 0x0E000u && off < 0x0F000u) {
         const u32 v = memctl_->read(off & 0xFCu);
         return static_cast<u8>(v >> (8 * (3 - (off & 3))));
+    }
+    if (const int bus = scsiDataPort(off); bus >= 0) {
+        if (!scsiPortReady(bus, true, addr, 1)) return 0xFF;
+        return (bus ? *scsi1_ : *scsi0_).dma8Read();
     }
     if (off >= 0x0F000u && off < 0x0F800u) {
         Ncr53c96& chip = off < 0x0F400u ? *scsi0_ : *scsi1_;
@@ -468,6 +545,10 @@ void Quadra950Machine::ioWrite8(u32 off, u8 v, u32 addr) {
         const u32 reg = off & 0xFCu;
         const int shift = static_cast<int>(8 * (3 - (off & 3)));
         memctl_->write(reg, (memctl_->read(reg) & ~(0xFFu << shift)) | (static_cast<u32>(v) << shift));
+        return;
+    }
+    if (const int bus = scsiDataPort(off); bus >= 0) {
+        if (scsiPortReady(bus, false, addr, 1)) (bus ? *scsi1_ : *scsi0_).dma8Write(v);
         return;
     }
     if (off >= 0x0F000u && off < 0x0F800u) {
@@ -609,6 +690,12 @@ const std::vector<u8>& Quadra950Machine::floppySectors() { return floppy_->secto
 void Quadra950Machine::keyEvent(u8 adbCode, bool down) { adb_->injectKey(adbCode, down); }
 void Quadra950Machine::mouseEvent(int dx, int dy, bool button) { adb_->injectMouse(dx, dy, button); }
 
+void Quadra950Machine::attachNet(bool attached, int busId) { netdev_->setAttached(attached, busId); }
+bool Quadra950Machine::netAttached() const { return netdev_->attachedState(); }
+bool Quadra950Machine::netInject(const u8* frame, u32 len) { return netdev_->injectFrame(frame, len); }
+bool Quadra950Machine::netDrain(std::vector<u8>& out) { return netdev_->drainFrame(out); }
+u32 Quadra950Machine::scsiCommands(int bus) const { return (bus ? *scsi1_ : *scsi0_).diagCommands; }
+
 int Quadra950Machine::screenWidth() const { return dafb_->width(); }
 int Quadra950Machine::screenHeight() const { return dafb_->height(); }
 void Quadra950Machine::renderScreen(u32* argbOut) const { dafb_->render(argbOut); }
@@ -695,6 +782,9 @@ std::string Quadra950Machine::diagnosticReport() const {
         floppy_->present() ? "disk in" : "empty", floppy_->track(),
         static_cast<unsigned long long>(floppy_->bytesRead()), static_cast<unsigned long long>(floppy_->bytesWritten()),
         floppy_->tracksWritten());
+    add("   SCSI: internal bus %u commands (%u selections), external bus %u commands (%u selections), "
+        "%u unchecked data-port misses",
+        scsi0_->diagCommands, scsi0_->diagSelects, scsi1_->diagCommands, scsi1_->diagSelects, scsiBlindMisses_);
     add("   ADB: %llu commands, %llu replies, %llu resets, last command %02X",
         static_cast<unsigned long long>(adbBus_->commands()), static_cast<unsigned long long>(adbBus_->replies()),
         static_cast<unsigned long long>(adbBus_->resets()), adbBus_->lastCommand());

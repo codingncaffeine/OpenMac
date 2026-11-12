@@ -11,10 +11,8 @@
 // 3rd ed., the Quadra 950 Developer Note, MAME and Linux as behavioral
 // references). Clean-room.
 //
-// Under construction: the board, its interrupt wiring, everything the ROM
-// needs to pass its self-tests, and the video chip with every depth the
-// developer note lists are here. Keyboard, mouse and floppy (behind the
-// second I/O processor) and the second SCSI bus's wiring follow.
+// Under construction: sound output, power through the microcontroller and
+// the NuBus slots' interrupt lines follow.
 
 #include "openmac/bus040.hpp"
 #include "openmac/cpu040.hpp"
@@ -40,6 +38,7 @@ class Dafb;
 class AdbTransceiver;
 class AdbBus;
 class IopFloppy;
+class ScsiEthernet;
 
 class Quadra950Machine final : public IBus040, public MacHostServices {
 public:
@@ -48,6 +47,11 @@ public:
         std::array<u32, 4> bankMb{4, 4, 0, 0};
         // Video RAM in megabytes: 1 (as shipped) or 2 (the sockets filled).
         u32 vramMb = 2;
+        // The machine has two SCSI buses: the internal one for the drives in
+        // its bays (first hard disk, CD drive) and the external connector
+        // (network adapter). The second hard disk is in a bay unless this
+        // says it is an external drive. An ID is used once across both.
+        bool secondDiskExternal = false;
     };
 
     Quadra950Machine(std::vector<u8> rom, const Config& cfg);
@@ -91,6 +95,15 @@ public:
     void keyEvent(u8 adbCode, bool down);
     void mouseEvent(int dx, int dy, bool button);
 
+    // The SCSI Ethernet adapter, on the external bus (the Quadra 650's
+    // surface: raw frames in and out, the front end owns what they mean).
+    void attachNet(bool attached, int busId = 4);
+    bool netAttached() const;
+    bool netInject(const u8* frame, u32 len);
+    bool netDrain(std::vector<u8>& out);
+    // Commands each SCSI chip has carried out for a target (0 internal, 1 external).
+    u32 scsiCommands(int bus) const;
+
     int screenWidth() const;
     int screenHeight() const;
     void renderScreen(u32* argbOut) const;
@@ -116,6 +129,10 @@ public:
     // What the memory controller's three boundaries currently say, in bytes.
     u32 bankBoundary(int k) const;
 
+    // Diagnosis: log this many of the floppy chip's register writes (the two
+    // data registers aside) and mechanism commands through onDiag.
+    int floppyTrace = 0;
+
     // A text snapshot of the CPU and the devices, for when the guest stops.
     std::string diagnosticReport() const;
 
@@ -134,6 +151,8 @@ private:
     void updateIpl();
     u8   ioRead8(u32 off, u32 addr);
     void ioWrite8(u32 off, u8 v, u32 addr);
+    int  scsiDataPort(u32 off) const;                  // 0, 1 or -1 = not a data port
+    bool scsiPortReady(int bus, bool read, u32 addr, int size);
     u8   ramRead8(u32 addr) const;
     void ramWrite8(u32 addr, u8 v);
 
@@ -157,6 +176,7 @@ private:
     std::unique_ptr<AdbTransceiver> adb_;
     std::unique_ptr<AdbBus> adbBus_;
     std::unique_ptr<Dafb> dafb_;
+    std::unique_ptr<ScsiEthernet> netdev_;
     M68040 cpu_;
 
     u16 sonicRegs_[0x40]{};
@@ -165,6 +185,8 @@ private:
 
     bool dafbIrq_ = false;
     bool scsiIrq_[2] = {false, false};
+    u32 scsiBlindMisses_ = 0;    // data-port accesses with no request and no wait bit
+    int scsiPortDiag_ = 16;
     bool via2Pb7_ = true;      // last level of VIA2 timer 1's output
     bool resetPending_ = false;   // the microcontroller asked for a system reset
     // True when [addr, addr+n) lies in fitted RAM that sits at its own address.

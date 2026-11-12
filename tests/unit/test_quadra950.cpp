@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include "../../core/src/machine/quadra/dafb.hpp"
+#include "../../core/src/machine/quadra/ncr53c96.hpp"
 #include "../../core/src/machine/quadra950/memctl.hpp"
 #include "openmac/quadra.hpp"
 
@@ -593,4 +594,89 @@ TEST_CASE("displays: each listed display presents Apple's sense code") {
         }
     }
     CHECK(extended[3] != extended[4]);
+}
+
+// ---- SCSI: the data request in the video chip, the byte-wide data port ----
+
+TEST_CASE("950 SCSI: the video chip's two SCSI registers carry each bus's data request in bit 9") {
+    Dafb chip(Dafb::Variant::Standalone, 0x200000);
+    bool request[2] = {false, false};
+    chip.scsiDrq = [&](int bus) { return request[bus]; };
+    chip.write(0x24, 0x041);      // what the ROM writes to both on a 950
+    chip.write(0x28, 0x1EC);      // and on the slower board: both wait bits set
+    CHECK(chip.read(0x24) == 0x041);
+    CHECK(chip.read(0x28) == 0x1EC);
+    request[0] = true;
+    CHECK(chip.read(0x24) == 0x241);
+    CHECK(chip.read(0x28) == 0x1EC);
+    request[0] = false;
+    request[1] = true;
+    CHECK(chip.read(0x24) == 0x041);
+    CHECK(chip.read(0x28) == 0x3EC);
+
+    // The wait bits are what the board acts on at the data ports.
+    CHECK((chip.scsiControl(0) & (Dafb::kScsiWaitRead | Dafb::kScsiWaitWrite)) == 0);
+    CHECK((chip.scsiControl(1) & Dafb::kScsiWaitRead) != 0);
+    CHECK((chip.scsiControl(1) & Dafb::kScsiWaitWrite) != 0);
+
+    // Bit 9 is the line, not a stored bit.
+    request[1] = false;
+    chip.write(0x28, 0x3EC);
+    CHECK(chip.read(0x28) == 0x1EC);
+
+    // The Quadra 650's video cell has no SCSI block: plain storage there.
+    Dafb cell;
+    cell.scsiDrq = [](int) { return true; };
+    cell.write(0x24, 0x041);
+    CHECK(cell.read(0x24) == 0x041);
+}
+
+TEST_CASE("950 SCSI: single bytes through the data port arrive once each") {
+    // A disk the bus will show: block 0 starts with the driver map's 'ER'.
+    std::vector<u8> image(64 * 512, 0);
+    image[0] = 0x45;
+    image[1] = 0x52;
+    ScsiDisk disk;
+    disk.attach(&image, 0);
+    Ncr53c96 chip;
+    chip.addTarget(&disk);
+    chip.reset();
+    u8 lastInterrupt = 0;
+    const auto interrupt = [&] {
+        REQUIRE(chip.irqAsserted());
+        lastInterrupt = chip.read(5);
+    };
+
+    // The ROM's command: five bytes into the FIFO, the sixth through the data
+    // port once the chip asks for it, with a count of one. WRITE(6), block 9.
+    const u8 cdb[6] = {0x0A, 0x00, 0x00, 0x09, 0x01, 0x00};
+    chip.write(0, 1);
+    chip.write(1, 0);
+    chip.write(4, 0);              // target 0
+    chip.write(3, 0xC1);           // select without ATN, the tail by data request
+    for (int i = 0; i < 5; ++i) chip.write(2, cdb[i]);
+    REQUIRE(chip.drq());
+    chip.dma8Write(cdb[5]);
+    interrupt();
+    CHECK(lastInterrupt == 0x18);  // function complete and bus service
+    CHECK(chip.lastCdbLen == 6);
+    CHECK(std::memcmp(chip.lastCdb, cdb, 6) == 0);
+    CHECK((chip.read(4) & 7) == Ncr53c96::kDataOut);
+
+    // The block, one byte per access. A byte taken twice would end the
+    // transfer early with the wrong contents.
+    chip.write(0, 0x00);
+    chip.write(1, 0x02);           // 512
+    chip.write(3, 0x90);           // transfer information, by data request
+    for (int i = 0; i < 512; ++i) {
+        REQUIRE(chip.drq());
+        chip.dma8Write(static_cast<u8>(i * 7 + 3));
+    }
+    CHECK_FALSE(chip.drq());
+    interrupt();
+    CHECK((chip.read(4) & 7) == Ncr53c96::kStatus);
+    bool same = true;
+    for (int i = 0; i < 512; ++i) same = same && image[9 * 512 + static_cast<std::size_t>(i)] == static_cast<u8>(i * 7 + 3);
+    CHECK(same);
+    CHECK(image[10 * 512] == 0);   // and nothing ran past the block
 }
