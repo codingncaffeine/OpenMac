@@ -119,7 +119,12 @@ int main(int argc, char** argv) {
     std::printf("end: frame %llu pc=%08X sr=%04X overlay=%d screen %dx%d\n",
                 static_cast<unsigned long long>(mac.frameCount()), mac.cpu().pc, mac.cpu().getSR(),
                 mac.overlayActive() ? 1 : 0, mac.screenWidth(), mac.screenHeight());
-    if (report) std::fputs(mac.diagnosticReport().c_str(), stdout);
+    if (report) {
+        std::fputs(mac.diagnosticReport().c_str(), stdout);
+        // What the guest believes about its screen: ScrnBase ($0824) and
+        // ScreenRow ($0106), next to what the video chip was told.
+        std::printf("   guest: ScrnBase=%08X ScreenRow=%u bytes\n", mac.read32(0x0824), mac.read16(0x0106));
+    }
 
     if (!shotPath.empty()) {
         const int w = mac.screenWidth(), h = mac.screenHeight();
