@@ -618,7 +618,8 @@ public sealed class QuadraEmulator : IEmulator
         "The SCSI CD-ROM takes .iso/.cdr/.toast masters (ISO 9660, Apple-partitioned or bare HFS), "
         + "raw-sector .bin/.cue/.mdf (MODE1 or MODE2, 2352/2336/2448 bytes) and Disk Utility .dmg "
         + "(UDIF, zlib). An HFS disc mounts on the desktop once the System is up; an ISO-9660-only "
-        + "disc needs Foreign File Access in the guest. The ROM does not boot from a CD.";
+        + "disc needs Foreign File Access in the guest. A startup disc (one that carries Apple's driver, "
+        + "like a Mac OS install CD) starts the machine when the hard disk has no System on it.";
 
     public string DiagnosticReport()
     {

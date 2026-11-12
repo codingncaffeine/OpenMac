@@ -37,6 +37,14 @@ namespace openmac {
 namespace {
 
 constexpr u64 kCpuHz = 33333333;         // 68040 @ 33.33 MHz
+// The drive numbers the two hard-disk seats add themselves under. A driver
+// that is loaded properly takes the first free number from 4 up, and one
+// can be loaded BEFORE these: the ROM installs the driver off a startup CD
+// at SCSI ID 3 ahead of the disk at ID 0, and it takes 4. The seats' own
+// numbers are fixed (the driver image carries them), so they sit above
+// anything that early loader can reach; every later driver sees them in
+// the drive queue and steps past.
+constexpr u16 kHdDrive = 8, kHd2Drive = 9;
 constexpr int kSlicesPerFrame = 370;     // audio rides the slice cadence
 constexpr int kCyclesPerSlice = 1498;    // ~60.15 Hz tick frame
 // ~694 us from ADB shift arm to completion, as measured on the Classic.
@@ -92,6 +100,9 @@ QuadraMachine::QuadraMachine(std::vector<u8> rom, const Config& cfg)
     scsi_->addTarget(disk_.get());
     scsi_->addTarget(disk2_.get());
     scsi_->addTarget(cdrom_.get());
+    // This machine starts up from its CD-ROM drive: the ROM loads the driver
+    // off the disc, and that driver wants an Apple drive with a tray.
+    cdrom_->setStartupDrive(true);
     scsi_->addTarget(netdev_.get());
 
     fd_->installed = true;      // the internal SuperDrive is always fitted
@@ -246,6 +257,27 @@ void QuadraMachine::wireDevices() {
         easc_->reset();
         adbArmed_ = false;
         adbPending_ = 0;
+        // A restart from inside the guest arrives here. The drive gets its
+        // reset (tray closed, 2048-byte blocks), and the driver this machine
+        // installed is gone with the System heap it lived in: the addresses
+        // it answered at belong to whatever the new startup puts there.
+        cdrom_->busReset();
+        cdDrvr_ = cdPrimePc_ = cdCtlPc_ = cdStatusPc_ = 0;
+        cdStatus_ = 0;
+        cdRefNum_ = 0;
+        cdDrive_ = 0;
+        cdInstallTries_ = 0;
+        cdMountTries_ = 0;
+        cdMountPending_ = cdrom_->discPresent();
+        // The same goes for the hard disks' driver entry points and the
+        // parameter block kept in the old System heap: found or allocated
+        // again by the new startup, never carried over from the last one.
+        for (int i = 0; i < 2; ++i)
+            diskPrimePc_[i] = diskCtlPc_[i] = diskStatusPc_[i] = 0;
+        hdMountPb_ = 0;
+        hdAnnouncePending_ = !hd_.empty();
+        hd2AnnouncePending_ = !hd2_.empty();
+        hdMountTries_ = 0;
     };
 }
 
@@ -1309,12 +1341,65 @@ bool QuadraMachine::volumeMountedFor(u16 drive) {
     return false;
 }
 
+// The drive a CD-ROM driver of the guest's own answers for, or 0. Apple's
+// driver -- loaded off a startup disc by the ROM, or installed by the Apple
+// CD-ROM extension -- is named .AppleCD like the one this machine installs,
+// so the drive queue is walked for an element whose driver carries that name
+// under a reference number that is not ours. While there is one, the disc is
+// its business over the SCSI bus and this machine's driver stays out: two
+// drivers on one drive mount the same volume twice.
+u16 QuadraMachine::guestCdDrive() {
+    const u32 uTable = guestPtr(read32(0x011C));
+    const u32 units = read16(0x01D2);                 // UnitNtryCnt
+    if (!uTable || uTable + units * 4u >= ram_.size()) return 0;
+    u32 dqe = guestPtr(read32(0x030A));               // DrvQHdr.qHead
+    for (int n = 0; dqe && dqe + 12 < ram_.size() && n < 32; ++n) {
+        const s16 ref = static_cast<s16>(read16(dqe + 8));   // dQRefNum
+        const u32 unit = static_cast<u16>(~ref);
+        if (ref < 0 && unit < units && !(cdDrvr_ && ref == cdRefNum_)) {
+            const u32 h = guestPtr(read32(uTable + unit * 4u));
+            const u32 dce = (h && h + 4 < ram_.size()) ? guestPtr(read32(h)) : 0;
+            if (dce && dce + 8 < ram_.size()) {
+                // dCtlDriver is a handle when dRAMBased is set, a pointer
+                // when it is not; the name is a Pascal string at +18.
+                u32 drvr = guestPtr(read32(dce));
+                if ((read16(dce + 4) & 0x0040) && drvr && drvr + 4 < ram_.size())
+                    drvr = guestPtr(read32(drvr));
+                static const char kName[] = "\010.AppleCD";
+                bool match = drvr && drvr + 18 + sizeof kName < ram_.size();
+                for (u32 i = 0; match && i + 1 < sizeof kName; ++i)
+                    match = read8(drvr + 18 + i) == static_cast<u8>(kName[i]);
+                if (match) return read16(dqe + 6);    // dQDrive
+            }
+        }
+        dqe = guestPtr(read32(dqe));                  // qLink
+    }
+    return 0;
+}
+
+// Has startup run its course? CurApName ($0910) is filler until the first
+// application -- the Finder -- is launched, and extensions load before that.
+// The machine's CD driver waits for this: installed any earlier, it would
+// already own the drive when the Apple CD-ROM extension loads and claims it.
+bool QuadraMachine::startupFinished() {
+    const u8 len = read8(0x0910);
+    if (len == 0 || len > 31) return false;
+    for (u8 i = 1; i <= len; ++i)
+        if (read8(0x0910 + i) < 0x20) return false;
+    return true;
+}
+
 // Locate the Prime entry of each installed .ScsiHD driver, so the machine can
 // serve its requests directly. The unit table ($011C) holds a handle per unit;
 // the DCE's dCtlDriver points at the DRVR, whose header carries the Prime
 // offset. Cached once the System has installed the driver.
 void QuadraMachine::findDiskDriverPrime() {
-    static const int kUnits[2] = {1, 33};
+    // Unit 32 + SCSI ID, the numbering every SCSI disk driver follows. It is
+    // not cosmetic for the first seat: the ROM's default startup device is
+    // the driver at reference number -33 (unit 32, the disk at ID 0), and a
+    // disk that answers there starts the machine ahead of a startup CD, as
+    // the internal disk of a real one does.
+    static const int kUnits[2] = {32, 33};
     const u32 uTable = guestPtr(read32(0x011C));
     if (!uTable || uTable + 256 >= ram_.size()) return;
     for (int i = 0; i < 2; ++i) {
@@ -1455,6 +1540,8 @@ void QuadraMachine::installCdDriver() {
     if (read8(0x0360) & 1) return;                    // FSBusy: a file op is running
     if ((cpu_.getSR() & 0x0700) != 0) return;         // mid-interrupt: not now
     if (addressingModeSwapped()) return;              // not now
+    if (!startupFinished()) return;                   // extensions first
+    if (guestCdDrive()) return;                       // the guest has its own
     if (++cdInstallTries_ > 30) return;
 
     // Find the slot BEFORE allocating anything: the unit table is not built
@@ -1463,7 +1550,8 @@ void QuadraMachine::installCdDriver() {
     const u32 uTable = guestPtr(read32(0x011C));
     const u32 units = read16(0x01D2);                 // UnitNtryCnt
     u32 unit = 0;
-    for (u32 i = 32; i < units && i < 128; ++i) {     // 0-31 are Apple's
+    for (u32 i = 34; i < units && i < 128; ++i) {     // 0-31 are Apple's,
+                                                      // 32 and 33 the disks'
         if (uTable + i * 4u + 3 >= ram_.size()) break;
         if (read32(uTable + i * 4u) == 0) { unit = i; break; }
     }
@@ -1834,8 +1922,8 @@ void QuadraMachine::announceHardDisks() {
     // the driver's Prime is hooked before startup -- there is nothing to
     // announce. Injecting anyway disturbs whatever is running: the 7.5
     // Installer loses its window and hangs on a watch cursor (measured).
-    if (volumeMountedFor(4)) hdAnnouncePending_ = false;
-    if (volumeMountedFor(5)) hd2AnnouncePending_ = false;
+    if (volumeMountedFor(kHdDrive)) hdAnnouncePending_ = false;
+    if (volumeMountedFor(kHd2Drive)) hd2AnnouncePending_ = false;
     if (!hdAnnouncePending_ && !hd2AnnouncePending_) return;
     // The File Manager's own queue must be initialised, or _MountVol enqueues
     // into a header the System has not built yet (the Classic address-errored
@@ -1879,8 +1967,8 @@ void QuadraMachine::announceHardDisks() {
         return res == 0 || res == -55;
     };
     ++hdMountTries_;
-    if (hdAnnouncePending_ && mountDrive(4)) hdAnnouncePending_ = false;
-    if (hd2AnnouncePending_ && mountDrive(5)) hd2AnnouncePending_ = false;
+    if (hdAnnouncePending_ && mountDrive(kHdDrive)) hdAnnouncePending_ = false;
+    if (hd2AnnouncePending_ && mountDrive(kHd2Drive)) hd2AnnouncePending_ = false;
     if (hdMountTries_ >= 15) { hdAnnouncePending_ = hd2AnnouncePending_ = false; }
     for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     announceInFlight_ = false;
@@ -1930,7 +2018,7 @@ bool QuadraMachine::markVolumeCleanIn(std::vector<u8>& backing, u32 base,
 }
 
 bool QuadraMachine::markVolumeClean(u16 drive) {
-    const int unit = drive == 4 ? 0 : 1;
+    const int unit = drive == kHdDrive ? 0 : 1;
     if (unit ? hd2RO_ : hdRO_) return false;
     const std::vector<u8>& img = unit ? hd2_ : hd_;
     if (img.empty()) return false;
@@ -1956,7 +2044,7 @@ bool QuadraMachine::shutdownVolumes() {
     }
     bool any = false;
     if (hdMountPb_) {
-        for (u16 drive : {u16(4), u16(5)}) {
+        for (u16 drive : {kHdDrive, kHd2Drive}) {
             if (!volumeMountedFor(drive)) continue;
             auto call = [&](u16 trap) -> s16 {
                 for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
@@ -1993,7 +2081,7 @@ bool QuadraMachine::shutdownVolumes() {
 }
 
 // The first half of a drop-box republish: get the guest off the second volume
-// so the host may rebuild it. Only drive 5 -- the boot volume is not ours to
+// so the host may rebuild it. Only the second seat -- the boot volume is not ours to
 // disturb, and unlike shutdownVolumes this is not a shutdown: the machine goes
 // on running with one fewer disk for the moment it takes to build the next one.
 //
@@ -2016,7 +2104,7 @@ bool QuadraMachine::unmountSecondDisk() {
     if (read8(0x0360) & 1) return false;              // FSBusy: a file op is running
     if ((cpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt: not now
     if (addressingModeSwapped()) return false;        // not now
-    if (!volumeMountedFor(5)) return true;            // already off line
+    if (!volumeMountedFor(kHd2Drive)) return true;            // already off line
     announceInFlight_ = true;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
@@ -2029,7 +2117,7 @@ bool QuadraMachine::unmountSecondDisk() {
     if (hdMountPb_) {
         auto call = [&](u16 trap) -> s16 {
             for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
-            write16(hdMountPb_ + 22, 5);              // ioVRefNum = drive number
+            write16(hdMountPb_ + 22, kHd2Drive);      // ioVRefNum = drive number
             cpu_.a[0] = hdMountPb_;
             execute68kTrap(trap);
             return static_cast<s16>(cpu_.d[0] & 0xFFFF);
@@ -2039,7 +2127,7 @@ bool QuadraMachine::unmountSecondDisk() {
     }
     for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     announceInFlight_ = false;
-    const bool off = !volumeMountedFor(5);
+    const bool off = !volumeMountedFor(kHd2Drive);
     if (onDiag) {
         char b[112];
         std::snprintf(b, sizeof b, "hd2: flush %d, unmount %d -- volume %s", fl, un,
@@ -2100,7 +2188,7 @@ bool QuadraMachine::readFileThroughGuest(const std::string& name,
 
         clearPb();
         write32(pb + 18, nameBuf);                    // ioNamePtr
-        write16(pb + 22, 5);                          // ioVRefNum = drive number
+        write16(pb + 22, kHd2Drive);                  // ioVRefNum = drive number
         write8(pb + 27, 1);                           // ioPermssn = fsRdPerm
         const s16 openErr = call(0xA000);             // _Open
         if (openErr != 0) {
@@ -2657,7 +2745,7 @@ void QuadraMachine::insertHardDisk(std::vector<u8> image, bool readOnly) {
         scsiImage_.clear();
         return;
     }
-    scsiImage_ = scsi::buildAppleScsiDisk(hd_, scsi::buildScsiDriverPortable(0, 4, 1));
+    scsiImage_ = scsi::buildAppleScsiDisk(hd_, scsi::buildScsiDriverPortable(0, kHdDrive, 32));
     hfsImageOffset_ = static_cast<u32>(scsiImage_.size() - hd_.size());
     disk_->attach(&scsiImage_, 0);
     disk_->readOnly = readOnly;
@@ -2704,7 +2792,7 @@ void QuadraMachine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
         scsiImage2_.clear();
         return;
     }
-    scsiImage2_ = scsi::buildAppleScsiDisk(hd2_, scsi::buildScsiDriverPortable(1, 5, 33));
+    scsiImage2_ = scsi::buildAppleScsiDisk(hd2_, scsi::buildScsiDriverPortable(1, kHd2Drive, 33));
     hfsImageOffset2_ = static_cast<u32>(scsiImage2_.size() - hd2_.size());
     disk2_->attach(&scsiImage2_, 1);
     disk2_->readOnly = readOnly;
@@ -2882,8 +2970,10 @@ void QuadraMachine::ejectCd() {
 void QuadraMachine::completeCdEject() {
     if (!cdEjectPending_) return;
     if (inDriver_ || announceInFlight_) return;
-    if (cdDrive_ && read32(0x0358) != 0 && !(read8(0x0360) & 1) &&
-        (cpu_.getSR() & 0x0700) == 0 && volumeMountedFor(cdDrive_)) {
+    // Whichever driver has the disc: this machine's, or the guest's own.
+    const u16 drive = cdDrive_ ? cdDrive_ : guestCdDrive();
+    if (drive && read32(0x0358) != 0 && !(read8(0x0360) & 1) &&
+        (cpu_.getSR() & 0x0700) == 0 && volumeMountedFor(drive)) {
         announceInFlight_ = true;
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
@@ -2895,7 +2985,7 @@ void QuadraMachine::completeCdEject() {
         s16 un = -1;
         if (hdMountPb_) {
             for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
-            write16(hdMountPb_ + 22, cdDrive_);       // ioVRefNum
+            write16(hdMountPb_ + 22, drive);          // ioVRefNum
             cpu_.a[0] = hdMountPb_;
             execute68kTrap(0xA00E);                   // _UnmountVol
             un = static_cast<s16>(cpu_.d[0] & 0xFFFF);

@@ -95,7 +95,7 @@ public:
     // System's cached blocks are lost and the volume stays flagged unclean,
     // which this ROM refuses at the next boot.
     bool shutdownVolumes();
-    // Flush and unmount ONLY the second disk's volume (drive 5), leaving the
+    // Flush and unmount ONLY the second disk's volume (the second seat), leaving the
     // boot volume alone. This is how the drop box republishes: the guest must
     // let go of the volume -- and write its cached blocks through our driver
     // into the image -- before the host may rebuild it. Returns true once the
@@ -321,22 +321,28 @@ private:
     void serveDiskPrime(int unit);
     void serveDiskCtlStatus(int unit, bool status);
     void findDiskDriverPrime();
-    // The CD needs a driver that does not exist. The ROM carries one for
-    // floppies and the hard disk brings its own on its partition map, but a
-    // CD-ROM's driver comes from Apple's CD-ROM extension -- and that extension
-    // never claims this drive, so no drive ever reaches the queue and no disc of
-    // any format can mount. So install one: a DRVR named ".AppleCD" whose entry
-    // points are addresses this machine watches, exactly as it watches the hard
-    // disk's Prime and the ROM's .Sony Prime. See BasiliskII/src/cdrom.cpp,
-    // which reaches the same conclusion from the other direction.
+    // The CD needs a driver, and the guest does not always have one. The ROM
+    // carries one for floppies and the hard disk brings its own on its
+    // partition map, but a CD-ROM's driver comes from the disc itself (a
+    // startup disc, loaded by the ROM) or from Apple's CD-ROM extension. Where
+    // either is there it runs the drive over the SCSI bus and this machine
+    // stays out of it (guestCdDrive). A System with neither would never put
+    // the drive in the queue and no disc of any format could mount, so for
+    // that case install one once startup has finished: a DRVR named ".AppleCD"
+    // whose entry points are addresses this machine watches, exactly as it
+    // watches the hard disk's Prime and the ROM's .Sony Prime. See
+    // BasiliskII/src/cdrom.cpp, which reaches the same conclusion from the
+    // other direction.
     void installCdDriver();
     void mountCdVolume();
     void completeCdEject();
     void serveCdPrime();
     void serveCdCtlStatus(bool status);
     bool volumeMountedFor(u16 drive);
+    u16 guestCdDrive();
+    bool startupFinished();
     bool inDriver_ = false;      // serving a driver request: no nested traps
-    u32 diskPrimePc_[2] = {0, 0};   // unit 1 (drive 4) and unit 33 (drive 5)
+    u32 diskPrimePc_[2] = {0, 0};   // units 32 and 33: the two seats
     u32 diskCtlPc_[2] = {0, 0}, diskStatusPc_[2] = {0, 0};
     // The installed .AppleCD driver: where its stubs live, and the drive it
     // owns. cdDrive_ is 0 until AddDrive has taken.

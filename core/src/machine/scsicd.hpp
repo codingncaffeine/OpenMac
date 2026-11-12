@@ -39,10 +39,32 @@ public:
     void insert(std::vector<u8> data) {
         media_ = std::move(data);
         blockSize_ = 2048;
+        trayOpen_ = false;
         unitAttention_ = true;   // the next command hears "medium changed"
     }
-    void eject() { media_.clear(); unitAttention_ = true; }
-    bool discPresent() const { return !media_.empty(); }
+    void eject() { media_.clear(); trayOpen_ = false; unitAttention_ = true; }
+    bool discPresent() const { return !media_.empty() && !trayOpen_; }
+
+    // What a machine that starts up from this drive needs of it, off unless
+    // the machine asks:
+    //  - the Apple vendor mode page ($30), without which the Apple CD-ROM
+    //    driver -- the one on a startup disc included -- loads, looks the
+    //    drive over and leaves it alone;
+    //  - a tray. A guest's eject then opens the tray with the disc still on
+    //    it instead of losing the disc, and a bus reset closes it again.
+    //    Restart ejects every volume on its way out, so without the tray a
+    //    System that restarts during startup (Mac OS 8 does, to turn 32-bit
+    //    addressing on) comes back to an empty drive.
+    void setStartupDrive(bool on) { appleVendorPage_ = on; trayLoading_ = on; }
+    // The machine's reset line: the tray closes, and the logical block size
+    // and the removal lock a driver set are gone with the driver that set
+    // them (the ROM's startup scan reads the disc in 2048-byte blocks).
+    void busReset() {
+        if (trayOpen_) { trayOpen_ = false; unitAttention_ = true; }
+        blockSize_ = 2048;
+        prevented_ = false;
+        modeSelectPending_ = false;
+    }
     // The flat byte run the drive serves. A driver installed by the machine
     // reads the disc from here rather than through the bus, the way the hard
     // disk's Prime hook reads its image -- the guest's driver, DCE and
@@ -114,11 +136,18 @@ private:
                 return 0x00;
             case 0x1A:   // MODE SENSE(6)
                 return appendModeSense(out, cdb[2] & 0x3F, cdb[4]);
-            case 0x1B:   // START STOP UNIT: LoEj without Start = eject
+            case 0x1B:   // START STOP UNIT: LoEj without Start = eject,
+                         // LoEj with Start = load (close the tray)
+                if ((cdb[4] & 0x03) == 0x03 && trayOpen_) {
+                    trayOpen_ = false;
+                    unitAttention_ = true;
+                    return good();
+                }
                 if ((cdb[4] & 0x02) && !(cdb[4] & 0x01)) {
                     if (prevented_) return check(0x05, 0x53);   // removal prevented
                     if (discPresent()) {
-                        media_.clear();
+                        if (trayLoading_) trayOpen_ = true;
+                        else media_.clear();
                         ejectRequest_ = true;
                         unitAttention_ = true;
                     }
@@ -225,6 +254,21 @@ private:
     // ILLEGAL REQUEST for a page it does not have, and that is an answer a
     // driver knows how to handle. Page 3F means "all of them".
     u8 appendModeSense(std::vector<u8>& out, u8 page, u8 allocLen) {
+        if (page == 0x30 && appleVendorPage_) {
+            // Apple's vendor page, the way the Apple CD-ROM driver tells an
+            // Apple drive from any other: it asks for exactly 36 bytes and
+            // compares the 22 at offset 14 with this string. The reply has
+            // NO block descriptor even though the request leaves DBD clear
+            // -- 4-byte header, 2-byte page header, 8 zero bytes, the name.
+            // A drive that fails the comparison is left alone, which is why
+            // a disc's own driver would load and then never add the drive.
+            u8 v[36] = {};
+            v[0] = sizeof v - 1;            // mode data length excludes itself
+            v[4] = 0x30; v[5] = 30;
+            std::memcpy(v + 14, "APPLE COMPUTER, INC   ", 22);
+            emitClamped(out, v, sizeof v, allocLen);
+            return good();
+        }
         u8 d[64] = {};
         std::size_t n = 4;
         d[3] = 8;      // block descriptor length
@@ -311,6 +355,9 @@ private:
     bool prevented_ = false;
     bool ejectRequest_ = false;
     bool modeSelectPending_ = false;
+    bool appleVendorPage_ = false;
+    bool trayLoading_ = false;
+    bool trayOpen_ = false;    // ejected by the guest, disc still on the tray
 };
 
 } // namespace openmac
