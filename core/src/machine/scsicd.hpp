@@ -43,6 +43,15 @@ public:
         unitAttention_ = true;   // the next command hears "medium changed"
     }
     void eject() { media_.clear(); trayOpen_ = false; unitAttention_ = true; }
+    // The guest let the disc go (its driver's eject, by command or by a
+    // driver the machine serves): with a tray the disc stays on it.
+    void guestEject() {
+        if (!discPresent()) return;
+        if (trayLoading_) trayOpen_ = true;
+        else media_.clear();
+        ejectRequest_ = true;
+        unitAttention_ = true;
+    }
     bool discPresent() const { return !media_.empty() && !trayOpen_; }
 
     // What a machine that starts up from this drive needs of it, off unless

@@ -149,6 +149,8 @@ public:
     struct DisplayInfo { const char* name; int width, height, grounded, pairs; };
     static const DisplayInfo* displays(int& count);
     bool setDisplay(const char* name);
+    // Test entry: make the guest call ShutDwnStart (restart). False = not now.
+    bool guestRestart();
     void forceVideoMode(int w, int h, int bpp);
 
     // SCSI media, mirroring the Classic's surface. Images are wrapped in an
@@ -341,6 +343,13 @@ private:
     bool volumeMountedFor(u16 drive);
     u16 guestCdDrive();
     bool startupFinished();
+    // The CPU reached the ROM's entry (power on or a guest restart): forget
+    // the last startup. lowMemoryFresh says when its unit table is gone too.
+    void machineStarting();
+    bool lowMemoryFresh();
+    u32 romEntry_ = 0;              // the ROM's reset vector
+    bool unitTableFresh_ = false;   // rebuilt since the machine last started
+    bool sawNoApp_ = false;         // CurApName seen unset since then
     bool inDriver_ = false;      // serving a driver request: no nested traps
     u32 diskPrimePc_[2] = {0, 0};   // units 32 and 33: the two seats
     u32 diskCtlPc_[2] = {0, 0}, diskStatusPc_[2] = {0, 0};

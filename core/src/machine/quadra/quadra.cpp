@@ -92,6 +92,8 @@ QuadraMachine::QuadraMachine(std::vector<u8> rom, const Config& cfg)
     while (rs < rom_.size()) rs <<= 1;
     rom_.resize(rs, 0xFF);
     romMask_ = rs - 1;
+    romEntry_ = (static_cast<u32>(rom_[4]) << 24) | (static_cast<u32>(rom_[5]) << 16) |
+                (static_cast<u32>(rom_[6]) << 8) | rom_[7];
 
     scc_->onDiag = [this](const char* s) { if (onDiag) onDiag(s); };
     // Default display: the 13-inch/14-inch RGB monitor the machine has always
@@ -257,28 +259,54 @@ void QuadraMachine::wireDevices() {
         easc_->reset();
         adbArmed_ = false;
         adbPending_ = 0;
-        // A restart from inside the guest arrives here. The drive gets its
-        // reset (tray closed, 2048-byte blocks), and the driver this machine
-        // installed is gone with the System heap it lived in: the addresses
-        // it answered at belong to whatever the new startup puts there.
-        cdrom_->busReset();
-        cdDrvr_ = cdPrimePc_ = cdCtlPc_ = cdStatusPc_ = 0;
-        cdStatus_ = 0;
-        cdRefNum_ = 0;
-        cdDrive_ = 0;
-        cdInstallTries_ = 0;
-        cdMountTries_ = 0;
-        cdMountPending_ = cdrom_->discPresent();
-        // The same goes for the hard disks' driver entry points and the
-        // parameter block kept in the old System heap: found or allocated
-        // again by the new startup, never carried over from the last one.
-        for (int i = 0; i < 2; ++i)
-            diskPrimePc_[i] = diskCtlPc_[i] = diskStatusPc_[i] = 0;
-        hdMountPb_ = 0;
-        hdAnnouncePending_ = !hd_.empty();
-        hd2AnnouncePending_ = !hd2_.empty();
-        hdMountTries_ = 0;
     };
+}
+
+// The CPU is at the ROM's entry: power on, or a restart the guest started
+// itself (ShutDwnStart ends in a jump to ROM base + $0A). Everything this
+// machine learned about the last startup is void from here -- the drivers
+// it hooked and the one it installed lived in a System heap that is about to
+// be rebuilt, and an address kept from it belongs to whatever the new
+// startup loads there. With a CD in the drive that is the disc's own driver,
+// loaded before the hard disks': it ran into a stale Prime address, the
+// machine served a disk request that was never made, and the restart ended
+// at the sad Mac.
+//
+// The CPU's RESET instruction is not this event: the ROM also executes it
+// well into a startup, with its drivers already in place.
+void QuadraMachine::machineStarting() {
+    // The drive gets its reset: tray closed, 2048-byte blocks again.
+    cdrom_->busReset();
+    cdDrvr_ = cdPrimePc_ = cdCtlPc_ = cdStatusPc_ = 0;
+    cdStatus_ = 0;
+    cdRefNum_ = 0;
+    cdDrive_ = 0;
+    cdInstallTries_ = 0;
+    cdMountTries_ = 0;
+    cdHfsOffset_ = cdrom_->discPresent() ? findHfsPartition(cdrom_->media()) : 0;
+    cdMountPending_ = cdrom_->discPresent();
+    for (int i = 0; i < 2; ++i)
+        diskPrimePc_[i] = diskCtlPc_[i] = diskStatusPc_[i] = 0;
+    hdMountPb_ = 0;
+    hdAnnouncePending_ = !hd_.empty();
+    hd2AnnouncePending_ = !hd2_.empty();
+    hdMountTries_ = 0;
+    // Low memory still describes the last startup until the ROM rebuilds
+    // it. Nothing is read back out of it before then (see lowMemoryFresh).
+    unitTableFresh_ = false;
+    sawNoApp_ = false;
+}
+
+// Has the ROM rebuilt the unit table since the machine last started? The
+// old one still holds the hard disks' drivers; a new one is empty at their
+// units until the startup scan installs them again, many frames later.
+bool QuadraMachine::lowMemoryFresh() {
+    if (unitTableFresh_) return true;
+    const u32 uTable = guestPtr(read32(0x011C));
+    if (!uTable || uTable + 34 * 4u >= ram_.size() ||
+        (read32(uTable + 32 * 4u) == 0 && read32(uTable + 33 * 4u) == 0))
+        unitTableFresh_ = true;
+    return unitTableFresh_;
 }
 
 void QuadraMachine::reset() {
@@ -1192,7 +1220,8 @@ void QuadraMachine::tickDevices(int cpuCycles) {
             // installed it -- BEFORE the System's startup mount runs. Hooked
             // late, that mount goes through the SCSI Manager's discard drain,
             // fails, and the volume is written off for the rest of the session.
-            if ((!hd_.empty() && !diskPrimePc_[0]) || (!hd2_.empty() && !diskPrimePc_[1]))
+            if (lowMemoryFresh() &&
+                ((!hd_.empty() && !diskPrimePc_[0]) || (!hd2_.empty() && !diskPrimePc_[1])))
                 findDiskDriverPrime();
             // The eject is a mechanism on its own clock, not a strobe (the
             // Classic's lesson): advance it, and when it completes take the
@@ -1349,6 +1378,7 @@ bool QuadraMachine::volumeMountedFor(u16 drive) {
 // its business over the SCSI bus and this machine's driver stays out: two
 // drivers on one drive mount the same volume twice.
 u16 QuadraMachine::guestCdDrive() {
+    if (!lowMemoryFresh()) return 0;
     const u32 uTable = guestPtr(read32(0x011C));
     const u32 units = read16(0x01D2);                 // UnitNtryCnt
     if (!uTable || uTable + units * 4u >= ram_.size()) return 0;
@@ -1383,10 +1413,11 @@ u16 QuadraMachine::guestCdDrive() {
 // already own the drive when the Apple CD-ROM extension loads and claims it.
 bool QuadraMachine::startupFinished() {
     const u8 len = read8(0x0910);
-    if (len == 0 || len > 31) return false;
+    if (len == 0 || len > 31) { sawNoApp_ = true; return false; }
     for (u8 i = 1; i <= len; ++i)
-        if (read8(0x0910 + i) < 0x20) return false;
-    return true;
+        if (read8(0x0910 + i) < 0x20) { sawNoApp_ = true; return false; }
+    // A name left over from before a restart is not this startup's.
+    return sawNoApp_;
 }
 
 // Locate the Prime entry of each installed .ScsiHD driver, so the machine can
@@ -1764,8 +1795,9 @@ void QuadraMachine::serveCdCtlStatus(bool status) {
     if (!status) {
         switch (csCode) {
         case 7:                                        // Eject
-            cdrom_->eject();
-            cdHfsOffset_ = 0;
+            // The same tray the drive's own eject command opens: the disc
+            // is back when the machine restarts.
+            cdrom_->guestEject();
             if (cdStatus_) write8(cdStatus_ + 3, 0);   // dsDiskInPlace
             if (onDiag) onDiag("cd: the guest ejected the disc");
             break;
@@ -1849,6 +1881,25 @@ bool QuadraMachine::leaveSwappedAddressingMode() {
     return !addressingModeSwapped();
 }
 
+// Have the guest restart itself: ShutDwnStart, the call behind an installer's
+// Restart button and the Finder's Restart. The three words go into
+// ApplScratch and the CPU is pointed at them; nothing is put back, because
+// the call does not return. A test entry: a restart the guest starts is a
+// different road from the reset line, and it has to be reachable without a
+// mouse.
+bool QuadraMachine::guestRestart() {
+    if (inDriver_ || announceInFlight_) return false;
+    if (read32(0x0358) == 0 || (read8(0x0360) & 1)) return false;   // no System / FSBusy
+    if ((cpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt
+    if (addressingModeSwapped()) return false;
+    const u32 scratch = 0x0A78;
+    write16(scratch, 0x3F3C);                         // MOVE.W #2,-(SP)
+    write16(scratch + 2, 0x0002);                     //   sdRestart
+    write16(scratch + 4, 0xA895);                     // _ShutDown
+    cpu_.pc = scratch;
+    return true;
+}
+
 void QuadraMachine::execute68kTrap(u16 trap) {
     // ApplScratch, the twelve low-memory bytes reserved for applications. The
     // Classic put this word at the top of RAM, which works on a machine with
@@ -1903,6 +1954,7 @@ s32 QuadraMachine::gestaltQuery(u32 selector, u32& response) {
 // insertion is -- the System mounts the volume and the Finder shows it.
 void QuadraMachine::announceHardDisks() {
     if (suppressHdAnnounce) return;
+    if (!lowMemoryFresh()) return;                // still the last startup's
     if (announceInFlight_) return;
     if (!hdAnnouncePending_ && !hd2AnnouncePending_) return;
     if (read32(0x0358) == 0) return;              // no live VCB: System not up
@@ -2234,6 +2286,7 @@ bool QuadraMachine::readFileThroughGuest(const std::string& name,
 }
 
 int QuadraMachine::stepInstruction() {
+    if (cpu_.pc == 0x4080000Au || (overlay_ && cpu_.pc == romEntry_)) machineStarting();
     if (countPc_ && (cpu_.pc | 0x40000000u) == (countPc_ | 0x40000000u)) ++countPcHits_;
     // The ROM's .Sony driver runs through both its 32-bit face and the 24-bit
     // alias; hook Prime at either and serve the request from the image.
