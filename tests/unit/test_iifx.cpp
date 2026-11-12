@@ -1830,6 +1830,55 @@ TEST_CASE("SuperDrive behind an I/O processor: two bytes handed to the chip at o
     CHECK(drive.mechanism().writesDropped == 1);
 }
 
+TEST_CASE("SuperDrive behind an I/O processor: set up for GCR, every byte of an 800K disk reaches the firmware") {
+    constexpr u64 hz = 1000000;
+    IoProcessor iop;
+    IopFloppy drive(iop, hz);
+    REQUIRE(drive.insert(std::vector<u8>(819200, 0), true));
+
+    u64 now = 1000;
+    (void)drive.access(7, true, 0x82, now);        // mode: motor on, drive 1
+    (void)drive.access(4, true, 0xF2, now);        // mechanism register 4, data 0: motor on
+    (void)drive.access(4, true, 0xFA, now);        // strobe
+    (void)drive.access(4, true, 0xF2, now);
+    now += hz;                                     // up to speed
+    drive.service(now);
+    REQUIRE(drive.mechanism().motorRunning(now));
+    const u64 per = drive.mechanism().cyclesPerByte();
+
+    // Start a read with the given setup register and collect what the chip
+    // hands over during about two sectors' worth of disk.
+    const auto read = [&](u8 setup) {
+        (void)drive.access(6, true, 0x18, now);    // mode: action and write off
+        (void)drive.access(5, true, setup, now);
+        (void)drive.access(7, true, 0x01, now);    // clear the FIFO: high, then low
+        (void)drive.access(6, true, 0x01, now);
+        (void)drive.access(7, true, 0x08, now);    // action
+        std::vector<u8> got;
+        for (int cell = 0; cell < 1600; ++cell) {
+            now += per;
+            drive.service(now);
+            while (drive.chip().ismFifoOccupancy() != 0) got.push_back(drive.access(8, false, 0, now));
+        }
+        return got;
+    };
+    const auto holds = [](const std::vector<u8>& bytes, std::initializer_list<u8> pattern) {
+        return std::search(bytes.begin(), bytes.end(), pattern.begin(), pattern.end()) != bytes.end();
+    };
+
+    // GCR: no mark search, the bytes come as they pass under the head, and
+    // among them are a sector's address and data headers.
+    const std::vector<u8> gcr = read(0x44);
+    CHECK(gcr.size() >= 1500);
+    CHECK(std::all_of(gcr.begin(), gcr.end(), [](u8 b) { return (b & 0x80) != 0; }));
+    CHECK(holds(gcr, {0xD5, 0xAA, 0x96}));
+    CHECK(holds(gcr, {0xD5, 0xAA, 0xAD}));
+    CHECK((drive.access(0xA, false, 0, now) & 0x02) == 0);   // none of them was a mark
+
+    // Set up for MFM the chip waits for a mark, and this disk has none.
+    CHECK(read(0x20).empty());
+}
+
 TEST_CASE("IIfx checkpoint carries the disk in the drive, not the one swapped out before it") {
     IifxMachine mac(testRom());
     std::vector<u8> first(1474560), second(1474560);

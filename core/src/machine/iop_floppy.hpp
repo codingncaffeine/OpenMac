@@ -286,7 +286,14 @@ public:
                 u8 byte = 0;
                 bool mark = false;
                 if (!drive_.nextByte(now, &byte, &mark)) break;
-                if (!readSynced_) {
+                if (swim_.ismGcr()) {
+                    // Set up for GCR (400K and 800K disks) the chip has no
+                    // marks to look for: every byte off the disk goes to the
+                    // firmware, which finds the address and data headers
+                    // itself.
+                    mark = false;
+                    readSynced_ = true;
+                } else if (!readSynced_) {
                     if (!mark) continue;
                     readSynced_ = true;
                     readMarkPrev_ = false;
