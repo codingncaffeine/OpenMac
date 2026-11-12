@@ -47,6 +47,7 @@ public:
         clutAddr_ = 0;
         clutPhase_ = 0;
         depthCtl_ = 0;
+        ctl1_ = 0;
         vblEnabled_ = false;
         vblPending_ = false;
         cursorPending_ = false;
@@ -115,7 +116,13 @@ public:
                 }
                 return v;
             }
-            if (reg == 0x20) return depthCtl_;
+            // The control port is two registers, picked by the address
+            // register: 0 is the pixel-bus control (depth), 1 a second
+            // one. The ROM tells this DAC from the older single-register
+            // kind by writing 6 to the first, 0 to the second, and
+            // reading the first back -- and offers the 16-bit modes only
+            // if the 6 is still there.
+            if (reg == 0x20) return clutAddr_ == 1 ? ctl1_ : depthCtl_;
             return 0;
         default:
             return 0;   // clock generator: nothing readable
@@ -179,7 +186,14 @@ public:
                     clutAddr_ = (clutAddr_ + 1) & 0xFF;
                 }
             } else if (reg == 0x20) {
-                depthCtl_ = v & 0xFF;
+                if (clutAddr_ == 1) ctl1_ = v & 0xFF;
+                else depthCtl_ = v & 0xFF;
+                if (ctlDiag_ > 0 && onDiag) {
+                    --ctlDiag_;
+                    char b[64];
+                    std::snprintf(b, sizeof b, "DAC ctl[%u] <- %02X", clutAddr_, v & 0xFF);
+                    onDiag(b);
+                }
             }
             break;
         default:
@@ -192,6 +206,8 @@ public:
 
     // ---- scanout ----
     // Depth from the Antelope control register bits [4:2].
+    // (Measured against the ROM's driver: $80/$88/$90/$98 for 1/2/4/8 bits and
+    // $9E for the 16-bit mode, with the second control register at $C0.)
     //
     // Do NOT try to derive this from the row length instead: rows are padded,
     // and by more than a factor of two. The 21-inch display sits at 1 bit with
@@ -205,6 +221,7 @@ public:
         case 0x08: return 2;
         case 0x10: return 4;
         case 0x18: return 8;
+        case 0x1C: return 16;
         default:   return 24;
         }
     }
@@ -260,6 +277,15 @@ public:
             case 8:
                 for (int x = 0; x < w; ++x)
                     dst[x] = clut_[vramRead8(row + static_cast<u32>(x))];
+                break;
+            case 16:   // one big-endian word per pixel, x RRRRR GGGGG BBBBB
+                for (int x = 0; x < w; ++x) {
+                    const u32 at = row + static_cast<u32>(x) * 2;
+                    const u32 p = (static_cast<u32>(vramRead8(at)) << 8) | vramRead8(at + 1);
+                    const u32 r = (p >> 10) & 31, g = (p >> 5) & 31, b = p & 31;
+                    dst[x] = 0xFF000000u | (((r << 3) | (r >> 2)) << 16) |
+                             (((g << 3) | (g >> 2)) << 8) | ((b << 3) | (b >> 2));
+                }
                 break;
             default:   // 24bpp: one pixel per 32-bit word, xRGB
                 for (int x = 0; x < w; ++x)
@@ -363,6 +389,8 @@ private:
     u32 clutAddr_ = 0;
     int clutPhase_ = 0;
     u32 depthCtl_ = 0;
+    u32 ctl1_ = 0;              // the DAC's second control register
+    int ctlDiag_ = 40;
     bool vblEnabled_ = false;
     bool vblPending_ = false;
     bool cursorPending_ = false;
