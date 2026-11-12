@@ -23,6 +23,7 @@ void Via6522::reset() {
     acr_ = pcr_ = 0;
     ifr_ = ier_ = 0;
     ca1_ = ca2_ = false;
+    cb1_ = cb2_ = false;
     pb7_ = false;
 }
 
@@ -210,6 +211,27 @@ void Via6522::setCA2(bool level) {
             setIFR(kIrqCA2);
         }
         ca2_ = level;
+    }
+}
+
+void Via6522::setCB1(bool level) {
+    const bool positive = (pcr_ & 0x10) != 0;
+    if (cb1_ != level) {
+        if ((positive && !cb1_ && level) || (!positive && cb1_ && !level)) {
+            setIFR(kIrqCB1);
+        }
+        cb1_ = level;
+    }
+}
+
+void Via6522::setCB2(bool level) {
+    if (pcr_ & 0x80) { cb2_ = level; return; }   // CB2 in output mode: ignore
+    const bool positive = (pcr_ & 0x40) != 0;    // input modes: bit 6 polarity
+    if (cb2_ != level) {
+        if ((positive && !cb2_ && level) || (!positive && cb2_ && !level)) {
+            setIFR(kIrqCB2);
+        }
+        cb2_ = level;
     }
 }
 

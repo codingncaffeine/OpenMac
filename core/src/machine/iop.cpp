@@ -58,7 +58,11 @@ u8 IoProcessor::read(u32 offset) {
         if (status_ & AutoInc) ++address_;
         return value;
     }
-    if (reg >= 0x20 && reg < 0x24)
+    // The upper half of the host window is the peripheral itself while the
+    // controller is in bypass mode: all of it, not only the two control
+    // registers (the Quadra 950's ROM reads and writes the SCC's data
+    // registers at +$24 and +$26 this way).
+    if (reg >= 0x20)
         return bypassed() && bypassRead ? bypassRead(offset) : 0xFF;
     return 0xFF;
 }
@@ -79,7 +83,7 @@ void IoProcessor::write(u32 offset, u8 value) {
         cpuWrite(address_, value);
         hostMemoryAccess_ = false;
         if (status_ & AutoInc) ++address_;
-    } else if (reg >= 0x20 && reg < 0x24 && bypassed() && bypassWrite) {
+    } else if (reg >= 0x20 && bypassed() && bypassWrite) {
         bypassWrite(offset, value);
     }
 }

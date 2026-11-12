@@ -79,7 +79,14 @@ public:
     // off = port offset & 6: 0 = ctl B, 2 = ctl A, 4 = data B, 6 = data A.
     u8 read(u32 off) {
         Chan& c = ch_[(off >> 1) & 1];
-        if (off & 4) return 0;             // data: nothing ever arrives
+        if (off & 4) {
+            // Nothing arrives from outside; the one source of received
+            // characters is the chip's own transmitter in local loopback.
+            if (!c.rxAvail) return 0;
+            c.rxAvail = false;
+            c.rxIp = false;
+            return c.rxData;
+        }
         const int reg = ptr_;
         ptr_ = 0;
         switch (reg) {
@@ -102,7 +109,7 @@ public:
     void write(u32 off, u8 v) {
         Chan& c = ch_[(off >> 1) & 1];
         if (off & 4) {                     // data port: transmit a byte
-            txByte(c);
+            txByte(c, v);
             return;
         }
         if (ptr_ == 0) {
@@ -113,7 +120,7 @@ public:
         ptr_ = 0;
         switch (reg) {
         case 2: wr2_ = v; break;
-        case 8: txByte(c); break;
+        case 8: txByte(c, v); break;
         case 9:
             // Shared master interrupt control. The reset field acts first.
             switch (v & 0xC0) {
@@ -153,6 +160,16 @@ public:
             break;
         }
     }
+
+    // Local loopback and the baud rate generator's zero-count interrupt are
+    // off unless a board asks for them. The Quadra 950's ROM tests both at
+    // every startup; the boards this model was written for never showed a
+    // need, and switching them on there changes what their serial firmware
+    // sees, which wants its own regression pass first.
+    void enableLoopbackAndZeroCount(bool on) { extended_ = on; }
+    // The processor clock the tick() cycles are counted in, and the chip's
+    // PCLK: together they pace the baud rate generator.
+    void setClocks(u64 cpuHz, u64 pclkHz) { brgCyclesQ16_ = (cpuHz << 16) / pclkHz; }
 
     void tick(s32 cycles) {
         tickChan(ch_[0], cycles);
@@ -197,6 +214,17 @@ private:
         s32 shiftTimer = 0;        // byte currently on the wire
         s32 feedTimer = 0;         // pending Tx-buffer-empty interrupt
         bool extIp = false, txIp = false, rxIp = false;
+        // Local loopback (WR14 bit 4): the byte leaving the shift register
+        // comes back in at the receiver. The ROM's serial self-tests on the
+        // machines that reach the SCC through an I/O processor use it.
+        u8 shiftByte = 0, bufByte = 0;
+        bool rxAvail = false;      // RR0 bit 0
+        u8 rxData = 0;
+        // Baud rate generator (WR14 bit 0): each time it counts down to zero
+        // RR0 bit 1 latches and, with WR15 bit 1, raises an external/status
+        // interrupt. brgPhase counts CPU cycles in 16.16 fixed point.
+        bool zeroCount = false;
+        u64 brgPhase = 0;
         // RR10. The clock-missing latches (bits 7/6) report that the DPLL
         // lost transitions while recovering a clock from an incoming
         // signal. Nothing ever arrives on an unconnected port, so there is
@@ -217,10 +245,17 @@ private:
         c.shiftTimer = c.feedTimer = 0;
         c.extIp = c.txIp = c.rxIp = false;
         c.rr10 = 0;
+        c.shiftByte = c.bufByte = 0;
+        c.rxAvail = false;
+        c.rxData = 0;
+        c.zeroCount = false;
+        c.brgPhase = 0;
     }
 
     u8 rr0(const Chan& c) const {
         u8 v = 0x10;                       // hunting: nothing to sync on
+        if (c.rxAvail) v |= 0x01;
+        if (c.zeroCount) v |= 0x02;
         if (c.txEmpty) v |= 0x04;
         if (c.underrun) v |= 0x40;
         return v;
@@ -264,6 +299,7 @@ private:
         switch (cmd) {
         case 2:                            // reset ext/status interrupts
             c.extIp = false;
+            c.zeroCount = false;
             break;
         case 5:                            // reset Tx int pending
             c.txIp = false;
@@ -294,14 +330,16 @@ private:
         }
     }
 
-    void txByte(Chan& c) {
+    void txByte(Chan& c, u8 value) {
         const bool wasEmpty = c.txEmpty;
         ++c.bytesSent;
         if (c.shiftTimer > 0) {
             c.bufFull = true;              // queued behind the byte in shift
+            c.bufByte = value;
             c.txEmpty = false;
         } else {
             c.shiftTimer = kByteCycles;    // straight into the shift register
+            c.shiftByte = value;
             c.txEmpty = true;
             c.feedTimer = kFeedDelay;      // "buffer free" fires almost at once
         }
@@ -316,7 +354,32 @@ private:
             onDmaRequestChange();
     }
 
+    // The byte in the shift register has left the pin.
+    void byteSent(Chan& c) {
+        if (extended_ && (c.wr[14] & 0x10) && (c.wr[3] & 0x01)) {   // local loopback, receiver on
+            c.rxAvail = true;
+            c.rxData = c.shiftByte;
+            if (c.wr[1] & 0x18) c.rxIp = true;         // any receive interrupt mode
+        }
+    }
+
+    void tickBrg(Chan& c, s32 cycles) {
+        if (!extended_ || !(c.wr[14] & 0x01)) { c.brgPhase = 0; return; }
+        // One countdown is (time constant + 2) generator clocks.
+        const u64 period = (static_cast<u64>(c.wr[13]) << 8 | c.wr[12]) + 2u;
+        const u64 periodCycles = period * brgCyclesQ16_;
+        c.brgPhase += static_cast<u64>(cycles) << 16;
+        while (c.brgPhase >= periodCycles) {
+            c.brgPhase -= periodCycles;
+            if (c.wr[15] & 0x02) {                     // zero count interrupt enable
+                c.zeroCount = true;
+                if (c.wr[1] & 0x01) c.extIp = true;
+            }
+        }
+    }
+
     void tickChan(Chan& c, s32 cycles) {
+        tickBrg(c, cycles);
         if (c.feedTimer > 0) {
             c.feedTimer -= cycles;
             if (c.feedTimer <= 0) {
@@ -328,9 +391,11 @@ private:
             c.shiftTimer -= cycles;
             if (c.shiftTimer <= 0) {
                 c.shiftTimer = 0;
+                byteSent(c);
                 if (c.bufFull) {
                     const bool wasEmpty = c.txEmpty;
                     c.bufFull = false;
+                    c.shiftByte = c.bufByte;
                     c.txEmpty = true;
                     c.shiftTimer = kByteCycles;
                     c.feedTimer = kFeedDelay;
@@ -358,6 +423,10 @@ private:
     int ptr_ = 0;
     u8 wr2_ = 0;
     u8 wr9_ = 0;
+    // CPU cycles per baud rate generator clock, 16.16: a 33.33 MHz processor
+    // against the 7.8336 MHz PCLK these boards give the chip.
+    u64 brgCyclesQ16_ = (33333333ull << 16) / 7833600ull;
+    bool extended_ = false;
     int cmdBudget_ = 400;
     int regBudget_ = 400;
     int dataBudget_ = 200;

@@ -25,6 +25,11 @@ public:
     // Input edges from the machine.
     void setCA1(bool level);
     void setCA2(bool level);
+    // The B-side control lines as plain interrupt inputs (the Quadra 950's
+    // VIA2 takes its sound and SCSI interrupts here). CB1 is also the shift
+    // register's external clock; that use goes through completeShift.
+    void setCB1(bool level);
+    void setCB2(bool level);
 
     bool irqAsserted() const { return (ifr_ & ier_ & 0x7F) != 0; }
 
@@ -93,6 +98,7 @@ private:
     u8 acr_ = 0, pcr_ = 0;
     u8 ifr_ = 0, ier_ = 0;
     bool ca1_ = false, ca2_ = false;
+    bool cb1_ = false, cb2_ = false;
     bool pb7_ = false;     // T1 output level on PB7 (ACR bit 7 modes)
     int srTicks_ = 0;      // countdown to shift-register completion
     bool srInput_ = false; // completing a shift-in (data arrives from outside)

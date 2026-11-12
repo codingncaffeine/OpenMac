@@ -37,6 +37,7 @@ public:
         fifoMode_ = 0;
         irqStatus_ = 0;
         volume_ = 0;
+        playRecA_ = 0;
         for (auto& r : ext_) r = 0;
         // FIFO interrupts start gated off (inverted-sense enables at $09 and
         // $29); the ROM leaves them off because it polls, and the Sound
@@ -70,9 +71,14 @@ public:
     }
 
     // ---- CPU window ($50014000 + offset, 0x1000 wide) ----
+    void enableSelfTestRegisters(bool on) { extended_ = on; }
+
     u8 read(u32 offset) {
         offset &= 0xFFF;
-        if (offset < 0x800) return 0;   // FIFO windows read as empty
+        // Mode 2 turns the two FIFOs' memory into 2 KB of ordinary RAM (the
+        // original chip's wavetable); the ROM's sound self-test fills it and
+        // reads it back. In the other modes the windows read as empty FIFOs.
+        if (offset < 0x800) return (extended_ && mode_ == 2) ? waveRam_[offset] : 0;
         switch (offset) {
         case 0x800: return 0xB0;        // EASC version
         case 0x801: return mode_;
@@ -92,6 +98,7 @@ public:
         }
         case 0x806: return volume_;
         case 0x807: return 3;           // clock rate: hardwired 44.1kHz
+        case 0x80A: return extended_ ? playRecA_ : 0;
         default:
             if (offset >= 0xF00 && offset < 0xF40) return ext_[offset - 0xF00];
             return 0;
@@ -100,6 +107,10 @@ public:
 
     void write(u32 offset, u8 v) {
         offset &= 0xFFF;
+        if (offset < 0x800 && extended_ && mode_ == 2) {
+            waveRam_[offset] = v;
+            return;
+        }
         if (offset < 0x400) {
             if (++pushesA_ == 1) diag("EASC first A push (mode=%02X dfac=%02X)", mode_, dfacSettings_);
             push(headA_, tailA_, bufA_, v);
@@ -130,6 +141,7 @@ public:
             }
             break;
         case 0x806: diag("EASC vol<-%02X (%u)", v, 0); volume_ = v; break;
+        case 0x80A: playRecA_ = v; break;
         default:
             if (offset >= 0xF00 && offset < 0xF40) {
                 const u32 r = offset - 0xF00;
@@ -370,6 +382,13 @@ private:
     u32 headA_ = 0, tailA_ = 0, headB_ = 0, tailB_ = 0;
     u8 lastA_ = 0x80, lastB_ = 0x80;
     u8 mode_ = 0, control_ = 0, fifoMode_ = 0, irqStatus_ = 0, volume_ = 0;
+    // Register $80A and the mode-2 RAM are what the ROM's sound self-test
+    // exercises beyond playing sound. Off unless a board asks: the Quadra
+    // 650 runs the same test, and passing it there shifts that machine's
+    // startup timing, which wants its own regression pass first.
+    bool extended_ = false;
+    u8 playRecA_ = 0;   // $80A: kept and read back
+    u8 waveRam_[0x800]{};   // $000-$7FF as RAM in mode 2
     u8 ext_[0x40]{};
 
     u8 dfacSettings_ = 0, dfacShift_ = 0;
