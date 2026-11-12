@@ -79,7 +79,7 @@ Quadra950Machine::Quadra950Machine(std::vector<u8> rom, const Config& cfg)
       easc_(std::make_unique<Easc>()),
       scsi0_(std::make_unique<Ncr53c96>()),
       scsi1_(std::make_unique<Ncr53c96>()),
-      dafb_(std::make_unique<Dafb>()),
+      dafb_(std::make_unique<Dafb>(Dafb::Variant::Standalone, cfg.vramMb == 1 ? 0x100000u : 0x200000u)),
       cpu_(*this) {
     ram_.assign(memctl_->flatBytes(), 0);
     u32 rs = 1;
@@ -143,7 +143,12 @@ void Quadra950Machine::wireDevices() {
         // PA0 Ethernet, PA1-PA5 slots $A-$E, PA6 built-in video: low = active.
         return static_cast<u8>(0xFFu & ~(dafbIrq_ ? 0x40u : 0u));
     };
-    via2_->inB = [] { return static_cast<u8>(0xCF); };   // no NuBus transfer error
+    // Port B inputs: PB4 low (no NuBus transfer error) and PB5 high. PB5 is
+    // how the ROM's video code tells this board from the Quadra 900's, which
+    // the same ROM also runs: low, it leaves the video chip in its slower
+    // configuration and offers no 16-bit modes (ROM $FA3B8 and $FC3EE; the
+    // 16-bit modes are the 950's, developer note).
+    via2_->inB = [] { return static_cast<u8>(0xEF); };
 
     // ---- I/O processors (dossier, "I/O processors") -------------------------
     sccIop_->bypassRead = [this](u32 offset) { return scc_->read(offset & 6u); };
@@ -229,10 +234,6 @@ void Quadra950Machine::reset() {
     sccIop_->reset();
     swimIop_->reset();
     dafb_->reset();
-    // The sense lines come up released. This ROM reads them before it writes
-    // the drive register (the Quadra 650's writes first), and the stand-in's
-    // zeroed register means "all three held low".
-    dafb_->write(0x1C, 7);
     dafbIrq_ = false;
     resetPeripherals();
     totalCycles_ = 0;
@@ -505,14 +506,17 @@ void Quadra950Machine::tickDevices(int cpuCycles) {
             sliceInFrame_ = 0;
             ++frameCounter_;
             storageFrameTick();
-            // DAFB vertical blank at ~66.67 Hz against the 60.15 Hz frame.
-            vblAcc_ += 6667;
-            dafb_->vblank();
-            if (vblAcc_ >= 6015 * 2) {
-                vblAcc_ -= 6015;
+            // The video chip's vertical blank runs at the display's own
+            // rate (60 to 75 Hz, from the clock generator and the timing
+            // registers) against this 60.15 Hz frame; 66.67 Hz until the ROM
+            // has programmed a raster.
+            u32 scans = dafb_->refreshMilliHz();
+            if (scans < 40000 || scans > 120000) scans = 66670;
+            vblAcc_ += scans;
+            while (vblAcc_ >= 60150) {
+                vblAcc_ -= 60150;
                 dafb_->vblank();
             }
-            vblAcc_ %= 6015;
         }
     }
     updateIpl();
@@ -574,6 +578,12 @@ bool Quadra950Machine::setDisplay(const char* name) {
 int Quadra950Machine::screenWidth() const { return dafb_->width(); }
 int Quadra950Machine::screenHeight() const { return dafb_->height(); }
 void Quadra950Machine::renderScreen(u32* argbOut) const { dafb_->render(argbOut); }
+
+Quadra950Machine::VideoState Quadra950Machine::videoState() const {
+    const int bits = dafb_->bpp();
+    return VideoState{bits == 24 ? 32 : bits, dafb_->timingWidth(), dafb_->timingHeight(), dafb_->vramBytes(),
+                      dafb_->pixelClockHz(), dafb_->refreshMilliHz()};
+}
 
 void Quadra950Machine::drainAudio(std::vector<u8>& out) {
     out.insert(out.end(), audioOut_.begin(), audioOut_.end());
@@ -643,6 +653,10 @@ std::string Quadra950Machine::diagnosticReport() const {
         swimIop_->status());
     add("   video %dx%d %d bpp base=%05X stride=%u depthCtl=%02X", dafb_->width(), dafb_->height(), dafb_->bpp(),
         dafb_->fbBase(), dafb_->strideBytes(), dafb_->depthCtlRaw());
+    add("   video RAM %u KB; programmed raster %dx%d%s, pixel clock %u Hz, %u.%03u scans a second%s",
+        dafb_->vramBytes() >> 10, dafb_->timingWidth(), dafb_->timingHeight(),
+        dafb_->interlaced() ? " interlaced" : "", dafb_->pixelClockHz(), dafb_->refreshMilliHz() / 1000,
+        dafb_->refreshMilliHz() % 1000, dafb_->displayDisabled() ? ", display off" : "");
     std::string regs = "   video registers:";
     for (u32 r = 0; r <= 0x2C; r += 4) {
         std::snprintf(line, sizeof line, " %02X=%X", r, dafb_->ctlReg(static_cast<int>(r >> 2)));
@@ -655,6 +669,18 @@ std::string Quadra950Machine::diagnosticReport() const {
         timing += line;
     }
     out += timing + '\n';
+    std::string clock = "   video clock generator:";
+    for (int r = 0; r < 16; ++r) {
+        std::snprintf(line, sizeof line, " %X", dafb_->clockReg(r));
+        clock += line;
+    }
+    out += clock + '\n';
+    std::string clut = "   video color table:";
+    for (int i : {0, 1, 2, 3, 7, 8, 9, 16, 31, 32, 127, 128, 240, 247, 248, 249, 254, 255}) {
+        std::snprintf(line, sizeof line, " [%d]=%06X", i, dafb_->clutEntry(i) & 0xFFFFFFu);
+        clut += line;
+    }
+    out += clut + '\n';
     return out;
 }
 

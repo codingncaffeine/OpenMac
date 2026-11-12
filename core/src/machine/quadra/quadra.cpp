@@ -1388,17 +1388,25 @@ u32 QuadraMachine::dafbSwatchReg(int i) const { return dafb_->swatchReg(i); }
 void QuadraMachine::forceVideoMode(int w, int h, int bpp) { dafb_->forceMode(w, h, bpp); }
 
 // The displays this video port can drive, as the developer note's table of
-// maximum pixel depths lists them, each with the sense wiring it presents --
-// measured from the ROM by setting the wiring and reading back the screen the
-// System configured (CrsrPin), not assumed.
+// maximum pixel depths lists them, each with the sense wiring it presents.
+// A display grounds the sense lines that read 0 in Apple's three-bit code
+// (sense 2, 1, 0): 12-inch RGB is 010, 13-inch 110, the color portrait
+// display 101, the 21-inch color display 000; the 16- and 19-inch displays
+// ground nothing and tie two lines together. Each was checked against the
+// raster the ROM then programs.
+//
+// Two codes that look right and are not: 100 (lines 0 and 1 grounded) is an
+// NTSC monitor, an interlaced 640x480 raster in which the ROM centers a
+// 512x384 desktop; and 011 (line 2 grounded) is the monochrome two-page
+// display, 1152x870 in grays only.
 const QuadraMachine::DisplayInfo* QuadraMachine::displays(int& count) {
     static const DisplayInfo kList[] = {
-        {"12-inch RGB",       512,  384, 0x3, 0},
+        {"12-inch RGB",       512,  384, 0x5, 0},
         {"13-inch RGB",       640,  480, 0x1, 0},
         {"15-inch Portrait",  640,  870, 0x2, 0},
         {"16-inch Color",     832,  624, 0x0, 4},
         {"19-inch Color",    1024,  768, 0x0, 1},
-        {"21-inch Color",    1152,  870, 0x4, 0},
+        {"21-inch Color",    1152,  870, 0x7, 0},
     };
     count = static_cast<int>(sizeof kList / sizeof kList[0]);
     return kList;

@@ -1,6 +1,11 @@
 #include <doctest/doctest.h>
 
+#include "../../core/src/machine/quadra/dafb.hpp"
 #include "../../core/src/machine/quadra950/memctl.hpp"
+#include "openmac/quadra.hpp"
+
+#include <cstring>
+#include <vector>
 
 using namespace openmac;
 
@@ -317,4 +322,275 @@ TEST_CASE("950 microcontroller: a machine reset drops what was in flight and kee
     host.flag = false;
     const auto after = host.ask({0x01, 0x07, 0x00, 0x40}, 4);
     CHECK(after == std::vector<u8>{0x01, 0x00, 0x07, 0x99});
+}
+
+// ---- video: the stand-alone chip ---------------------------------------------------
+
+namespace {
+
+// What the ROM leaves in the chip for one display and depth: the clock
+// generator's sixteen registers (one hex digit each, register 0 first), the
+// timing registers that place the picture, and the DAC's control register.
+// Read out of a start of the Quadra 950's ROM on each display.
+struct ProgrammedMode {
+    const char* name;
+    const char* clock;
+    u32 hal, hfp, hpix, vhline, val, vfp, control;
+    int width, height;
+    u32 dotClockHz;       // the display's nominal dot clock
+    u32 scansMilliHz;     // and vertical rate
+};
+
+constexpr ProgrammedMode kModes[] = {
+    {"12-inch, 256 colors",   "E500F00003564100", 0x063, 0x263, 0x27E, 0x32E, 0x2A, 0x32A, 0x98,  512, 384,  15667200, 60150},
+    {"13-inch, 256 colors",   "EF00510003564100", 0x093, 0x313, 0x35E, 0x41A, 0x52, 0x412, 0x98,  640, 480,  30240000, 66670},
+    {"portrait, 256 colors",  "E700610001564100", 0x048, 0x188, 0x19E, 0x72C, 0x58, 0x724, 0xB8,  640, 870,  57283200, 75000},
+    {"16-inch, 256 colors",   "E700B00002564100", 0x089, 0x229, 0x23E, 0x536, 0x52, 0x532, 0xB8,  832, 624,  57283200, 74550},
+    {"16-inch, millions",     "E700B00002564100", 0x113, 0x453, 0x47E, 0x536, 0x52, 0x532, 0x3C,  832, 624,  57283200, 74550},
+    {"19-inch, 256 colors",   "8F00F10001564100", 0x03F, 0x13F, 0x14A, 0x648, 0x40, 0x640, 0xD8, 1024, 768,  80000000, 74930},
+    {"21-inch, 256 colors",   "EB00620000564100", 0x03F, 0x15F, 0x16A, 0x726, 0x52, 0x71E, 0xD8, 1152, 870, 100000000, 75060},
+    {"21-inch, thousands",    "EB00620000564100", 0x07F, 0x2BF, 0x2D6, 0x726, 0x52, 0x71E, 0xBE, 1152, 870, 100000000, 75060},
+};
+
+void program(Dafb& chip, const ProgrammedMode& m) {
+    for (u32 r = 0; r < 16; ++r) {
+        const char c = m.clock[r];
+        chip.write(0x300 + r * 0x10, static_cast<u32>(c <= '9' ? c - '0' : c - 'A' + 10));
+    }
+    chip.write(0x140, m.hal);
+    chip.write(0x144, m.hfp);
+    chip.write(0x148, m.hpix);
+    chip.write(0x14C, m.vhline);
+    chip.write(0x15C, m.val);
+    chip.write(0x160, m.vfp);
+    chip.write(0x200, 0);
+    chip.write(0x220, m.control);
+}
+
+void setControl(Dafb& chip, u32 first, u32 second) {
+    chip.write(0x200, 0);
+    chip.write(0x220, 0x06);       // the second register answers only behind this
+    chip.write(0x200, 1);
+    chip.write(0x220, second);
+    chip.write(0x200, 0);
+    chip.write(0x220, first);
+}
+
+// The ROM's video RAM sizing: a different word at the top of each half
+// megabyte, highest first, then a look at which are still there.
+int sizedKilobytes(Dafb& chip) {
+    chip.vramWrite32(0x1FFFFC, 0x324D4547);   // '2MEG'
+    chip.vramWrite32(0x17FFFC, 0x312E354D);   // '1.5M'
+    chip.vramWrite32(0x0FFFFC, 0x316D6567);   // '1meg'
+    chip.vramWrite32(0x07FFFC, 0x3531324B);   // '512K'
+    if (chip.vramRead32(0x0FFFFC) != 0x316D6567) return 512;
+    if (chip.vramRead32(0x17FFFC) != 0x312E354D) return 1024;
+    if (chip.vramRead32(0x1FFFFC) != 0x324D4547) return 1536;
+    return 2048;
+}
+
+} // namespace
+
+TEST_CASE("950 video: the ROM's sizing probe finds the video RAM that is fitted") {
+    Dafb two(Dafb::Variant::Standalone, 0x200000);
+    Dafb one(Dafb::Variant::Standalone, 0x100000);
+    CHECK(sizedKilobytes(two) == 2048);
+    CHECK(sizedKilobytes(one) == 1024);
+    // An empty socket is an open bus: nothing written there comes back, and
+    // nothing lands in the megabyte that is fitted.
+    one.vramWrite8(0x100000, 0x12);
+    CHECK(one.vramRead8(0x100000) == Dafb::kOpenBus);
+    one.vramWrite8(0x000000, 0x34);
+    one.vramWrite8(0x100000, 0x56);
+    CHECK(one.vramRead8(0x000000) == 0x34);
+    // The memory controller's cell repeats its megabyte instead.
+    Dafb cell;
+    cell.vramWrite8(0x000010, 0x77);
+    CHECK(cell.vramRead8(0x100010) == 0x77);
+    CHECK(sizedKilobytes(cell) == 1024);
+}
+
+TEST_CASE("950 video: the DAC's second control register carries the AC842a's version") {
+    Dafb chip(Dafb::Variant::Standalone, 0x200000);
+    setControl(chip, 0x9E, 0xC0);
+    chip.write(0x200, 1);
+    CHECK(chip.read(0x220) == 0xC1);
+    chip.write(0x200, 0);
+    CHECK(chip.read(0x220) == 0x9E);
+    // The ROM's test for a two-register DAC: 6 in the first, 0 in the
+    // second, and the 6 must still be in the first.
+    chip.write(0x200, 0);
+    chip.write(0x220, 6);
+    chip.write(0x200, 1);
+    chip.write(0x220, 0);
+    chip.write(0x200, 0);
+    CHECK((chip.read(0x220) & 0x0F) == 6);
+    // The Quadra 650's DAC returns its second register as written.
+    Dafb cell;
+    setControl(cell, 0x9E, 0xC0);
+    cell.write(0x200, 1);
+    CHECK(cell.read(0x220) == 0xC0);
+}
+
+TEST_CASE("950 video: pixel depth follows both control registers") {
+    for (Dafb::Variant v : {Dafb::Variant::Standalone, Dafb::Variant::Memc}) {
+        Dafb chip(v, 0x200000);
+        setControl(chip, 0x80, 0x00); CHECK(chip.bpp() == 1);
+        setControl(chip, 0x88, 0x01); CHECK(chip.bpp() == 2);
+        setControl(chip, 0x90, 0x01); CHECK(chip.bpp() == 4);
+        setControl(chip, 0x98, 0x01); CHECK(chip.bpp() == 8);
+        setControl(chip, 0x9E, 0xC0); CHECK(chip.bpp() == 16);
+        setControl(chip, 0xBE, 0xC0); CHECK(chip.bpp() == 16);
+        // 32-bit pixels: the same depth bits without the 16-bit mode's two.
+        setControl(chip, 0x9C, 0x01); CHECK(chip.bpp() == 24);
+        setControl(chip, 0x3C, 0x01); CHECK(chip.bpp() == 24);
+        setControl(chip, 0x9C, 0xC0); CHECK(chip.bpp() == 24);
+        setControl(chip, 0x9E, 0x01); CHECK(chip.bpp() == 24);
+    }
+}
+
+TEST_CASE("950 video: the programmed raster, dot clock and refresh are each display's own") {
+    for (const ProgrammedMode& m : kModes) {
+        CAPTURE(m.name);
+        Dafb chip(Dafb::Variant::Standalone, 0x200000);
+        CHECK(chip.refreshMilliHz() == 0);            // nothing programmed yet
+        program(chip, m);
+        CHECK(chip.timingWidth() == m.width);
+        CHECK(chip.timingHeight() == m.height);
+        const double clockError = (static_cast<double>(chip.pixelClockHz()) - m.dotClockHz) / m.dotClockHz;
+        CHECK(clockError > -0.001);
+        CHECK(clockError < 0.001);
+        const int rateError = static_cast<int>(chip.refreshMilliHz()) - static_cast<int>(m.scansMilliHz);
+        CHECK(rateError > -100);
+        CHECK(rateError < 100);
+    }
+    // The Quadra 650's cell has another clock generator; this one's
+    // registers mean nothing there.
+    Dafb cell;
+    program(cell, kModes[1]);
+    CHECK(cell.pixelClockHz() == 0);
+    CHECK(cell.refreshMilliHz() == 0);
+}
+
+TEST_CASE("950 video: direct-color pixels pass through the color table, channel by channel") {
+    for (Dafb::Variant v : {Dafb::Variant::Standalone, Dafb::Variant::Memc}) {
+        Dafb chip(v, 0x200000);
+        Dafb::MonitorWiring monitor;
+        monitor.width = 4;
+        monitor.height = 1;
+        chip.setMonitor(monitor);
+        // A table that is different in every channel of every entry.
+        chip.write(0x200, 0);
+        for (u32 i = 0; i < 256; ++i) {
+            chip.write(0x210, i ^ 0x55);              // red
+            chip.write(0x210, 255 - i);               // green
+            chip.write(0x210, (i * 7) & 0xFF);        // blue
+        }
+        chip.write(0x00, 0);
+        chip.write(0x04, 0);
+        chip.write(0x08, 4);                          // 16 bytes a row
+        u32 out[4];
+
+        setControl(chip, 0x9C, 0x01);                 // 32-bit: x, red, green, blue
+        chip.vramWrite32(0, 0xEE123456);
+        chip.vramWrite32(4, 0x00FF0080);
+        chip.render(out);
+        CHECK(out[0] == (0xFF000000u | ((0x12u ^ 0x55u) << 16) | ((255u - 0x34u) << 8) | ((0x56u * 7u) & 0xFFu)));
+        CHECK(out[1] == (0xFF000000u | ((0xFFu ^ 0x55u) << 16) | (255u << 8) | ((0x80u * 7u) & 0xFFu)));
+
+        setControl(chip, 0x9E, 0xC0);                 // 16-bit: x rrrrr ggggg bbbbb
+        chip.vramWrite8(0, 0x7C);                     // red 31, green 0, blue 0
+        chip.vramWrite8(1, 0x00);
+        chip.vramWrite8(2, 0x04);                     // red 1, green 2, blue 30
+        chip.vramWrite8(3, 0x5E);
+        chip.render(out);
+        // A 5-bit value reaches the entry its top bits repeat into: 31 -> 255,
+        // 1 -> 8, 2 -> 16, 30 -> 247.
+        CHECK(out[0] == (0xFF000000u | ((255u ^ 0x55u) << 16) | (255u << 8) | 0u));
+        CHECK(out[1] == (0xFF000000u | ((8u ^ 0x55u) << 16) | ((255u - 16u) << 8) | ((247u * 7u) & 0xFFu)));
+    }
+}
+
+TEST_CASE("950 video: one-bit pixels use the table's first two entries on the 950, plain black on white on the 650") {
+    Dafb::MonitorWiring monitor;
+    monitor.width = 8;
+    monitor.height = 1;
+    const auto load = [&](Dafb& chip) {
+        chip.setMonitor(monitor);
+        chip.write(0x200, 0);
+        for (u32 v : {0xF0u, 0xE0u, 0xD0u, 0x05u, 0x06u, 0x07u}) chip.write(0x210, v);
+        chip.write(0x00, 0);
+        chip.write(0x04, 0);
+        chip.write(0x08, 4);
+        setControl(chip, 0x80, 0x00);
+        chip.vramWrite8(0, 0x80);
+    };
+    u32 out[8];
+    Dafb chip(Dafb::Variant::Standalone, 0x100000);
+    load(chip);
+    chip.render(out);
+    CHECK(out[0] == 0xFF050607u);
+    CHECK(out[1] == 0xFFF0E0D0u);
+    Dafb cell;
+    load(cell);
+    cell.render(out);
+    CHECK(out[0] == 0xFF000000u);
+    CHECK(out[1] == 0xFFFFFFFFu);
+}
+
+TEST_CASE("950 video: the sense lines come up released, and a switched-off display is black") {
+    Dafb::MonitorWiring thirteen;
+    thirteen.grounded = 1;
+    thirteen.width = 2;
+    thirteen.height = 1;
+    Dafb chip(Dafb::Variant::Standalone, 0x100000);
+    chip.setMonitor(thirteen);
+    CHECK(chip.read(0x1C) == 1);                      // read before any write, as the ROM does
+    chip.write(0x1C, 5);
+    chip.reset();
+    CHECK(chip.read(0x1C) == 1);
+    Dafb cell;
+    cell.setMonitor(thirteen);
+    CHECK(cell.read(0x1C) == 7);                      // the cell holds all three low until written
+
+    chip.write(0x200, 0);
+    for (u32 v : {0xFFu, 0xFFu, 0xFFu}) chip.write(0x210, v);
+    setControl(chip, 0x98, 0x01);
+    u32 out[2];
+    chip.write(0x100, 0xFF2);
+    chip.render(out);
+    CHECK(out[0] == 0xFFFFFFFFu);
+    chip.write(0x100, 0x001);                         // what the ROM writes with no display attached
+    chip.render(out);
+    CHECK(out[0] == 0xFF000000u);
+    CHECK(out[1] == 0xFF000000u);
+}
+
+TEST_CASE("displays: each listed display presents Apple's sense code") {
+    // Apple's three-bit code (sense 2, 1, 0) reads back inverted, one bit
+    // set per grounded line: 12-inch RGB 010, 13-inch 110, color portrait
+    // 101, 21-inch color 000; the 16- and 19-inch ground nothing (111) and
+    // are told apart by which lines follow a driven one.
+    struct Want { const char* name; u32 passive; };
+    const Want want[] = {{"12-inch RGB", 5}, {"13-inch RGB", 1}, {"15-inch Portrait", 2},
+                         {"16-inch Color", 0}, {"19-inch Color", 0}, {"21-inch Color", 7}};
+    int n = 0;
+    const QuadraMachine::DisplayInfo* list = QuadraMachine::displays(n);
+    REQUIRE(n == 6);
+    u32 extended[6] = {};
+    for (int i = 0; i < n; ++i) {
+        CAPTURE(list[i].name);
+        CHECK(std::strcmp(list[i].name, want[i].name) == 0);
+        Dafb chip(Dafb::Variant::Standalone, 0x100000);
+        Dafb::MonitorWiring m;
+        m.grounded = static_cast<u8>(list[i].grounded);
+        m.pairs = static_cast<u8>(list[i].pairs);
+        chip.setMonitor(m);
+        CHECK(chip.read(0x1C) == want[i].passive);
+        for (u32 line = 0; line < 3; ++line) {        // drive one line low, read all three
+            chip.write(0x1C, 7u & ~(1u << line));
+            extended[i] = (extended[i] << 3) | chip.read(0x1C);
+        }
+    }
+    CHECK(extended[3] != extended[4]);
 }

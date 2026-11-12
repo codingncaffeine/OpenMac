@@ -17,8 +17,21 @@
 //   +$200 CLUT address  +$210 CLUT data (R,G,B bytes)  +$220 depth control
 //   +$300 DP8534 clock generator (serial-shift protocol; stored, not decoded)
 //
+// The same class is also the stand-alone chip of the Quadra 950 (DAFB II,
+// Variant::Standalone). What differs there:
+//   - video RAM is 1 MB on the board plus 1 MB in sockets; the 2 MB window
+//     does not repeat, and an empty socket answers with an open bus;
+//   - the DAC is an AC842a: its second control register reads back with the
+//     part's version in the low four bits, and with 2 MB there is room for
+//     32-bit pixels;
+//   - +$24 / +$28 hold the two SCSI chips' bus timing (stored here);
+//   - the clock generator is a DP8531 with sixteen 4-bit registers at
+//     +$300, +$310 ... +$3F0, from which the pixel clock follows.
+//
 // Reference: Quadra 650 hardware dossier (DAFB/MEMC sections), Apple
-// Developer Notes for the Centris 650/Quadra 800 family. Clean-room.
+// Developer Notes for the Centris 650/Quadra 800 family and the Quadra 950;
+// MAME's dafb.cpp for the DP8531's divider arithmetic and the AC842a's
+// version nibble (behavior only). Clean-room.
 
 #include "openmac/types.hpp"
 
@@ -30,7 +43,15 @@ namespace openmac {
 
 class Dafb {
 public:
-    Dafb() : vram_(kVramSize, 0) {
+    // Memc: the cell inside the Quadra 610/650/800 memory controller, 1 MB.
+    // Standalone: the Quadra 950's chip, with 1 MB or 2 MB of video RAM fitted.
+    enum class Variant { Memc, Standalone };
+
+    explicit Dafb(Variant variant = Variant::Memc, u32 vramBytes = kVramSize)
+        : variant_(variant),
+          vramFitted_(variant == Variant::Memc ? kVramSize : vramBytes),
+          vramMask_((variant == Variant::Memc ? kVramSize : kVramWindow) - 1),
+          vram_(vramFitted_, 0) {
         reset();
         // A neutral ramp so anything drawn before the ROM loads the CLUT is
         // visible rather than black-on-black.
@@ -53,25 +74,42 @@ public:
         cursorPending_ = false;
         intMask_ = 0;
         clockShift_ = 0;
+        for (auto& r : clockRegs_) r = 0;
+        // The stand-alone chip comes up with the sense lines released (a 1
+        // bit lets a line go). The Quadra 950's ROM reads them before it
+        // writes the drive register; the Quadra 650's writes first.
+        if (variant_ == Variant::Standalone) regs_[0x1C >> 2] = 7;
     }
 
-    // ---- VRAM (the machine routes $F9000000+ here; 1MB mirrored) ----
-    static constexpr u32 kVramSize = 0x100000;
-    u8   vramRead8(u32 off) const { return vram_[off & (kVramSize - 1)]; }
-    void vramWrite8(u32 off, u8 v) { vram_[off & (kVramSize - 1)] = v; }
+    Variant variant() const { return variant_; }
+    u32 vramBytes() const { return vramFitted_; }
+
+    // ---- VRAM (the machine routes $F9000000+ here) ----
+    // The memory controller's cell repeats its 1 MB through the 2 MB window.
+    // The stand-alone chip decodes the whole window; what is not fitted reads
+    // as an open bus and takes no writes, which is how the ROM tells 1 MB
+    // from 2 MB (it leaves a different word at the top of each half megabyte
+    // and looks which of them are still there).
+    static constexpr u32 kVramSize = 0x100000;     // the cell's, and the 950's on-board megabyte
+    static constexpr u32 kVramWindow = 0x200000;
+    static constexpr u8 kOpenBus = 0xFF;
+    u8 vramRead8(u32 off) const {
+        off &= vramMask_;
+        return off < vramFitted_ ? vram_[off] : kOpenBus;
+    }
+    void vramWrite8(u32 off, u8 v) {
+        off &= vramMask_;
+        if (off < vramFitted_) vram_[off] = v;
+    }
     u32 vramRead32(u32 off) const {
-        off &= kVramSize - 1;
-        return (static_cast<u32>(vram_[off]) << 24) |
-               (static_cast<u32>(vram_[(off + 1) & (kVramSize - 1)]) << 16) |
-               (static_cast<u32>(vram_[(off + 2) & (kVramSize - 1)]) << 8) |
-               vram_[(off + 3) & (kVramSize - 1)];
+        return (static_cast<u32>(vramRead8(off)) << 24) | (static_cast<u32>(vramRead8(off + 1)) << 16) |
+               (static_cast<u32>(vramRead8(off + 2)) << 8) | vramRead8(off + 3);
     }
     void vramWrite32(u32 off, u32 v) {
-        off &= kVramSize - 1;
-        vram_[off] = static_cast<u8>(v >> 24);
-        vram_[(off + 1) & (kVramSize - 1)] = static_cast<u8>(v >> 16);
-        vram_[(off + 2) & (kVramSize - 1)] = static_cast<u8>(v >> 8);
-        vram_[(off + 3) & (kVramSize - 1)] = static_cast<u8>(v);
+        vramWrite8(off, static_cast<u8>(v >> 24));
+        vramWrite8(off + 1, static_cast<u8>(v >> 16));
+        vramWrite8(off + 2, static_cast<u8>(v >> 8));
+        vramWrite8(off + 3, static_cast<u8>(v));
     }
 
     // ---- register window ($F9800000 + offset, offset < 0x400) ----
@@ -122,7 +160,17 @@ public:
             // kind by writing 6 to the first, 0 to the second, and
             // reading the first back -- and offers the 16-bit modes only
             // if the 6 is still there.
-            if (reg == 0x20) return clutAddr_ == 1 ? ctl1_ : depthCtl_;
+            if (reg == 0x20) {
+                if (regDiag_ > 0 && onDiag && variant_ == Variant::Standalone) {
+                    --regDiag_;
+                    char b[64];
+                    std::snprintf(b, sizeof b, "DAC ctl[%u] read (%02X, %02X)", clutAddr_, depthCtl_, ctl1_);
+                    onDiag(b);
+                }
+                if (clutAddr_ != 1) return depthCtl_;
+                // The AC842a answers with its version in the low four bits.
+                return variant_ == Variant::Standalone ? ((ctl1_ & 0xF0u) | kAc842aVersion) : ctl1_;
+            }
             return 0;
         default:
             return 0;   // clock generator: nothing readable
@@ -136,6 +184,12 @@ public:
         switch (block) {
         case 0:
             regs_[reg >> 2] = v;
+            if (reg != 0x1C && regDiag_ > 0 && onDiag && variant_ == Variant::Standalone) {
+                --regDiag_;
+                char b[64];
+                std::snprintf(b, sizeof b, "video: +$%02X <- %X", reg, v);
+                onDiag(b);
+            }
             if (reg == 0x1C && senseDiag_ > 0 && onDiag) {
                 --senseDiag_;
                 char b[80];
@@ -197,6 +251,11 @@ public:
             }
             break;
         default:
+            if (variant_ == Variant::Standalone) {
+                // DP8531: sixteen registers of four bits, 16 bytes apart.
+                clockRegs_[reg >> 4] = static_cast<u8>(v & 0xF);
+                break;
+            }
             // DP8534 serial shift: store the stream for the record; the
             // pixel clock itself is derived from the swatch timing.
             clockShift_ = (clockShift_ << 1) | (v & 1);
@@ -214,6 +273,10 @@ public:
     // 1152 pixels in a 576-byte row -- 144 bytes of picture in four times the
     // space -- so "the largest depth that fits the row" reads it as 4 bits and
     // renders a quarter of the screen stretched across all of it.
+    //
+    // $1C in those bits is the widest setting, 32-bit pixels. The 16-bit mode
+    // is that setting with the low two mode bits also set and the second
+    // control register's top two bits on -- which is how $9E with $C0 reads.
     int bpp() const {
         if (forceBpp_) return forceBpp_;
         switch (depthCtl_ & 0x1C) {
@@ -221,10 +284,18 @@ public:
         case 0x08: return 2;
         case 0x10: return 4;
         case 0x18: return 8;
-        case 0x1C: return 16;
+        case 0x1C:
+            return ((depthCtl_ & 0x06) == 0x06 && (ctl1_ & 0xC0) == 0xC0) ? 16 : 24;
         default:   return 24;
         }
     }
+    // The pixel bus carries the dot clock divided by 1, 2 or 4 (control
+    // register bits 6-5): the timing registers count in that slower clock, so
+    // a 1152-pixel line is programmed as 288 counts.
+    // Bit 7 switches that divider in: of the ROM's 36 modes the one with
+    // bit 7 clear (32-bit pixels at 832x624, $3C) is also the one whose
+    // timing is written in whole dot clocks.
+    int clockDivider() const { return (depthCtl_ & 0x80u) ? 1 << ((depthCtl_ >> 5) & 3u) : 1; }
     u32 fbBase() const {
         return ((regs_[0] & 0xFFFu) << 9) | ((regs_[1] & 0xFu) << 5);
     }
@@ -237,9 +308,66 @@ public:
     int width() const { return forceW_ ? forceW_ : monitor_.width; }
     int height() const { return forceH_ ? forceH_ : monitor_.height; }
 
+    // ---- the raster as programmed ----
+    // What the timing generator was told, as against width()/height(), which
+    // is what the attached monitor shows. On every display Apple lists the
+    // two agree, and the mode tests hold them against each other.
+    //   +$140 HAL  first active count       +$144 HFP  first count after it
+    //   +$148 HPIX counts per line less 2   +$14C VHLINE half-lines per frame
+    //   +$15C VAL  first active half-line   +$160 VFP  first half-line after
+    bool interlaced() const { return (regs_[0x10 >> 2] & 4u) != 0; }
+    bool displayDisabled() const { return (swatch_[0] & 1u) != 0; }
+    int timingWidth() const {
+        const int n = static_cast<int>(swatch_[0x44 >> 2]) - static_cast<int>(swatch_[0x40 >> 2]);
+        return n > 0 ? n * clockDivider() : 0;
+    }
+    int timingHeight() const {
+        const int n = static_cast<int>(swatch_[0x60 >> 2]) - static_cast<int>(swatch_[0x5C >> 2]);
+        if (n <= 0) return 0;
+        return interlaced() ? n : n / 2;
+    }
+    int timingLineClocks() const { return (static_cast<int>(swatch_[0x48 >> 2]) + 2) * clockDivider(); }
+    int timingHalfLines() const { return static_cast<int>(swatch_[0x4C >> 2]); }
+
+    // ---- DP8531 clock generator (stand-alone chip) ----
+    // The sixteen registers hold, four bits each: 0-3 the feedback count, 4-6
+    // the reference divider, 9 the output divider's power of two. The
+    // feedback is a dual-modulus counter: its low five bits (inverted) are A,
+    // the rest is B, and the multiplier is 32(B - A) + 31(1 + A). The
+    // reference is the board's 20 MHz crystal. (Arithmetic after MAME's
+    // dafb.cpp; checked against the dot clocks of Apple's displays in the
+    // unit tests.)
+    u8 clockReg(int i) const { return clockRegs_[i & 15]; }
+    u32 pixelClockHz() const {
+        if (variant_ != Variant::Standalone) return 0;
+        const int r = (clockRegs_[6] << 8) | (clockRegs_[5] << 4) | clockRegs_[4];
+        if (r == 0) return 0;
+        const int p = 1 << clockRegs_[9];
+        const int modulus = (clockRegs_[3] << 12) | (clockRegs_[2] << 8) | (clockRegs_[1] << 4) | clockRegs_[0];
+        int a = (modulus & 0x1F) ^ 0x1F;
+        int b = (modulus & 0xFFE0) >> 5;
+        if (a > b) a = b;
+        if (b < 2) b = 2;
+        const int n = 32 * (b - a) + 31 * (1 + a);
+        const u64 vco = static_cast<u64>(kClockReferenceHz) * static_cast<u64>(n) / static_cast<u64>(r);
+        return static_cast<u32>(vco / static_cast<u64>(p));
+    }
+    // Vertical scans a second (fields, when interlaced), in thousandths; 0
+    // while the timing is not programmed.
+    u32 refreshMilliHz() const {
+        const u64 halfLineClocks = static_cast<u64>(timingLineClocks()) * static_cast<u64>(timingHalfLines());
+        const u32 pclk = pixelClockHz();
+        if (pclk == 0 || timingWidth() == 0 || timingHeight() == 0 || halfLineClocks == 0) return 0;
+        return static_cast<u32>(static_cast<u64>(pclk) * 2000u / halfLineClocks);
+    }
+
     // Expand the framebuffer to ARGB8888. `out` holds width()*height().
     void render(u32* out) const {
         const int w = width(), h = height();
+        if (variant_ == Variant::Standalone && displayDisabled()) {
+            for (int i = 0; i < w * h; ++i) out[i] = 0xFF000000u;
+            return;
+        }
         const u32 base = fbBase();
         const u32 stride = strideBytes() ? strideBytes()
                                          : static_cast<u32>(w) * static_cast<u32>(bpp()) / 8;
@@ -256,10 +384,15 @@ public:
                 // test, against 2316 on the same machine at 8 bits. Reading
                 // the table here hands back whatever that test left behind,
                 // which is why a 1152x870 desktop came up entirely blue.
+                //
+                // The Quadra 950's ROM does load entries 0 and 1 at one bit
+                // (white, and the display's own black), so there the table
+                // is used like at every other depth.
                 for (int x = 0; x < w; ++x) {
                     const u8 b = vramRead8(row + static_cast<u32>(x >> 3));
-                    dst[x] = ((b >> (7 - (x & 7))) & 1) ? 0xFF000000u
-                                                        : 0xFFFFFFFFu;
+                    const u32 bit = (b >> (7 - (x & 7))) & 1u;
+                    if (variant_ == Variant::Standalone) dst[x] = clut_[bit];
+                    else dst[x] = bit ? 0xFF000000u : 0xFFFFFFFFu;
                 }
                 break;
             case 2:
@@ -278,18 +411,25 @@ public:
                 for (int x = 0; x < w; ++x)
                     dst[x] = clut_[vramRead8(row + static_cast<u32>(x))];
                 break;
+            // In the two direct modes the color table is still in the
+            // path: each channel's value picks an entry and takes that
+            // entry's own channel, which is where the driver puts the gamma
+            // ramp (256 entries for 32-bit pixels; for 16-bit ones the 32
+            // entries a 5-bit value reaches when its top bits are repeated
+            // below it: 0, 8, 16 ... 247, 255).
             case 16:   // one big-endian word per pixel, x RRRRR GGGGG BBBBB
                 for (int x = 0; x < w; ++x) {
                     const u32 at = row + static_cast<u32>(x) * 2;
                     const u32 p = (static_cast<u32>(vramRead8(at)) << 8) | vramRead8(at + 1);
                     const u32 r = (p >> 10) & 31, g = (p >> 5) & 31, b = p & 31;
-                    dst[x] = 0xFF000000u | (((r << 3) | (r >> 2)) << 16) |
-                             (((g << 3) | (g >> 2)) << 8) | ((b << 3) | (b >> 2));
+                    dst[x] = throughTable((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2));
                 }
                 break;
             default:   // 24bpp: one pixel per 32-bit word, xRGB
-                for (int x = 0; x < w; ++x)
-                    dst[x] = 0xFF000000u | (vramRead32(row + static_cast<u32>(x) * 4) & 0xFFFFFF);
+                for (int x = 0; x < w; ++x) {
+                    const u32 p = vramRead32(row + static_cast<u32>(x) * 4);
+                    dst[x] = throughTable((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+                }
                 break;
             }
         }
@@ -377,12 +517,23 @@ private:
     void updateIrq() {
         if (onIrq) onIrq(irqAsserted());
     }
+    // A direct-color pixel through the color table, channel by channel.
+    u32 throughTable(u32 r, u32 g, u32 b) const {
+        return 0xFF000000u | (clut_[r] & 0x00FF0000u) | (clut_[g] & 0x0000FF00u) | (clut_[b] & 0x000000FFu);
+    }
+    static constexpr u32 kAc842aVersion = 1;
+    static constexpr u32 kClockReferenceHz = 20000000;
+
     MonitorWiring monitor_{};
     mutable int senseDiag_ = 60;
     int clutDiag_ = 24;
     int forceW_ = 0, forceH_ = 0, forceBpp_ = 0;
 
+    Variant variant_;
+    u32 vramFitted_;            // bytes of video RAM present
+    u32 vramMask_;              // the decoded window, less one
     std::vector<u8> vram_;
+    u8 clockRegs_[16]{};        // DP8531 (stand-alone chip)
     u32 regs_[64]{};
     u32 swatch_[64]{};
     u32 clut_[256]{};
@@ -391,6 +542,7 @@ private:
     u32 depthCtl_ = 0;
     u32 ctl1_ = 0;              // the DAC's second control register
     int ctlDiag_ = 40;
+    mutable int regDiag_ = 120;  // stand-alone chip: register writes and DAC reads, for the log
     bool vblEnabled_ = false;
     bool vblPending_ = false;
     bool cursorPending_ = false;

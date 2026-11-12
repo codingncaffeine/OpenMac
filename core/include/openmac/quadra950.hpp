@@ -11,10 +11,10 @@
 // 3rd ed., the Quadra 950 Developer Note, MAME and Linux as behavioral
 // references). Clean-room.
 //
-// Under construction: the board, its interrupt wiring and everything the ROM
-// needs to pass its self-tests and reach video are here. Keyboard, mouse and
-// floppy (behind the second I/O processor), the second SCSI bus's wiring and
-// the 950's own video modes follow.
+// Under construction: the board, its interrupt wiring, everything the ROM
+// needs to pass its self-tests, and the video chip with every depth the
+// developer note lists are here. Keyboard, mouse and floppy (behind the
+// second I/O processor) and the second SCSI bus's wiring follow.
 
 #include "openmac/bus040.hpp"
 #include "openmac/cpu040.hpp"
@@ -43,6 +43,8 @@ public:
     struct Config {
         // The four SIMM banks A-D in megabytes: 0 (empty) or 4, 8, 16, 32, 64.
         std::array<u32, 4> bankMb{4, 4, 0, 0};
+        // Video RAM in megabytes: 1 (as shipped) or 2 (the sockets filled).
+        u32 vramMb = 2;
     };
 
     Quadra950Machine(std::vector<u8> rom, const Config& cfg);
@@ -70,6 +72,11 @@ public:
     int screenWidth() const;
     int screenHeight() const;
     void renderScreen(u32* argbOut) const;
+    // What the video chip is programmed to: bits per pixel on the pixel bus
+    // (32-bit pixels count as 32), the raster of its timing generator, video
+    // RAM fitted, and vertical scans a second in thousandths (0 = no raster).
+    struct VideoState { int bitsPerPixel, timingWidth, timingHeight; u32 vramBytes, pixelClockHz, scansMilliHz; };
+    VideoState videoState() const;
     void drainAudio(std::vector<u8>& out);
 
     // ---- parameter RAM and clock --------------------------------------------
