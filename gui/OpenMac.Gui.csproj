@@ -13,7 +13,7 @@
     <Product>OpenMac</Product>
     <AssemblyTitle>OpenMac</AssemblyTitle>
     <UseWindowsForms>false</UseWindowsForms>
-    <Version>0.7.2</Version>
+    <Version>0.7.3</Version>
   </PropertyGroup>
 
   <!-- Ship the native core DLL (built by CMake into gui/native) beside the app.

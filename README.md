@@ -57,6 +57,10 @@ RAM chooses 1 or 2 MB, and File ▸ Create Hard Disk has a 1 GB size for it.
   and the Quadra 950 a startup disc such as a Mac OS install CD starts the machine
 - **Drop box** — a folder on your PC, kept mounted inside the Mac as a volume;
   files dropped on the window land in it
+- **Dropped archives** — a StuffIt, Compact Pro, BinHex or MacBinary file
+  dropped on the window rides into the Mac on a floppy or, when it is too big
+  for one, on a disk of its own; File ▸ Remove Dropped Disk, or its icon
+  dragged to the Trash, takes that disk off again
 - **Parameter RAM persists**, so the startup disk, sound volume, 32-bit
   addressing and the date survive quitting
 - **Help ▸ Capture Diagnostics** writes a snapshot of what the machine is doing
