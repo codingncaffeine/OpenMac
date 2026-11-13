@@ -194,6 +194,9 @@ internal static class Native
     public static extern int omac_unmount_harddisk2(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_harddisk2_put_away(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int omac_flush_volumes(IntPtr h);
 
     // The second SCSI disk (ID 1, drive 5): the drop box / folder disk seat.
@@ -353,6 +356,9 @@ internal static class Native
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int omac_fx_unmount_harddisk2(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_fx_harddisk2_put_away(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void omac_fx_attach_cd(IntPtr h, int attached, int busId);

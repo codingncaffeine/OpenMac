@@ -110,6 +110,12 @@ public:
     // Flush and unmount ONLY drive 5's volume, leaving the boot disk alone.
     // Returns true once the volume is off line (or was never mounted).
     bool unmountHardDisk2();
+    // True once the Macintosh itself has put the second disk's volume away
+    // (its icon dragged to the Trash) and run on without it for three
+    // seconds. An unmount asked for through unmountHardDisk2 does not count,
+    // and a restart or a shut down takes every volume with it and is not
+    // this. Cleared by the next insert or detach.
+    bool secondDiskPutAway() const { return hardDisk2PutAway_; }
 
     // CD-ROM: an AppleCD-class SCSI target (ID 3) the front end attaches, the
     // same surface as the Quadra. The System installs no CD driver of its own,
@@ -405,6 +411,10 @@ private:
     u32 hfsImageOffset2_ = 0;
     bool hardDisk2IsWholeScsi_ = false;
     bool hardDisk2MountPending_ = false;
+    void watchSecondDiskPutAway();
+    bool hardDisk2SeenOnLine_ = false;   // on line since it went in
+    int hardDisk2OffSeconds_ = 0;        // seconds off line with the System up
+    bool hardDisk2PutAway_ = false;
     u32 hardDisk2MountTries_ = 0;
     bool inDiskDriver_ = false;
     u32 diskPrimePc_ = 0;

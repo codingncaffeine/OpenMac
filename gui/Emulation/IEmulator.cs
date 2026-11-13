@@ -138,8 +138,8 @@ public interface IEmulator : IDisposable
     // An oversized dropped archive rides the same second-disk seat as the
     // folder disk, read-only, sized to fit. One at a time; it stays on the
     // seat across restarts (the first one may be what loads its driver) until
-    // RemoveTransferDisk takes it off, another disk replaces it, or -- on the
-    // Quadras -- the Macintosh puts its volume away itself.
+    // RemoveTransferDisk takes it off, another disk replaces it, or the
+    // Macintosh puts its volume away itself.
     // TransferDiskResident says whether the seat's driver was loaded by the
     // boot scan (mounts live) or a restart is needed.
     string? TransferDiskLabel { get; }

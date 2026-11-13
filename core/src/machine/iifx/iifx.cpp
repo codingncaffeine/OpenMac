@@ -822,6 +822,7 @@ void IifxMachine::tickDevices(int cpuCycles) {
         via_->setCA2(true);
         via_->setCA2(false);
         announceHardDisk();
+        watchSecondDiskPutAway();
         // The CD's driver goes in on the same clock and for the same reason:
         // there is no unit table to install into until the System has built
         // one. Eject before mount, so a disc swapped at the host is unmounted
@@ -1637,6 +1638,42 @@ bool IifxMachine::secondDiskDriverResident() {
     return driveInQueue(5);
 }
 
+// Has the Macintosh put the second disk's volume away? The Finder unmounts it
+// when its icon is dragged to the Trash and tells nobody; the drive stays in
+// the queue. Three seconds with the System up and the volume off line is the
+// put-away. A restart or a shut down unmounts every volume, so the queue is
+// empty then and nothing seen before it counts.
+//
+// Memory is looked at, not read: a read goes through the machine's cache model
+// and its counters, and a watch that runs every second for the life of the
+// machine must leave no trace in it.
+void IifxMachine::watchSecondDiskPutAway() {
+    if (hardDisk2_.empty() || hardDisk2PutAway_) return;
+    if (inDiskDriver_ || hardDiskMountInFlight_) return;
+    const u32 vcbHead = peek32(0x0358u);
+    if (vcbHead == 0 || vcbHead == 0xFFFFFFFFu || peek32(0x0360u) == 0xFFFFFFFFu) {
+        hardDisk2SeenOnLine_ = false;
+        hardDisk2OffSeconds_ = 0;
+        return;
+    }
+    bool onLine = false;
+    u32 vcb = vcbHead;
+    for (int count = 0; count < 16 && vcb && vcb != 0xFFFFFFFFu && !onLine; ++count) {
+        vcb = guestPtr(vcb);
+        if (vcb + 80u > ram_.size()) break;
+        onLine = peek16(vcb + 72u) == 5;              // vcbDrvNum
+        vcb = peek32(vcb);
+    }
+    if (onLine) {
+        hardDisk2SeenOnLine_ = true;
+        hardDisk2OffSeconds_ = 0;
+        return;
+    }
+    if (!hardDisk2SeenOnLine_ || ++hardDisk2OffSeconds_ < 3) return;
+    hardDisk2PutAway_ = true;
+    if (onDiag) onDiag("IIfx second disk: the Macintosh put the volume away");
+}
+
 void IifxMachine::announceHardDisk() {
     const bool bootWanted = hardDiskMountPending_ && !hardDisk_.empty();
     const bool secondWanted = hardDisk2MountPending_ && !hardDisk2_.empty();
@@ -1737,6 +1774,8 @@ void IifxMachine::announceHardDisk() {
 
 void IifxMachine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     hardDisk2_ = std::move(image);
+    hardDisk2SeenOnLine_ = hardDisk2PutAway_ = false;
+    hardDisk2OffSeconds_ = 0;
     scsiImage2_.clear();
     hfsImageOffset2_ = 0;
     hardDisk2IsWholeScsi_ = false;
@@ -1765,6 +1804,8 @@ void IifxMachine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
 }
 
 void IifxMachine::detachHardDisk2() {
+    hardDisk2SeenOnLine_ = hardDisk2PutAway_ = false;
+    hardDisk2OffSeconds_ = 0;
     hardDisk2_.clear();
     scsiImage2_.clear();
     hardDisk2MountPending_ = false;
@@ -1822,6 +1863,8 @@ bool IifxMachine::unmountHardDisk2() {
     }
     hardDiskMountInFlight_ = false;
     const bool offLine = !volumeMountedFor(5);
+    // Asked for from outside: not the Macintosh putting the disk away.
+    if (offLine) { hardDisk2SeenOnLine_ = false; hardDisk2OffSeconds_ = 0; }
     if (onDiag) {
         char message[128];
         std::snprintf(message, sizeof message,

@@ -891,6 +891,8 @@ void Machine::insertHardDisk(std::vector<u8> image, bool readOnly) {
 void Machine::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     hd2_ = std::move(image);
     hd2Mounted_ = false;
+    hd2SeenOnLine_ = hd2PutAway_ = false;
+    hd2OffSeconds_ = 0;
     hd2MountTries_ = 0;
     // Same wrapping as the first disk, but this copy of the driver answers for
     // SCSI ID 1, adds drive 5, and installs at unit 33 (the real-world SCSI
@@ -908,6 +910,8 @@ void Machine::detachHardDisk2() {
     disk2_->detach();
     hd2_.clear();
     scsiImage2_.clear();
+    hd2SeenOnLine_ = hd2PutAway_ = false;
+    hd2OffSeconds_ = 0;
     hd2Mounted_ = false;
     hd2MountTries_ = 0;
     if (onDiag) onDiag("hd2: disk detached");
@@ -951,6 +955,19 @@ bool Machine::flushVolumes() {
     return any;
 }
 
+// Is a volume on line for this drive? The VCB queue's head is at $0358 and
+// each VCB carries its drive number at +$48.
+bool Machine::volumeOnLine(u16 drive) {
+    u32 vcb = read32(0x0358);
+    for (int n = 0; n < 16 && vcb != 0 && vcb != 0xFFFFFFFFu; ++n) {
+        vcb &= 0x00FFFFFFu;
+        if (vcb + 80u > ram_.size()) return false;
+        if (read16(vcb + 72u) == drive) return true;
+        vcb = read32(vcb);
+    }
+    return false;
+}
+
 // The first half of a drop-box republish: get the guest off the second volume
 // so the host may rebuild it, leaving the boot volume alone.
 //
@@ -991,6 +1008,8 @@ bool Machine::unmountSecondDisk() {
     // is the state we were asking for.
     const bool off = (un == 0 || un == -35);
     if (off) hd2Mounted_ = false;
+    // Asked for from outside: not the Macintosh putting the disk away.
+    if (off) { hd2SeenOnLine_ = false; hd2OffSeconds_ = 0; }
     if (onDiag) {
         char b[112];
         std::snprintf(b, sizeof b, "hd2: flush %d, unmount %d -- volume %s", fl, un,
@@ -2133,6 +2152,28 @@ void Machine::runFrame() {
         read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
         hd2Installed_ = true;
     }
+    // Has the Macintosh put the second disk's volume away? The Finder unmounts
+    // it when its icon is dragged to the Trash and tells nobody; the drive stays
+    // in the queue. Three seconds with the System up and the volume off line is
+    // the put-away. A restart or a shut down unmounts every volume, so the
+    // queue is empty then and nothing seen before it counts.
+    if ((frameCounter_ % 60) == 20 && !hd2_.empty() && !hd2PutAway_ && !inSony_) {
+        if (!systemUp) {
+            hd2SeenOnLine_ = false;
+            hd2OffSeconds_ = 0;
+            // The Macintosh is starting again: the volume it had mounted is
+            // gone with the old System and is mounted afresh for the new one.
+            hd2Mounted_ = false;
+            hd2MountTries_ = 0;
+        } else if (volumeOnLine(5)) {
+            hd2SeenOnLine_ = true;
+            hd2OffSeconds_ = 0;
+        } else if (hd2SeenOnLine_ && ++hd2OffSeconds_ >= 3) {
+            hd2PutAway_ = true;
+            if (onDiag) onDiag("hd2: the Macintosh put the volume away");
+        }
+    }
+
     // The mount itself waits for a safe point (mountAtSafePoint): this only
     // says one is wanted, every 90 frames while the volume is not on line.
     if (hd2Installed_ && !hd2Mounted_ && !hd2_.empty() &&

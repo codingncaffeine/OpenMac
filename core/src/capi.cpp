@@ -174,6 +174,11 @@ OMAC_API int omac_unmount_harddisk2(OMac* m)
     return (m && m->mac.unmountSecondDisk()) ? 1 : 0;
 }
 
+OMAC_API int omac_harddisk2_put_away(OMac* m)
+{
+    return (m && m->mac.secondDiskPutAway()) ? 1 : 0;
+}
+
 OMAC_API int omac_flush_volumes(OMac* m)
 {
     return (m && m->mac.flushVolumes()) ? 1 : 0;
@@ -759,6 +764,11 @@ OMAC_API int omac_fx_harddisk2_booted(OMacFx* m)
 OMAC_API int omac_fx_unmount_harddisk2(OMacFx* m)
 {
     return (m && m->mac.unmountHardDisk2()) ? 1 : 0;
+}
+
+OMAC_API int omac_fx_harddisk2_put_away(OMacFx* m)
+{
+    return (m && m->mac.secondDiskPutAway()) ? 1 : 0;
 }
 
 OMAC_API void omac_fx_attach_cd(OMacFx* m, int attached, int scsi_id)

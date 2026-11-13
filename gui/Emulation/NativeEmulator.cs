@@ -217,10 +217,18 @@ public sealed class NativeEmulator : IEmulator
     // guest wrote to that disk is never saved back to the file it came from.
     private void NoticeGuestEjects()
     {
-        bool internalGone, externalGone, cdGone;
+        bool internalGone, externalGone, cdGone, putAway = false;
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return;
+            // The Mac put the transfer disk's volume away (its icon went to
+            // the Trash): the disk leaves the seat with it, or the next
+            // restart would mount it again.
+            if (TransferDiskLabel is not null && Native.omac_harddisk2_put_away(_h) != 0)
+            {
+                Native.omac_detach_harddisk2(_h);
+                putAway = true;
+            }
             internalGone = FloppyPath is not null && Native.omac_floppy_present(_h, 0) == 0;
             externalGone = ExternalFloppyPath is not null && Native.omac_floppy_present(_h, 1) == 0;
             cdGone = CdPath is not null && Native.omac_cd_present(_h) == 0;
@@ -244,7 +252,14 @@ public sealed class NativeEmulator : IEmulator
             Log.Line($"[disk] the machine ejected the CD {Path.GetFileName(CdPath)}");
             CdPath = null;
         }
-        if (internalGone || externalGone || cdGone) _diskStateDirty = true;
+        if (putAway)
+        {
+            Log.Line($"[disk] the Mac put away {TransferDiskLabel}; "
+                     + "it is off the second SCSI seat");
+            _readOnlySeatImage = null;
+            TransferDiskLabel = null;
+        }
+        if (internalGone || externalGone || cdGone || putAway) _diskStateDirty = true;
     }
 
     private void PublishFrame()

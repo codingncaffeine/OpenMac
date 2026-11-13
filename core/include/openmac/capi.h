@@ -96,6 +96,11 @@ OMAC_API int omac_harddisk2_booted(OMac*);
    image and it forgets its catalog, so the host may rebuild the volume and put
    it back. Returns non-zero once the volume is off line. */
 OMAC_API int omac_unmount_harddisk2(OMac*);
+/* 1 once the Macintosh itself has put the seat's volume away (its icon
+   dragged to the Trash) and run on without it for three seconds. A restart,
+   a shut down and omac_unmount_harddisk2 do not set it; the next insert or
+   detach clears it. omac_fx_ and omac_q_harddisk2_put_away are the same. */
+OMAC_API int omac_harddisk2_put_away(OMac*);
 
 /* Push out every block the File Manager is still holding. Call this before
    persisting a disk image to a file: the driver serves writes synchronously, so
@@ -350,6 +355,7 @@ OMAC_API void    omac_fx_detach_harddisk2(OMacFx*);
 OMAC_API size_t  omac_fx_harddisk2_data(OMacFx*, uint8_t* out, size_t cap);
 OMAC_API int     omac_fx_harddisk2_booted(OMacFx*);
 OMAC_API int     omac_fx_unmount_harddisk2(OMacFx*);
+OMAC_API int     omac_fx_harddisk2_put_away(OMacFx*);
 /* CD-ROM on the IIfx: an AppleCD-class target on the SCSI bus (ID 3 by
    default) plus a ".AppleCD" driver the machine installs once the System is
    up, so a disc mounts without Apple's CD-ROM software (which a stock 7.1

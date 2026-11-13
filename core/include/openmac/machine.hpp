@@ -158,6 +158,12 @@ public:
     // the image -- before the host may rebuild it and put it back. Returns true
     // once the volume is off line, which includes it never having been mounted.
     bool unmountSecondDisk();
+    // True once the Macintosh itself has put the second disk's volume away
+    // (its icon dragged to the Trash) and run on without it for three
+    // seconds. An unmount asked for through unmountSecondDisk does not count,
+    // and a restart or a shut down takes every volume with it and is not
+    // this. Cleared by the next insert or detach.
+    bool secondDiskPutAway() const { return hd2PutAway_; }
     // Push out every block the File Manager is still holding, before the host
     // writes an image to a file the user keeps. Our driver serves writes
     // synchronously, so the image is current for everything the System has
@@ -456,6 +462,10 @@ private:
     // gates.
     bool hd2Installed_ = false;    // the second disk's deferred mount is set up
     bool hd2Mounted_ = false;
+    bool volumeOnLine(u16 drive);
+    bool hd2SeenOnLine_ = false;   // the put-away watch: on line since it went in
+    int hd2OffSeconds_ = 0;        // seconds off line with the System up
+    bool hd2PutAway_ = false;
     u32 hd2MountTries_ = 0;
     bool bootHadHd2_ = false;      // disk 2 present when the boot scan ran
     bool scsiHandlesHd_ = true;    // true: SCSI driver owns the HD (skip .Sony HD reg); false: .Sony still mounts

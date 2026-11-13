@@ -267,13 +267,28 @@ public sealed class IifxEmulator : IEmulator
     public bool WriteProtectFloppies { get; set; }
     public bool ConsumeDiskStateChanged()
     {
-        bool present;
+        bool present, putAway = false;
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return false;
             present = Native.omac_fx_floppy_present(_h) != 0;
+            // The Mac put the transfer disk's volume away (its icon went to
+            // the Trash): the disk leaves the seat with it, or the next
+            // restart would mount it again.
+            if (TransferDiskLabel is not null && Native.omac_fx_harddisk2_put_away(_h) != 0)
+            {
+                Native.omac_fx_detach_harddisk2(_h);
+                putAway = true;
+            }
         }
-        if (present == _lastFloppyPresent) return false;
+        if (putAway)
+        {
+            Log.Line($"[disk] the Mac put away {TransferDiskLabel}; "
+                     + "it is off the second SCSI seat");
+            _seatImage = null;
+            TransferDiskLabel = null;
+        }
+        if (present == _lastFloppyPresent) return putAway;
         _lastFloppyPresent = present;
         if (!present && FloppyPath is not null)
         {
