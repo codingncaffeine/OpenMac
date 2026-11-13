@@ -737,3 +737,37 @@ TEST_CASE("950 sound: each call for samples returns only those made since the la
     mac.drainAudio(samples);
     CHECK(samples.empty());
 }
+
+TEST_CASE("950 parameter RAM: asked without a buffer the machine gives the size, and what it saves loads back") {
+    const auto nopRom = [] {
+        std::vector<u8> rom(0x100000);
+        for (std::size_t i = 0; i < rom.size(); i += 2) { rom[i] = 0x4E; rom[i + 1] = 0x71; }   // NOP
+        const u8 vectors[8] = {0x00, 0x00, 0x20, 0x00, 0x40, 0x80, 0x01, 0x00};
+        std::copy(vectors, vectors + 8, rom.begin());
+        return rom;
+    };
+    Quadra950Machine mac(nopRom());
+    mac.reset();
+    // A front end asks for the size first; zero there means nothing is ever saved.
+    CHECK(mac.savePram(nullptr, 0) == Quadra950Machine::kPramBlobBytes);
+    std::vector<u8> small(16);
+    CHECK(mac.savePram(small.data(), 16) == Quadra950Machine::kPramBlobBytes);
+    CHECK(small == std::vector<u8>(16));              // and a short buffer is left alone
+
+    std::vector<u8> blob(Quadra950Machine::kPramBlobBytes);
+    REQUIRE(mac.savePram(blob.data(), static_cast<u32>(blob.size())) == Quadra950Machine::kPramBlobBytes);
+    blob[8 + 0x10] = 0xA5;                            // a byte of parameter RAM
+    blob[8 + 0xFF] = 0x5A;
+    blob[264] = 0x12; blob[265] = 0x34; blob[266] = 0x56; blob[267] = 0x78;   // the clock
+
+    Quadra950Machine other(nopRom());
+    other.reset();
+    REQUIRE(other.loadPram(blob.data(), static_cast<u32>(blob.size()), 10));
+    std::vector<u8> back(Quadra950Machine::kPramBlobBytes);
+    REQUIRE(other.savePram(back.data(), static_cast<u32>(back.size())) == Quadra950Machine::kPramBlobBytes);
+    CHECK(back[8 + 0x10] == 0xA5);
+    CHECK(back[8 + 0xFF] == 0x5A);
+    const u32 clock = (u32(back[264]) << 24) | (u32(back[265]) << 16) | (u32(back[266]) << 8) | back[267];
+    CHECK(clock == 0x12345678u + 10);                 // the time the file sat unread is added
+    CHECK_FALSE(other.loadPram(blob.data(), 100, 0)); // a file of the wrong size is refused
+}

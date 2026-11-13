@@ -729,8 +729,10 @@ u32 Quadra950Machine::bankBoundary(int k) const { return memctl_->boundaryBytes(
 
 // 'PRAM', a version, the 256 bytes, then the clock: the Quadra 650's layout,
 // so a front end stores both machines' files the same way.
+// Asked without a buffer (or with one too small) it answers the size, as the
+// Quadra 650 does: that is how a front end sizes its buffer.
 u32 Quadra950Machine::savePram(u8* out, u32 cap) const {
-    if (cap < kPramBlobBytes) return 0;
+    if (!out || cap < kPramBlobBytes) return kPramBlobBytes;
     std::memcpy(out, "PRAM", 4);
     out[4] = 0; out[5] = 0; out[6] = 0; out[7] = 1;
     std::memcpy(out + 8, egret_->pram().data(), 256);
