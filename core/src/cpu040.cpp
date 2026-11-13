@@ -655,6 +655,19 @@ u32 M68040::invalidateDataCache030(u32 logical, u32 bytes) {
     return dropped;
 }
 
+void M68040::dropDataCache030(u32 address, u32 bytes) {
+    if (!is68030() || bytes == 0) return;
+    if (bytes >= 256) {                       // every entry of the sixteen lines
+        for (CacheLine030& line : dataCache030_) line.valid = 0;
+        return;
+    }
+    const u64 end = static_cast<u64>(address) + bytes;
+    for (u64 at = address & ~3u; at < end; at += 4) {
+        CacheLine030& line = dataCache030_[(static_cast<u32>(at) >> 4) & 15u];
+        line.valid &= static_cast<u8>(~(1u << ((static_cast<u32>(at) >> 2) & 3u)));
+    }
+}
+
 u32 M68040::invalidateInstructionCache030(u32 logical, u32 bytes) {
     if (!is68030() || bytes == 0) return 0;
     u32 dropped = 0;

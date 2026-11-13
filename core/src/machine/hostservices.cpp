@@ -595,7 +595,12 @@ void MacHostServices::serveDiskCtlStatus(int unit, bool status) {
 // the measurement behind it.
 bool MacHostServices::addressingModeSwapped() {
     const bool now32 = read8(0x0CB2) != 0;
-    const bool system32 = (read8(0x1EFC) & 1) != 0;
+    // MMFlags is a low-memory global only where low memory reaches that far.
+    // The 256K ROMs of the Macintosh II family put the System heap at $1E00
+    // (SysZone, $02A6), and $1EFC is then a word of the heap: a System built
+    // on such a ROM has the 24-bit Memory Manager and nothing else.
+    const u32 sysZone = guestPtr(read32(0x02A6));
+    const bool system32 = sysZone > 0x1EFCu && (read8(0x1EFC) & 1) != 0;
     return now32 != system32;
 }
 
@@ -704,6 +709,7 @@ void MacHostServices::execute68kTrap(u16 trap) {
     hcpu_.invalidateInstructionCache030(scratch, 2);
     const u32 savedPc = hcpu_.pc;
     const u16 savedSr = hcpu_.getSR();
+    const u32 d0In = hcpu_.d[0], a0In = hcpu_.a[0];
     hcpu_.pc = scratch;
     // The trap makes calls of its own, and those are not the guest's: the
     // CPU is not to stop at one. A request that was standing, or one a clock
@@ -722,6 +728,12 @@ void MacHostServices::execute68kTrap(u16 trap) {
         char b[96];
         std::snprintf(b, sizeof b, "guest call %04X did not return (given up at pc %08X)", trap,
                       hcpu_.pc);
+        onDiag(b);
+    }
+    if (traceGuestCalls && onDiag) {
+        char b[128];
+        std::snprintf(b, sizeof b, "guest call %04X: D0=%08X A0=%08X -> D0=%08X A0=%08X (from pc %08X sr %04X)", trap,
+                      d0In, a0In, hcpu_.d[0], hcpu_.a[0], savedPc, savedSr);
         onDiag(b);
     }
     hcpu_.pc = savedPc;
@@ -1067,7 +1079,6 @@ bool MacHostServices::readFileThroughGuest(const std::string& name,
     if (read8(0x0360) & 1) { why = "the File Manager is busy"; return false; }
     if (!leaveSwappedAddressingMode()) { why = "busy"; return false; }
 
-    constexpr u32 kChunk = 32768;
     announceInFlight_ = true;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = hcpu_.d[i]; sa[i] = hcpu_.a[i]; }
@@ -1075,11 +1086,19 @@ bool MacHostServices::readFileThroughGuest(const std::string& name,
     auto newPtr = [&](u32 bytes) -> u32 {
         hcpu_.d[0] = bytes;
         execute68kTrap(0xA71E);                       // _NewPtr,Sys,Clear
-        return guestPtr(hcpu_.a[0]);
+        // A0 is the block only when the Memory Manager says it made one.
+        return static_cast<s16>(hcpu_.d[0] & 0xFFFF) == 0 ? guestPtr(hcpu_.a[0]) : 0;
     };
     const u32 pb = newPtr(80);
     const u32 nameBuf = newPtr(64);
-    const u32 dataBuf = newPtr(kChunk);
+    // The read buffer: as much as the System heap gives. System 6's heap
+    // does not grow and has a few kilobytes free.
+    u32 chunk = 32768;
+    u32 dataBuf = newPtr(chunk);
+    while (!dataBuf && chunk > 512) {
+        chunk /= 4;
+        dataBuf = newPtr(chunk);
+    }
     bool ok = false;
     if (!pb || !nameBuf || !dataBuf) {
         why = "the guest heap would not give us working space";
@@ -1112,7 +1131,7 @@ bool MacHostServices::readFileThroughGuest(const std::string& name,
                 clearPb();
                 write16(pb + 24, refNum);             // ioRefNum
                 write32(pb + 32, dataBuf);            // ioBuffer
-                write32(pb + 36, kChunk);             // ioReqCount
+                write32(pb + 36, chunk);             // ioReqCount
                 write16(pb + 44, 0);                  // ioPosMode = fsAtMark
                 readErr = call(0xA002);               // _Read
                 const u32 got = read32(pb + 40);      // ioActCount
@@ -1359,8 +1378,9 @@ MacHostServices::~MacHostServices() = default;
 // entry of a driver this code serves, serve the request and return true (the
 // board then charges the time of a short driver call and executes nothing).
 bool MacHostServices::serveStorageHooks(u64 frame) {
-    if ((diskPrimePc_[0] && hcpu_.pc == diskPrimePc_[0]) ||
-        (diskPrimePc_[1] && hcpu_.pc == diskPrimePc_[1])) {
+    if (!diskDriverOverScsi &&
+        ((diskPrimePc_[0] && hcpu_.pc == diskPrimePc_[0]) ||
+         (diskPrimePc_[1] && hcpu_.pc == diskPrimePc_[1]))) {
         const int unit = (diskPrimePc_[0] && hcpu_.pc == diskPrimePc_[0]) ? 0 : 1;
         inDriver_ = true;
         try { serveDiskPrime(unit); } catch (const BusFault& f) {

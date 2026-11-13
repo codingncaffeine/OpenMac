@@ -191,6 +191,12 @@ public:
     // Code a host bridge wrote into logical memory: a 68030 does not snoop
     // its instruction cache, so a stale line would run the previous bytes.
     u32 invalidateInstructionCache030(u32 logical, u32 bytes);
+    // For a store made into RAM from outside the processor, where the
+    // logical address the guest reads that memory by is not known (a 24-bit
+    // System reaches one byte under 256 of them): the data-cache entries
+    // those long words could be held in are dropped whatever their tag. A
+    // 68040 keeps no such cache here and nothing happens.
+    void dropDataCache030(u32 address, u32 bytes);
 
 private:
     friend struct CpuOps040;

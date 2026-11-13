@@ -310,6 +310,30 @@ TEST_CASE("030 data cache is write-through and clear-data forces a refill") {
     CHECK(f.cpu.cacheStats030().dataMisses == 2);
 }
 
+TEST_CASE("030 data cache: a store made from outside drops the entry whatever its tag") {
+    Fix030 f;
+    f.cpu.cacr = 0x00000100;                  // ED
+    f.cpu.a[0] = 0x00012000;                  // same line and entry as $2000, another tag
+    f.bus.write32(0x12000, 0x11223344);
+    for (u32 pc = 0x0400; pc < 0x0408; pc += 2) f.bus.write16(pc, 0x2010);   // MOVE.L (A0),D0
+
+    f.cpu.step();
+    CHECK(f.cpu.d[0] == 0x11223344);
+    f.bus.write32(0x12000, 0xCAFEF00D);       // a device's store: the cache does not see it
+    f.cpu.step();
+    CHECK(f.cpu.d[0] == 0x11223344);          // still the old long word
+    // The entry is named by where the memory is, not by the address the
+    // guest read it under (a 24-bit System has 256 of those for one byte).
+    f.cpu.dropDataCache030(0x00002000, 4);
+    f.cpu.step();
+    CHECK(f.cpu.d[0] == 0xCAFEF00D);
+    // A larger store than the cache empties it.
+    f.bus.write32(0x12000, 0x01020304);
+    f.cpu.dropDataCache030(0x00040000, 512);
+    f.cpu.step();
+    CHECK(f.cpu.d[0] == 0x01020304);
+}
+
 TEST_CASE("030 logical cache hits precede PMMU translation") {
     Fix030 f;
     f.cpu.cacr = 0x00000101;                  // EI | ED

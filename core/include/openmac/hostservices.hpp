@@ -109,6 +109,9 @@ public:
     u32 hdReads() const { return hdReadCount_; }
     u32 hdWrites() const { return hdWriteCount_; }
     void traceHdRequests(int n) { hdTraceBudget_ = n; }
+    // True while the MMU is in the other addressing mode from the one the
+    // System started in; no trap is injected then. (Read from low memory.)
+    bool addressingModeSwapped();
 
     // Diagnosis switch: skip the injected mount/announce of hard disks, to
     // separate "our injection perturbs the boot" from everything else.
@@ -118,6 +121,14 @@ public:
     // does to the ROM's rebuild -- the refusal is invisible once the volume has
     // been put back inside the ROM's reach.
     bool suppressVolumeRepair = false;
+    // Diagnosis switch: leave the hard disks' own driver to move its blocks
+    // over the SCSI bus (its Prime calls the SCSI Manager) instead of serving
+    // its requests here. Slower, and every block then crosses the board's
+    // SCSI chip: the way to exercise that chip with a whole System.
+    bool diskDriverOverScsi = false;
+    // Diagnosis switch: report every call this code runs on the guest CPU,
+    // with D0 and A0 going in and coming out.
+    bool traceGuestCalls = false;
     std::function<void(const char* msg)> onDiag;
 
 protected:
@@ -171,21 +182,29 @@ protected:
     void finishCdEject();
 
     // Guest memory through the board's bus, as the moved code always read it.
+    // A store goes around the processor, so what a 68030 holds of that
+    // memory in its data cache is dropped with it: the guest would read the
+    // old bytes back (a trap word of the last call, a parameter block's last
+    // drive number, a disk block's buffer before it was filled).
     u8   read8(u32 addr) { return hbus_.read8(addr); }
     u16  read16(u32 addr) { return hbus_.read16(addr); }
     u32  read32(u32 addr) { return hbus_.read32(addr); }
-    void write8(u32 addr, u8 value) { hbus_.write8(addr, value); }
-    void write16(u32 addr, u16 value) { hbus_.write16(addr, value); }
-    void write32(u32 addr, u32 value) { hbus_.write32(addr, value); }
+    void write8(u32 addr, u8 value) { hbus_.write8(addr, value); hcpu_.dropDataCache030(addr, 1); }
+    void write16(u32 addr, u16 value) { hbus_.write16(addr, value); hcpu_.dropDataCache030(addr, 2); }
+    void write32(u32 addr, u32 value) { hbus_.write32(addr, value); hcpu_.dropDataCache030(addr, 4); }
+
+    // An 80-byte File Manager parameter block cleared and aimed at a drive
+    // (ioVRefNum), for the call that follows.
+    void primeParamBlock(u32 pb, u16 drive) {
+        for (u32 i = 0; i < 80; ++i) write8(pb + i, 0);
+        write16(pb + 22, drive);
+    }
 
     // The CPU reached the ROM's entry (power on or a guest restart): forget
     // the last startup. lowMemoryFresh says when its unit table is gone too.
     void machineStarting();
     bool lowMemoryFresh();
     void execute68kTrap(u16 trap);
-    // True while the MMU is in the other addressing mode from the one the
-    // System started in; no trap is injected then.
-    bool addressingModeSwapped();
     bool leaveSwappedAddressingMode();
     void announceHardDisks();
     // The on-disk SCSI driver's Prime, served in C++ (see the definition).
