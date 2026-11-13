@@ -213,6 +213,9 @@ internal static class Native
     public static extern int omac_q_unmount_harddisk2(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_harddisk2_put_away(IntPtr h);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern nuint omac_q_diagnostics(IntPtr h, byte[]? outBuf, nuint cap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

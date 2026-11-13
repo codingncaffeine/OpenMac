@@ -613,6 +613,25 @@ public sealed class NativeEmulator : IEmulator
         return false;
     }
 
+    public bool RemoveTransferDisk(out string error)
+    {
+        error = "";
+        if (TransferDiskLabel is not { } label) return true;
+        // A volume the Mac has mounted is put away first, as for a swap; one
+        // it never saw has nothing to let go of.
+        if (TransferDiskResident && !PutAwaySeatVolume())
+        {
+            error = "A file on it is still open in the Mac. Quit the program that "
+                  + "is using it, then remove the disk again.";
+            return false;
+        }
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_detach_harddisk2(_h); }
+        _readOnlySeatImage = null;
+        TransferDiskLabel = null;
+        Log.Line($"[disk] {label} taken off the second SCSI seat");
+        return true;
+    }
+
     /// <summary>Make the seat free for another transfer disk. A previous one
     /// the Mac has mounted is flushed and unmounted (the guest must let go of
     /// its catalog before the blocks change under it); one the Mac never saw

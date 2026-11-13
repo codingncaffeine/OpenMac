@@ -69,7 +69,19 @@ public:
     // driver. Until then a volume put on that seat cannot mount, because there
     // is no driver to read it: the boot scan is what loads one.
     bool secondDiskDriverResident() const { return diskPrimePc_[1] != 0; }
+    // True once the Macintosh itself has put the second disk's volume away
+    // (its icon dragged to the Trash) and gone on running without it. A
+    // restart or a shut down also unmounts the volume and is not this: the
+    // System has to stay up for three seconds with the volume off line. An
+    // unmount this machine asked for (unmountSecondDisk) does not count
+    // either. Cleared by the next insert or detach.
+    bool secondDiskPutAway() const { return hd2PutAway_; }
 
+    // Test entry: unmount the second disk's volume the way the Finder does
+    // for an icon dragged to the Trash (_FlushVol, _UnmountVol on the guest
+    // CPU), leaving the put-away watch to see it. False = not now, or no
+    // volume of that disk is on line.
+    bool guestPutAwaySecondDisk();
     // Test entry: make the guest call ShutDwnStart (restart). False = not now.
     bool guestRestart();
     // Test entry: make the guest call ShutDwnPower, what the Finder's Shut
@@ -171,6 +183,7 @@ protected:
     void serveCdPrime();
     void serveCdCtlStatus(bool status);
     bool volumeMountedFor(u16 drive);
+    void watchSecondDiskPutAway();
     u16 guestCdDrive();
     bool startupFinished();
     bool markVolumeClean(u16 drive);
@@ -212,6 +225,10 @@ protected:
     // scan, whose announcement startup flushes; once the System settles, a
     // disk-inserted event makes it the same event a user's insertion is.
     bool hdAnnouncePending_ = false, hd2AnnouncePending_ = false;
+    // The second volume's put-away watch (watchSecondDiskPutAway).
+    bool hd2SeenMounted_ = false;   // on line at some point since it went in
+    int hd2OffSeconds_ = 0;         // seconds off line with the System up
+    bool hd2PutAway_ = false;
     int  hdAnnounceDelay_ = 0;
     bool announceInFlight_ = false;
     u32  hdMountPb_ = 0;        // System-heap param block for the _MountVol retries

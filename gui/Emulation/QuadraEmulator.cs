@@ -313,12 +313,28 @@ public sealed class QuadraEmulator : IEmulator
     // menus keep offering to eject a drive with nothing in it.
     public bool ConsumeDiskStateChanged()
     {
-        bool present, off;
+        bool present, off, putAway = false;
         lock (_sync)
         {
             if (_h == IntPtr.Zero) return false;
             present = Native.omac_q_floppy_present(_h) != 0;
             off = Is950 && Native.omac_q_powered_off(_h) != 0;
+            // The Mac put the transfer disk's volume away (its icon went to
+            // the Trash): the disk leaves the seat with it, or the next
+            // restart would mount it again.
+            if (TransferDiskLabel is not null &&
+                Native.omac_q_harddisk2_put_away(_h) != 0)
+            {
+                Native.omac_q_detach_harddisk2(_h);
+                putAway = true;
+            }
+        }
+        if (putAway)
+        {
+            Log.Line($"[disk] the Mac put away {TransferDiskLabel}; "
+                     + "it is off the second SCSI seat");
+            _readOnlySeatImage = null;
+            TransferDiskLabel = null;
         }
         if (off != PoweredOff)
         {
@@ -334,7 +350,7 @@ public sealed class QuadraEmulator : IEmulator
             }
             if (present == _lastFloppyPresent) return true;
         }
-        if (present == _lastFloppyPresent) return false;
+        if (present == _lastFloppyPresent) return putAway;
         _lastFloppyPresent = present;
         if (!present && FloppyPath is not null)
         {
@@ -488,6 +504,25 @@ public sealed class QuadraEmulator : IEmulator
         }
         Log.Line("[disk] the Mac would not let go of the seat's volume (a file on it is open)");
         return false;
+    }
+
+    public bool RemoveTransferDisk(out string error)
+    {
+        error = "";
+        if (TransferDiskLabel is not { } label) return true;
+        // A volume the Mac has mounted is put away first, as for a swap; one
+        // it never saw has nothing to let go of.
+        if (TransferDiskResident && !PutAwaySeatVolume())
+        {
+            error = "A file on it is still open in the Mac. Quit the program that "
+                  + "is using it, then remove the disk again.";
+            return false;
+        }
+        lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_detach_harddisk2(_h); }
+        _readOnlySeatImage = null;
+        TransferDiskLabel = null;
+        Log.Line($"[disk] {label} taken off the second SCSI seat");
+        return true;
     }
 
     /// <summary>Make the seat free for another transfer disk. A previous one

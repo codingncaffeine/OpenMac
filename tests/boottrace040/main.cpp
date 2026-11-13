@@ -558,6 +558,8 @@ int main(int argc, char** argv) {
     int ejectAtFrame = -1;          // --eject-at N: front-end eject at boot frame N
     int ejectCdAtFrame = -1;        // --eject-cd-at N: the same for the disc
     int guestRestartAt = -1;        // --guest-restart-at N: the guest restarts itself
+    int putAwayDisk2At = -1;        // --put-away-disk2-at N: the guest unmounts the second volume
+    bool disk2PutAwaySeen = false;
     bool noVolumeRepair = false;        // --no-volume-repair: reproduce the dirty-volume refusal
     const char* hd2Path = nullptr;  // --harddisk2 FILE: an existing image on seat 2
     std::string dropBoxDir;         // --dropbox DIR: serve DIR on the second seat
@@ -848,6 +850,7 @@ int main(int argc, char** argv) {
         else if (a == "--eject-at" && i + 1 < argc) ejectAtFrame = std::atoi(argv[++i]);
         else if (a == "--eject-cd-at" && i + 1 < argc) ejectCdAtFrame = std::atoi(argv[++i]);
         else if (a == "--guest-restart-at" && i + 1 < argc) guestRestartAt = std::atoi(argv[++i]);
+        else if (a == "--put-away-disk2-at" && i + 1 < argc) putAwayDisk2At = std::atoi(argv[++i]);
         else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
         else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
         else if (a == "--no-volume-repair") noVolumeRepair = true;
@@ -1624,6 +1627,14 @@ int main(int argc, char** argv) {
         if (ejectAtFrame >= 0 && i == ejectAtFrame) {
             std::printf("front-end eject requested at frame %d\n", i);
             mac.ejectFloppy();
+        }
+        if (putAwayDisk2At >= 0 && i >= putAwayDisk2At && mac.guestPutAwaySecondDisk()) {
+            std::printf("second disk: the guest unmounted its volume at frame %d\n", static_cast<int>(i));
+            putAwayDisk2At = -1;
+        }
+        if (!disk2PutAwaySeen && mac.secondDiskPutAway()) {
+            disk2PutAwaySeen = true;
+            std::printf("second disk: put away by the Macintosh, seen at frame %d\n", static_cast<int>(i));
         }
         if (guestRestartAt >= 0 && i >= guestRestartAt && mac.guestRestart()) {
             std::printf("f=%d guest restart requested\n", i);

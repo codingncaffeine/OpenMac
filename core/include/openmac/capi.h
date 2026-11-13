@@ -250,6 +250,11 @@ OMAC_API void   omac_q_detach_harddisk2(OMacQ*);
 OMAC_API size_t omac_q_harddisk2_data(OMacQ*, uint8_t* out, size_t cap);
 OMAC_API int    omac_q_harddisk2_booted(OMacQ*);
 OMAC_API int    omac_q_unmount_harddisk2(OMacQ*);
+/* 1 once the Macintosh itself has put the seat's volume away (its icon
+   dragged to the Trash) and run on without it for three seconds. A restart,
+   a shut down and omac_q_unmount_harddisk2 do not set it; the next insert or
+   detach clears it. */
+OMAC_API int    omac_q_harddisk2_put_away(OMacQ*);
 
 /* A text snapshot of CPU, low memory and every device, for capturing what a
    wedged guest was doing. Pass out=NULL to learn the size needed. Reads model

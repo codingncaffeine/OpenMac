@@ -12,6 +12,7 @@
 //                    [--floppy-at FRAME FILE]... [--eject-floppy-at FRAME]...
 //                    [--harddisk FILE] [--harddisk2 FILE] [--save-harddisk OUT]
 //                    [--cd FILE] [--eject-cd-at FRAME] [--guest-restart-at FRAME]
+//                    [--put-away-disk2-at FRAME]
 //                    [--gestalt] [--slots] [--shutdown] [--profile FROM TO]
 //                    [--beep-at FRAME] [--guest-power-off-at FRAME]
 //                    [--dropbox DIR] [--dropbox-guest-read FILE] [--drivers]
@@ -75,6 +76,8 @@ int main(int argc, char** argv) {
     std::string wavPath;
     std::vector<u8> audio, audioChunk;
     int ejectCdAt = -1, guestRestartAt = -1, beepAt = -1, guestPowerOffAt = -1;
+    int putAwayDisk2At = -1;        // --put-away-disk2-at N: the guest unmounts the second volume
+    bool disk2PutAwaySeen = false;
     bool askGestalt = false, doShutdown = false, askSlots = false;
     int profileFrom = -1, profileTo = -1;
     std::map<u32, u64> profile;
@@ -125,6 +128,7 @@ int main(int argc, char** argv) {
         else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
         else if (a == "--eject-cd-at" && i + 1 < argc) ejectCdAt = std::atoi(argv[++i]);
         else if (a == "--guest-restart-at" && i + 1 < argc) guestRestartAt = std::atoi(argv[++i]);
+        else if (a == "--put-away-disk2-at" && i + 1 < argc) putAwayDisk2At = std::atoi(argv[++i]);
         else if (a == "--profile" && i + 2 < argc) { profileFrom = std::atoi(argv[++i]); profileTo = std::atoi(argv[++i]); }
         else if (a == "--gestalt") askGestalt = true;
         else if (a == "--slots") askSlots = true;
@@ -298,6 +302,14 @@ int main(int argc, char** argv) {
         if (ejectCdAt == f) {
             mac.ejectCd();
             std::printf("cd eject asked for at frame %d\n", f);
+        }
+        if (putAwayDisk2At >= 0 && f >= putAwayDisk2At && mac.guestPutAwaySecondDisk()) {
+            std::printf("second disk: the guest unmounted its volume at frame %d\n", static_cast<int>(f));
+            putAwayDisk2At = -1;
+        }
+        if (!disk2PutAwaySeen && mac.secondDiskPutAway()) {
+            disk2PutAwaySeen = true;
+            std::printf("second disk: put away by the Macintosh, seen at frame %d\n", static_cast<int>(f));
         }
         if (guestRestartAt >= 0 && f >= guestRestartAt && mac.guestRestart()) {
             std::printf("guest restart at frame %d\n", f);

@@ -60,6 +60,9 @@ void MacHostServices::machineStarting() {
     hdAnnouncePending_ = !hd_.empty();
     hd2AnnouncePending_ = !hd2_.empty();
     hdMountTries_ = 0;
+    // The volume queue is the last startup's: nothing seen in it counts.
+    hd2SeenMounted_ = false;
+    hd2OffSeconds_ = 0;
     // Low memory still describes the last startup until the ROM rebuilds
     // it. Nothing is read back out of it before then (see lowMemoryFresh).
     unitTableFresh_ = false;
@@ -620,6 +623,15 @@ bool MacHostServices::guestRestart() {
     return true;
 }
 
+bool MacHostServices::guestPutAwaySecondDisk() {
+    if (hd2_.empty() || inDriver_ || announceInFlight_) return false;
+    if (read32(0x0358) == 0 || !volumeMountedFor(kHd2Drive)) return false;
+    const bool seen = hd2SeenMounted_;
+    const bool off = unmountSecondDisk();
+    hd2SeenMounted_ = seen;                           // as if the guest had done it
+    return off;
+}
+
 bool MacHostServices::guestPowerOff() {
     if (inDriver_ || announceInFlight_) return false;
     if (read32(0x0358) == 0 || (read8(0x0360) & 1)) return false;   // no System / FSBusy
@@ -886,6 +898,7 @@ bool MacHostServices::shutdownVolumes() {
             // file is open on it -- a real Shut Down cannot unmount that one
             // either.
             const s16 un = call(0xA00E);              // _UnmountVol
+            if (drive == kHd2Drive) hd2SeenMounted_ = false;   // our doing
             bool marked = false;
             if (fl == 0 && un != 0) marked = markVolumeClean(drive);
             any = any || un == 0 || marked;
@@ -951,6 +964,9 @@ bool MacHostServices::unmountSecondDisk() {
     for (int i = 0; i < 8; ++i) { hcpu_.d[i] = sd[i]; hcpu_.a[i] = sa[i]; }
     announceInFlight_ = false;
     const bool off = !volumeMountedFor(kHd2Drive);
+    // This unmount was asked for from outside; it is not the Macintosh
+    // putting the disk away.
+    if (off) { hd2SeenMounted_ = false; hd2OffSeconds_ = 0; }
     if (onDiag) {
         char b[112];
         std::snprintf(b, sizeof b, "hd2: flush %d, unmount %d -- volume %s", fl, un,
@@ -1106,6 +1122,8 @@ const std::vector<u8>& MacHostServices::hardDiskImage() const {
 void MacHostServices::insertHardDisk2(std::vector<u8> image, bool readOnly) {
     hd2_ = std::move(image);
     hd2RO_ = readOnly;
+    hd2SeenMounted_ = hd2PutAway_ = false;
+    hd2OffSeconds_ = 0;
     if (hd2_.empty()) {
         disk2_->detach();
         scsiImage2_.clear();
@@ -1135,6 +1153,8 @@ void MacHostServices::insertHardDisk2(std::vector<u8> image, bool readOnly) {
 }
 
 void MacHostServices::detachHardDisk2() {
+    hd2SeenMounted_ = hd2PutAway_ = false;
+    hd2OffSeconds_ = 0;
     hd2_.clear();
     scsiImage2_.clear();
     disk2_->detach();
@@ -1327,9 +1347,43 @@ bool MacHostServices::serveStorageHooks(u64 frame) {
     return false;
 }
 
+// Has the Macintosh put the second disk's volume away? The Finder does it
+// with _UnmountVol when the icon is dragged to the Trash; the drive stays in
+// the queue, so the only trace is the volume leaving the VCB queue while the
+// System runs on. A restart and a shut down unmount it as well, and are told
+// apart by what follows: the machine starts again (machineStarting clears the
+// watch) or the last volume goes too and the queue is empty. Three seconds
+// with the System up and the volume off line is the put-away.
+//
+// Nothing is read before this startup's scan has loaded the seat's driver:
+// until then the queue in low memory may still be the last startup's.
+void MacHostServices::watchSecondDiskPutAway() {
+    if (hd2_.empty() || hd2PutAway_) return;
+    if (!diskPrimePc_[1] || !lowMemoryFresh() || inDriver_ || announceInFlight_) {
+        hd2OffSeconds_ = 0;
+        return;
+    }
+    const bool queueBuilt =
+        ((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) != 0xFFFFFFFFu;
+    if (!queueBuilt || read32(0x0358) == 0) {         // no volume at all
+        hd2OffSeconds_ = 0;
+        return;
+    }
+    if (volumeMountedFor(kHd2Drive)) {
+        hd2SeenMounted_ = true;
+        hd2OffSeconds_ = 0;
+        return;
+    }
+    if (!hd2SeenMounted_) return;
+    if (++hd2OffSeconds_ < 3) return;
+    hd2PutAway_ = true;
+    if (onDiag) onDiag("hd2: the Macintosh put the volume away");
+}
+
 // Once per emulated second.
 void MacHostServices::storageSecondTick() {
     announceHardDisks();
+    watchSecondDiskPutAway();
     // The CD's driver goes in on the same clock and for the same reason:
     // there is no unit table to install into until the System has built one.
     if (cdrom_->attachedState() && !cdDrvr_) installCdDriver();

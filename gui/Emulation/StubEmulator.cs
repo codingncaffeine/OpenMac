@@ -132,6 +132,12 @@ public sealed class StubEmulator : IEmulator
         TransferDiskLabel = System.IO.Path.GetFileName(filePath);
         return true;
     }
+    public bool RemoveTransferDisk(out string error)
+    {
+        error = "";
+        TransferDiskLabel = null;
+        return true;
+    }
 
     public bool CdRomAttached { get; private set; }
     public string? CdPath { get; private set; }

@@ -1101,6 +1101,11 @@ OMAC_API int omac_q_unmount_harddisk2(OMacQ* m)
     return (m && m->hs().unmountSecondDisk()) ? 1 : 0;
 }
 
+OMAC_API int omac_q_harddisk2_put_away(OMacQ* m)
+{
+    return (m && m->hs().secondDiskPutAway()) ? 1 : 0;
+}
+
 OMAC_API int omac_q_shutdown_volumes(OMacQ* m)
 {
     // A machine that switched itself off has done this already, and is not

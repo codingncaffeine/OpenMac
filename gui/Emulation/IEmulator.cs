@@ -136,12 +136,20 @@ public interface IEmulator : IDisposable
 
     // ---- transfer disk ----
     // An oversized dropped archive rides the same second-disk seat as the
-    // folder disk, read-only, sized to fit. One at a time; it clears when the
-    // machine reloads. TransferDiskResident says whether the seat's driver
-    // was loaded by the boot scan (mounts live) or a restart is needed.
+    // folder disk, read-only, sized to fit. One at a time; it stays on the
+    // seat across restarts (the first one may be what loads its driver) until
+    // RemoveTransferDisk takes it off, another disk replaces it, or -- on the
+    // Quadras -- the Macintosh puts its volume away itself.
+    // TransferDiskResident says whether the seat's driver was loaded by the
+    // boot scan (mounts live) or a restart is needed.
     string? TransferDiskLabel { get; }
     bool TransferDiskResident { get; }
     bool AttachTransferDisk(string filePath, out string error);
+    /// <summary>Take the transfer disk (or the second disk image) off the
+    /// seat for good. A volume the Mac has mounted is flushed and unmounted
+    /// first; false, with the reason, only when the Mac still has a file
+    /// open on it -- the disk then stays where it is.</summary>
+    bool RemoveTransferDisk(out string error);
 
     // ---- CD-ROM ----
     // The drive is a SCSI device (attached to the bus; the ROM and the Apple CD
