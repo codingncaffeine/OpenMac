@@ -46,6 +46,7 @@ add_executable(openmac_unit
     unit/test_macbinary.cpp
     unit/test_quadra950.cpp
     unit/test_se30.cpp
+    unit/test_direct_floppy.cpp
 )
 target_link_libraries(openmac_unit PRIVATE openmac_core doctest::doctest openmac_warnings)
 target_link_libraries(openmac_unit PRIVATE nlohmann_json::nlohmann_json)
