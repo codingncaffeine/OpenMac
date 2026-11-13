@@ -1159,6 +1159,8 @@ int main(int argc, char** argv) {
     std::string cdImagePath;   // --cd <path>: attach the CD-ROM drive with this disc in it
     bool cdAttach = false;     // --cd-attach: attach the drive with an empty tray
     std::string hd2ImagePath;  // --harddisk2 <path>: attach a second SCSI disk (ID 1)
+    std::string pramPath;      // --pram <path>: a front end's saved parameter RAM, loaded before the first frame
+    bool hd2ReadOnly = false;  // --harddisk2-read-only: the second disk as a dropped file's disk is attached
     std::string dropBoxDir;    // --dropbox DIR: serve DIR on the second seat
     int dropBoxRepublishAt = -1;  // --dropbox-republish N: swap the volume at frame N
     int dropBoxRounds = 1;        // --dropbox-rounds N: repeat the swap N times
@@ -1208,6 +1210,8 @@ int main(int argc, char** argv) {
         else if (arg == "--cd" && i + 1 < argc) cdImagePath = argv[++i];
         else if (arg == "--cd-attach") cdAttach = true;
         else if (arg == "--harddisk2" && i + 1 < argc) hd2ImagePath = argv[++i];
+        else if (arg == "--pram" && i + 1 < argc) pramPath = argv[++i];
+        else if (arg == "--harddisk2-read-only") hd2ReadOnly = true;
         else if (arg == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
         else if (arg == "--dropbox-republish" && i + 1 < argc)
             dropBoxRepublishAt = std::atoi(argv[++i]);
@@ -1507,12 +1511,20 @@ int main(int argc, char** argv) {
         std::printf("HARD DISK %zu bytes loaded from %s\n", hd.size(), hdImagePath.c_str());
         mac.insertHardDisk(std::move(hd), false);
     }
+    if (!pramPath.empty()) {
+        std::ifstream pf(pramPath, std::ios::binary);
+        std::vector<u8> blob((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
+        const bool ok = mac.loadPram(blob.data(), static_cast<u32>(blob.size()), 0);
+        std::printf("PARAMETER RAM %s from %s\n", ok ? "loaded" : "REFUSED", pramPath.c_str());
+        if (!ok) return 1;
+    }
     if (!hd2ImagePath.empty()) {
         std::ifstream hf(hd2ImagePath, std::ios::binary);
         if (!hf) { std::printf("HARD DISK 2: cannot open %s\n", hd2ImagePath.c_str()); return 1; }
         std::vector<u8> hd{std::istreambuf_iterator<char>(hf), std::istreambuf_iterator<char>()};
-        std::printf("HARD DISK 2 %zu bytes loaded from %s\n", hd.size(), hd2ImagePath.c_str());
-        mac.insertHardDisk2(std::move(hd), false);
+        std::printf("HARD DISK 2 %zu bytes loaded from %s%s\n", hd.size(), hd2ImagePath.c_str(),
+                    hd2ReadOnly ? " (read-only)" : "");
+        mac.insertHardDisk2(std::move(hd), hd2ReadOnly);
     }
     // The drop box goes on before the first frame, so the ROM's startup bus
     // scan loads its driver -- exactly as the front end attaches it in LoadRom.

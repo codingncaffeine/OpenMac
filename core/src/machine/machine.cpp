@@ -230,6 +230,7 @@ void Machine::wireVia() {
 }
 
 void Machine::reset() {
+    mountsWaiting_ = 0;
     overlay_ = true;
     via_->reset();
     rtc_->reset();
@@ -576,6 +577,7 @@ int Machine::stepInstruction() {
     if (gcrErrSpan_ && (cpu_.pc - gcrErrLo_) <= gcrErrSpan_) noteGcrError(cpu_.pc);
     if (sonyPrimePc_ && cpu_.pc == sonyPrimePc_) watchSonyPrime();
     if (sonyResultPc_ && cpu_.pc == sonyResultPc_) watchSonyResult();
+    if (mountsWaiting_ && atSafePoint()) mountAtSafePoint();
     cpu_.setIrqLevel(via_->irqAsserted() ? 1 : 0);
     const int c = cpu_.step();
     tickDevices(c);
@@ -926,6 +928,7 @@ void Machine::detachHardDisk2() {
 bool Machine::flushVolumes() {
     if (inSony_) return false;
     if (read8(0x0360) & 1) return false;               // FSBusy
+    if (scsiManagerBusy()) return false;               // see scsiManagerBusy
     if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
         return false;                                  // FS queue not built
     if ((cpu_.getSR() & 0x0700) != 0) return false;    // mid-interrupt
@@ -970,6 +973,7 @@ bool Machine::unmountSecondDisk() {
     if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
         return true;                                   // FS queue not built
     if ((cpu_.getSR() & 0x0700) != 0) return false;    // mid-interrupt: not now
+    if (scsiManagerBusy()) return false;               // see scsiManagerBusy
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
     const u32 pb = stackParamBlock();
@@ -1831,6 +1835,86 @@ bool Machine::trySonyTrap() {
     return true;
 }
 
+// Is the ROM's SCSI Manager between SCSIGet and SCSIComplete? A File Manager
+// call injected then never finishes. System 7's File Manager asks the SCSI
+// Manager whether it is busy before it runs a request (_SCSIDispatch selector
+// 14, from its dispatcher in the System heap) and, told yes, leaves the
+// request queued with bit 1 of $0360 set for SCSIComplete to restart. The
+// code that would reach SCSIComplete is the code the injection interrupted,
+// so a synchronous call spins on its ioResult until the step guard gives up
+// and leaves the request, in a parameter block on a stack frame that is gone,
+// at the head of the queue: no file call completes again.
+//
+// The answer selector 14 gives on this ROM is bit 0 of the byte at $61 in the
+// SCSI Manager's globals ($0C0C): the same byte is read here.
+bool Machine::scsiManagerBusy() {
+    const u32 globals = read32(0x0C0C);
+    if (globals == 0 || (globals & 1) || globals + 0x62 > ram_.size()) return false;
+    return (read8(globals + 0x61) & 1) != 0;
+}
+
+// Is the running program about to call its event loop? That is the one
+// moment a trap can be run on its behalf that allocates memory, as _MountVol
+// does for the volume's control block and buffers. Anywhere else the injected
+// call may land inside the Memory Manager: a mount put in at a frame edge
+// that fell in _BlockMove, called from a heap compaction, walked the
+// half-moved heap for good (ROM $40AC78), was given up by the step guard and
+// left its request at the head of the File Manager's queue, so no file call
+// completed again and the machine sat on an empty desktop.
+//
+// The words are _GetNextEvent, _WaitNextEvent, _EventAvail and _SystemTask:
+// calls a program makes from its own level, never from an interrupt.
+bool Machine::atSafePoint() {
+    if ((cpu_.getSR() & 0x0700) != 0) return false;
+    const u16 word = read16(cpu_.pc);
+    return word == 0xA970 || word == 0xA860 || word == 0xA971 || word == 0xA9B4;
+}
+
+// Mount the volumes that are waiting, with the File Manager idle. _MountVol
+// enqueues the new VCB into the volume queue at $0360, which the System only
+// builds when it mounts its startup volume, so the queue has to exist; and a
+// synchronous call injected while the System is inside a File Manager call
+// of its own parks on that queue with its caller spinning on ioResult.
+//
+// The interrupted program's registers are kept: execute68kTrap only saves PC
+// and SR.
+void Machine::mountAtSafePoint() {
+    if (inSony_ || (read8(0x0360) & 1) != 0 || scsiManagerBusy() ||
+        (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
+        return;                                       // asked for again in 90 frames
+    const u8 waiting = mountsWaiting_;
+    mountsWaiting_ = 0;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    if ((waiting & 1) && hdAutoMount_ && hdDriveNum_ != 0 && !hdMounted_) {
+        const u32 pb = stackParamBlock();
+        write16(pb + ioVRefNum, static_cast<u16>(hdDriveNum_));
+        cpu_.a[0] = pb;
+        execute68kTrap(kTrapMountVol);
+        diskEvtResult_ = cpu_.d[0] & 0xFFFF;           // OSErr from _MountVol
+        ++diskEvtPosts_;
+        // 0 = mounted; 0xFFC9 = volOnLinErr (-55) = the volume is already
+        // on line (the System mounted its startup disk itself).
+        if (diskEvtResult_ == 0 || diskEvtResult_ == 0xFFC9) hdMounted_ = true;
+    }
+    if ((waiting & 2) && hd2Installed_ && !hd2Mounted_ && !hd2_.empty()) {
+        const u32 pb = stackParamBlock();
+        write16(pb + ioVRefNum, 5);                   // drive 5
+        cpu_.a[0] = pb;
+        execute68kTrap(kTrapMountVol);
+        const u16 r = static_cast<u16>(cpu_.d[0] & 0xFFFF);
+        ++hd2MountTries_;
+        if (r == 0 || r == 0xFFC9) hd2Mounted_ = true;   // mounted / already on line
+        if (onDiag && (hd2Mounted_ || hd2MountTries_ == 15)) {
+            char b[80];
+            std::snprintf(b, sizeof b, "hd2: mount result %04X after %u tries", r,
+                          hd2MountTries_);
+            onDiag(b);
+        }
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+}
+
 void Machine::execute68kTrap(u16 trap) {
     // Place the A-line word in a scratch cell above the sound buffer, point the
     // PC at it, and step until control returns to the following word. The trap
@@ -2049,27 +2133,11 @@ void Machine::runFrame() {
         read32(0x011C) != 0 && read32(0x011C) < 0x800000) {
         hd2Installed_ = true;
     }
+    // The mount itself waits for a safe point (mountAtSafePoint): this only
+    // says one is wanted, every 90 frames while the volume is not on line.
     if (hd2Installed_ && !hd2Mounted_ && !hd2_.empty() &&
-        systemUp && hd2MountTries_ < 15 && (frameCounter_ % 90) == 45 && !inSony_ &&
-        (read8(0x0360) & 1) == 0 &&
-        (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) != 0xFFFFFFFFu)) {
-        u32 sd[8], sa[8];
-        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-        const u32 pb = stackParamBlock();
-        write16(pb + ioVRefNum, 5);                   // drive 5
-        cpu_.a[0] = pb;
-        execute68kTrap(kTrapMountVol);
-        const u16 r = static_cast<u16>(cpu_.d[0] & 0xFFFF);
-        ++hd2MountTries_;
-        if (r == 0 || r == 0xFFC9) hd2Mounted_ = true;   // mounted / already on-line
-        if (onDiag && (hd2Mounted_ || hd2MountTries_ == 15)) {
-            char b[80];
-            std::snprintf(b, sizeof b, "hd2: mount result %04X after %u tries", r,
-                          hd2MountTries_);
-            onDiag(b);
-        }
-        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
-    }
+        systemUp && hd2MountTries_ < 15 && (frameCounter_ % 90) == 45)
+        mountsWaiting_ |= 2;
 
     // Mount the hard-disk volume once the System's file system is actually ready.
     // _MountVol enqueues the new VCB into a low-memory volume queue at $360 that
@@ -2090,26 +2158,8 @@ void Machine::runFrame() {
     // the disk it was waiting for never read. Waiting for an idle moment costs
     // at most another 90 frames.
     if (hdAutoMount_ && hdDriveNum_ != 0 && !hdMounted_ &&
-        systemUp && diskEvtPosts_ < 15 && (frameCounter_ % 90) == 0 && !inSony_ &&
-        (read8(0x0360) & 1) == 0 &&
-        (((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) != 0xFFFFFFFFu)) {
-        // Mount the hard-disk volume once the System is up (the boot path only
-        // mounts the startup floppy). Preserve the interrupted System's
-        // registers -- execute68kTrap only saves PC/SR, so _MountVol would
-        // otherwise clobber D0-D7/A0-A6 and the System would fault on resume.
-        u32 sd[8], sa[8];
-        for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
-        const u32 pb = stackParamBlock();
-        write16(pb + ioVRefNum, static_cast<u16>(hdDriveNum_));
-        cpu_.a[0] = pb;
-        execute68kTrap(kTrapMountVol);                 // _MountVol drive hdDriveNum_
-        diskEvtResult_ = cpu_.d[0] & 0xFFFF;           // OSErr from _MountVol
-        ++diskEvtPosts_;
-        // 0 = mounted; 0xFFC9 = volOnLinErr (-55) = the volume is already
-        // on-line (a prior async attempt mounted it). Either way we are done.
-        if (diskEvtResult_ == 0 || diskEvtResult_ == 0xFFC9) hdMounted_ = true;
-        for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
-    }
+        systemUp && diskEvtPosts_ < 15 && (frameCounter_ % 90) == 0)
+        mountsWaiting_ |= 1;
 
     u64 target = totalCycles_;
     for (int line = 0; line < kLinesPerFrame; ++line) {

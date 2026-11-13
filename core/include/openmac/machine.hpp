@@ -372,6 +372,12 @@ private:
     void ismService(SonyDrive& d); // move bytes between the ISM FIFO and the surface
     void installHardDisk();       // give the hard disk its deferred mount
     u32 stackParamBlock();        // an 80-byte parameter block on the guest's stack
+    bool scsiManagerBusy();       // the ROM's SCSI Manager is inside a transaction
+    // A volume mount waits for the running program's next event-loop call
+    // (see atSafePoint): bit 0 the hard disk, bit 1 the second disk.
+    bool atSafePoint();
+    void mountAtSafePoint();
+    u8 mountsWaiting_ = 0;
     int sonyPrime(u32 pb, u32 dce);
     int sonyControl(u32 pb, u32 dce);
     int sonyStatus(u32 pb, u32 dce);
