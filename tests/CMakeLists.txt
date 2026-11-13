@@ -45,6 +45,7 @@ add_executable(openmac_unit
     unit/test_dc42.cpp
     unit/test_macbinary.cpp
     unit/test_quadra950.cpp
+    unit/test_se30.cpp
 )
 target_link_libraries(openmac_unit PRIVATE openmac_core doctest::doctest openmac_warnings)
 target_link_libraries(openmac_unit PRIVATE nlohmann_json::nlohmann_json)
@@ -64,6 +65,11 @@ add_executable(openmac_trace950
     boottrace950/main.cpp
 )
 target_link_libraries(openmac_trace950 PRIVATE openmac_core openmac_warnings)
+
+add_executable(openmac_tracese30
+    boottracese30/main.cpp
+)
+target_link_libraries(openmac_tracese30 PRIVATE openmac_core openmac_warnings)
 
 add_executable(openmac_trace030
     boottrace030/main.cpp
