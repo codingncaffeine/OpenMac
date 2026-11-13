@@ -1198,8 +1198,8 @@ public partial class MainWindow : Window
         if (_emulator.TransferDiskLabel is { } tdl)
         {
             MessageBox.Show(this,
-                $"The transfer disk “{tdl}” is using the second SCSI seat. Restart the " +
-                "machine to release it, then turn the drop box on.",
+                $"The dropped disk “{tdl}” is using the second SCSI seat. Take it off " +
+                "with File ▸ Remove Dropped Disk, then turn the drop box on.",
                 "Drop Box", MessageBoxButton.OK, MessageBoxImage.Information);
             DropBoxEnabledItem.IsChecked = false;
             return;
@@ -1311,8 +1311,8 @@ public partial class MainWindow : Window
         if (_emulator.TransferDiskLabel is { } tdl)
         {
             MessageBox.Show(this,
-                $"The transfer disk “{tdl}” is using the second SCSI seat. Restart the " +
-                "machine to release it, then open the folder disk.",
+                $"The dropped disk “{tdl}” is using the second SCSI seat. Take it off " +
+                "with File ▸ Remove Dropped Disk, then open the folder disk.",
                 "Folder Disk", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
@@ -1362,6 +1362,21 @@ public partial class MainWindow : Window
             "The Mac may still show the volume until it restarts — like a SCSI " +
             "drive unplugged while running.",
             "Folder Disk", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    // A dropped file or disk image stays on the second SCSI seat across
+    // restarts, so it needs its own way out: nothing else in the menus names it.
+    private void RemoveDroppedDisk_Click(object sender, RoutedEventArgs e)
+    {
+        if (_emulator.TransferDiskLabel is not { } label) return;
+        if (!_emulator.RemoveTransferDisk(out string error))
+        {
+            Log.Line($"dropped disk not removed: {label} -- {error}");
+            MessageBox.Show(this, $"“{label}” was not removed.\n\n" + error,
+                            "Remove Dropped Disk", MessageBoxButton.OK,
+                            MessageBoxImage.Warning);
+        }
+        UpdateUi();
     }
 
     // ---- drag & drop / media routing ----
@@ -1976,6 +1991,9 @@ public partial class MainWindow : Window
         EjectCdItem.Header = _emulator.CdPath is { } cdPath
             ? $"Eject “{Path.GetFileNameWithoutExtension(cdPath)}”" : "Eject CD";
         CloseFolderDiskItem.IsEnabled = _emulator.FolderDiskPath is not null;
+        RemoveDroppedDiskItem.IsEnabled = _emulator.TransferDiskLabel is not null;
+        RemoveDroppedDiskItem.Header = _emulator.TransferDiskLabel is { } dropped
+            ? $"Remove Dropped Disk “{dropped}”" : "Remove Dropped Disk";
         NetworkingItem.IsChecked = _emulator.NetworkingEnabled;
         NetworkingItem.IsEnabled = classic;
         CdDriveItem.IsEnabled = !fx;
