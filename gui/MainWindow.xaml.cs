@@ -745,6 +745,16 @@ public partial class MainWindow : Window
             return;
         }
         Log.Line("  ROM loaded ok");
+        // OPENMAC_STATE names a saved state to start the first machine of the
+        // session from, so a test begins at a desktop instead of at power-on.
+        // A reset afterwards is an ordinary start.
+        if (!_startStateTried &&
+            Environment.GetEnvironmentVariable("OPENMAC_STATE") is { Length: > 0 } statePath)
+        {
+            _startStateTried = true;
+            if (!_emulator.LoadState(statePath, out string stateError))
+                Log.Line($"[state] not loaded: {statePath} -- {stateError}");
+        }
         // Every boot invalidates any pending Shift release from the last one.
         _bootShiftGen++;
         if (_settings.BootExtensionsOff) HoldBootShift();
@@ -754,6 +764,8 @@ public partial class MainWindow : Window
         BuildMonitorMenu();
         UpdateUi();
     }
+
+    private bool _startStateTried;
 
     private void OpenRom_Click(object sender, RoutedEventArgs e)
     {
