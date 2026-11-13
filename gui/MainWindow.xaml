@@ -173,7 +173,7 @@
                                Foreground="{StaticResource TextPrimary}" HorizontalAlignment="Center" />
                     <Border Width="66" Height="3" Background="{StaticResource Accent}"
                             Margin="0,12" HorizontalAlignment="Center" />
-                    <TextBlock Text="Classic · IIfx · Quadra 650" FontSize="14"
+                    <TextBlock Text="Classic · IIfx · Quadra 650 · Quadra 950" FontSize="14"
                                Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" />
                     <TextBlock Text="File  ▸  Open ROM  to begin" Margin="0,16,0,0"
                                Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" />

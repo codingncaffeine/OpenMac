@@ -610,7 +610,7 @@ public partial class MainWindow : Window
         // The machines take distinct ROMs (Classic and IIfx: 512 KB, Quadra
         // family: 1 MB). Feeding the wrong one wedges the CPU into a white
         // screen with no diagnostics -- refuse it with directions instead.
-        long romLen = new FileInfo(path).Length;
+        long romLen = FileSize.Of(path);
         bool looksQuadra = romLen >= 1024 * 1024;
         uint header = 0;
         if (romLen >= 4)
@@ -771,7 +771,7 @@ public partial class MainWindow : Window
                             "8•24 GC ROM (*.bin;*.rom)|*.bin;*.rom|All files (*.*)|*.*",
                             _settings.VideoRomIifx) is not { } path)
             return;
-        long bytes = new FileInfo(path).Length;
+        long bytes = FileSize.Of(path);
         if (bytes != 32 * 1024 && bytes != 64 * 1024)
         {
             MessageBox.Show(this,
@@ -1094,6 +1094,19 @@ public partial class MainWindow : Window
     /// the drive took the disc.</summary>
     private bool InsertCdFrom(string path)
     {
+        // A Quadra has no machine until a ROM is opened: keep the disc for then
+        // (opening the ROM inserts the remembered one) rather than refuse it.
+        if (_settings.IsQuadra && !_emulator.IsRomLoaded)
+        {
+            _settings.CdRomAttached = true;
+            _settings.LastCd = path;
+            _settings.Save();
+            Log.Line($"cd kept for the next ROM: {path}");
+            MessageBox.Show(this,
+                Path.GetFileName(path) + " goes in the drive when a ROM is opened (File > Open ROM).",
+                "CD-ROM Drive", MessageBoxButton.OK, MessageBoxImage.Information);
+            return true;
+        }
         bool driveWasAttached = _emulator.CdRomAttached;
         if (_emulator.InsertCd(path))
         {
@@ -1398,7 +1411,7 @@ public partial class MainWindow : Window
         }
 
         long size;
-        try { size = new FileInfo(path).Length; } catch { return; }
+        try { size = FileSize.Of(path); } catch { return; }
 
         // With a drop box on the desktop, a loose Mac file simply goes in it --
         // no disk of its own, nothing to throw in the Trash afterwards. Without
@@ -1535,7 +1548,7 @@ public partial class MainWindow : Window
     private bool TransferDrop(string path, bool requireMacBinary)
     {
         long size;
-        try { size = new FileInfo(path).Length; } catch { return false; }
+        try { size = FileSize.Of(path); } catch { return false; }
         if (size > 1_300_000)
         {
             // Too big for a floppy: ride the second SCSI disk instead, sized
