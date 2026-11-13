@@ -231,6 +231,36 @@ public:
 
     ScsiDisk disk;   // the built-in hard disk, first target on the bus
 
+    // The chip's own rule for its data request, for a board that wires the
+    // DRQ pin to hardware (the SE/30 holds a bus cycle on it). When set, a
+    // byte is asked for in DMA mode only while the target's phase is the one
+    // in the Target Command register, and an access through /DACK with no
+    // request pending moves nothing. A request in another phase is the
+    // interrupt, not a data request (NCR 5380 Design Manual, DMA mode).
+    // The same rule gives the chip's receive latch: in DMA mode a byte the
+    // target offers in the expected phase is taken into the Input Data
+    // register and acknowledged at once, so the target's /REQ reads released
+    // while DRQ waits for the processor, and a byte so held is gone when DMA
+    // mode is switched off before it is read. Clear, a request stands for
+    // any pending byte and /REQ for every one: the Classic and the IIfx run
+    // that way, as they always have.
+    bool dmaNeedsPhaseMatch = false;
+    // The target's own time between taking the last Data Out byte and
+    // presenting Status, in the clocks advance() is given. During it the bus
+    // still shows Data Out with /REQ released, which is what the processor
+    // sees of a real drive that is busy writing. 0 = Status at once.
+    int statusDelayClocks = 0;
+
+    // Time passing, for statusDelayClocks. True = the bus changed.
+    bool advance(int clocks) {
+        if (settleLeft_ <= 0) return false;
+        settleLeft_ -= clocks;
+        if (settleLeft_ > 0) return false;
+        settleLeft_ = 0;
+        toStatus();
+        return true;
+    }
+
     // Put another device on the bus alongside the built-in disk. The pointer
     // must outlive the controller; a device leaves the bus by answering
     // present() = false, so nothing ever needs removing.
@@ -243,6 +273,7 @@ public:
     u32 diagWrites = 0;        // total register writes
     u32 diagSelects = 0;       // successful target selections
     u32 diagCommands = 0;      // CDBs executed
+    u32 diagCommandsById[8] = {};   // the same, by the target's ID
     u32 diagDataInBytes = 0;   // bytes handed to the initiator
     u32 diagDataOutBytes = 0;  // bytes taken from the initiator
     u8  diagLastCdb[12] = {};
@@ -264,6 +295,7 @@ public:
         irq_ = false;
         dmaStart_ = DmaStart::None;
         ackCompletion_ = AckCompletion::None;
+        settleLeft_ = 0;
     }
 
     u8 read(int reg) {
@@ -311,10 +343,11 @@ public:
     bool acknowledgeAsserted() const { return (icr_ & 0x10u) != 0; }
     u8 modeRegister() const { return mr_; }
     u8 initiatorCommand() const { return icr_; }
-    bool dmaRequestAsserted() const {
-        return reqAsserted() && (mr_ & 0x02) != 0;
-    }
+    bool dmaRequestAsserted() const { return dmaRequest(); }
     bool phaseMatches() const { return phaseMatch(); }
+    // Register 6 read with chip select and no /DACK: the byte on the bus,
+    // and no handshake.
+    u8 inputDataNoAck() const { return peekDataIn(); }
 
     // /EOP is supplied by the surrounding DMA controller when its byte
     // counter reaches zero.  The 53C80 turns it into a latched IRQ only when
@@ -332,7 +365,11 @@ private:
     // ---- registers -------------------------------------------------------
     void writeMr(u8 v) {
         const u8 prev = mr_;
+        // Leaving DMA mode releases the chip's /ACK: a byte it had already
+        // taken from the target and not yet handed over is lost.
+        const bool heldByte = (prev & 0x02) && !(v & 0x02) && phase_ == DataIn && receiveLatched();
         mr_ = v;
+        if (heldByte) consumeDataIn(true);
         // Arbitration: setting Arbitrate (b0) while the bus is free begins
         // arbitration. With a single initiator we win it immediately (AIP set in the
         // ICR read below, LA never). Clearing it before selection abandons the bus.
@@ -352,6 +389,7 @@ private:
             irq_ = true;
             dmaStart_ = DmaStart::None;
             ackCompletion_ = AckCompletion::None;
+            settleLeft_ = 0;
             return;
         }
         // Selection: the initiator asserts /SEL (b2) with the target ID on the data
@@ -386,7 +424,7 @@ private:
         u8 s = 0;
         if (icr_ & 0x80) s |= 0x80;                 // /RST
         if (phase_ != BusFree) s |= 0x40;           // /BSY (a target holds the bus)
-        if (reqAsserted()) s |= 0x20;               // /REQ
+        if (reqAsserted() && !receiveLatched()) s |= 0x20;   // /REQ
         const u8 pl = phaseLines();                 // MSG,C-D,I-O for the current phase
         if (pl & 0x04) s |= 0x10;                   // /MSG
         if (pl & 0x02) s |= 0x08;                   // /C-D
@@ -397,11 +435,11 @@ private:
     // Bus and Status: b6 DRQ, b4 IRQ, b3 Phase Match, b1 /ATN, b0 /ACK.
     u8 readBsr() const {
         u8 s = 0;
-        if (reqAsserted() && (mr_ & 0x02)) s |= 0x40;   // DRQ (in DMA mode a byte is ready)
+        if (dmaRequest()) s |= 0x40;                    // DRQ (in DMA mode a byte is ready)
         if (irq_) s |= 0x10;                            // IRQ active
         if (phaseMatch()) s |= 0x08;                    // Phase Match
         if (icr_ & 0x02) s |= 0x02;                     // /ATN
-        if (icr_ & 0x10) s |= 0x01;                     // /ACK
+        if ((icr_ & 0x10) || receiveLatched()) s |= 0x01;   // /ACK
         return s;
     }
 
@@ -425,6 +463,7 @@ private:
         ++diagSelects;
         dmaStart_ = DmaStart::None;
         ackCompletion_ = AckCompletion::None;
+        settleLeft_ = 0;
     }
 
     // The three phase lines (MSG,C-D,I-O) the target drives for the current phase.
@@ -462,13 +501,25 @@ private:
         return (tcr_ & 0x07) == phaseLines();
     }
 
+    // The DRQ pin: DMA mode, the target asking, and (see dmaNeedsPhaseMatch)
+    // its phase the expected one.
+    bool dmaRequest() const {
+        return reqAsserted() && (mr_ & 0x02) != 0 && (!dmaNeedsPhaseMatch || phaseMatch());
+    }
+
+    // The chip holds a byte it took from the target in DMA mode and has
+    // acknowledged on its own (see dmaNeedsPhaseMatch).
+    bool receiveLatched() const {
+        return dmaNeedsPhaseMatch && (phaseLines() & 0x01) != 0 && dmaRequest();
+    }
+
     // The ordinary Output Data register only drives the SCSI data bus.  In
     // programmed-I/O mode the target accepts that byte on the following /ACK
     // edge.  A started DMA-send cycle includes its own handshake and therefore
     // consumes the byte immediately.
     void writeDataOut(u8 v) {
         odr_ = v;
-        if ((mr_ & 0x02) && dmaStart_ == DmaStart::Send && reqAsserted())
+        if (dmaStart_ == DmaStart::Send && dmaRequest())
             consumeDataOut(true);
     }
 
@@ -481,6 +532,7 @@ private:
                 else ackCompletion_ = AckCompletion::ExecuteCdb;
             }
         } else if (phase_ == DataOut) {
+            if (settleLeft_ > 0) return;             // the target has all it asked for
             if (xferPos_ < xfer_.size()) {
                 xfer_[xferPos_++] = odr_;
                 ++diagDataOutBytes;
@@ -510,6 +562,7 @@ private:
     // the bus as register 0 does.
     u8 dmaDataIn() {
         const u8 value = peekDataIn();
+        if (dmaNeedsPhaseMatch && !dmaRequest()) return value;   // no request: no handshake
         consumeDataIn(true);
         return value;
     }
@@ -567,6 +620,7 @@ private:
 
     void executeCdb() {
         ++diagCommands;
+        if (sel_) ++diagCommandsById[sel_->id() & 7];
         std::memcpy(diagLastCdb, cdb_, 12);
         diagLastCdbLen = cdbLen_;
         if (diagCdbHistLen < 16) std::memcpy(diagCdbHist[diagCdbHistLen++], cdb_, 12);
@@ -591,7 +645,8 @@ private:
     void finishDataOut() {
         if (writeMode_ && sel_) sel_->acceptWrite(xfer_);
         writeMode_ = false;
-        toStatus();
+        if (statusDelayClocks > 0) settleLeft_ = statusDelayClocks;   // Status follows in advance()
+        else toStatus();
     }
 
     void toStatus() {
@@ -631,6 +686,7 @@ private:
     bool irq_ = false;
     DmaStart dmaStart_ = DmaStart::None;
     AckCompletion ackCompletion_ = AckCompletion::None;
+    int settleLeft_ = 0;         // clocks until Status follows a finished Data Out
 
     static constexpr int kMaxTargets = 8;
     ScsiTarget* targets_[kMaxTargets] = {};

@@ -212,6 +212,141 @@ TEST_CASE("5380 start-DMA does not retroactively interrupt for an asserted REQ")
     CHECK((c.read(5) & 0x10) == 0);
 }
 
+// ---- the chip's own data-request rule (Ncr5380::dmaNeedsPhaseMatch) ----------
+// A board that wires the DRQ pin to hardware sets it; the Classic and the IIfx
+// do not. Each case below is run both ways, so the flag is shown to be what
+// makes the difference.
+
+namespace {
+
+// A disk whose block 1 holds 0, 1, 2 ... so a lost or repeated byte shows.
+std::vector<u8> countingImage() {
+    std::vector<u8> img = ddmImage(8);
+    for (std::size_t i = 0; i < 512; ++i) img[512 + i] = static_cast<u8>(i);
+    return img;
+}
+
+// READ(6) of block 1 from target 0, left in Data In with DMA receive started.
+void startDmaRead(Ncr5380& c) {
+    REQUIRE(select(c, 0));
+    const u8 read6[6] = {0x08, 0, 0, 1, 1, 0};
+    sendCdb(c, read6);
+    REQUIRE(c.phase() == Ncr5380::DataIn);
+    c.write(3, 0x01);   // TCR: Data In
+    c.write(2, 0x02);   // MR: DMA mode
+    c.write(7, 0x00);   // Start DMA Initiator Receive
+}
+
+} // namespace
+
+TEST_CASE("5380 data request, the chip's rule: a byte is asked for only in the expected phase") {
+    for (const bool chipRule : {true, false}) {
+        CAPTURE(chipRule);
+        Ncr5380 c;
+        c.dmaNeedsPhaseMatch = chipRule;
+        auto img = countingImage();
+        c.disk.attach(&img, 0);
+        startDmaRead(c);
+
+        // A byte waits. With the chip's rule it is already in the Input Data
+        // register: the chip answered the target, whose /REQ reads released.
+        CHECK(c.dmaRequestAsserted());
+        CHECK((c.read(5) & 0x40) != 0);                      // BSR: DRQ
+        CHECK(((c.read(4) & 0x20) == 0) == chipRule);        // CSR: /REQ
+        CHECK(((c.read(5) & 0x01) != 0) == chipRule);        // BSR: /ACK, the chip's own
+        for (int i = 0; i < 512; ++i) CHECK(c.read(6) == static_cast<u8>(i));
+
+        // Status is another phase than the Target Command register names.
+        REQUIRE(c.phase() == Ncr5380::Status);
+        CHECK((c.read(4) & 0x20) != 0);                      // /REQ stands either way
+        CHECK(c.dmaRequestAsserted() == !chipRule);
+        CHECK(((c.read(5) & 0x40) != 0) == !chipRule);
+        // A read through /DACK with no request moves nothing; without the
+        // rule it takes the Status byte for data.
+        (void)c.read(6);
+        CHECK((c.phase() == Ncr5380::Status) == chipRule);
+    }
+}
+
+TEST_CASE("5380 data request, the chip's rule: a byte held when DMA mode ends is lost") {
+    for (const bool chipRule : {true, false}) {
+        CAPTURE(chipRule);
+        Ncr5380 c;
+        c.dmaNeedsPhaseMatch = chipRule;
+        auto img = countingImage();
+        c.disk.attach(&img, 0);
+        startDmaRead(c);
+        for (int i = 0; i < 4; ++i) CHECK(c.read(6) == static_cast<u8>(i));
+        // Byte 4 is in the chip, acknowledged. Leaving DMA mode releases
+        // /ACK, the target goes on to byte 5, and byte 4 was never read.
+        c.write(2, 0x00);
+        CHECK((c.read(4) & 0x20) != 0);                      // /REQ again, for the next byte
+        CHECK(receiveByte(c) == (chipRule ? 5 : 4));
+    }
+}
+
+TEST_CASE("5380 data request, the chip's rule: a write through /DACK is taken only in the expected phase") {
+    for (const bool chipRule : {true, false}) {
+        CAPTURE(chipRule);
+        Ncr5380 c;
+        c.dmaNeedsPhaseMatch = chipRule;
+        TestTarget t;
+        c.addTarget(&t);
+        REQUIRE(select(c, 5));
+        const u8 write6[6] = {0x0A, 0, 0, 0, 1, 0};
+        sendCdb(c, write6);
+        REQUIRE(c.phase() == Ncr5380::DataOut);
+        c.write(3, 0x01);                   // Target Command says Data In: the wrong phase
+        c.write(2, 0x02);
+        c.write(5, 0x00);                   // Start DMA Send
+        c.write(0, 0xEE);
+        CHECK(c.xferPos() == (chipRule ? 0u : 1u));   // the chip gave the target nothing
+        c.write(3, 0x00);                   // the right phase: the byte goes
+        c.write(0, 0xEE);
+        CHECK(c.xferPos() == (chipRule ? 1u : 2u));
+    }
+}
+
+TEST_CASE("5380 Status follows a finished Data Out after the target's own time") {
+    for (const int delay : {1000, 0}) {
+        CAPTURE(delay);
+        Ncr5380 c;
+        c.statusDelayClocks = delay;
+        TestTarget t;
+        c.addTarget(&t);
+        REQUIRE(select(c, 5));
+        const u8 write6[6] = {0x0A, 0, 0, 0, 1, 0};
+        sendCdb(c, write6);
+        REQUIRE(c.phase() == Ncr5380::DataOut);
+        c.write(3, 0x00);   // TCR: Data Out
+        c.write(2, 0x02);   // MR: DMA mode
+        c.write(1, 0x01);   // ICR: drive the data bus
+        c.write(5, 0x00);   // Start DMA Send
+        for (int i = 0; i < 512; ++i) c.write(0, static_cast<u8>(i));
+        CHECK(t.accepted.size() == 512);                     // the target has its data
+        if (delay == 0) {
+            CHECK(c.phase() == Ncr5380::Status);             // and says so at once
+            CHECK_FALSE(c.advance(5000));
+            continue;
+        }
+        // The bus still shows Data Out, nothing asked for: a drive busy writing.
+        CHECK(c.phase() == Ncr5380::DataOut);
+        CHECK(c.phaseMatches());
+        CHECK((c.read(4) & 0x20) == 0);
+        CHECK_FALSE(c.dmaRequestAsserted());
+        c.write(0, 0x77);                                    // a byte too many goes nowhere
+        CHECK(t.accepted.size() == 512);
+        CHECK_FALSE(c.advance(999));
+        CHECK(c.phase() == Ncr5380::DataOut);
+        CHECK(c.advance(1));                                 // true: the bus changed
+        CHECK(c.phase() == Ncr5380::Status);
+        CHECK(c.irqAsserted());                              // a new phase in DMA mode
+        CHECK_FALSE(c.advance(5000));
+        c.write(2, 0x00);
+        CHECK(receiveByte(c) == 0x00);                       // GOOD
+    }
+}
+
 TEST_CASE("IIfx SCSI ASIC performs paced misaligned true DMA and exposes EOP") {
     Ncr5380 c;
     auto img = ddmImage(8);
