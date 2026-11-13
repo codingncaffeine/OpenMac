@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include "../../core/src/machine/asc.hpp"
 #include "../../core/src/machine/se30/video.hpp"
 #include "openmac/se30.hpp"
 
@@ -117,21 +118,81 @@ TEST_CASE("SE/30 SCSI: registers at $50F1 0000, data at $50F1 2000, data held fo
     CHECK(m.scsiCounts().bytesIn == 512);
 }
 
-TEST_CASE("SE/30 SCSI: a handshake cycle nobody answers lasts the watchdog's 44 microseconds") {
+TEST_CASE("SE/30 bus timing: what each cycle costs beyond the two clocks the processor counts") {
     Se30Machine m(quietRom(), banks(1, 0));
-    u64 at = m.totalCycles();
-    m.stepInstruction();
-    const u64 plain = m.totalCycles() - at;            // one instruction of the quiet ROM
-    at = m.totalCycles();
-    m.stepInstruction();
-    REQUIRE(m.totalCycles() - at == plain);
-    CHECK_THROWS_AS(m.read8(kScsiHandshake + 0x60), BusFault);
-    at = m.totalCycles();
-    m.stepInstruction();
-    CHECK(m.totalCycles() - at == plain + 689);        // 44 microseconds at 15.6672 MHz
-    at = m.totalCycles();
-    m.stepInstruction();
-    CHECK(m.totalCycles() - at == plain);              // charged once
+    overlayOff(m);
+    setSizeBits(m, 0);                                 // 1 MB in bank A, every byte at its own address
+    (void)m.takeCyclePenalty();
+    const auto cost = [&] { return m.takeCyclePenalty(); };
+
+    // RAM and ROM: one cycle of four clocks whatever the operand's size.
+    (void)m.read32(0x1000);            CHECK(cost() == 2);
+    (void)m.read8(0x1000);             CHECK(cost() == 2);
+    m.write16(0x1000, 0);              CHECK(cost() == 2);
+    (void)m.read32(0x40800000u);       CHECK(cost() == 2);
+    CHECK(cost() == 0);                                // taken once
+    // Devices are 8-bit ports: a cycle a byte, each with its wait states.
+    (void)m.read8(scsiReg(1));         CHECK(cost() == 2);     // SCSI chip: 4 clocks
+    (void)m.read8(0x50F17C00u);        CHECK(cost() == 2);     // floppy chip: 4
+    (void)m.read8(0x50F14800u);        CHECK(cost() == 3);     // sound chip, a read: 5
+    m.write8(0x50F14000u, 0);          CHECK(cost() == 2);     // a write: 4
+    (void)m.read32(0xFE008040u);       CHECK(cost() == 14);    // the screen, a long word: four cycles of 4
+    m.write32(0xFE008040u, 0);         CHECK(cost() == 14);
+    m.write16(0xFE008040u, 0);         CHECK(cost() == 6);
+    // The serial chip: 4 clocks, and a second access is held until 2.2
+    // microseconds (35 clocks) after the first.
+    (void)m.read8(0x50F04002u);        CHECK(cost() == 2);
+    (void)m.read8(0x50F04002u);        CHECK(cost() == 2 + 4 + 35);
+    // A VIA cycle starts on the VIA's clock (20 processor clocks) and ends
+    // half of one later: here the machine stands on an edge.
+    REQUIRE(m.totalCycles() % 20 == 0);
+    (void)m.read8(kVia1 + kIfr);       CHECK(cost() == 10 - 2);
+    // A cycle nobody answers lasts until the watchdog's 44 microseconds.
+    CHECK_THROWS_AS(m.read8(0x58000000u), BusFault);
+    CHECK(cost() == 689);
+    CHECK_THROWS_AS(m.read8(kScsiHandshake + 0x60), BusFault);   // no data request: the same
+    CHECK(cost() == 689);
+}
+
+TEST_CASE("SE/30 bus timing: an instruction fetched from memory is a memory cycle, one from the cache is not") {
+    // The quiet ROM, with a loop of three instructions at $08-$11.
+    std::vector<u8> rom = quietRom();
+    rom[0x10] = 0x60;                                  // BRA.S $08
+    rom[0x11] = 0xF6;
+    const auto clocksFor = [](Se30Machine& m, int instructions) {
+        const u64 at = m.totalCycles();
+        for (int i = 0; i < instructions; ++i) m.stepInstruction();
+        return static_cast<int>(m.totalCycles() - at);
+    };
+    // Caches off: the processor model fetches a word at a time.
+    Se30Machine off(rom, banks(1, 0));
+    (void)clocksFor(off, 12);                          // into the loop
+    const int uncached = clocksFor(off, 30);           // ten times round
+    // Instruction cache on: after the first time round nothing is fetched.
+    Se30Machine on(rom, banks(1, 0));
+    on.cpu().cacr = 0x00000001;
+    (void)clocksFor(on, 12);
+    const int cached = clocksFor(on, 30);
+    // Five words a round, two clocks a word: four for a long word of code.
+    CHECK(uncached - cached == 10 * 5 * 2);
+    // The first time through fresh code with the cache on, a long word (one
+    // ORI.B #0,D0) is one cycle of four clocks, none of which the
+    // processor's own time for the instruction holds.
+    Se30Machine cold(quietRom(), banks(1, 0));
+    cold.cpu().cacr = 0x00000001;
+    (void)clocksFor(cold, 4);
+    const int coldTen = clocksFor(cold, 10);
+    Se30Machine warm(rom, banks(1, 0));                // the same instruction, from the cache
+    warm.cpu().cacr = 0x00000001;
+    (void)clocksFor(warm, 12);
+    int oriCached = 0;
+    for (int i = 0; i < 3; ++i) {                      // one round: two ORIs and the branch
+        const u32 pc = warm.cpu().pc;
+        const int c = clocksFor(warm, 1);
+        if (pc == 0x08) oriCached = c;
+    }
+    REQUIRE(oriCached > 0);
+    CHECK(coldTen == 10 * (oriCached + 4));
 }
 
 TEST_CASE("SE/30 SCSI: the chip's data request is VIA2's CA2 and its interrupt CB2, both high when asserted") {
@@ -198,6 +259,75 @@ TEST_CASE("SE/30 host calls: this ROM's System heap begins at $1E00, and $1EFC i
     CHECK(m.addressingModeSwapped());
     m.write8(0x1EFC, 0x00);
     CHECK_FALSE(m.addressingModeSwapped());
+}
+
+TEST_CASE("SE/30 sound: the chip gives the jack its two channels and the speaker their mix") {
+    Asc asc;
+    constexpr u8 tableValues[4] = {0x10, 0x20, 0x30, 0x40};
+    for (u32 voice = 0; voice < 4; ++voice) asc.write(voice * Asc::kTableBytes, tableValues[voice]);
+    asc.write(0x806, 0xE0);                    // full output level
+    asc.write(0x801, 2);                       // four-voice synthesis, one channel
+    Asc::MixedSample s = asc.pullMixedSample();
+    CHECK(s.mono == 0xA0);                     // all four voices
+    CHECK(s.left == 0xA0);
+    CHECK(s.right == 0xA0);
+
+    asc.write(0x802, 0x02);                    // stereo: two voices a channel
+    s = asc.pullMixedSample();
+    CHECK(s.mono == 0xA0);                     // the speaker's mixer still hears all four
+    CHECK(s.left == 0x70);                     // $10 + $20 about the channel's rest at $40, given about $80
+    CHECK(s.right == 0xB0);                    // $30 + $40
+
+    asc.write(0x801, 1);                       // sampled sound, a buffer a channel
+    asc.write(0x000, 0x90);
+    asc.write(0x400, 0x20);
+    s = asc.pullMixedSample();
+    CHECK(s.left == 0x90);
+    CHECK(s.right == 0x20);
+    CHECK(s.mono == 0x58);                     // their mean
+    s = asc.pullMixedSample();                 // buffers empty: the last sample is held
+    CHECK(s.left == 0x90);
+    CHECK(s.right == 0x20);
+    CHECK(s.mono == 0x58);
+
+    asc.write(0x806, 0x00);                    // output level 0: silence everywhere
+    s = asc.pullMixedSample();
+    CHECK(s.left == 0x80);
+    CHECK(s.right == 0x80);
+    CHECK(s.mono == 0x80);
+}
+
+TEST_CASE("SE/30 sound: the speaker's samples and the jack's are kept and drained apart") {
+    Se30Machine m(quietRom(), banks(1, 0));
+    std::vector<u8> speaker, jack;
+    m.runFrame();
+    m.drainAudio(speaker);
+    CHECK(speaker.size() == 370);              // a sample a line
+    m.drainAudio(speaker);
+    CHECK(speaker.empty());
+    m.drainAudioStereo(jack);                  // the same frame, still there
+    CHECK(jack.size() == 2 * 370);
+    CHECK(std::all_of(jack.begin(), jack.end(), [](u8 v) { return v == 0x80; }));
+    // Nobody listening: each keeps 8192 sample periods and no more.
+    for (int f = 0; f < 30; ++f) m.runFrame();
+    m.drainAudio(speaker);
+    m.drainAudioStereo(jack);
+    CHECK(speaker.size() == 8192);
+    CHECK(jack.size() == 2 * 8192);
+}
+
+TEST_CASE("SE/30 clock: a one-second pulse the System leaves unanswered is counted, with its frame") {
+    Se30Machine m(quietRom(), banks(1, 0));
+    for (int f = 0; f < 61; ++f) m.runFrame();           // the first pulse: its flag is raised
+    CHECK((m.read8(kVia1 + kIfr) & 0x01) != 0);
+    CHECK(m.boardState().secondsUnanswered == 0);
+    for (int f = 0; f < 60; ++f) m.runFrame();           // the second finds it standing
+    Se30Machine::BoardState b = m.boardState();
+    CHECK(b.secondsUnanswered == 1);
+    CHECK(b.unansweredAtFrame[0] == 120);
+    m.write8(kVia1 + kIfr, 0x01);                        // the System answers
+    for (int f = 0; f < 60; ++f) m.runFrame();
+    CHECK(m.boardState().secondsUnanswered == 1);        // the third pulse was the first of a new count
 }
 
 TEST_CASE("SE/30 RAM: the RAM-size bits pick one address line as the bank select") {

@@ -125,7 +125,13 @@ public:
     int screenWidth() const;
     int screenHeight() const;
     void renderScreen(u32* argbOut) const;
+    // Sound, unsigned 8-bit at 22,254.5 Hz: the samples since the last call
+    // of the same kind. drainAudio gives the one speaker, which on this
+    // machine is a mixer's sum of the two channels; drainAudioStereo gives
+    // the stereo jack, left and right in turn. Each keeps at most 8192
+    // sample periods when nobody drains it.
     void drainAudio(std::vector<u8>& out);
+    void drainAudioStereo(std::vector<u8>& out);
 
     // ---- parameter RAM and clock --------------------------------------------
     // The same 268-byte blob as the Quadras': 'PRAM', a version, the 256
@@ -143,6 +149,11 @@ public:
         u32 bankBStart;
         bool mainScreenBuffer, screenInterruptEnabled, screenInterruptRequested;
         u64 screenInterrupts;   // requests raised since reset
+        // One-second pulses of the clock chip that found the pulse before
+        // still unanswered by the System (its count of seconds then falls
+        // one behind the chip's), and the frames of the first eight.
+        u32 secondsUnanswered;
+        std::array<u32, 8> unansweredAtFrame;
     };
     BoardState boardState() const;
 
@@ -156,6 +167,10 @@ public:
     void write8(u32 addr, u8 value) override;
     void write16(u32 addr, u16 value) override;
     void write32(u32 addr, u32 value) override;
+    // The clocks the board's bus cycles took beyond the two the processor
+    // counts for an access, since the last call (wait states, 8-bit ports,
+    // the watchdog).
+    int takeCyclePenalty() override;
 
     static constexpr u32 kNoRam = 0xFFFFFFFFu;
     // Where a RAM-space address lands in the fitted bytes (bank A first,
@@ -175,6 +190,9 @@ private:
     void updateRamDecode();
     void updateScsiLines();
     bool scsiHandshakeCycle();
+    int viaCycleClocks() const;
+    int serialCycleClocks();
+    void chargeAccess(u32 addr);
     bool deviceRead8(u32 addr, u8& out);
     bool deviceWrite8(u32 addr, u8 value);
 
@@ -211,13 +229,18 @@ private:
     int line_ = 0;
     u64 secondAcc_ = 0;
     int secondPulseLines_ = 0;
-    int busWaitClocks_ = 0;    // clocks a bus cycle was held beyond the instruction's own
+    u32 secondsUnanswered_ = 0;
+    std::array<u32, 8> unansweredAtFrame_{};
+    int busWaitClocks_ = 0;    // clocks of bus cycles beyond what the processor counts, not yet taken
+    u64 serialFreeAt_ = 0;     // when the serial chip may be accessed again
+    u64 fetchesCounted_ = 0;   // instruction fetches from memory already charged
     u64 scsiPlainCycles_ = 0, scsiHandshakeCycles_ = 0;
     u32 scsiHandshakeTimeouts_ = 0;
     bool floppyEjectPending_ = false;   // the host's Eject, until the disk is out
     bool floppyEjectAsked_ = false;     // the File Manager has been asked
     int floppyEjectFrames_ = 0;         // frames since the host's Eject
-    std::vector<u8> audioOut_;
+    std::vector<u8> audioOut_;          // the speaker
+    std::vector<u8> audioStereo_;       // the jack: left, right, left, ...
 };
 
 } // namespace openmac

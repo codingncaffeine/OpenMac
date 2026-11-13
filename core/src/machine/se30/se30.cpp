@@ -55,6 +55,27 @@ constexpr u8 kVia2PortB = 0x87;
 // The board ends any bus cycle that lasts 44 microseconds in a bus error
 // (Designing Cards and Drivers, 3rd ed., the SE/30's watchdog timer).
 constexpr int kWatchdogClocks = 689;
+// Bus cycles (Guide to the Macintosh Family Hardware 2nd ed., ch. 3). The
+// processor model counts two clocks for an operand's access and none for an
+// instruction fetch (the 68030 manual's cache-case times); the board's
+// cycles are longer, and takeCyclePenalty() hands the difference over. RAM
+// and ROM answer an asynchronous cycle (three clocks) with one wait state.
+// Every device is an 8-bit port, one cycle a byte: the floppy chip and the
+// SCSI chip with one wait state, the sound chip with two for a read and one
+// for a write; two accesses to the serial chip are held 2.2 microseconds
+// apart; a VIA access starts on the VIA's own 783.36 kHz clock and ends half
+// of one later (the rule the IIfx's VIAs follow). The video RAM's wait
+// states are in no document in hand: it is given the other devices' cycle.
+// With these a real SE/30's Speedometer 3.06 figures are met to within 3%
+// (the dossier, "Speed").
+constexpr int kNominalCycle = 2;
+constexpr int kMemoryCycle = 4;
+constexpr int kDeviceCycle = 4;
+constexpr int kSoundReadCycle = 5;
+constexpr int kSoundWriteCycle = 4;
+constexpr int kSerialCycle = 4;
+constexpr int kSerialGapClocks = 35;
+constexpr int kVideoCycle = 4;
 // A target's time from the last byte of a write to its Status: 100
 // microseconds. A model constant; no document gives a drive's figure, and
 // only its order matters (the ROM reads the phase lines right after the last
@@ -239,6 +260,8 @@ void Se30Machine::resetPeripherals() {
     via2_->setCB2(false);
     secondPulseLines_ = 0;
     busWaitClocks_ = 0;
+    serialFreeAt_ = 0;
+    fetchesCounted_ = cpu_.cacheStats030().instructionMisses;
     updateIpl();
 }
 
@@ -246,13 +269,17 @@ void Se30Machine::reset() {
     rtc_->reset();            // protocol state only; time and parameter RAM survive
     resetPeripherals();
     screenInterrupts_ = 0;
+    secondsUnanswered_ = 0;
+    unansweredAtFrame_ = {};
     totalCycles_ = 0;
     viaRemainder_ = 0;
     lineAcc_ = 0;
     line_ = 0;
     secondAcc_ = 0;
     audioOut_.clear();
+    audioStereo_.clear();
     cpu_.reset();
+    fetchesCounted_ = 0;      // the processor's own counts start again with it
 }
 
 void Se30Machine::updateIpl() {
@@ -295,8 +322,36 @@ bool Se30Machine::scsiHandshakeCycle() {
     ++scsiHandshakeCycles_;
     if (scsi_->dmaRequestAsserted()) return true;
     ++scsiHandshakeTimeouts_;
-    busWaitClocks_ += kWatchdogClocks;
     return false;
+}
+
+// A VIA cycle begins on the next edge of the VIA's clock and ends half a
+// VIA clock later: its length from now, in processor clocks.
+int Se30Machine::viaCycleClocks() const {
+    const u64 now = totalCycles_ + static_cast<u64>(busWaitClocks_ > 0 ? busWaitClocks_ : 0);
+    const int phase = static_cast<int>(now % kClocksPerViaTick);
+    return (kClocksPerViaTick - phase) % kClocksPerViaTick + kClocksPerViaTick / 2;
+}
+
+// The serial chip wants 2.2 microseconds between two accesses: the board
+// holds the second one off for what is left of that.
+int Se30Machine::serialCycleClocks() {
+    const u64 now = totalCycles_ + static_cast<u64>(busWaitClocks_ > 0 ? busWaitClocks_ : 0);
+    int clocks = kSerialCycle;
+    if (now < serialFreeAt_) clocks += static_cast<int>(serialFreeAt_ - now);
+    serialFreeAt_ = now + static_cast<u64>(clocks) + kSerialGapClocks;
+    return clocks;
+}
+
+int Se30Machine::takeCyclePenalty() {
+    // An instruction fetch the 68030's cache could not answer was a memory
+    // cycle too, and the processor's times count none of it: the two clocks
+    // every other access already carries are added here.
+    const u64 fetches = cpu_.cacheStats030().instructionMisses;
+    const int clocks = busWaitClocks_ + static_cast<int>(fetches - fetchesCounted_) * kNominalCycle;
+    fetchesCounted_ = fetches;
+    busWaitClocks_ = 0;
+    return clocks;
 }
 
 // ---- bus ------------------------------------------------------------------------
@@ -330,15 +385,17 @@ bool Se30Machine::deviceRead8(u32 addr, u8& out) {
     if (addr < kDeviceEnd) {
         const u32 off = addr & 0x1FFFFu;
         switch (off >> 13) {
-            case 0: out = via1_->read(static_cast<int>((off >> 9) & 15)); updateIpl(); return true;
-            case 1: out = via2_->read(static_cast<int>((off >> 9) & 15)); updateIpl(); return true;
-            case 2: out = scc_->read(off & 6u); updateIpl(); return true;
+            case 0: busWaitClocks_ += viaCycleClocks(); out = via1_->read(static_cast<int>((off >> 9) & 15)); updateIpl(); return true;
+            case 1: busWaitClocks_ += viaCycleClocks(); out = via2_->read(static_cast<int>((off >> 9) & 15)); updateIpl(); return true;
+            case 2: busWaitClocks_ += serialCycleClocks(); out = scc_->read(off & 6u); updateIpl(); return true;
             case 3:                                    // SCSI data, cycle held for the data request
                 if (!scsiHandshakeCycle()) return false;
+                busWaitClocks_ += kDeviceCycle;
                 out = scsi_->read(6);
                 updateScsiLines();
                 return true;
             case 8: {                                  // SCSI registers
+                busWaitClocks_ += kDeviceCycle;
                 const int reg = static_cast<int>((off >> 4) & 7);
                 // Register 6 without /DACK shows the byte and moves nothing.
                 out = reg == 6 ? scsi_->inputDataNoAck() : scsi_->read(reg);
@@ -347,20 +404,23 @@ bool Se30Machine::deviceRead8(u32 addr, u8& out) {
             }
             case 9:                                    // SCSI data, no wait
                 ++scsiPlainCycles_;
+                busWaitClocks_ += kDeviceCycle;
                 out = scsi_->read(6);
                 updateScsiLines();
                 return true;
-            case 10: out = asc_->read(off & 0xFFFu); return true;
-            case 11: out = floppy_->access(static_cast<int>((off >> 9) & 15), false, 0, totalCycles_); return true;
+            case 10: busWaitClocks_ += kSoundReadCycle; out = asc_->read(off & 0xFFFu); return true;
+            case 11: busWaitClocks_ += kDeviceCycle; out = floppy_->access(static_cast<int>((off >> 9) & 15), false, 0, totalCycles_); return true;
             default: return false;
         }
     }
     if (addr >= kVideoBase) {
         if (addr < kVideoRomBase) {
+            busWaitClocks_ += kVideoCycle;
             out = video_->read(addr);
             return true;
         }
         if (addr <= 0xFEFFFFFFu && !videoRom_.empty()) {
+            busWaitClocks_ += kVideoCycle;
             out = videoRom_[addr & videoRomMask_];
             return true;
         }
@@ -379,95 +439,130 @@ bool Se30Machine::deviceWrite8(u32 addr, u8 value) {
     if (addr < kDeviceEnd) {
         const u32 off = addr & 0x1FFFFu;
         switch (off >> 13) {
-            case 0: via1_->write(static_cast<int>((off >> 9) & 15), value); updateIpl(); return true;
-            case 1: via2_->write(static_cast<int>((off >> 9) & 15), value); updateIpl(); return true;
-            case 2: scc_->write(off & 6u, value); updateIpl(); return true;
+            case 0: busWaitClocks_ += viaCycleClocks(); via1_->write(static_cast<int>((off >> 9) & 15), value); updateIpl(); return true;
+            case 1: busWaitClocks_ += viaCycleClocks(); via2_->write(static_cast<int>((off >> 9) & 15), value); updateIpl(); return true;
+            case 2: busWaitClocks_ += serialCycleClocks(); scc_->write(off & 6u, value); updateIpl(); return true;
             case 3:
                 if (!scsiHandshakeCycle()) return false;
+                busWaitClocks_ += kDeviceCycle;
                 scsi_->write(0, value);
                 updateScsiLines();
                 return true;
             case 8:
+                busWaitClocks_ += kDeviceCycle;
                 scsi_->write(static_cast<int>((off >> 4) & 7), value);
                 updateScsiLines();
                 return true;
             case 9:
                 ++scsiPlainCycles_;
+                busWaitClocks_ += kDeviceCycle;
                 scsi_->write(0, value);
                 updateScsiLines();
                 return true;
-            case 10: asc_->write(off & 0xFFFu, value); return true;
-            case 11: (void)floppy_->access(static_cast<int>((off >> 9) & 15), true, value, totalCycles_); return true;
+            case 10: busWaitClocks_ += kSoundWriteCycle; asc_->write(off & 0xFFFu, value); return true;
+            case 11: busWaitClocks_ += kDeviceCycle; (void)floppy_->access(static_cast<int>((off >> 9) & 15), true, value, totalCycles_); return true;
             default: return false;
         }
     }
     if (addr >= kVideoBase) {
         if (addr < kVideoRomBase) {
+            busWaitClocks_ += kVideoCycle;
             video_->write(addr, value);
             return true;
         }
-        if (addr <= 0xFEFFFFFFu && !videoRom_.empty()) return true;
+        if (addr <= 0xFEFFFFFFu && !videoRom_.empty()) { busWaitClocks_ += kVideoCycle; return true; }
     }
     return false;
 }
 
+// The six bus functions. RAM and ROM are 32 bits wide: one cycle whatever
+// the operand's size. Everything else is an 8-bit port: one cycle a byte,
+// at consecutive addresses, each already counted where the device answered.
+// A cycle nobody answers is ended by the watchdog.
+void Se30Machine::chargeAccess(u32 addr) {
+    busWaitClocks_ += (addr < kRomEnd ? kMemoryCycle : 0) - kNominalCycle;
+}
+
 u8 Se30Machine::read8(u32 addr) {
-    if (identityRam_ && !overlay_ && addr < ram_.size()) return ram_[addr];
+    if (identityRam_ && !overlay_ && addr < ram_.size()) {
+        busWaitClocks_ += kMemoryCycle - kNominalCycle;
+        return ram_[addr];
+    }
     u8 v = 0;
-    if (!deviceRead8(addr, v)) throw BusFault{addr, true, 1};
+    if (!deviceRead8(addr, v)) { busWaitClocks_ += kWatchdogClocks; throw BusFault{addr, true, 1}; }
+    chargeAccess(addr);
     return v;
 }
 
 u16 Se30Machine::read16(u32 addr) {
-    if (identityRam_ && !overlay_ && addr < ram_.size() && ram_.size() - addr >= 2)
+    if (identityRam_ && !overlay_ && addr < ram_.size() && ram_.size() - addr >= 2) {
+        busWaitClocks_ += kMemoryCycle - kNominalCycle;
         return static_cast<u16>((ram_[addr] << 8) | ram_[addr + 1]);
-    // Everything but RAM and ROM is an 8-bit port: the processor makes one
-    // bus cycle per byte, at consecutive addresses.
+    }
     u8 hi = 0, lo = 0;
-    if (!deviceRead8(addr, hi) || !deviceRead8(addr + 1, lo)) throw BusFault{addr, true, 2};
+    if (!deviceRead8(addr, hi) || !deviceRead8(addr + 1, lo)) {
+        busWaitClocks_ += kWatchdogClocks;
+        throw BusFault{addr, true, 2};
+    }
+    chargeAccess(addr);
     return static_cast<u16>((hi << 8) | lo);
 }
 
 u32 Se30Machine::read32(u32 addr) {
-    if (identityRam_ && !overlay_ && addr < ram_.size() && ram_.size() - addr >= 4)
+    if (identityRam_ && !overlay_ && addr < ram_.size() && ram_.size() - addr >= 4) {
+        busWaitClocks_ += kMemoryCycle - kNominalCycle;
         return be32(&ram_[addr]);
+    }
     u32 v = 0;
     for (u32 i = 0; i < 4; ++i) {
         u8 b = 0;
-        if (!deviceRead8(addr + i, b)) throw BusFault{addr, true, 4};
+        if (!deviceRead8(addr + i, b)) { busWaitClocks_ += kWatchdogClocks; throw BusFault{addr, true, 4}; }
         v = (v << 8) | b;
     }
+    chargeAccess(addr);
     return v;
 }
 
 void Se30Machine::write8(u32 addr, u8 value) {
     if (identityRam_ && !overlay_ && addr < ram_.size()) {
+        busWaitClocks_ += kMemoryCycle - kNominalCycle;
         ram_[addr] = value;
         return;
     }
-    if (!deviceWrite8(addr, value)) throw BusFault{addr, false, 1};
+    if (!deviceWrite8(addr, value)) { busWaitClocks_ += kWatchdogClocks; throw BusFault{addr, false, 1}; }
+    chargeAccess(addr);
 }
 
 void Se30Machine::write16(u32 addr, u16 value) {
     if (identityRam_ && !overlay_ && addr < ram_.size() && ram_.size() - addr >= 2) {
+        busWaitClocks_ += kMemoryCycle - kNominalCycle;
         ram_[addr] = static_cast<u8>(value >> 8);
         ram_[addr + 1] = static_cast<u8>(value);
         return;
     }
-    if (!deviceWrite8(addr, static_cast<u8>(value >> 8)) || !deviceWrite8(addr + 1, static_cast<u8>(value)))
+    if (!deviceWrite8(addr, static_cast<u8>(value >> 8)) || !deviceWrite8(addr + 1, static_cast<u8>(value))) {
+        busWaitClocks_ += kWatchdogClocks;
         throw BusFault{addr, false, 2};
+    }
+    chargeAccess(addr);
 }
 
 void Se30Machine::write32(u32 addr, u32 value) {
     if (identityRam_ && !overlay_ && addr < ram_.size() && ram_.size() - addr >= 4) {
+        busWaitClocks_ += kMemoryCycle - kNominalCycle;
         ram_[addr] = static_cast<u8>(value >> 24);
         ram_[addr + 1] = static_cast<u8>(value >> 16);
         ram_[addr + 2] = static_cast<u8>(value >> 8);
         ram_[addr + 3] = static_cast<u8>(value);
         return;
     }
-    for (u32 i = 0; i < 4; ++i)
-        if (!deviceWrite8(addr + i, static_cast<u8>(value >> (8 * (3 - i))))) throw BusFault{addr, false, 4};
+    for (u32 i = 0; i < 4; ++i) {
+        if (!deviceWrite8(addr + i, static_cast<u8>(value >> (8 * (3 - i))))) {
+            busWaitClocks_ += kWatchdogClocks;
+            throw BusFault{addr, false, 4};
+        }
+    }
+    chargeAccess(addr);
 }
 
 // ---- time -----------------------------------------------------------------------
@@ -496,6 +591,11 @@ void Se30Machine::tickDevices(int cpuCycles) {
     if (secondAcc_ >= kCpuHz) {
         secondAcc_ -= kCpuHz;
         rtc_->tickSecond();
+        if (via1_->ifr() & 0x01) {     // the last pulse's flag is still standing
+            if (secondsUnanswered_ < unansweredAtFrame_.size())
+                unansweredAtFrame_[secondsUnanswered_] = static_cast<u32>(frameCounter_);
+            ++secondsUnanswered_;
+        }
         via1_->setCA2(false);          // the clock chip's one-second pulse
         secondPulseLines_ = 2;
         storageSecondTick();
@@ -505,8 +605,12 @@ void Se30Machine::tickDevices(int cpuCycles) {
     while (lineAcc_ >= kClocksPerLine) {
         lineAcc_ -= kClocksPerLine;
         // One sound sample a line: 22,254.5 Hz, the sound chip's own rate.
-        const u8 sample = asc_->pullSample();
-        if (audioOut_.size() < 8192) audioOut_.push_back(sample);
+        const Asc::MixedSample sample = asc_->pullMixedSample();
+        if (audioOut_.size() < 8192) audioOut_.push_back(sample.mono);
+        if (audioStereo_.size() < 2 * 8192) {
+            audioStereo_.push_back(sample.left);
+            audioStereo_.push_back(sample.right);
+        }
         if (secondPulseLines_ > 0 && --secondPulseLines_ == 0) via1_->setCA2(true);
         ++line_;
         if (line_ == kVisibleLines) {
@@ -534,24 +638,25 @@ void Se30Machine::tickDevices(int cpuCycles) {
 
 int Se30Machine::stepInstruction() {
     if (cpu_.pc == 0x4080000Au || (overlay_ && cpu_.pc == romEntry_)) machineStarting();
+    // The board's longer bus cycles reach the processor through
+    // takeCyclePenalty(), inside step(). What the host's own reads and
+    // stores of guest memory added is not machine time and is dropped.
     if (serveStorageHooks(frameCounter_)) {
+        busWaitClocks_ = 0;
         tickDevices(40);
         return 40;
     }
-    int c = cpu_.step();
+    const int c = cpu_.step();
     if (cpu_.heldAtCall) {
         // The CPU stopped in front of a call instead of executing it: the
         // moment work for the host was waiting for (MacHostServices).
         cpu_.heldAtCall = false;
         storageAtCall();
+        busWaitClocks_ = 0;
         return 0;
     }
-    if (busWaitClocks_) {
-        // A bus cycle the board held until its watchdog ended it.
-        c += busWaitClocks_;
-        busWaitClocks_ = 0;
-    }
     tickDevices(c);
+    busWaitClocks_ = 0;
     return c;
 }
 
@@ -670,6 +775,11 @@ void Se30Machine::drainAudio(std::vector<u8>& out) {
     audioOut_.clear();
 }
 
+void Se30Machine::drainAudioStereo(std::vector<u8>& out) {
+    out = std::move(audioStereo_);
+    audioStereo_.clear();
+}
+
 const std::array<u8, 256>& Se30Machine::pram() const { return rtc_->xpram(); }
 
 // 'PRAM', a version, the 256 bytes, then the clock: the Quadras' layout, so
@@ -698,7 +808,7 @@ bool Se30Machine::loadPram(const u8* data, u32 len, u32 addSeconds) {
 
 Se30Machine::BoardState Se30Machine::boardState() const {
     return {sizeBits_, 0x100000u << (2 * sizeBits_), video_->mainBufferShown(), video_->interruptEnabled(),
-            video_->interruptRequested(), screenInterrupts_};
+            video_->interruptRequested(), screenInterrupts_, secondsUnanswered_, unansweredAtFrame_};
 }
 
 std::string Se30Machine::diagnosticReport() const {
@@ -715,7 +825,13 @@ std::string Se30Machine::diagnosticReport() const {
                   via2_->ora(), via2_->ddra(), via2_->orb(), via2_->ddrb(), via2_->acr(), via2_->pcr(), via2_->ifr(), via2_->ier(),
                   video_->mainBufferShown() ? "main" : "alternate", video_->interruptEnabled() ? "enabled" : "off",
                   video_->interruptRequested() ? ", asking" : "", static_cast<unsigned long long>(screenInterrupts_));
-    return b;
+    std::string report = b;
+    char sound[1024];
+    asc_->debugState(sound, sizeof sound);
+    report += "   sound chip: ";
+    report += sound;
+    report += "\n";
+    return report;
 }
 
 } // namespace openmac

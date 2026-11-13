@@ -10,15 +10,18 @@
 //                     [--floppy FILE] [--floppy-writable] [--save-floppy OUT]
 //                     [--floppy-at FRAME FILE]... [--eject-floppy-at FRAME]...
 //                     [--harddisk FILE] [--harddisk2 FILE] [--harddisk2-read-only]
-//                     [--save-harddisk OUT] [--cd FILE] [--eject-cd-at FRAME]
+//                     [--save-harddisk OUT] [--save-harddisk-at FRAME OUT]
+//                     [--cd FILE] [--eject-cd-at FRAME]
 //                     [--guest-restart-at FRAME] [--put-away-disk2-at FRAME]
 //                     [--dropbox DIR] [--dropbox-guest-read FILE] [--net]
 //                     [--gestalt] [--drivers] [--shutdown] [--hd-trace N]
 //                     [--profile FROM TO] [--disasm ADDRESS COUNT]...
 //                     [--traps FRAME COUNT] [--guest-calls] [--driver-over-scsi]
+//                     [--beep-at FRAME]... [--guest-power-off-at FRAME] [--dump-audio OUT.wav]
 //
 // Disk and disc files are read into memory and never written; --save-harddisk
-// writes the first disk as it stands at the end. --dropbox builds a volume
+// writes the first disk as it stands at the end, --save-harddisk-at as it
+// stands before a frame. --dropbox builds a volume
 // from a host folder and puts it on the second hard-disk seat, as the front
 // end's drop box does; --dropbox-guest-read has the guest read one of its
 // files back at the end. --net attaches the SCSI Ethernet adapter (ID 4).
@@ -32,6 +35,13 @@
 // --guest-calls (with --log) reports each call the machine runs on the guest
 // CPU for the host, going in and coming out. --driver-over-scsi leaves the
 // hard disks' own driver to move every block over the SCSI bus.
+//
+// The sound output is always summarized: how many samples came out of the
+// speaker and each stretch of anything but silence (stretches end after 0.2 s
+// of silence) with its length and loudest sample, and how the stereo jack's
+// two channels compare. --dump-audio writes the jack's two channels to a WAV
+// file. --beep-at has the guest play its alert sound; --guest-power-off-at has
+// it make the call the Finder's Shut Down ends in.
 //
 // A floppy file is never changed: a writable disk lives in memory and goes to
 // --save-floppy at the end, in the file format it came in.
@@ -88,6 +98,10 @@ int main(int argc, char** argv) {
     std::string hdPath, hd2Path, hdOut, cdPath, dropBoxDir, dropBoxGuestRead;
     bool hd2ReadOnly = false, netAttach = false, askGestalt = false, showDrivers = false, doShutdown = false;
     int ejectCdAt = -1, guestRestartAt = -1, putAwayDisk2At = -1, hdTrace = 0;
+    int guestPowerOffAt = -1, hdOutAtFrame = -1;
+    std::vector<int> beeps;         // frames at which the alert sound is asked for, in order
+    std::string hdOutAt;
+    std::string wavPath;
     int profileFrom = -1, profileTo = -1;
     std::map<u32, u64> profile;
     std::vector<std::pair<u32, int>> listings;
@@ -128,6 +142,7 @@ int main(int argc, char** argv) {
         else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
         else if (a == "--harddisk2-read-only") hd2ReadOnly = true;
         else if (a == "--save-harddisk" && i + 1 < argc) hdOut = argv[++i];
+        else if (a == "--save-harddisk-at" && i + 2 < argc) { hdOutAtFrame = std::atoi(argv[++i]); hdOutAt = argv[++i]; }
         else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
         else if (a == "--eject-cd-at" && i + 1 < argc) ejectCdAt = std::atoi(argv[++i]);
         else if (a == "--guest-restart-at" && i + 1 < argc) guestRestartAt = std::atoi(argv[++i]);
@@ -140,6 +155,9 @@ int main(int argc, char** argv) {
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--hd-trace" && i + 1 < argc) hdTrace = std::atoi(argv[++i]);
         else if (a == "--guest-calls") guestCalls = true;
+        else if (a == "--beep-at" && i + 1 < argc) beeps.push_back(std::atoi(argv[++i]));
+        else if (a == "--guest-power-off-at" && i + 1 < argc) guestPowerOffAt = std::atoi(argv[++i]);
+        else if (a == "--dump-audio" && i + 1 < argc) wavPath = argv[++i];
         else if (a == "--driver-over-scsi") driverOverScsi = true;
         else if (a == "--profile" && i + 2 < argc) { profileFrom = std::atoi(argv[++i]); profileTo = std::atoi(argv[++i]); }
         else if (a == "--traps" && i + 2 < argc) { trapsFrom = std::atoi(argv[++i]); trapsLeft = std::atoi(argv[++i]); }
@@ -259,12 +277,17 @@ int main(int argc, char** argv) {
     std::vector<u32> px(static_cast<std::size_t>(mac.screenWidth()) * static_cast<std::size_t>(mac.screenHeight()));
     std::map<u32, int> hashes;   // picture -> first frame seen
     u32 lastHash = 0;            // the frame before's
-    std::vector<u8> audio;
+    std::vector<u8> audio, audioChunk, stereo, stereoChunk;
     int ejectsSeen = 0;
-    u64 audioSamples = 0, loudSamples = 0;
     bool disk2PutAwaySeen = false;
     for (int f = 0; f < frames; ++f) {
         lastFrame = static_cast<u32>(f);
+        if (hdOutAtFrame == f) {
+            const std::vector<u8>& image = mac.hardDiskImage();
+            std::ofstream out(hdOutAt, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
+            std::printf("frame %d: hard disk saved: %s (%zu bytes)\n", f, hdOutAt.c_str(), image.size());
+        }
         if (ejectCdAt == f) {
             mac.ejectCd();
             std::printf("cd eject asked for at frame %d\n", f);
@@ -280,6 +303,14 @@ int main(int argc, char** argv) {
         if (guestRestartAt >= 0 && f >= guestRestartAt && mac.guestRestart()) {
             std::printf("guest restart at frame %d\n", f);
             guestRestartAt = -1;
+        }
+        if (guestPowerOffAt >= 0 && f >= guestPowerOffAt && mac.guestPowerOff()) {
+            std::printf("guest asked to switch off at frame %d\n", f);
+            guestPowerOffAt = -1;
+        }
+        if (!beeps.empty() && f >= beeps.front() && mac.systemBeep()) {
+            std::printf("alert sound asked for at frame %d\n", f);
+            beeps.erase(beeps.begin());
         }
         for (const MouseEvent& e : mouse) if (e.frame == f) mac.mouseEvent(e.dx, e.dy, e.button);
         for (const KeyEvent& e : keys) if (e.frame == f) mac.keyEvent(e.code, e.down);
@@ -303,9 +334,10 @@ int main(int argc, char** argv) {
         // the first frames.
         if ((chimeReached || testFailed) && (profileFrom < 0 || f >= profileTo) && mac.cpu().onStep)
             mac.cpu().onStep = nullptr;
-        mac.drainAudio(audio);
-        audioSamples += audio.size();
-        for (u8 s : audio) if (s < 0x7C || s > 0x84) ++loudSamples;
+        mac.drainAudio(audioChunk);
+        audio.insert(audio.end(), audioChunk.begin(), audioChunk.end());
+        mac.drainAudioStereo(stereoChunk);
+        stereo.insert(stereo.end(), stereoChunk.begin(), stereoChunk.end());
         if (hashFrom >= 0 && f + 1 >= hashFrom) {
             mac.renderScreen(px.data());
             const u32 h = pictureHash(px);
@@ -336,8 +368,67 @@ int main(int argc, char** argv) {
                 board.screenInterruptEnabled ? "enabled" : "off",
                 static_cast<unsigned long long>(board.screenInterrupts),
                 static_cast<unsigned long long>(mac.frameCount()));
-    std::printf("sound: %llu samples, %llu off the center line\n", static_cast<unsigned long long>(audioSamples),
-                static_cast<unsigned long long>(loudSamples));
+    {
+        // The speaker: every stretch in which the signal moves. A level that
+        // is merely held (the chip keeps its last sample when its buffers run
+        // empty) is silence to a speaker behind a capacitor, whatever it is.
+        constexpr double rate = 22254.5;
+        constexpr std::size_t gap = 4451;            // 0.2 s without movement ends a stretch
+        std::printf("sound: %zu samples in %u frames\n", audio.size(), lastFrame + 1);
+        std::size_t start = 0, last = 0;
+        int low = 255, high = 0, shown = 0;
+        bool in = false;
+        const auto close = [&] {
+            if (!in) return;
+            in = false;
+            if (++shown > 12) return;
+            std::printf("sound heard: %.2f to %.2f s, %zu samples, swing %d of 255\n",
+                        static_cast<double>(start) / rate, static_cast<double>(last + 1) / rate, last - start + 1,
+                        high - low);
+        };
+        for (std::size_t k = 1; k < audio.size(); ++k) {
+            if (audio[k] == audio[k - 1]) {
+                if (in && k - last > gap) close();
+                continue;
+            }
+            if (!in) { in = true; start = k - 1; low = high = audio[k - 1]; }
+            last = k;
+            low = std::min<int>(low, audio[k]);
+            high = std::max<int>(high, audio[k]);
+        }
+        close();
+        if (shown > 12) std::printf("sound heard: %d stretches in all\n", shown);
+        // The jack: does each channel move, and are they one signal or two?
+        std::size_t leftMoves = 0, rightMoves = 0, differ = 0;
+        for (std::size_t k = 2; k + 1 < stereo.size(); k += 2) {
+            if (stereo[k] != stereo[k - 2]) ++leftMoves;
+            if (stereo[k + 1] != stereo[k - 1]) ++rightMoves;
+            if (stereo[k] != stereo[k + 1]) ++differ;
+        }
+        std::printf("sound, stereo jack: %zu sample pairs, left moving in %zu, right in %zu, the two differ in %zu\n",
+                    stereo.size() / 2, leftMoves, rightMoves, differ);
+    }
+    if (up) {
+        // The clock chip's seconds against the System's own (Time, $020C),
+        // and the one-second pulses the System let go by.
+        std::printf("clock: the System's Time is %u s, %.1f s of machine time have passed", mac.read32(0x020C),
+                    static_cast<double>(mac.totalCycles()) / 15667200.0);
+        std::printf("; %u one-second pulses went unanswered", board.secondsUnanswered);
+        for (u32 k = 0; k < board.secondsUnanswered && k < board.unansweredAtFrame.size(); ++k)
+            std::printf("%s%u", k ? ", " : " (frames ", board.unansweredAtFrame[k]);
+        std::printf("%s\n", board.secondsUnanswered ? ")" : "");
+    }
+    if (!wavPath.empty()) {
+        // PCM, 8 bits unsigned, two channels, at the machine's 22.25 kHz.
+        std::ofstream wav(wavPath, std::ios::binary);
+        const u32 n = static_cast<u32>(stereo.size()), wavRate = 22255;
+        const auto le32 = [&](u32 v) { for (int k = 0; k < 4; ++k) wav.put(static_cast<char>(v >> (8 * k))); };
+        const auto le16 = [&](u32 v) { for (int k = 0; k < 2; ++k) wav.put(static_cast<char>(v >> (8 * k))); };
+        wav.write("RIFF", 4); le32(36 + n); wav.write("WAVEfmt ", 8); le32(16); le16(1); le16(2);
+        le32(wavRate); le32(wavRate * 2); le16(2); le16(8); wav.write("data", 4); le32(n);
+        wav.write(reinterpret_cast<const char*>(stereo.data()), static_cast<std::streamsize>(n));
+        std::printf("sound saved: %s (%u sample pairs)\n", wavPath.c_str(), n / 2);
+    }
     if (up) {
         // What the guest believes about its screen (ScrnBase $0824, ScreenRow
         // $0106), its pointer (Mouse $0830: vertical, horizontal; MBState
