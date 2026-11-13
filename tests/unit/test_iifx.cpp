@@ -8,7 +8,7 @@
 #include "../../core/src/machine/dc42.hpp"
 #include "../../core/src/machine/adb_bus.hpp"
 #include "../../core/src/machine/iifx/am29000.hpp"
-#include "../../core/src/machine/iifx/asc.hpp"
+#include "../../core/src/machine/asc.hpp"
 #include "../../core/src/machine/iop.hpp"
 #include "../../core/src/machine/iop_floppy.hpp"
 #include "../../core/src/machine/iop_serial.hpp"

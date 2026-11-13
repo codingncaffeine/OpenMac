@@ -18,7 +18,7 @@
 #include "../quadra/easc.hpp"
 #include "../quadra/scc.hpp"
 #include "../adb_bus.hpp"
-#include "asc.hpp"
+#include "../asc.hpp"
 #include "../iop.hpp"
 #include "../iop_floppy.hpp"
 #include "nubus_video.hpp"
