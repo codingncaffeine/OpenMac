@@ -7,13 +7,20 @@
 //                     [--frames N] [--shot OUT.ppm] [--pram FILE] [--save-pram FILE]
 //                     [--log] [--report] [--hashes FROM STEP] [--peek ADDRESS COUNT]...
 //                     [--mouse-at FRAME DX DY BUTTON]... [--key-at FRAME CODE down|up]...
+//                     [--floppy FILE] [--floppy-writable] [--save-floppy OUT]
+//                     [--floppy-at FRAME FILE]... [--eject-floppy-at FRAME]...
+//
+// A floppy file is never changed: a writable disk lives in memory and goes to
+// --save-floppy at the end, in the file format it came in.
 //
 // --ram takes one of the totals the machine offers (1 2 4 5 8 16 17 20 32 65
 // 68 80 128); --banks gives the two SIMM banks in megabytes (0, 1, 4, 16 or
 // 64) for sets the machine does not offer. --vrom is the 8 KB video ROM;
 // without it slot $E is empty. --hashes prints the distinct pictures seen
-// from frame FROM on, sampled every STEP frames. --peek prints guest memory
-// at the end.
+// from frame FROM on, sampled every STEP frames; a picture counts only when
+// the frame before showed the same one, so a frame that ends in the middle
+// of a redraw is not taken for a picture. --peek prints guest memory at the
+// end.
 //
 // The start-up tests' verdict is read where the ROM takes it: a failed test
 // jumps to ROM $2C3C with the test's number in D7 and the failing bits in
@@ -50,7 +57,9 @@ struct KeyEvent { int frame; u8 code; bool down; };
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string romPath, vromPath, shotPath, pramIn, pramOut;
+    std::string romPath, vromPath, shotPath, pramIn, pramOut, floppyPath, floppyOut;
+    bool floppyWritable = false;
+    std::vector<std::pair<int, std::string>> floppyEvents;   // frame, file ("" = eject)
     int frames = 600;
     u32 bankA = 4, bankB = 4;
     bool log = false, report = false;
@@ -77,6 +86,11 @@ int main(int argc, char** argv) {
         else if (a == "--shot" && i + 1 < argc) shotPath = argv[++i];
         else if (a == "--pram" && i + 1 < argc) pramIn = argv[++i];
         else if (a == "--save-pram" && i + 1 < argc) pramOut = argv[++i];
+        else if (a == "--floppy" && i + 1 < argc) floppyPath = argv[++i];
+        else if (a == "--floppy-writable") floppyWritable = true;
+        else if (a == "--save-floppy" && i + 1 < argc) floppyOut = argv[++i];
+        else if (a == "--floppy-at" && i + 2 < argc) { const int f = std::atoi(argv[++i]); floppyEvents.emplace_back(f, argv[++i]); }
+        else if (a == "--eject-floppy-at" && i + 1 < argc) floppyEvents.emplace_back(std::atoi(argv[++i]), "");
         else if (a == "--log") log = true;
         else if (a == "--report") report = true;
         else if (a == "--hashes" && i + 2 < argc) { hashFrom = std::atoi(argv[++i]); hashStep = std::atoi(argv[++i]); }
@@ -121,6 +135,12 @@ int main(int argc, char** argv) {
     u32 lastFrame = 0;
     if (log) mac.onDiag = [&](const char* m) { std::printf("f=%u pc=%08X %s\n", lastFrame, mac.cpu().pc, m); };
 
+    if (!floppyPath.empty()) {
+        const bool ok = mac.insertFloppy(tracetools::loadFile(floppyPath.c_str()), !floppyWritable);
+        std::printf("floppy %s: %s\n", floppyPath.c_str(), ok ? "inserted" : "NOT a floppy image");
+        if (!ok) return 2;
+    }
+
     // The verdict of the start-up tests, read at the ROM's own two exits.
     bool testFailed = false, chimeReached = false;
     u32 failedTest = 0, failedBits = 0;
@@ -139,12 +159,28 @@ int main(int argc, char** argv) {
 
     std::vector<u32> px(static_cast<std::size_t>(mac.screenWidth()) * static_cast<std::size_t>(mac.screenHeight()));
     std::map<u32, int> hashes;   // picture -> first frame seen
+    u32 lastHash = 0;            // the frame before's
     std::vector<u8> audio;
+    int ejectsSeen = 0;
     u64 audioSamples = 0, loudSamples = 0;
     for (int f = 0; f < frames; ++f) {
         lastFrame = static_cast<u32>(f);
         for (const MouseEvent& e : mouse) if (e.frame == f) mac.mouseEvent(e.dx, e.dy, e.button);
         for (const KeyEvent& e : keys) if (e.frame == f) mac.keyEvent(e.code, e.down);
+        for (const auto& [at, file] : floppyEvents) {
+            if (at != f) continue;
+            if (file.empty()) {
+                mac.ejectFloppy();
+                std::printf("frame %d: floppy taken out by the host\n", f);
+            } else {
+                const bool ok = mac.insertFloppy(tracetools::loadFile(file.c_str()), !floppyWritable);
+                std::printf("frame %d: floppy %s %s\n", f, file.c_str(), ok ? "inserted" : "NOT a floppy image");
+            }
+        }
+        if (static_cast<int>(mac.floppyEjects()) != ejectsSeen) {
+            ejectsSeen = static_cast<int>(mac.floppyEjects());
+            std::printf("frame %d: the Macintosh ejected the floppy\n", f);
+        }
         mac.runFrame();
         if (mac.cpu().halted) break;
         // The hook costs a call per instruction; both exits are passed in
@@ -153,9 +189,11 @@ int main(int argc, char** argv) {
         mac.drainAudio(audio);
         audioSamples += audio.size();
         for (u8 s : audio) if (s < 0x7C || s > 0x84) ++loudSamples;
-        if (hashFrom >= 0 && f >= hashFrom && (f - hashFrom) % hashStep == 0) {
+        if (hashFrom >= 0 && f + 1 >= hashFrom) {
             mac.renderScreen(px.data());
-            hashes.emplace(pictureHash(px), f);
+            const u32 h = pictureHash(px);
+            if (f >= hashFrom && (f - hashFrom) % hashStep == 0 && h == lastHash) hashes.emplace(h, f);
+            lastHash = h;
         }
     }
 
@@ -192,6 +230,40 @@ int main(int argc, char** argv) {
                     static_cast<s16>(mac.read16(0x0830)), (mac.read8(0x0172) & 0x80) ? "up" : "down",
                     mac.read32(0x0174), mac.read32(0x0178), mac.read32(0x016A));
     }
+    {
+        const Se30Machine::FloppyCounts fc = mac.floppyCounts();
+        std::printf("floppy: %s, %llu bytes read, %llu written, %u tracks put back, head on track %d, chip in %s mode, %u ejects by the Macintosh\n",
+                    mac.floppyPresent() ? "disk in the drive" : "drive empty", static_cast<unsigned long long>(fc.bytesRead),
+                    static_cast<unsigned long long>(fc.bytesWritten), fc.tracksWritten, fc.track,
+                    fc.secondRegisterSet ? "ISM" : "IWM", mac.floppyEjects());
+    }
+    if (up) {
+        // What the guest has running and mounted: the current application's
+        // name (CurApName $0910) and the volume names down the VCB queue ($0356).
+        const auto pascal = [&](u32 at, u32 limit) {
+            std::string text;
+            try {
+                const u32 n = mac.read8(at);
+                if (n > limit) return text;
+                for (u32 k = 1; k <= n; ++k) {
+                    const u8 c = mac.read8(at + k);
+                    text += (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?';
+                }
+            } catch (const BusFault&) {
+            }
+            return text;
+        };
+        std::string volumes;
+        try {
+            u32 vcb = mac.read32(0x0358) & 0x00FFFFFFu;
+            for (int n = 0; n < 8 && vcb != 0 && vcb < mac.ramBytes(); ++n) {
+                volumes += (volumes.empty() ? "" : ", ") + pascal(vcb + 44, 27);
+                vcb = mac.read32(vcb) & 0x00FFFFFFu;
+            }
+        } catch (const BusFault&) {
+        }
+        std::printf("guest: application '%s', volumes [%s]\n", pascal(0x0910, 31).c_str(), volumes.c_str());
+    }
     std::printf("end: frame %llu pc=%08X sr=%04X overlay=%d%s\n", static_cast<unsigned long long>(mac.frameCount()),
                 mac.cpu().pc, mac.cpu().getSR(), mac.overlayActive() ? 1 : 0, mac.cpu().halted ? " HALTED" : "");
     if (report) std::fputs(mac.diagnosticReport().c_str(), stdout);
@@ -216,6 +288,12 @@ int main(int argc, char** argv) {
             out.write(rgb, 3);
         }
         std::printf("screen written to %s\n", shotPath.c_str());
+    }
+    if (!floppyOut.empty()) {
+        const std::vector<u8> file = mac.floppyForWriteBack();
+        std::ofstream out(floppyOut, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+        std::printf("floppy written to %s (%zu bytes)\n", floppyOut.c_str(), file.size());
     }
     if (!pramOut.empty()) {
         std::vector<u8> blob(Se30Machine::kPramBlobBytes);

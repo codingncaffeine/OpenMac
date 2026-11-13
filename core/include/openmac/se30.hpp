@@ -12,8 +12,7 @@
 // and Drivers for the Macintosh Family 3rd ed., Apple Technical Notes HW14
 // and HW25, MAME and Linux as behavioral references). Clean-room.
 //
-// Under construction: the floppy drive, disks on the SCSI bus, and sound
-// output to the host follow.
+// Under construction: disks on the SCSI bus follow.
 
 #include "openmac/bus040.hpp"
 #include "openmac/cpu030.hpp"
@@ -35,7 +34,7 @@ class AdbViaPort;
 class Scc8530;
 class Ncr5380;
 class Asc;
-class Iwm;
+class DirectFloppy;
 class Se30Video;
 
 class Se30Machine final : public IBus040, public MacHostServices {
@@ -77,6 +76,30 @@ public:
     void keyEvent(u8 adbCode, bool down);
     void mouseEvent(int dx, int dy, bool button);
 
+    // The internal SuperDrive: 400K, 800K or 1.44 MB of sectors, bare or in
+    // a DiskCopy 4.2 or MacBinary file. False = not a floppy image.
+    bool insertFloppy(std::vector<u8> image, bool readOnly = false);
+    // The host's Eject. A disk whose volume is on line is not pulled out
+    // from under the System (the drive has no way to lose a disk but its own
+    // eject motor, and the ROM's driver never looks again): the File Manager
+    // is asked to flush and eject it at the guest's next event call, and the
+    // mechanism throws it out under a second later. A disk with no volume on
+    // line comes out at once, and so does one the Macintosh has not ejected
+    // four seconds after being asked. floppyPresent() says when it is out;
+    // floppyEjects() counts the mechanism's own ejects.
+    void ejectFloppy();
+    bool floppyPresent() const;
+    u32 floppyEjects() const;
+    // The disk's sectors as they are now (the ejected disk's, once it is out).
+    const std::vector<u8>& floppySectors();
+    // The same in the file format the disk came in: what goes back to the
+    // host file.
+    std::vector<u8> floppyForWriteBack();
+    // Bytes moved between the floppy chip and the disk, and tracks put back
+    // into the disk's sectors.
+    struct FloppyCounts { u64 bytesRead, bytesWritten; u32 tracksWritten; bool secondRegisterSet; int track; };
+    FloppyCounts floppyCounts() const;
+
     int screenWidth() const;
     int screenHeight() const;
     void renderScreen(u32* argbOut) const;
@@ -117,8 +140,13 @@ public:
     // then bank B), or kNoRam for an empty bank.
     u32 ramIndex(u32 addr) const;
 
+protected:
+    bool boardWorkWanted() override;
+    void boardWorkAtCall() override;
+
 private:
     void wireDevices();
+    void askGuestToEjectFloppy();
     void resetPeripherals();
     void tickDevices(int cpuCycles);
     void updateIpl();
@@ -145,7 +173,7 @@ private:
     std::unique_ptr<Scc8530> scc_;
     std::unique_ptr<Ncr5380> scsi_;
     std::unique_ptr<Asc> asc_;
-    std::unique_ptr<Iwm> swim_;
+    std::unique_ptr<DirectFloppy> floppy_;
     std::unique_ptr<Se30Video> video_;
     M68030 cpu_;
 
@@ -158,6 +186,9 @@ private:
     int line_ = 0;
     u64 secondAcc_ = 0;
     int secondPulseLines_ = 0;
+    bool floppyEjectPending_ = false;   // the host's Eject, until the disk is out
+    bool floppyEjectAsked_ = false;     // the File Manager has been asked
+    int floppyEjectFrames_ = 0;         // frames since the host's Eject
     std::vector<u8> audioOut_;
 };
 

@@ -3,7 +3,7 @@
 #include "../adb.hpp"
 #include "../adb_via.hpp"
 #include "../asc.hpp"
-#include "../iwm.hpp"
+#include "../direct_floppy.hpp"
 #include "../quadra/scc.hpp"
 #include "../rtc.hpp"
 #include "../scsi.hpp"
@@ -96,7 +96,7 @@ Se30Machine::Se30Machine(std::vector<u8> rom, const Config& cfg)
       scc_(std::make_unique<Scc8530>()),
       scsi_(std::make_unique<Ncr5380>()),
       asc_(std::make_unique<Asc>()),
-      swim_(std::make_unique<Iwm>()),
+      floppy_(std::make_unique<DirectFloppy>(kCpuHz)),
       video_(std::make_unique<Se30Video>()),
       cpu_(*this) {
     ram_.assign(static_cast<std::size_t>(bankA_) + bankB_, 0);
@@ -136,6 +136,7 @@ void Se30Machine::wireDevices() {
         // overlay on. Bit 6 picks the screen buffer.
         overlay_ = !(ddr & 0x10) || (value & 0x10);
         video_->selectMainBuffer(!(ddr & 0x40) || (value & 0x40));
+        floppy_->setHeadSelect((value & 0x20) != 0);      // bit 5: the drive's SEL line
     };
     via1_->outB = [this](u8 value, u8 ddr) {
         const u8 eff = static_cast<u8>(value | ~ddr);
@@ -169,6 +170,7 @@ void Se30Machine::wireDevices() {
         updateIpl();
     };
     asc_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
+    floppy_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     scc_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     scc_->setClocks(kCpuHz, 3672000);
 
@@ -190,11 +192,8 @@ void Se30Machine::resetPeripherals() {
     scc_->reset();
     scsi_->reset();
     asc_->reset();
-    {
-        // No drive yet: the sense line reads "no disk" whatever is asked.
-        swim_->reset();
-        swim_->senseHigh = true;
-    }
+    floppy_->reset();
+    floppy_->setHeadSelect(false);
     // The lines' resting levels, set after the reset so no edge is latched:
     // the slot and sound requests rest high; the SCSI chip's two outputs are
     // active high and rest low.
@@ -284,7 +283,7 @@ bool Se30Machine::deviceRead8(u32 addr, u8& out) {
             case 8: out = scsi_->read(static_cast<int>((off >> 4) & 7)); return true;
             case 9: out = scsi_->read(6); return true;                       // data
             case 10: out = asc_->read(off & 0xFFFu); return true;
-            case 11: out = swim_->access(static_cast<int>((off >> 9) & 15), false, 0); return true;
+            case 11: out = floppy_->access(static_cast<int>((off >> 9) & 15), false, 0, totalCycles_); return true;
             default: return false;
         }
     }
@@ -319,7 +318,7 @@ bool Se30Machine::deviceWrite8(u32 addr, u8 value) {
             case 8: scsi_->write(static_cast<int>((off >> 4) & 7), value); return true;
             case 9: scsi_->write(0, value); return true;
             case 10: asc_->write(off & 0xFFFu, value); return true;
-            case 11: (void)swim_->access(static_cast<int>((off >> 9) & 15), true, value); return true;
+            case 11: (void)floppy_->access(static_cast<int>((off >> 9) & 15), true, value, totalCycles_); return true;
             default: return false;
         }
     }
@@ -436,6 +435,17 @@ void Se30Machine::tickDevices(int cpuCycles) {
         } else if (line_ >= kLinesPerFrame) {
             line_ = 0;
             ++frameCounter_;
+            if (floppyEjectPending_) {
+                // Four seconds for the Macintosh to act on the host's Eject,
+                // then the disk is taken out regardless.
+                if (!floppy_->present()) {
+                    floppyEjectPending_ = false;
+                } else if (++floppyEjectFrames_ > 240) {
+                    floppyEjectPending_ = false;
+                    if (onDiag) onDiag("floppy: the Macintosh did not eject the disk; taken out");
+                    floppy_->eject();
+                }
+            }
             storageFrameTick();
         }
     }
@@ -472,6 +482,80 @@ void Se30Machine::runFrame() {
 
 void Se30Machine::keyEvent(u8 adbCode, bool down) { adb_->injectKey(adbCode, down); }
 void Se30Machine::mouseEvent(int dx, int dy, bool button) { adb_->injectMouse(dx, dy, button); }
+
+bool Se30Machine::insertFloppy(std::vector<u8> image, bool readOnly) {
+    return floppy_->insert(std::move(image), readOnly);
+}
+void Se30Machine::ejectFloppy() {
+    if (!floppy_->present()) return;
+    // Low memory describes a System only once this start-up has an
+    // application running; before that it may still hold the last one's.
+    if (overlay_ || !startupFinished() || !(fileSystemUp() && volumeMountedFor(1))) {
+        // Nothing mounted from the drive: no volume to lose.
+        floppy_->eject();
+        return;
+    }
+    floppyEjectPending_ = true;
+    floppyEjectAsked_ = false;
+    floppyEjectFrames_ = 0;
+    askForCall();
+}
+
+bool Se30Machine::boardWorkWanted() {
+    return floppyEjectPending_ && !floppyEjectAsked_ && floppy_->present() && fileSystemUp() && volumeMountedFor(1);
+}
+
+void Se30Machine::boardWorkAtCall() { askGuestToEjectFloppy(); }
+
+// The host's Eject for a disk the System has mounted, with the CPU in front
+// of one of the guest's event calls: _FlushVol, then _Eject, on drive 1. That
+// is what the Finder's own Eject Disk issues. The File Manager marks the
+// volume ejected and has the ROM's driver command the drive, and the disk
+// leaves through the mechanism as on a guest's own eject.
+void Se30Machine::askGuestToEjectFloppy() {
+    if (inDriver_ || announceInFlight_) return;
+    if ((cpu_.getSR() & 0x0700) != 0) return;         // inside an interrupt
+    if (addressingModeSwapped()) return;
+    if ((read8(0x0360) & 1) != 0) return;             // the File Manager is in a call of its own
+    announceInFlight_ = true;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
+    if (!hdMountPb_) {
+        cpu_.d[0] = 80;
+        execute68kTrap(0xA71E);                       // _NewPtr,Sys,Clear
+        hdMountPb_ = guestPtr(cpu_.a[0]);
+    }
+    s16 flushed = 0, ejected = 0;
+    if (hdMountPb_) {
+        const auto call = [&](u16 trap) -> s16 {
+            for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
+            write16(hdMountPb_ + 22, 1);              // ioVRefNum = drive 1
+            cpu_.a[0] = hdMountPb_;
+            execute68kTrap(trap);
+            return static_cast<s16>(cpu_.d[0] & 0xFFFF);
+        };
+        flushed = call(0xA013);                       // _FlushVol
+        ejected = call(0xA017);                       // _Eject
+    }
+    for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
+    announceInFlight_ = false;
+    if (onDiag) {
+        char b[96];
+        std::snprintf(b, sizeof b, "floppy: the host's Eject asked the File Manager (flush %d, eject %d)", flushed, ejected);
+        onDiag(b);
+    }
+    // Asked once. If the disk is still in the drive four seconds after the
+    // host's Eject, the frame clock takes it out.
+    if (ejected == 0) floppyEjectAsked_ = true;
+}
+bool Se30Machine::floppyPresent() const { return floppy_->present(); }
+u32 Se30Machine::floppyEjects() const { return floppy_->ejects(); }
+const std::vector<u8>& Se30Machine::floppySectors() { return floppy_->sectors(); }
+std::vector<u8> Se30Machine::floppyForWriteBack() { return floppy_->fileImage(); }
+Se30Machine::FloppyCounts Se30Machine::floppyCounts() const {
+    return {floppy_->bytesRead(), floppy_->bytesWritten(), floppy_->tracksWritten(), floppy_->chip().ismSelected(),
+            floppy_->mechanism().track};
+}
 
 int Se30Machine::screenWidth() const { return Se30Video::kWidth; }
 int Se30Machine::screenHeight() const { return Se30Video::kHeight; }
