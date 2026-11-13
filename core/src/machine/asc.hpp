@@ -202,6 +202,64 @@ public:
     // Mac OS sends mono sounds to that channel when no stereo jack is present.
     u8 pullSample() { return pullStereoSample().left; }
 
+    // One sample period as a board with a stereo jack and a mixer for its one
+    // speaker hears it (the Macintosh SE/30: Guide to the Macintosh Family
+    // Hardware 2nd ed., ch. 13).  left and right are the jack's two channels;
+    // mono is the mixer's sum of them.  Both outputs are AC-coupled, so what
+    // matters is each signal about its own resting level:
+    //  - sampled sound: the two buffers, and their mean for the speaker;
+    //  - four-voice synthesis: the speaker gets all four voices, which is the
+    //    chip's own sum in mono; in stereo each channel carries two voices
+    //    about a quarter of full scale, moved here to rest at $80 like every
+    //    other signal the host is given.
+    struct MixedSample {
+        u8 left = 0x80;
+        u8 right = 0x80;
+        u8 mono = 0x80;
+    };
+    MixedSample pullMixedSample() {
+        MixedSample sample;
+        u8 rawLeft = 0x80;
+        switch (mode()) {
+        case 1: {
+            const StereoSample s = fifoSample();
+            rawLeft = s.left;
+            sample.left = s.left;
+            sample.right = s.right;
+            sample.mono = static_cast<u8>((static_cast<unsigned>(s.left) + s.right + 1u) / 2u);
+            break;
+        }
+        case 2: {
+            unsigned voices[4]{};
+            stepVoices(voices);
+            const unsigned a = voices[0] + voices[1], b = voices[2] + voices[3];
+            sample.mono = rawByte(a + b);
+            if (stereo()) {
+                rawLeft = rawByte(a);
+                sample.left = centeredByte(static_cast<int>(a) - 0x40);
+                sample.right = centeredByte(static_cast<int>(b) - 0x40);
+            } else {
+                rawLeft = sample.left = sample.right = sample.mono;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        sample.left = applyVolume(sample.left);
+        sample.right = applyVolume(sample.right);
+        sample.mono = applyVolume(sample.mono);
+        rawLeft = applyVolume(rawLeft);
+        lastOutput_[0] = sample.left;
+        lastOutput_[1] = sample.right;
+        ++producedSamples_;
+        if (sample.left != 0x80 || sample.right != 0x80 || sample.mono != 0x80)
+            ++nonSilentSamples_;
+        outputMin_ = std::min(outputMin_, rawLeft);
+        outputMax_ = std::max(outputMax_, rawLeft);
+        return sample;
+    }
+
     u32 sampleRate() const {
         switch (clock()) {
         case 2: return 22050;
@@ -374,14 +432,20 @@ private:
         return result;
     }
 
-    StereoSample wavetableSample() {
-        unsigned voices[4]{};
+    // One sample period of the four voices: each phase moves on by its
+    // increment and reads its own 512-byte table.
+    void stepVoices(unsigned voices[4]) {
         for (int voice = 0; voice < 4; ++voice) {
             phase_[voice] = (phase_[voice] + increment_[voice]) & 0x00FFFFFFu;
             const u32 index = (phase_[voice] >> 15) & 0x01FFu;
             voices[voice] =
                 ram_[static_cast<u32>(voice) * kTableBytes + index];
         }
+    }
+
+    StereoSample wavetableSample() {
+        unsigned voices[4]{};
+        stepVoices(voices);
 
         StereoSample result;
         if (stereo()) {
