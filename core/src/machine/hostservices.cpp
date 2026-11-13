@@ -699,6 +699,9 @@ void MacHostServices::execute68kTrap(u16 trap) {
     const u8 was0 = read8(scratch), was1 = read8(scratch + 1);
     write8(scratch, static_cast<u8>(trap >> 8));
     write8(scratch + 1, static_cast<u8>(trap & 0xFF));
+    // A 68030 keeps the words it has fetched; the one written here must not
+    // be answered from what the last call left in its instruction cache.
+    hcpu_.invalidateInstructionCache030(scratch, 2);
     const u32 savedPc = hcpu_.pc;
     const u16 savedSr = hcpu_.getSR();
     hcpu_.pc = scratch;
@@ -725,6 +728,7 @@ void MacHostServices::execute68kTrap(u16 trap) {
     hcpu_.setSR(savedSr);
     write8(scratch, was0);
     write8(scratch + 1, was1);
+    hcpu_.invalidateInstructionCache030(scratch, 2);
     if (outer) {
         inGuestCall_ = false;
         if (wasAsked || askedInCall_) {
