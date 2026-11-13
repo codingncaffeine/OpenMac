@@ -227,6 +227,22 @@ internal static class Native
         IntPtr h, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] err, nuint errCap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_save_state(
+        IntPtr h, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] err, nuint errCap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_load_state(
+        IntPtr h, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] err, nuint errCap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_fx_save_state(
+        IntPtr h, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] err, nuint errCap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_fx_load_state(
+        IntPtr h, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] err, nuint errCap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern nuint omac_q_diagnostics(IntPtr h, byte[]? outBuf, nuint cap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

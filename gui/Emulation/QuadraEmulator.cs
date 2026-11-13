@@ -74,6 +74,13 @@ public sealed class QuadraEmulator : IEmulator
     private long _loudFed;   // non-silent samples handed to the audio device
     private readonly Thread _worker;
     private volatile bool _stop;
+    // No frames while set: from the moment LoadRom begins to settle the old
+    // machine until the new one stands in its place. A machine left running
+    // after the settle runs with its volumes unmounted behind the Finder's
+    // back -- the Finder faults on one a moment later -- and can write to a
+    // disk whose image has already been judged consistent and is on its way
+    // to the file.
+    private volatile bool _hold;
     private const double FrameSeconds = 1.0 / 60.147;
     private double _speedPercent;
     public double SpeedPercent => Volatile.Read(ref _speedPercent);
@@ -87,6 +94,15 @@ public sealed class QuadraEmulator : IEmulator
 
     public void LoadRom(string path, int ramMB, bool bootRomDisk)
     {
+        // Read first: a ROM that cannot be read leaves the running machine be.
+        byte[] rom = File.ReadAllBytes(path);
+        _hold = true;
+        try { ReplaceMachine(path, rom, ramMB, bootRomDisk); }
+        finally { _hold = false; }
+    }
+
+    private void ReplaceMachine(string path, byte[] rom, int ramMB, bool bootRomDisk)
+    {
         // Settle before persisting, exactly as closing does. Loading a ROM
         // tears the running machine down -- it is how the monitor is changed --
         // and writing the disk out while its volume is still mounted saves it
@@ -97,7 +113,6 @@ public sealed class QuadraEmulator : IEmulator
         // And the PRAM, for the same reason: this is how the machine restarts
         // onto another monitor or RAM size, and the chip goes with it.
         SavePram();
-        byte[] rom = File.ReadAllBytes(path);
         lock (_sync)
         {
             Destroy();
@@ -160,7 +175,7 @@ public sealed class QuadraEmulator : IEmulator
         {
             IntPtr h;
             lock (_sync) h = _h;
-            if (h == IntPtr.Zero)
+            if (h == IntPtr.Zero || _hold)
             {
                 Thread.Sleep(10);
                 last = sw.ElapsedTicks;
@@ -183,7 +198,7 @@ public sealed class QuadraEmulator : IEmulator
             {
                 lock (_sync)
                 {
-                    if (_h == IntPtr.Zero) break;
+                    if (_h == IntPtr.Zero || _hold) break;
                     Native.omac_q_run_frame(_h);
                     if (_audio.Ok)
                     {
@@ -494,7 +509,7 @@ public sealed class QuadraEmulator : IEmulator
     /// only when the Mac keeps a file open on it.</summary>
     private bool PutAwaySeatVolume()
     {
-        for (int attempt = 0; attempt < 100; ++attempt)
+        for (int attempt = 0; attempt < 250; ++attempt)
         {
             bool offLine;
             lock (_sync)
@@ -784,12 +799,14 @@ public sealed class QuadraEmulator : IEmulator
     private void WriteBackHardDisk()
     {
         if (!HardDiskAttached || string.IsNullOrEmpty(HardDiskPath)) return;
-        SettleVolumes();
         byte[]? buf = null;
         try
         {
+            // The settle and the copy under one hold of the lock: a frame run
+            // between the two could write to the volume just judged clean.
             lock (_sync)
             {
+                SettleVolumes();
                 if (_h == IntPtr.Zero) return;
                 nuint size = Native.omac_q_harddisk_data(_h, null, 0);
                 if (size == 0) return;

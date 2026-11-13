@@ -36,6 +36,13 @@ public sealed class IifxEmulator : IEmulator
     private bool _frameDirty;
     private readonly Thread _worker;
     private volatile bool _stop;
+    // No frames while set: from the moment LoadRom begins to settle the old
+    // machine until the new one stands in its place. A machine left running
+    // after the settle runs with its volumes unmounted behind the Finder's
+    // back -- the Finder faults on one a moment later -- and can write to a
+    // disk whose image has already been judged consistent and is on its way
+    // to the file.
+    private volatile bool _hold;
     private const double FrameSeconds = 1.0 / 60.15;
     private double _speedPercent;
     public double SpeedPercent => Volatile.Read(ref _speedPercent);
@@ -48,11 +55,19 @@ public sealed class IifxEmulator : IEmulator
 
     public void LoadRom(string path, int ramMB, bool bootRomDisk)
     {
+        // Read first: a ROM that cannot be read leaves the running machine be.
+        byte[] rom = File.ReadAllBytes(path);
+        _hold = true;
+        try { ReplaceMachine(path, rom, ramMB, bootRomDisk); }
+        finally { _hold = false; }
+    }
+
+    private void ReplaceMachine(string path, byte[] rom, int ramMB, bool bootRomDisk)
+    {
         WriteBackFloppy();
         SyncFolderDisk();   // the drop box's volume dies with the machine
         WriteBackHardDisk();
         SavePram();
-        byte[] rom = File.ReadAllBytes(path);
         byte[]? videoRom = !string.IsNullOrEmpty(VideoRomPath) &&
                            File.Exists(VideoRomPath)
             ? File.ReadAllBytes(VideoRomPath) : null;
@@ -119,9 +134,11 @@ public sealed class IifxEmulator : IEmulator
 
         while (!_stop)
         {
+            bool idle;
             lock (_sync)
             {
-                if (_h == IntPtr.Zero)
+                idle = _h == IntPtr.Zero || _hold;
+                if (idle)
                 {
                     last = clock.ElapsedTicks;
                     accumulator = 0;
@@ -130,7 +147,7 @@ public sealed class IifxEmulator : IEmulator
                     Volatile.Write(ref _speedPercent, 0);
                 }
             }
-            if (_h == IntPtr.Zero) { Thread.Sleep(10); continue; }
+            if (idle) { Thread.Sleep(10); continue; }
 
             long now = clock.ElapsedTicks;
             double elapsed = (now - last) / frequency;
@@ -144,7 +161,7 @@ public sealed class IifxEmulator : IEmulator
             {
                 lock (_sync)
                 {
-                    if (_h == IntPtr.Zero) break;
+                    if (_h == IntPtr.Zero || _hold) break;
                     Native.omac_fx_run_frame(_h);
                     int rate = checked((int)Native.omac_fx_audio_rate(_h));
                     if (rate != _audioRate)
@@ -368,12 +385,14 @@ public sealed class IifxEmulator : IEmulator
         // File Manager caches belong to the guest. Ask it to flush/unmount
         // before copying the backing image, on every path that can replace or
         // destroy the machine (disk swap, RAM/ROM restart, and application exit).
-        SettleHardDisk();
         try
         {
             byte[] image;
+            // The settle and the copy under one hold of the lock: a frame run
+            // between the two could write to the volume just judged clean.
             lock (_sync)
             {
+                SettleHardDisk();
                 if (_h == IntPtr.Zero) return;
                 nuint size = Native.omac_fx_harddisk_data(_h, null, 0);
                 if (size == 0) return;
@@ -465,7 +484,7 @@ public sealed class IifxEmulator : IEmulator
     /// only when the Mac keeps a file open on it.</summary>
     private bool PutAwaySeatVolume()
     {
-        for (int attempt = 0; attempt < 100; ++attempt)
+        for (int attempt = 0; attempt < 250; ++attempt)
         {
             bool offLine;
             lock (_sync)
@@ -479,8 +498,40 @@ public sealed class IifxEmulator : IEmulator
 
     public bool LoadState(string path, out string error)
     {
-        error = "this machine has no saved state";
-        return false;
+        error = "";
+        byte[] why = new byte[512];
+        byte[]? seat = null;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+            if (Native.omac_fx_load_state(_h, path, why, (nuint)why.Length) == 0)
+            {
+                int n = Array.IndexOf(why, (byte)0);
+                error = System.Text.Encoding.UTF8.GetString(why, 0, n < 0 ? why.Length : n);
+                return false;
+            }
+            // A disk the state carries on the second seat is the front end's
+            // to answer for from here on, as if it had been dropped just now.
+            nuint size = Native.omac_fx_harddisk2_data(_h, null, 0);
+            if (size != 0 && _seat?.Folder is null)
+            {
+                seat = new byte[size];
+                if (Native.omac_fx_harddisk2_data(_h, seat, size) == 0) seat = null;
+            }
+        }
+        if (seat is not null)
+        {
+            _seatImage = seat;
+            _seatReadOnly = true;
+            // An HFS volume's name: a Pascal string 36 bytes into its master
+            // directory block.
+            int len = seat.Length > 1024 + 64 ? Math.Min((int)seat[1024 + 36], 27) : 0;
+            TransferDiskLabel = len > 0
+                ? System.Text.Encoding.Latin1.GetString(seat, 1024 + 37, len) : "second disk";
+        }
+        Log.Line($"[state] loaded {Path.GetFileName(path)}"
+                 + (seat is not null ? $", with “{TransferDiskLabel}” on the second SCSI seat" : ""));
+        return true;
     }
 
     public bool RemoveTransferDisk(out string error)
