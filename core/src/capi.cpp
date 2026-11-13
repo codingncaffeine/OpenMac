@@ -887,6 +887,11 @@ struct OMacQ {
         // onDiag is deliberately NOT wired here -- this machine's device
         // channels run at frame rate (the SCC alone writes a thousand lines
         // across a boot) and would bury exactly the lines worth reading.
+        // One line is let through: a call run on the guest that never came
+        // back, which is what a wrecked startup looks like from here.
+        hs().onDiag = [this](const char* s) {
+            if (std::strncmp(s, "guest call", 10) == 0) log(s);
+        };
         cpu().onException = [this](int vector, u32 pc) { fault(vector, pc); };
     }
 

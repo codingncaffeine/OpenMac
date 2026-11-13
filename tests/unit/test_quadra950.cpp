@@ -772,6 +772,39 @@ TEST_CASE("950 parameter RAM: asked without a buffer the machine gives the size,
     CHECK_FALSE(other.loadPram(blob.data(), 100, 0)); // a file of the wrong size is refused
 }
 
+TEST_CASE("Quadras: a machine that has not started is left alone by a flush of its volumes") {
+    // The front end attaches the hard disk to a new machine with a flush
+    // first, and after a dropped archive the new machine already carries a
+    // disk on its second seat. Nothing is mounted in a machine that has not
+    // run: the flush must find that out without running it or calling into it.
+    const auto nopRom = [] {
+        std::vector<u8> rom(0x100000);
+        for (std::size_t i = 0; i < rom.size(); i += 2) { rom[i] = 0x4E; rom[i + 1] = 0x71; }   // NOP
+        const u8 vectors[8] = {0x00, 0x00, 0x20, 0x00, 0x40, 0x80, 0x01, 0x00};
+        std::copy(vectors, vectors + 8, rom.begin());
+        return rom;
+    };
+    const std::vector<u8> disk(2u * 1024u * 1024u, 0x5A);
+    Quadra950Machine big(nopRom());
+    big.insertHardDisk2(disk, true);
+    const std::vector<u8> before950 = big.saveState();
+    CHECK_FALSE(big.shutdownVolumes());
+    CHECK(big.unmountSecondDisk());                   // nothing to unmount: off line already
+    CHECK(big.frameCount() == 0);
+    CHECK(big.saveState() == before950);              // not one instruction was run
+    QuadraMachine small(nopRom());
+    small.insertHardDisk2(disk, true);
+    const std::vector<u8> before650 = small.saveState();
+    CHECK_FALSE(small.shutdownVolumes());
+    CHECK(small.unmountSecondDisk());
+    CHECK(small.saveState() == before650);
+    // The same after a few frames, with the ROM off low memory.
+    for (int i = 0; i < 3; ++i) big.runFrame();
+    const std::vector<u8> running = big.saveState();
+    CHECK_FALSE(big.shutdownVolumes());
+    CHECK(big.saveState() == running);
+}
+
 TEST_CASE("650 saved state: a machine loaded from one goes on exactly as the machine that saved it") {
     const auto nopRom = [] {
         std::vector<u8> rom(0x100000);

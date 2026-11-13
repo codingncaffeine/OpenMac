@@ -906,6 +906,14 @@ bool MacHostServices::markVolumeClean(u16 drive) {
 bool MacHostServices::shutdownVolumes() {
     if (hd_.empty() && hd2_.empty()) return false;
     if (inDriver_ || announceInFlight_ || !guestRunning()) return false;
+    // A seat's volume can be on line only in a startup whose boot scan has
+    // loaded the seat's driver. Low memory alone does not say a System is
+    // up: on a machine that has not started the ROM is mapped there, and
+    // during the ROM's memory test it holds test patterns. Asked to settle
+    // such a machine (the front end does, when it attaches the hard disk to a
+    // new machine that already carries a dropped disk), this used to run it
+    // ahead looking for a call and then put one into the memory test.
+    if (!diskPrimePc_[0] && !diskPrimePc_[1]) return false;
     if (!fileSystemUp()) return false;                // no System, or no FS queue yet
     // At a call of the guest's own, like every other trap run for the host.
     // A guest that makes none -- stopped on a system error, say -- still gets
@@ -925,7 +933,7 @@ bool MacHostServices::shutdownVolumes() {
     bool any = false;
     if (hdMountPb_) {
         for (u16 drive : {kHdDrive, kHd2Drive}) {
-            if (!volumeMountedFor(drive)) continue;
+            if (!diskPrimePc_[drive == kHdDrive ? 0 : 1] || !volumeMountedFor(drive)) continue;
             auto call = [&](u16 trap) -> s16 {
                 for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
                 write16(hdMountPb_ + 22, drive);      // ioVRefNum
@@ -979,6 +987,7 @@ bool MacHostServices::shutdownVolumes() {
 bool MacHostServices::unmountSecondDisk() {
     if (hd2_.empty()) return true;
     if (inDriver_ || announceInFlight_) return false;
+    if (!diskPrimePc_[1]) return true;                // its driver is not loaded: never mounted
     if (!fileSystemUp()) return true;                 // no System, or no FS queue yet
     if (!volumeMountedFor(kHd2Drive)) return true;    // already off line
     if (!guestRunning()) return true;                 // nothing is reading it
@@ -991,7 +1000,7 @@ bool MacHostServices::unmountSecondDisk() {
 // True = the traps were run (or there was nothing to unmount); false = the
 // File Manager was busy, and the request stands.
 bool MacHostServices::unmountSecondDiskAtCall() {
-    if (hd2_.empty() || !fileSystemUp()) return true;
+    if (hd2_.empty() || !diskPrimePc_[1] || !fileSystemUp()) return true;
     if (inDriver_ || announceInFlight_) return false;
     if (read8(0x0360) & 1) return false;              // FSBusy: a file op is running
     if ((hcpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt: not now
