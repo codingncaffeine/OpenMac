@@ -140,6 +140,8 @@ public:
     // Diagnosis: log this many of the floppy chip's register writes (the two
     // data registers aside) and mechanism commands through onDiag.
     int floppyTrace = 0;
+    // Diagnostic: report the next n accesses to the color table's ports.
+    void traceColorTable(int n);
 
     // A text snapshot of the CPU and the devices, for when the guest stops.
     std::string diagnosticReport() const;

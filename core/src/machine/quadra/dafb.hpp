@@ -170,6 +170,12 @@ public:
             if (reg == 0x10) {   // CLUT data readback, same 3-byte cycle
                 const u32 rgb = clut_[clutAddr_ & 0xFF];
                 const u32 v = (rgb >> (16 - clutPhase_ * 8)) & 0xFF;
+                if (clutTrace_ > 0 && onDiag) {
+                    --clutTrace_;
+                    char b[80];
+                    std::snprintf(b, sizeof b, "CLUT[%u] phase %d read (%02X)", clutAddr_, clutPhase_, v);
+                    onDiag(b);
+                }
                 if (++clutPhase_ == 3) {
                     clutPhase_ = 0;
                     clutAddr_ = (clutAddr_ + 1) & 0xFF;
@@ -197,6 +203,31 @@ public:
         default:
             return 0;   // clock generator: nothing readable
         }
+    }
+
+    // One byte of a register. The DAC's ports are a byte wide, in the low
+    // byte of their long word: a byte written or read there is one step of
+    // the color table's red, green, blue cycle, and the other three bytes
+    // reach nothing. (Mac OS 8.1's own driver loads the table with byte
+    // writes; the ROM's driver writes long words.) Every other register
+    // merges the byte into what it holds.
+    void write8(u32 offset, u8 v) {
+        offset &= 0x3FF;
+        const u32 reg = offset & ~3u;
+        const u32 lane = offset & 3;
+        if ((offset >> 8) == 2) {
+            if (lane == 3) write(reg, v);
+            return;
+        }
+        const int shift = static_cast<int>(8 * (3 - lane));
+        const u32 old = read(reg);
+        write(reg, (old & ~(0xFFu << shift)) | (static_cast<u32>(v) << shift));
+    }
+    u8 read8(u32 offset) {
+        offset &= 0x3FF;
+        const u32 lane = offset & 3;
+        if ((offset >> 8) == 2 && lane != 3) return 0;
+        return static_cast<u8>(read(offset & ~3u) >> (8 * (3 - lane)));
     }
 
     void write(u32 offset, u32 v) {
@@ -241,6 +272,12 @@ public:
             break;
         case 2:
             if (reg == 0x00) {
+                if (clutTrace_ > 0 && onDiag) {
+                    --clutTrace_;
+                    char b[80];
+                    std::snprintf(b, sizeof b, "CLUT address <- %08X (was %u, phase %d)", v, clutAddr_, clutPhase_);
+                    onDiag(b);
+                }
                 clutAddr_ = v & 0xFF;
                 clutPhase_ = 0;
             } else if (reg == 0x10) {
@@ -474,6 +511,9 @@ public:
     u32 ctlReg(int i) const { return regs_[i & 63]; }
     u32 depthCtlRaw() const { return depthCtl_; }
     u32 clutEntry(int i) const { return clut_[i & 0xFF]; }
+    // Diagnostic: report the next n accesses to the color table's ports
+    // (address writes and reads too, which the start-up log leaves out).
+    void traceColorTable(int n) { clutDiag_ = n; clutTrace_ = n; }
     // Diagnosis override: render at a stated geometry regardless of what the
     // registers decode to, to settle what the guest is actually drawing.
     void forceMode(int w, int h, int bpp) { forceW_ = w; forceH_ = h; forceBpp_ = bpp; }
@@ -549,6 +589,7 @@ private:
     MonitorWiring monitor_{};
     mutable int senseDiag_ = 60;
     int clutDiag_ = 24;
+    int clutTrace_ = 0;
     int forceW_ = 0, forceH_ = 0, forceBpp_ = 0;
 
     Variant variant_;

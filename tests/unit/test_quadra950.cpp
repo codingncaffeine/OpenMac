@@ -680,3 +680,36 @@ TEST_CASE("950 SCSI: single bytes through the data port arrive once each") {
     CHECK(same);
     CHECK(image[10 * 512] == 0);   // and nothing ran past the block
 }
+
+TEST_CASE("950 video: a color table loaded one byte at a time fills entry by entry") {
+    Dafb chip(Dafb::Variant::Standalone, 0x200000);
+    chip.write(0x200, 0);   // the address, as a long word
+    const u8 colors[3][3] = {{0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xDA}, {0x11, 0x22, 0x33}};
+    for (const auto& c : colors)
+        for (const u8 v : c) chip.write8(0x213, v);   // MOVE.B to the port's low byte
+    CHECK((chip.clutEntry(0) & 0xFFFFFFu) == 0xFFFFFFu);
+    CHECK((chip.clutEntry(1) & 0xFFFFFFu) == 0xFFFFDAu);
+    CHECK((chip.clutEntry(2) & 0xFFFFFFu) == 0x112233u);
+
+    // The three bytes beside the port reach nothing and step nothing.
+    chip.write(0x200, 2);
+    chip.write8(0x210, 0x99);
+    chip.write8(0x211, 0x99);
+    chip.write8(0x212, 0x99);
+    chip.write8(0x213, 0x44);
+    CHECK((chip.clutEntry(2) & 0xFFFFFFu) == 0x442233u);
+
+    // Read back the same way: one byte, one step.
+    chip.write(0x200, 1);
+    CHECK(chip.read8(0x210) == 0x00);
+    CHECK(chip.read8(0x213) == 0xFF);
+    CHECK(chip.read8(0x213) == 0xFF);
+    CHECK(chip.read8(0x213) == 0xDA);
+    CHECK(chip.read8(0x213) == 0x44);
+
+    // A register outside the DAC takes the byte into the word it holds.
+    chip.write(0x24, 0x041);
+    chip.write8(0x26, 0x01);
+    CHECK(chip.read(0x24) == 0x141);
+    CHECK(chip.read8(0x27) == 0x41);
+}

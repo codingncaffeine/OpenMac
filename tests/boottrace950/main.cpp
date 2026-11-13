@@ -16,7 +16,8 @@
 //                    [--beep-at FRAME] [--guest-power-off-at FRAME]
 //                    [--dropbox DIR] [--dropbox-guest-read FILE] [--drivers]
 //                    [--harddisk2-external] [--net]
-//                    [--floppy-trace FRAME COUNT] [--dump-audio OUT.wav]
+//                    [--floppy-trace FRAME COUNT] [--clut-trace FRAME COUNT]
+//                    [--dump-audio OUT.wav]
 // The sound output is always summarized: how many samples came out and each
 // stretch of anything but silence (stretches end after 0.2 s of silence),
 // with its length and loudest sample. Sound made inside a guest call the
@@ -70,6 +71,7 @@ int main(int argc, char** argv) {
     std::string hdPath, hd2Path, hdOut, cdPath, dropBoxDir, dropBoxGuestRead;
     bool showDrivers = false, netAttach = false;
     int floppyTraceAt = -1, floppyTraceCount = 0;
+    int clutTraceAt = -1, clutTraceCount = 0;
     std::string wavPath;
     std::vector<u8> audio, audioChunk;
     int ejectCdAt = -1, guestRestartAt = -1, beepAt = -1, guestPowerOffAt = -1;
@@ -134,6 +136,7 @@ int main(int argc, char** argv) {
         else if (a == "--harddisk2-external") cfg.secondDiskExternal = true;
         else if (a == "--net") netAttach = true;
         else if (a == "--dump-audio" && i + 1 < argc) wavPath = argv[++i];
+        else if (a == "--clut-trace" && i + 2 < argc) { clutTraceAt = std::atoi(argv[++i]); clutTraceCount = std::atoi(argv[++i]); }
         else if (a == "--floppy-trace" && i + 2 < argc) { floppyTraceAt = std::atoi(argv[++i]); floppyTraceCount = std::atoi(argv[++i]); }
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--floppy-at" && i + 2 < argc) {
@@ -291,6 +294,7 @@ int main(int argc, char** argv) {
             if (!floppyIn) std::printf("floppy left the drive by frame %d\n", f);
         }
         if (floppyTraceAt == f) mac.floppyTrace = floppyTraceCount;
+        if (clutTraceAt == f) mac.traceColorTable(clutTraceCount);
         if (ejectCdAt == f) {
             mac.ejectCd();
             std::printf("cd eject asked for at frame %d\n", f);

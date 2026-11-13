@@ -332,10 +332,7 @@ u8 Quadra950Machine::read8(u32 addr) {
     if ((addr >> 24) == 0xF9) {
         const u32 off = addr & 0x00FFFFFFu;
         if (off < 0x200000u) return dafb_->vramRead8(off);
-        if (off >= 0x800000u && off < 0x800400u) {
-            const u32 v = dafb_->read(off & 0x3FCu);
-            return static_cast<u8>(v >> (8 * (3 - (off & 3))));
-        }
+        if (off >= 0x800000u && off < 0x800400u) return dafb_->read8(off & 0x3FFu);
     }
     throw BusFault{addr, true, 1};
 }
@@ -353,13 +350,7 @@ void Quadra950Machine::write8(u32 addr, u8 value) {
     if ((addr >> 24) == 0xF9) {
         const u32 off = addr & 0x00FFFFFFu;
         if (off < 0x200000u) { dafb_->vramWrite8(off, value); return; }
-        if (off >= 0x800000u && off < 0x800400u) {
-            const u32 reg = off & 0x3FCu;
-            const int shift = static_cast<int>(8 * (3 - (off & 3)));
-            const u32 old = dafb_->read(reg);
-            dafb_->write(reg, (old & ~(0xFFu << shift)) | (static_cast<u32>(value) << shift));
-            return;
-        }
+        if (off >= 0x800000u && off < 0x800400u) { dafb_->write8(off & 0x3FFu, value); return; }
     }
     throw BusFault{addr, false, 1};
 }
@@ -722,6 +713,8 @@ Quadra950Machine::VideoState Quadra950Machine::videoState() const {
     return VideoState{bits == 24 ? 32 : bits, dafb_->timingWidth(), dafb_->timingHeight(), dafb_->vramBytes(),
                       dafb_->pixelClockHz(), dafb_->refreshMilliHz()};
 }
+
+void Quadra950Machine::traceColorTable(int n) { dafb_->traceColorTable(n); }
 
 void Quadra950Machine::drainAudio(std::vector<u8>& out) {
     out.insert(out.end(), audioOut_.begin(), audioOut_.end());
