@@ -717,7 +717,9 @@ Quadra950Machine::VideoState Quadra950Machine::videoState() const {
 void Quadra950Machine::traceColorTable(int n) { dafb_->traceColorTable(n); }
 
 void Quadra950Machine::drainAudio(std::vector<u8>& out) {
-    out.insert(out.end(), audioOut_.begin(), audioOut_.end());
+    // The samples since the last call, replacing what the caller's buffer
+    // held: the Quadra 650's contract, which the C API relies on.
+    out = std::move(audioOut_);
     audioOut_.clear();
 }
 

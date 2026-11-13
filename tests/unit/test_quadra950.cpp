@@ -4,6 +4,8 @@
 #include "../../core/src/machine/quadra/ncr53c96.hpp"
 #include "../../core/src/machine/quadra950/memctl.hpp"
 #include "openmac/quadra.hpp"
+#include "openmac/quadra950.hpp"
+#include <algorithm>
 
 #include <cstring>
 #include <vector>
@@ -712,4 +714,26 @@ TEST_CASE("950 video: a color table loaded one byte at a time fills entry by ent
     chip.write8(0x26, 0x01);
     CHECK(chip.read(0x24) == 0x141);
     CHECK(chip.read8(0x27) == 0x41);
+}
+
+TEST_CASE("950 sound: each call for samples returns only those made since the last") {
+    std::vector<u8> rom(0x100000);
+    for (std::size_t i = 0; i < rom.size(); i += 2) { rom[i] = 0x4E; rom[i + 1] = 0x71; }   // NOP
+    const u8 vectors[8] = {0x00, 0x00, 0x20, 0x00, 0x40, 0x80, 0x01, 0x00};
+    std::copy(vectors, vectors + 8, rom.begin());
+    Quadra950Machine mac(std::move(rom));
+    mac.reset();
+    std::vector<u8> samples;
+    mac.runFrame();
+    mac.drainAudio(samples);
+    const std::size_t oneFrame = samples.size();
+    CHECK(oneFrame >= 369);
+    CHECK(oneFrame <= 371);
+    // The same buffer again, as a front end passes it every frame.
+    mac.runFrame();
+    mac.drainAudio(samples);
+    CHECK(samples.size() >= 369);
+    CHECK(samples.size() <= 371);
+    mac.drainAudio(samples);
+    CHECK(samples.empty());
 }
