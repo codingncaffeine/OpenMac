@@ -73,6 +73,48 @@ TEST_CASE("040 reset loads ISP and PC, supervisor, caches and MMU off") {
     CHECK(f.cpu.mmuEnabled() == false);
 }
 
+TEST_CASE("040 stops in front of an event call when the machine asks, and nowhere else") {
+    Cpu040Fix f;
+    f.bus.write32(0x28, 0x00002000);              // A-line vector
+    f.cpu.setSR(0x2000);                          // supervisor, interrupts open
+
+    // Asked for an event call: a resource call goes through as ever.
+    f.cpu.holdAtCalls = M68040::kEventCalls;
+    f.run({0xA9A0});                              // _GetResource
+    CHECK_FALSE(f.cpu.heldAtCall);
+    CHECK(f.cpu.pc == 0x00002000);
+    CHECK(f.cpu.holdAtCalls == M68040::kEventCalls);
+
+    // _WaitNextEvent: the CPU stays on the word, nothing of it carried out.
+    f.cpu.pc = 0x00000400;
+    f.cpu.setSR(0x2000);
+    const u32 stack = f.cpu.a[7];
+    f.run({0xA860});
+    CHECK(f.cpu.heldAtCall);
+    CHECK(f.cpu.pc == 0x00000400);
+    CHECK(f.cpu.a[7] == stack);
+    CHECK(f.cpu.holdAtCalls == 0);                // asked once, stopped once
+    f.cpu.heldAtCall = false;
+    f.cpu.step();                                 // the next step executes it
+    CHECK_FALSE(f.cpu.heldAtCall);
+    CHECK(f.cpu.pc == 0x00002000);
+
+    // Inside an interrupt handler the same word is not a program's call.
+    f.cpu.pc = 0x00000400;
+    f.cpu.setSR(0x2100);
+    f.cpu.holdAtCalls = M68040::kEventCalls | M68040::kResourceCalls;
+    f.run({0xA860});
+    CHECK_FALSE(f.cpu.heldAtCall);
+    CHECK(f.cpu.pc == 0x00002000);
+
+    // Both classes asked for: a resource call stops it too.
+    f.cpu.pc = 0x00000400;
+    f.cpu.setSR(0x2000);
+    f.run({0xA9A0});
+    CHECK(f.cpu.heldAtCall);
+    CHECK(f.cpu.pc == 0x00000400);
+}
+
 TEST_CASE("040 misaligned word and long data access is legal") {
     Cpu040Fix f;
     f.bus.write32(0x1001, 0xDEADBEEF);

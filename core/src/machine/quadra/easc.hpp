@@ -223,7 +223,7 @@ public:
 
 private:
     friend class IifxStateCodec;
-    friend class Quadra950StateCodec;
+    friend class QuadraStateCodec;
 
     static constexpr u32 kFifo = 1024;
 

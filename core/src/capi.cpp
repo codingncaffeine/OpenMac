@@ -1129,18 +1129,50 @@ static int stateResult(bool ok, const std::string& why, char* err, size_t cap)
 OMAC_API int omac_q_save_state(OMacQ* m, const char* path, char* err, size_t cap)
 {
     if (!m || !path) return stateResult(false, "no machine", err, cap);
-    if (!m->q950) return stateResult(false, "this machine has no saved state", err, cap);
     std::string why;
-    const bool ok = m->q950->saveStateFile(path, &why);
+    const bool ok = m->q950 ? m->q950->saveStateFile(path, &why)
+                            : m->q650->saveStateFile(path, &why);
     return stateResult(ok, why, err, cap);
 }
 
 OMAC_API int omac_q_load_state(OMacQ* m, const char* path, char* err, size_t cap)
 {
     if (!m || !path) return stateResult(false, "no machine", err, cap);
-    if (!m->q950) return stateResult(false, "this machine has no saved state", err, cap);
     std::string why;
-    const bool ok = m->q950->loadStateFile(path, &why);
+    const bool ok = m->q950 ? m->q950->loadStateFile(path, &why)
+                            : m->q650->loadStateFile(path, &why);
+    return stateResult(ok, why, err, cap);
+}
+
+OMAC_API int omac_save_state(OMac* m, const char* path, char* err, size_t cap)
+{
+    if (!m || !path) return stateResult(false, "no machine", err, cap);
+    std::string why;
+    const bool ok = m->mac.saveStateFile(path, &why);
+    return stateResult(ok, why, err, cap);
+}
+
+OMAC_API int omac_load_state(OMac* m, const char* path, char* err, size_t cap)
+{
+    if (!m || !path) return stateResult(false, "no machine", err, cap);
+    std::string why;
+    const bool ok = m->mac.loadStateFile(path, &why);
+    return stateResult(ok, why, err, cap);
+}
+
+OMAC_API int omac_fx_save_state(OMacFx* m, const char* path, char* err, size_t cap)
+{
+    if (!m || !path) return stateResult(false, "no machine", err, cap);
+    std::string why;
+    const bool ok = m->mac.saveStateFile(path, &why);
+    return stateResult(ok, why, err, cap);
+}
+
+OMAC_API int omac_fx_load_state(OMacFx* m, const char* path, char* err, size_t cap)
+{
+    if (!m || !path) return stateResult(false, "no machine", err, cap);
+    std::string why;
+    const bool ok = m->mac.loadStateFile(path, &why);
     return stateResult(ok, why, err, cap);
 }
 

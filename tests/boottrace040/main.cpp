@@ -562,6 +562,12 @@ int main(int argc, char** argv) {
     bool disk2PutAwaySeen = false;
     bool noVolumeRepair = false;        // --no-volume-repair: reproduce the dirty-volume refusal
     const char* hd2Path = nullptr;  // --harddisk2 FILE: an existing image on seat 2
+    // --load-state FILE starts from a saved state (frame numbers go on from
+    // the state's); --save-state FILE writes one at the end, --save-state-at
+    // F FILE before frame F.
+    std::string loadStatePath, saveStatePath, saveStateAtPath;
+    int saveStateAt = -1;
+    tracetools::CallCensus census;   // --call-census
     std::string dropBoxDir;         // --dropbox DIR: serve DIR on the second seat
     std::string dropBoxAdd;         // --dropbox-add FILE: drop FILE in at republish time
     int dropBoxRepublishAt = -1;    // --dropbox-republish N: swap the volume at frame N
@@ -853,6 +859,10 @@ int main(int argc, char** argv) {
         else if (a == "--put-away-disk2-at" && i + 1 < argc) putAwayDisk2At = std::atoi(argv[++i]);
         else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
         else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
+        else if (a == "--load-state" && i + 1 < argc) loadStatePath = argv[++i];
+        else if (a == "--save-state" && i + 1 < argc) saveStatePath = argv[++i];
+        else if (a == "--save-state-at" && i + 2 < argc) { saveStateAt = std::atoi(argv[++i]); saveStateAtPath = argv[++i]; }
+        else if (a == "--call-census") census.on = true;
         else if (a == "--no-volume-repair") noVolumeRepair = true;
         else if (a == "--dropbox-add" && i + 1 < argc) dropBoxAdd = argv[++i];
         else if (a == "--dropbox-rounds" && i + 1 < argc) dropBoxRounds = std::atoi(argv[++i]);
@@ -1599,7 +1609,29 @@ int main(int argc, char** argv) {
     }
 
     std::vector<u8> audio;
-    for (int i = 0; i < frames; ++i) {
+    int firstFrame = 0;
+    if (!loadStatePath.empty()) {
+        std::string why;
+        if (!mac.loadStateFile(loadStatePath, &why)) {
+            std::fprintf(stderr, "state not loaded: %s\n", why.c_str());
+            return 2;
+        }
+        firstFrame = static_cast<int>(mac.frameCount());
+        std::printf("state loaded: %s, frame %d\n", loadStatePath.c_str(), firstFrame);
+    }
+    const auto saveStateTo = [&](const std::string& path, int frame) {
+        std::string why;
+        if (mac.saveStateFile(path, &why)) std::printf("state saved: %s, frame %d\n", path.c_str(), frame);
+        else std::fprintf(stderr, "state not saved: %s\n", why.c_str());
+    };
+    u32 censusFrame = static_cast<u32>(firstFrame);
+    if (census.on) {
+        census.lastEventFrame = censusFrame;
+        mac.cpu().onTrap = [&](u16 opcode, u32) { census.note(opcode, mac.cpu().getSR(), censusFrame); };
+    }
+    for (int i = firstFrame; i < frames; ++i) {
+        if (i == saveStateAt) saveStateTo(saveStateAtPath, i);
+        censusFrame = static_cast<u32>(i);
         if (i == trapRingFrom) trapRingOn = trapRingArmed;
         if (profile && (i % 60) == 30) {
             // One frame of unique-PC ranges: the shape of the active code.
@@ -1708,6 +1740,7 @@ int main(int argc, char** argv) {
             mac.mouseMove((i & 1) ? 7 : -7, (i & 2) ? 5 : -5, false);
         }
         mac.runFrame();
+        census.frameDone(static_cast<u32>(i));
         std::vector<u8> chunk;
         mac.drainAudio(chunk);
         audio.insert(audio.end(), chunk.begin(), chunk.end());
@@ -1722,6 +1755,9 @@ int main(int argc, char** argv) {
             if (s > 0x84 || s < 0x7C) ++loud;
         std::printf("audio: %zu samples, %zu non-silent\n", audio.size(), loud);
     }
+
+    // Before anything below runs a trap of its own on the guest.
+    if (!saveStatePath.empty()) saveStateTo(saveStatePath, frames);
 
     if (!busErrSites.empty()) {
         std::printf("\n-- bus-error sites --\n");

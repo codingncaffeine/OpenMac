@@ -21,6 +21,7 @@
 namespace openmac {
 
 class PseudoVia {
+    friend class QuadraStateCodec;
 public:
     void reset() {
         // The real chip's power-on IFR reads $1B, but those bits are not

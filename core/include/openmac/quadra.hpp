@@ -35,7 +35,10 @@ class Scc8530;
 class ScsiEthernet;
 class SonyDrive;
 
+class QuadraStateCodec;
+
 class QuadraMachine final : public IBus040, public MacHostServices {
+    friend class QuadraStateCodec;
 public:
     struct Config {
         u32 ramSize = 8u * 1024 * 1024;   // 8/16/32/64/128 MB
@@ -171,6 +174,18 @@ public:
     u32 savePram(u8* out, u32 cap) const;
     bool loadPram(const u8* data, u32 len, u32 addSeconds);
 
+    // A saved state: everything that changes while the machine runs -- the
+    // processor, RAM, every chip, both hard disks' contents, the floppy in
+    // the drive -- in the format of the Macintosh IIfx's checkpoints. The ROM
+    // is named by its contents, not copied; the RAM size and the monitor are
+    // configuration, and a state loads only into a machine built the same
+    // way. A CD and the network adapter are the loader's to put back. Take
+    // one between frames.
+    std::vector<u8> saveState() const;
+    bool loadState(const u8* data, std::size_t size, std::string* error = nullptr);
+    bool saveStateFile(const std::string& path, std::string* error = nullptr) const;
+    bool loadStateFile(const std::string& path, std::string* error = nullptr);
+
     const std::vector<std::string>& accessLog() const { return accessLog_; }
     void clearAccessLog() { accessLog_.clear(); }
     // Fires on VRAM writes with the offset and the guest PC. Bring-up only.
@@ -199,6 +214,9 @@ private:
     void ioWrite8Impl(u32 off, u8 v);
     void traceIo(u32 off, bool write, u8 v);
     void completeFloppyEject();
+    bool floppyEjectNeedsGuest();
+    bool boardWorkWanted() override;
+    void boardWorkAtCall() override;
     int  insertFloppyNow(std::vector<u8> image, bool readOnly);
     static bool floppyGeometry(std::vector<u8>& image);
     void seatFloppy(std::vector<u8> image, bool readOnly);
@@ -242,7 +260,8 @@ private:
     std::unique_ptr<SonyDrive> fd_;
     std::vector<u8> floppy_;
     std::vector<u8> floppyEjected_;
-    bool floppyEjectPending_ = false;   // front-end eject, run at a frame edge
+    bool floppyEjectPending_ = false;   // front-end eject, run at the guest's next call
+    int  floppyEjectWait_ = 0;          // frames it has waited for one
     // A disk handed in while another one is still in the drive waits here until
     // the drive is empty. There is one slot in a Macintosh and the guest has to
     // be told the old volume left before the new bytes appear underneath it.

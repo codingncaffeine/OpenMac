@@ -173,6 +173,8 @@ IifxMachine::IifxMachine(std::vector<u8> rom, const Config& config)
     const u32 romSize = nextPowerOfTwo(static_cast<u32>(rom_.size()));
     rom_.resize(romSize, 0xFF);
     romMask_ = romSize - 1;
+    romEntry_ = (static_cast<u32>(rom_[4]) << 24) | (static_cast<u32>(rom_[5]) << 16) |
+                (static_cast<u32>(rom_[6]) << 8) | rom_[7];
 
     // A reset/default Macintosh PRAM selects the Macintosh Operating System.
     // This ROM's GetOSDefault reads the two-byte DefOSRec at XPRAM $76; byte
@@ -821,15 +823,7 @@ void IifxMachine::tickDevices(int cpuCycles) {
         rtc_->tickSecond();
         via_->setCA2(true);
         via_->setCA2(false);
-        announceHardDisk();
-        watchSecondDiskPutAway();
-        // The CD's driver goes in on the same clock and for the same reason:
-        // there is no unit table to install into until the System has built
-        // one. Eject before mount, so a disc swapped at the host is unmounted
-        // before its replacement is announced.
-        if (cdrom_->attachedState() && !cdDrvr_) installCdDriver();
-        if (cdEjectPending_) completeCdEject();
-        else if (cdMountPending_) mountCdVolume();
+        storageSecondTick();
     }
 
     framePhase_ += static_cast<u64>(cpuCycles) * kFrameNumerator;
@@ -839,7 +833,10 @@ void IifxMachine::tickDevices(int cpuCycles) {
         ++frameCounter_;
         if (videoEnabled_ && !video_->genuineGc()) video_->onVblank();
         oss_->pulse(Oss::Clock60Hz);
-        if (!hardDisk_.empty() && !diskPrimePc_) findDiskDriverPrime();
+        if (!hardDisk_.empty() && !diskPrimePc_ && lowMemoryFresh())
+            findDiskDriverPrime();
+        // An unmount the front end is asking for does not keep to the second.
+        if (hardDisk2UnmountAsked_ > 0 && --hardDisk2UnmountAsked_ > 0) askForCall();
     }
 
     updateIpl();
@@ -1031,6 +1028,7 @@ int IifxMachine::stepInstruction() {
         hardwareTrace_.record(std::move(event));
     }
     if (onStep) onStep(cpu_.pc);
+    if (cpu_.pc == 0x4080000Au || (overlay_ && cpu_.pc == romEntry_)) machineStarting();
     // The installed CD driver's entry points, whichever storage mode the
     // machine runs in: no guest code ever serves these.
     if (cdPrimePc_ && cpu_.pc == cdPrimePc_) {
@@ -1162,8 +1160,13 @@ int IifxMachine::stepInstruction() {
         return 40;
     }
     const int cycles = cpu_.step();
+    // The CPU stopped in front of a call instead of executing it: the moment
+    // work for the host was waiting for. The fetch it made is still paid for.
+    const bool held = cpu_.heldAtCall;
+    cpu_.heldAtCall = false;
     if (!tickBatching_) {
         tickDevices(cycles);
+        if (held) storageAtCall();
         return cycles;
     }
     // Bank the cycles; the devices catch up when the bank is full or this
@@ -1175,6 +1178,7 @@ int IifxMachine::stepInstruction() {
         deviceTouched_ = false;
         flushPendingTicks();
     }
+    if (held) storageAtCall();
     return cycles;
 }
 
@@ -1194,6 +1198,7 @@ bool IifxMachine::diagnosticGestalt(u32 selector, u32& response, s16& err) {
     response = 0;
     err = -1;
     if (read32(0x0358u) == 0 || inDiskDriver_ || hardDiskMountInFlight_) return false;
+    runToCall();                                  // where the guest stands, failing that
     if (!leaveSwappedAddressingMode()) return false;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
@@ -1205,6 +1210,25 @@ bool IifxMachine::diagnosticGestalt(u32 selector, u32& response, s16& err) {
     }
     for (int i = 0; i < 8; ++i) { cpu_.d[i] = sd[i]; cpu_.a[i] = sa[i]; }
     return ok;
+}
+
+// Have the guest restart itself: ShutDwnStart, the call behind the Finder's
+// Restart. The three words go into ApplScratch and the CPU is pointed at
+// them; nothing is put back, because the call does not return. A test entry:
+// a restart the guest starts is a different road from the reset line.
+bool IifxMachine::guestRestart() {
+    if (inDiskDriver_ || hardDiskMountInFlight_) return false;
+    if (!fileSystemUp() || !runToCall()) return false;   // no System / no call
+    if ((read8(0x0360u) & 1u) != 0) return false;        // FSBusy
+    if (addressingModeSwapped()) return false;
+    constexpr u32 scratch = 0x0A78u;
+    write16(scratch, 0x3F3Cu);                           // MOVE.W #2,-(SP)
+    write16(scratch + 2u, 0x0002u);                      //   sdRestart
+    write16(scratch + 4u, 0xA895u);                      // _ShutDown
+    cpu_.invalidateInstructionCache030(scratch, 6);
+    cpu_.invalidateDataCache030(scratch, 6);
+    cpu_.pc = scratch;
+    return true;
 }
 
 bool IifxMachine::diagnosticFloppyMounted() {
@@ -1483,6 +1507,12 @@ bool IifxMachine::shutdownHardDisk() {
         return false;
     if (!volumeMountedFor(4)) return false;
     if (read32(0x0360u) == 0xFFFFFFFFu) return false;  // FS queue not built
+    // At a call of the guest's own, like every other trap run for the host.
+    // A guest that makes none -- stopped on a system error, say -- still gets
+    // its volume flushed, where it stands: the machine is about to go, and
+    // blocks left in its cache are lost for certain.
+    runToCall();
+    if (!volumeMountedFor(4)) return false;            // it went down meanwhile
     if (!leaveSwappedAddressingMode()) return false;
 
     hardDiskMountInFlight_ = true;
@@ -1585,11 +1615,25 @@ bool IifxMachine::execute68kTrap(u16 trap) {
     const u32 savedPc = cpu_.pc;
     const u16 savedSr = cpu_.getSR();
     cpu_.pc = scratch;
+    // The trap makes calls of its own, and those are not the guest's: the
+    // CPU is not to stop at one. A request that was standing, or one a clock
+    // tick makes while the trap runs, is put to the CPU again afterwards.
+    const bool wasAsked = cpu_.holdAtCalls != 0;
+    cpu_.holdAtCalls = 0;
+    const bool outer = !inGuestCall_;
+    inGuestCall_ = true;
 
     int guard = 64000000;
     while (guard-- > 0 && cpu_.pc != scratch + 2u && !cpu_.halted &&
            !poweredOff()) {
         stepInstruction();
+    }
+    if (outer) {
+        inGuestCall_ = false;
+        if (wasAsked || askedInCall_) {
+            askedInCall_ = false;
+            askForCall();
+        }
     }
     const bool completed = cpu_.pc == scratch + 2u;
     if (!completed) {
@@ -1649,7 +1693,7 @@ bool IifxMachine::secondDiskDriverResident() {
 // machine must leave no trace in it.
 void IifxMachine::watchSecondDiskPutAway() {
     if (hardDisk2_.empty() || hardDisk2PutAway_) return;
-    if (inDiskDriver_ || hardDiskMountInFlight_) return;
+    if (inDiskDriver_ || hardDiskMountInFlight_ || !lowMemoryFresh()) return;
     const u32 vcbHead = peek32(0x0358u);
     if (vcbHead == 0 || vcbHead == 0xFFFFFFFFu || peek32(0x0360u) == 0xFFFFFFFFu) {
         hardDisk2SeenOnLine_ = false;
@@ -1824,12 +1868,26 @@ const std::vector<u8>& IifxMachine::hardDisk2Image() const {
     return hardDisk2_;
 }
 
+// False means not yet: the unmount is carried out when the guest next makes
+// a call it can be run at (storageAtCall), and the caller asks again. A
+// request nobody repeats for half a second is dropped.
 bool IifxMachine::unmountHardDisk2() {
     if (hardDisk2_.empty()) return true;
     if (inDiskDriver_ || hardDiskMountInFlight_) return false;
-    const u32 vcbHead = read32(0x0358u);
-    if (vcbHead == 0 || vcbHead == 0xFFFFFFFFu) return true;   // System never came up
-    if (read32(0x0360u) == 0xFFFFFFFFu) return true;           // FS queue not built
+    if (!fileSystemUp() || !lowMemoryFresh()) return true;     // no System to ask
+    if (!volumeMountedFor(5)) return true;                     // already off line
+    if (cpu_.halted || poweredOff()) return true;              // nothing is reading it
+    hardDisk2UnmountAsked_ = 30;
+    askForCall();
+    return false;
+}
+
+// The unmount itself, with the CPU in front of one of the guest's calls.
+// True = the traps were run (or there was nothing to unmount); false = the
+// File Manager was busy, and the request stands.
+bool IifxMachine::unmountHardDisk2AtCall() {
+    if (hardDisk2_.empty() || !fileSystemUp()) return true;
+    if (inDiskDriver_ || hardDiskMountInFlight_) return false;
     if ((read8(0x0360u) & 1u) != 0) return false;              // FSBusy: not now
     if ((cpu_.getSR() & 0x0700u) != 0) return false;           // mid-interrupt
     if (addressingModeSwapped()) return false;                 // not now
@@ -1872,7 +1930,7 @@ bool IifxMachine::unmountHardDisk2() {
                       flushed, unmounted, offLine ? "off line" : "STILL MOUNTED");
         onDiag(message);
     }
-    return offLine;
+    return true;
 }
 
 void IifxMachine::serveSonyPrime() {
@@ -2706,7 +2764,7 @@ int IifxMachine::insertCd(std::vector<u8> image) {
 // The front end's Eject only STAGES: the disc has a volume mounted on it, and
 // taking the medium out from under one leaves the guest holding a volume with
 // nothing behind it -- offLinErr forever. completeCdEject unmounts first, on
-// the emulation thread, at the second tick.
+// the emulation thread, when the guest next makes a call it can be run at.
 void IifxMachine::ejectCd() {
     if (!cdrom_->discPresent()) return;
     cdEjectPending_ = true;
@@ -2873,9 +2931,9 @@ void IifxMachine::mountCdVolume() {
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
     // CurApName is a Pascal string once _Launch has run an application (the
-    // Finder included); until then it holds whatever the RAM test left.
-    const u8 apName = read8(0x0910u);
-    const bool eventLoop = apName != 0 && apName <= 31;
+    // Finder included); until then it holds whatever the RAM test left, or
+    // the name the last startup put there.
+    const bool eventLoop = startupFinished();
     s16 res = -108;
     if (eventLoop) {
         cpu_.a[0] = 7;                                // diskEvt
@@ -2911,12 +2969,21 @@ void IifxMachine::mountCdVolume() {
     }
 }
 
+// Does the disc carry a volume the guest has to let go of first?
+bool IifxMachine::cdEjectNeedsGuest() {
+    return cdDrive_ && !cpu_.halted && !poweredOff() && lowMemoryFresh() &&
+           peek32(0x0358u) != 0 && volumeMountedFor(cdDrive_);
+}
+
+// With the CPU in front of one of the guest's calls: unmount the disc's
+// volume, then take the disc.
 void IifxMachine::completeCdEject() {
     if (!cdEjectPending_) return;
     if (inDiskDriver_ || hardDiskMountInFlight_) return;
-    if (addressingModeSwapped()) return;              // not now
-    if (cdDrive_ && read32(0x0358u) != 0 && !(read8(0x0360u) & 1u) &&
-        (cpu_.getSR() & 0x0700u) == 0 && volumeMountedFor(cdDrive_)) {
+    if (cdDrive_ && read32(0x0358u) != 0 && volumeMountedFor(cdDrive_)) {
+        if ((read8(0x0360u) & 1u) || (cpu_.getSR() & 0x0700u) != 0 ||
+            addressingModeSwapped())
+            return;                                   // not now: next second
         hardDiskMountInFlight_ = true;
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
@@ -2946,6 +3013,10 @@ void IifxMachine::completeCdEject() {
             if (++cdEjectTries_ < 20) return;
         }
     }
+    finishCdEject();
+}
+
+void IifxMachine::finishCdEject() {
     cdEjectPending_ = false;
     cdEjectTries_ = 0;
     cdrom_->eject();
@@ -2956,6 +3027,148 @@ void IifxMachine::completeCdEject() {
         cpu_.invalidateDataCache030(cdStatus_, 22);
     }
     if (onDiag) onDiag("cd: disc taken out by the host");
+}
+
+// The CPU is at the ROM's entry: power on, the reset line, or a restart the
+// guest started itself (ShutDwnStart ends in a jump to ROM base + $0A).
+// Everything this machine learned about the last startup is void from here:
+// the drivers it hooked and the one it installed lived in a System heap that
+// is about to be rebuilt, the parameter block it kept there belongs to
+// whatever the new startup loads at that address, and the volumes it mounted
+// are gone with the old System and are mounted afresh for the new one.
+void IifxMachine::machineStarting() {
+    cdDrvr_ = cdPrimePc_ = cdCtlPc_ = cdStatusPc_ = 0;
+    cdStatus_ = 0;
+    cdRefNum_ = 0;
+    cdDrive_ = 0;
+    cdInstallTries_ = 0;
+    cdMountTries_ = 0;
+    cdMountPending_ = cdrom_->discPresent();
+    diskPrimePc_ = diskCtlPc_ = diskStatusPc_ = 0;
+    hardDiskMountPb_ = 0;
+    hardDiskMountPending_ = !hardDisk_.empty();
+    hardDiskMounted_ = false;
+    hardDiskMountTries_ = 0;
+    hardDiskMountDelay_ = 0;
+    hardDisk2MountPending_ = !hardDisk2_.empty();
+    hardDisk2MountTries_ = 0;
+    // The volume queue is the last startup's: nothing seen in it counts.
+    hardDisk2SeenOnLine_ = false;
+    hardDisk2OffSeconds_ = 0;
+    // Low memory still describes the last startup until the ROM rebuilds
+    // it. Nothing is read back out of it before then (see lowMemoryFresh).
+    unitTableFresh_ = false;
+    sawNoApp_ = false;
+    storageDue_ = false;
+    hardDisk2UnmountAsked_ = 0;
+    cpu_.holdAtCalls = 0;
+}
+
+// Has the ROM rebuilt the unit table since the machine last started? The
+// old one still holds the hard disks' drivers; a new one is empty at their
+// units until the startup scan installs them again. Looked at, not read: see
+// watchSecondDiskPutAway.
+bool IifxMachine::lowMemoryFresh() {
+    if (unitTableFresh_) return true;
+    const u32 table = guestPtr(peek32(0x011Cu));
+    if (!table || table + (kScsiDiskUnit + 2u) * 4u > ram_.size() ||
+        (peek32(table + kScsiDiskUnit * 4u) == 0 &&
+         peek32(table + (kScsiDiskUnit + 1u) * 4u) == 0))
+        unitTableFresh_ = true;
+    return unitTableFresh_;
+}
+
+// Has an application been launched in this startup? CurApName ($0910) is a
+// Pascal string once _Launch has run one (the Finder included). A name left
+// there by the last startup only counts once it has been seen unset.
+bool IifxMachine::startupFinished() {
+    const u8 length = peek8(0x0910u);
+    bool name = length != 0 && length <= 31;
+    for (u8 i = 1; name && i <= length; ++i) name = peek8(0x0910u + i) >= 0x20;
+    if (!name) {
+        sawNoApp_ = true;
+        return false;
+    }
+    return sawNoApp_;
+}
+
+bool IifxMachine::fileSystemUp() {
+    const u32 vcbHead = peek32(0x0358u);
+    return vcbHead != 0 && vcbHead != 0xFFFFFFFFu && peek32(0x0360u) != 0xFFFFFFFFu;
+}
+
+u8 IifxMachine::callClasses() {
+    return startupFinished() ? M68040::kEventCalls
+                             : static_cast<u8>(M68040::kEventCalls | M68040::kResourceCalls);
+}
+
+void IifxMachine::askForCall() {
+    if (inGuestCall_) askedInCall_ = true;
+    else cpu_.holdAtCalls = callClasses();
+}
+
+// Is there work for the guest's next call? Only what could run there: a
+// request that would give up at its first check asks for nothing, so a
+// machine with nothing to do is never stopped.
+bool IifxMachine::storageWorkWanted() {
+    if (cpu_.halted || poweredOff() || !lowMemoryFresh()) return false;
+    const u32 vcbHead = peek32(0x0358u);
+    if (vcbHead == 0 || vcbHead == 0xFFFFFFFFu) return false;   // System not up
+    if ((hardDiskMountPending_ && !hardDisk_.empty()) ||
+        (hardDisk2MountPending_ && !hardDisk2_.empty()))
+        return true;
+    if (cdEjectPending_ || (cdMountPending_ && cdDrive_)) return true;
+    return cdrom_->attachedState() && !cdDrvr_ && cdInstallTries_ <= 30;
+}
+
+// The CPU has stopped in front of one of the guest's calls. This second's
+// storage work is run if it is still owed, then an unmount the front end
+// asked for.
+void IifxMachine::storageAtCall() {
+    atCall_ = true;
+    if (storageDue_) {
+        storageDue_ = false;
+        announceHardDisk();
+        // The CD's driver goes in on the same clock and for the same reason:
+        // there is no unit table to install into until the System has built
+        // one. Eject before mount, so a disc swapped at the host is unmounted
+        // before its replacement is announced.
+        if (cdrom_->attachedState() && !cdDrvr_) installCdDriver();
+        if (cdEjectPending_) completeCdEject();
+        else if (cdMountPending_) mountCdVolume();
+    }
+    if (hardDisk2UnmountAsked_ > 0 && unmountHardDisk2AtCall()) hardDisk2UnmountAsked_ = 0;
+}
+
+// Run the guest on until it stops in front of such a call: for a request
+// that has to be answered before the caller goes on. An idle System 7 Finder
+// makes its event call once a second; the bound is some seconds of the
+// machine's time.
+bool IifxMachine::runToCall() {
+    if (cpu_.halted || poweredOff() || inGuestCall_) return false;
+    atCall_ = false;
+    cpu_.holdAtCalls = callClasses();
+    for (int guard = 0; guard < 30000000 && !atCall_ && !cpu_.halted && !poweredOff();
+         ++guard) {
+        stepInstruction();
+    }
+    return atCall_;
+}
+
+// Once per emulated second.
+void IifxMachine::storageSecondTick() {
+    watchSecondDiskPutAway();
+    // Watched every second, whoever asks later (see startupFinished).
+    (void)startupFinished();
+    // A second's work still owed means that second brought no call.
+    const bool noCall = storageDue_;
+    // A disc with no volume on line comes out at once. One the guest holds
+    // waits for its next call; after twenty seconds without one, or twenty
+    // refusals, it comes out anyway.
+    if (cdEjectPending_ && (!cdEjectNeedsGuest() || (noCall && ++cdEjectTries_ >= 20)))
+        finishCdEject();
+    storageDue_ = storageWorkWanted();
+    if (storageDue_) askForCall();
 }
 
 // The CD driver's Prime: read-only, served straight out of the disc image at

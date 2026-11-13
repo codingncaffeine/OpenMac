@@ -176,6 +176,8 @@ public:
     // Ask the guest's Gestalt Manager (an injected _Gestalt): the response in
     // `response`, the OSErr returned. False when the trap could not run.
     bool diagnosticGestalt(u32 selector, u32& response, s16& err);
+    // Test entry: make the guest call ShutDwnStart (restart). False = not now.
+    bool guestRestart();
     u64 diagnosticMediaEventId() const { return activeMediaEventId_; }
     u32 diagnosticGcProcessorPc() const;
     u64 diagnosticGcProcessorInstructions() const;
@@ -333,6 +335,32 @@ private:
     // data cache -- host stores bypass it, the ROM reads the block through it.
     void primeMountPb(u16 drive);
     void announceHardDisk();
+    // ---- guest calls run for the host (as MacHostServices does it) ------
+    // A mount, an unmount or a flush is a trap run on the guest CPU, which a
+    // Macintosh allows from a program's own level only. The work is noted,
+    // the CPU is asked to stop in front of the guest's next event call
+    // (M68040::holdAtCalls), and storageAtCall runs it there.
+    void machineStarting();         // the CPU is at the ROM's entry
+    bool lowMemoryFresh();          // the ROM has rebuilt the unit table since
+    bool startupFinished();         // an application has been launched since
+    bool fileSystemUp();
+    void storageSecondTick();
+    void storageAtCall();
+    bool storageWorkWanted();
+    u8 callClasses();
+    void askForCall();
+    bool runToCall();
+    bool unmountHardDisk2AtCall();
+    bool cdEjectNeedsGuest();
+    void finishCdEject();
+    u32 romEntry_ = 0;              // the reset vector's PC
+    bool unitTableFresh_ = true;
+    bool sawNoApp_ = false;         // CurApName seen unset since the start
+    bool storageDue_ = false;       // this second's work waits for a call
+    int  hardDisk2UnmountAsked_ = 0;   // frames an asked-for unmount stays wanted
+    bool atCall_ = false;           // runToCall: the CPU stopped at one
+    bool inGuestCall_ = false;      // inside execute68kTrap
+    bool askedInCall_ = false;      // askForCall came while inside one
     bool volumeMountedFor(u16 drive);
     bool driveInQueue(u16 drive);
     // The CD drive and its installed driver (mirrors the Quadra's).
@@ -349,7 +377,7 @@ private:
     bool cdMountPending_ = false;
     int cdMountTries_ = 0;
     int cdInstallTries_ = 0;
-    bool cdEjectPending_ = false;   // front-end eject, run at a frame edge
+    bool cdEjectPending_ = false;   // front-end eject, run at the guest's next call
     int cdEjectTries_ = 0;
     bool cdOnBus_ = false;          // the target has been added to the 5380
     bool markHardDiskClean();

@@ -931,6 +931,14 @@ void Machine::detachHardDisk2() {
 // would be worse than the problem.
 bool Machine::flushVolumes() {
     if (inSony_) return false;
+    if (!hdInstalled_ && !hd2Installed_) return false;
+    if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
+        return false;                                  // FS queue not built
+    // At a call of the guest's own, like the mounts (see atSafePoint). A
+    // guest that makes none -- stopped on a system error, say -- is still
+    // flushed where it stands, behind the checks below: the image is about
+    // to be written out, and blocks left in the cache would be missing.
+    runToSafePoint();
     if (read8(0x0360) & 1) return false;               // FSBusy
     if (scsiManagerBusy()) return false;               // see scsiManagerBusy
     if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
@@ -981,16 +989,26 @@ bool Machine::volumeOnLine(u16 drive) {
 //
 // Returns true once the volume is off line, which includes it never having
 // been mounted -- the caller's next step is the same either way.
+//
+// False means not yet: the unmount is carried out when the running program
+// next reaches a safe point (see atSafePoint), and the caller asks again. A
+// request nobody repeats for half a second is dropped.
 bool Machine::unmountSecondDisk() {
     if (hd2_.empty()) return true;
     if (!hd2Mounted_) return true;                     // never mounted / already gone
-    if (inSony_) return false;                         // inside our own driver
     if (!hd2Installed_) return true;                   // nothing was ever mounted
-    if (read8(0x0360) & 1) return false;               // FSBusy: a file op is running
     if ((((static_cast<u32>(read16(0x360)) << 16) | read16(0x362)) == 0xFFFFFFFFu))
         return true;                                   // FS queue not built
-    if ((cpu_.getSR() & 0x0700) != 0) return false;    // mid-interrupt: not now
-    if (scsiManagerBusy()) return false;               // see scsiManagerBusy
+    if (cpu_.halted) return true;                      // nothing is reading it
+    hd2UnmountAsked_ = 30;
+    mountsWaiting_ |= 4;
+    return false;
+}
+
+// The unmount itself, at a safe point with the File Manager idle (the caller,
+// mountAtSafePoint, has checked both).
+void Machine::unmountSecondDiskNow() {
+    if (hd2_.empty() || !hd2Mounted_ || !hd2Installed_) return;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
     const u32 pb = stackParamBlock();
@@ -1016,7 +1034,6 @@ bool Machine::unmountSecondDisk() {
                       off ? "off line" : "STILL MOUNTED");
         onDiag(b);
     }
-    return off;
 }
 
 const std::vector<u8>& Machine::hardDisk2Image() const {
@@ -1883,10 +1900,37 @@ bool Machine::scsiManagerBusy() {
 //
 // The words are _GetNextEvent, _WaitNextEvent, _EventAvail and _SystemTask:
 // calls a program makes from its own level, never from an interrupt.
+//
+// A startup has no program running until the first one is launched, and a
+// volume mounted only then is one an installer started from a floppy has
+// already missed when it lists its destinations. Until CurApName ($0910)
+// holds a name, the Resource Manager's reads count as well: _GetResource,
+// _Get1Resource, the two by name, _OpenResFile, _HOpenResFile. They are what
+// a startup is made of, and a caller of one expects memory to move.
 bool Machine::atSafePoint() {
     if ((cpu_.getSR() & 0x0700) != 0) return false;
     const u16 word = read16(cpu_.pc);
-    return word == 0xA970 || word == 0xA860 || word == 0xA971 || word == 0xA9B4;
+    if (word == 0xA970 || word == 0xA860 || word == 0xA971 || word == 0xA9B4) return true;
+    if (word != 0xA9A0 && word != 0xA81F && word != 0xA9A1 && word != 0xA820 &&
+        word != 0xA997 && word != 0xA81A)
+        return false;
+    const u8 length = read8(0x0910);
+    if (length == 0 || length > 31) return true;       // no application yet
+    for (u8 i = 1; i <= length; ++i)
+        if (read8(0x0910u + i) < 0x20) return true;
+    return false;
+}
+
+// Run the guest on until the running program reaches a safe point: for a
+// request that has to be answered before the caller goes on. An idle Finder
+// makes its event call at least once a second; the bound is a few seconds of
+// this machine's time.
+bool Machine::runToSafePoint() {
+    for (int guard = 0; guard < 4000000 && !cpu_.halted; ++guard) {
+        if (atSafePoint()) return true;
+        stepInstruction();
+    }
+    return atSafePoint();
 }
 
 // Mount the volumes that are waiting, with the File Manager idle. _MountVol
@@ -1903,6 +1947,10 @@ void Machine::mountAtSafePoint() {
         return;                                       // asked for again in 90 frames
     const u8 waiting = mountsWaiting_;
     mountsWaiting_ = 0;
+    if (waiting & 4) {                                // an unmount the front end asked for
+        hd2UnmountAsked_ = 0;
+        unmountSecondDiskNow();
+    }
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = cpu_.d[i]; sa[i] = cpu_.a[i]; }
     if ((waiting & 1) && hdAutoMount_ && hdDriveNum_ != 0 && !hdMounted_) {
@@ -1965,6 +2013,14 @@ void Machine::execute68kTrap(u16 trap) {
         }
         cpu_.setIrqLevel(via_->irqAsserted() ? 1 : 0);
         tickDevices(cpu_.step());
+    }
+    // A call that never came back is given up, and said: the guest was not
+    // in a state to take it, and what the caller reads next is not a result.
+    if (cpu_.pc != scratch + 2 && onDiag) {
+        char b[96];
+        std::snprintf(b, sizeof b, "guest call %04X did not return (given up at pc %06X)", trap,
+                      cpu_.pc);
+        onDiag(b);
     }
     cpu_.pc = savedPc;
     cpu_.setSR(savedSr);
@@ -2067,6 +2123,8 @@ int Machine::sonyStatus(u32 pb, u32 /*dce*/) {
 
 void Machine::runFrame() {
     ++frameCounter_;
+    // An unmount nobody has asked for again in half a second is dropped.
+    if (hd2UnmountAsked_ > 0 && --hd2UnmountAsked_ == 0) mountsWaiting_ &= static_cast<u8>(~4u);
 
     // Force the built-in ROM disk (EDisk) to boot. The ROM boots System 6 from
     // ROM only when TWO conditions hold at its startup boot-device check ($43F8E6):

@@ -7,6 +7,7 @@
 #include <openmac/debugger.hpp>
 #include <openmac/hfs.hpp>
 #include "host_sampler.hpp"
+#include "../common/tracetools.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -363,6 +364,8 @@ int main(int argc, char** argv) {
         std::vector<u8> image;
     };
     std::vector<FloppyEvent> floppyEvents;
+    int guestRestartAt = -1;            // --guest-restart-at-frame: the guest calls ShutDwnStart
+    tracetools::CallCensus census;      // --call-census
     // CD-ROM: attached before the run (and a disc put in), or a disc inserted
     // / taken out at a frame; the frame events use the same shape as floppies.
     const char* cdPath = nullptr;
@@ -623,6 +626,10 @@ int main(int argc, char** argv) {
             event.eject = true;
             floppyEvents.push_back(std::move(event));
         }
+        else if (option == "--guest-restart-at-frame" && index + 1 < argc)
+            guestRestartAt = std::atoi(argv[++index]);
+        else if (option == "--call-census")
+            census.on = true;
         else if (option == "--cd" && index + 1 < argc)
             cdPath = argv[++index];
         else if (option == "--cd-attach")
@@ -1292,7 +1299,9 @@ int main(int argc, char** argv) {
         // and are what a media test is judged by: printed whatever the
         // budgets and --quiet say.
         if (std::strncmp(message, "cd:", 3) == 0 ||
-            std::strncmp(message, "floppy:", 7) == 0) {
+            std::strncmp(message, "floppy:", 7) == 0 ||
+            std::strncmp(message, "IIfx second disk", 16) == 0 ||
+            std::strncmp(message, "IIfx hard disk drive", 20) == 0) {
             std::printf("DEVICE %s\n", message);
             return;
         }
@@ -1642,7 +1651,9 @@ int main(int argc, char** argv) {
         // The drives' own lines stay: they are the gate signal for a media test.
         mac.onDiag = [](const char* message) {
             if (std::strncmp(message, "cd:", 3) == 0 ||
-                std::strncmp(message, "floppy:", 7) == 0)
+                std::strncmp(message, "floppy:", 7) == 0 ||
+                std::strncmp(message, "IIfx second disk", 16) == 0 ||
+                std::strncmp(message, "IIfx hard disk drive", 20) == 0)
                 std::printf("DEVICE %s\n", message);
         };
         // A trap watch is an explicitly requested probe: keep the exception
@@ -1903,6 +1914,11 @@ int main(int argc, char** argv) {
     } else {
         HostSampler hostSampler;
         if (hostProfile) hostSampler.start();
+        u32 censusFrame = 0;
+        if (census.on)
+            mac.cpu().onTrap = [&](u16 opcode, u32) {
+                census.note(opcode, mac.cpu().getSR(), censusFrame);
+            };
         const auto frameLoopStart = std::chrono::steady_clock::now();
         struct SamplerStop {
             HostSampler& sampler;
@@ -1934,6 +1950,13 @@ int main(int argc, char** argv) {
                             event.path.c_str(),
                             accepted ? "accepted" : "REFUSED");
                 if (!accepted) return 2;
+            }
+            if (guestRestartAt >= 0 && frame >= guestRestartAt && mac.guestRestart()) {
+                std::printf("guest restart at frame=%d\n", frame);
+                guestRestartAt = -1;
+                // What the startup that follows does on the SCSI bus is the
+                // point of staging one: let it be seen.
+                scsiBudget = 400000;
             }
             if (mac.floppyPresent() != floppyInDrive) {
                 floppyInDrive = !floppyInDrive;
@@ -2021,6 +2044,10 @@ int main(int argc, char** argv) {
                 std::printf("key event: frame=%d adb=%02X state=%s\n",
                             frame, event.adbCode,
                             event.down ? "down" : "up");
+            }
+            if (census.on) {
+                if (frame > 0) census.frameDone(static_cast<u32>(frame - 1));
+                censusFrame = static_cast<u32>(frame);
             }
             try {
                 const u64 targetFrame = mac.frameCount() + 1;

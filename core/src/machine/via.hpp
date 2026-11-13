@@ -81,7 +81,7 @@ public:
 
 private:
     friend class IifxStateCodec;
-    friend class Quadra950StateCodec;
+    friend class QuadraStateCodec;
 
     void setIFR(u8 bit);
     void clearIFR(u8 bit);

@@ -261,14 +261,19 @@ OMAC_API int    omac_q_unmount_harddisk2(OMacQ*);
    detach clears it. */
 OMAC_API int    omac_q_harddisk2_put_away(OMacQ*);
 
-/* The Quadra 950's saved state: the whole running machine in one file, both
-   hard disks' contents included (Quadra950Machine::saveState). A state loads
-   only into a machine with the same ROM, RAM, video RAM, monitor and SCSI
-   layout; a CD is the caller's to put back. 1 = done; on 0 the reason is in
-   err as a C string. The Quadra 650 has no saved state and answers 0. Call
-   between frames. */
+/* A Quadra's saved state: the whole running machine in one file, both hard
+   disks' contents included (QuadraMachine::saveState, Quadra950Machine::
+   saveState). A state loads only into a machine of the same model with the
+   same ROM, RAM, monitor and, on the Quadra 950, video RAM and SCSI layout;
+   a CD is the caller's to put back. 1 = done; on 0 the reason is in err as a
+   C string. Call between frames. */
 OMAC_API int    omac_q_save_state(OMacQ*, const char* path, char* err, size_t err_cap);
 OMAC_API int    omac_q_load_state(OMacQ*, const char* path, char* err, size_t err_cap);
+/* The same for the Macintosh Classic (Machine::saveState): a state loads into
+   a machine with the same ROM, RAM, external floppy drive, CD-ROM drive and
+   network adapter. */
+OMAC_API int    omac_save_state(OMac*, const char* path, char* err, size_t err_cap);
+OMAC_API int    omac_load_state(OMac*, const char* path, char* err, size_t err_cap);
 
 /* A text snapshot of CPU, low memory and every device, for capturing what a
    wedged guest was doing. Pass out=NULL to learn the size needed. Reads model
@@ -365,6 +370,12 @@ OMAC_API size_t  omac_fx_harddisk2_data(OMacFx*, uint8_t* out, size_t cap);
 OMAC_API int     omac_fx_harddisk2_booted(OMacFx*);
 OMAC_API int     omac_fx_unmount_harddisk2(OMacFx*);
 OMAC_API int     omac_fx_harddisk2_put_away(OMacFx*);
+/* The Macintosh IIfx's saved state (IifxMachine::saveState), both hard disks'
+   contents included: it loads into a machine with the same ROM, video card
+   ROM and RAM. A CD is the caller's to put back. 1 = done; on 0 the reason
+   is in err as a C string. Call between frames. */
+OMAC_API int     omac_fx_save_state(OMacFx*, const char* path, char* err, size_t err_cap);
+OMAC_API int     omac_fx_load_state(OMacFx*, const char* path, char* err, size_t err_cap);
 /* CD-ROM on the IIfx: an AppleCD-class target on the SCSI bus (ID 3 by
    default) plus a ".AppleCD" driver the machine installs once the System is
    up, so a disc mounts without Apple's CD-ROM software (which a stock 7.1

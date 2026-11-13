@@ -1138,6 +1138,11 @@ void stepOut(Machine& mac, u32 target, u64 maxCycles) {
 int main(int argc, char** argv) {
     std::string romPath;
     int frames = 60;
+    // --load-state FILE starts from a saved state (frame numbers go on from
+    // the state's); --save-state FILE writes one after the last frame,
+    // --save-state-at F FILE before frame F.
+    std::string loadStatePath, saveStatePath, saveStateAtPath;
+    int saveStateAt = -1;
     u32 ramMB = 4;
     int profileAt = -1;
     u32 traceToPc = 0;
@@ -1212,6 +1217,9 @@ int main(int argc, char** argv) {
         else if (arg == "--harddisk2" && i + 1 < argc) hd2ImagePath = argv[++i];
         else if (arg == "--pram" && i + 1 < argc) pramPath = argv[++i];
         else if (arg == "--harddisk2-read-only") hd2ReadOnly = true;
+        else if (arg == "--load-state" && i + 1 < argc) loadStatePath = argv[++i];
+        else if (arg == "--save-state" && i + 1 < argc) saveStatePath = argv[++i];
+        else if (arg == "--save-state-at" && i + 2 < argc) { saveStateAt = std::atoi(argv[++i]); saveStateAtPath = argv[++i]; }
         else if (arg == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
         else if (arg == "--dropbox-republish" && i + 1 < argc)
             dropBoxRepublishAt = std::atoi(argv[++i]);
@@ -2523,7 +2531,23 @@ int main(int argc, char** argv) {
 
     std::vector<u8> allAudio;
     std::vector<u8> tmpAudio;
-    for (int i = 0; i < frames; ++i) {
+    int firstFrame = 0;
+    if (!loadStatePath.empty()) {
+        std::string why;
+        if (!mac.loadStateFile(loadStatePath, &why)) {
+            std::fprintf(stderr, "state not loaded: %s\n", why.c_str());
+            return 2;
+        }
+        firstFrame = static_cast<int>(mac.frameCount());
+        std::printf("state loaded: %s, frame %d\n", loadStatePath.c_str(), firstFrame);
+    }
+    const auto saveStateTo = [&](const std::string& path, int frame) {
+        std::string why;
+        if (mac.saveStateFile(path, &why)) std::printf("state saved: %s, frame %d\n", path.c_str(), frame);
+        else std::fprintf(stderr, "state not saved: %s\n", why.c_str());
+    };
+    for (int i = firstFrame; i < frames; ++i) {
+        if (i == saveStateAt) saveStateTo(saveStateAtPath, i);
         // Put a disk into the external drive mid-run, the way a user does when an
         // installer asks for the next one. A disk already in the drive at power-on
         // is a different case: the ROM reads the disk-switched line during its own
@@ -2618,6 +2642,7 @@ int main(int argc, char** argv) {
         }
         if (cpu.halted) break;
     }
+    if (!saveStatePath.empty()) saveStateTo(saveStatePath, frames);
 
     auto rd32 = [&](u32 a) {
         return (u32(mac.read16(a)) << 16) | mac.read16(a + 2);

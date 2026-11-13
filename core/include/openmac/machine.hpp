@@ -24,7 +24,10 @@ class ScsiEthernet;
 class Iwm;
 class SonyDrive;
 
+class ClassicStateCodec;
+
 class Machine final : public IBus {
+    friend class ClassicStateCodec;
 public:
     struct Config {
         u32 ramSize = 4u * 1024 * 1024;   // 1, 2, 2.5 or 4 MB
@@ -213,6 +216,18 @@ public:
     // ~22.25 kHz scanline rate) into `out`; the internal buffer is emptied.
     void drainAudio(std::vector<u8>& out);
 
+    // A saved state: everything that changes while the machine runs -- the
+    // processor, RAM, every chip, both hard disks' contents, the floppies in
+    // the drives -- in the format of the Macintosh IIfx's checkpoints. The
+    // ROM is named by its contents, not copied; the RAM size, the external
+    // floppy drive, the CD-ROM drive and the network adapter are
+    // configuration, and a state loads only into a machine built the same
+    // way. A CD is the loader's to put back. Take one between frames.
+    std::vector<u8> saveState() const;
+    bool loadState(const u8* data, std::size_t size, std::string* error = nullptr);
+    bool saveStateFile(const std::string& path, std::string* error = nullptr) const;
+    bool loadStateFile(const std::string& path, std::string* error = nullptr);
+
     // Host input, delivered through the ADB devices.
     void mouseMove(int dx, int dy, bool button);
     void keyEvent(u8 adbCode, bool down);
@@ -379,11 +394,16 @@ private:
     void installHardDisk();       // give the hard disk its deferred mount
     u32 stackParamBlock();        // an 80-byte parameter block on the guest's stack
     bool scsiManagerBusy();       // the ROM's SCSI Manager is inside a transaction
-    // A volume mount waits for the running program's next event-loop call
-    // (see atSafePoint): bit 0 the hard disk, bit 1 the second disk.
+    // A volume mount or unmount waits for the running program's next
+    // event-loop call (see atSafePoint): bit 0 the hard disk's mount, bit 1
+    // the second disk's, bit 2 an unmount of the second disk the front end
+    // asked for.
     bool atSafePoint();
+    bool runToSafePoint();
     void mountAtSafePoint();
+    void unmountSecondDiskNow();
     u8 mountsWaiting_ = 0;
+    int hd2UnmountAsked_ = 0;     // frames an asked-for unmount stays wanted
     int sonyPrime(u32 pb, u32 dce);
     int sonyControl(u32 pb, u32 dce);
     int sonyStatus(u32 pb, u32 dce);

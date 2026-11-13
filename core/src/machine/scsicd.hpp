@@ -355,7 +355,8 @@ private:
     }
 
     friend class IifxStateCodec;
-    friend class Quadra950StateCodec;
+    friend class QuadraStateCodec;
+    friend class ClassicStateCodec;
     bool attached_ = false;
     int  id_ = 3;              // Apple's factory default CD-ROM bus ID
     std::vector<u8> media_;

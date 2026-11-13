@@ -69,6 +69,7 @@ public:
 
 private:
     friend struct CpuOps;
+    friend class ClassicStateCodec;
 
     // Data access. Word/long access to an odd address raises an address
     // error (thrown, caught in step(), turned into a group-0 exception).

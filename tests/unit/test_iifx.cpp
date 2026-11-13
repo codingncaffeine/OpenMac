@@ -1896,6 +1896,29 @@ TEST_CASE("IIfx checkpoint carries the disk in the drive, not the one swapped ou
     CHECK(mac.saveState().size() < oneDisk + 4096u);
 }
 
+TEST_CASE("IIfx checkpoint carries the second disk") {
+    std::vector<u8> disk(2u * 1024u * 1024u);
+    for (std::size_t i = 0; i < disk.size(); ++i) disk[i] = static_cast<u8>(i * 31u + (i >> 9));
+    IifxMachine mac(testRom());
+    mac.insertHardDisk2(disk, true);
+    for (int index = 0; index < 20; ++index) mac.stepInstruction();
+    const std::vector<u8> saved = mac.saveState();
+
+    IifxMachine other(testRom());
+    CHECK_FALSE(other.hardDisk2Present());
+    std::string error;
+    REQUIRE(other.loadState(saved.data(), saved.size(), &error));
+    CHECK(other.hardDisk2Present());
+    CHECK(other.hardDisk2Image() == disk);
+    CHECK(other.saveState() == saved);
+
+    // And an empty seat empties the loader's.
+    IifxMachine bare(testRom());
+    const std::vector<u8> none = bare.saveState();
+    REQUIRE(other.loadState(none.data(), none.size(), &error));
+    CHECK_FALSE(other.hardDisk2Present());
+}
+
 TEST_CASE("IIfx full-machine checkpoints replay cycle-for-cycle") {
     IifxMachine::Config config;
     config.ramSize = 4u * 1024u * 1024u;

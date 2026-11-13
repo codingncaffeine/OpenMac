@@ -67,6 +67,11 @@ void MacHostServices::machineStarting() {
     // it. Nothing is read back out of it before then (see lowMemoryFresh).
     unitTableFresh_ = false;
     sawNoApp_ = false;
+    // Whatever waited for a call of the last startup's guest is void too.
+    storageDue_ = false;
+    hd2UnmountAsked_ = 0;
+    beepAsked_ = false;
+    hcpu_.holdAtCalls = 0;
 }
 
 // Has the ROM rebuilt the unit table since the machine last started? The
@@ -612,7 +617,8 @@ bool MacHostServices::leaveSwappedAddressingMode() {
 // mouse.
 bool MacHostServices::guestRestart() {
     if (inDriver_ || announceInFlight_) return false;
-    if (read32(0x0358) == 0 || (read8(0x0360) & 1)) return false;   // no System / FSBusy
+    if (read32(0x0358) == 0 || !runToCall()) return false;   // no System / no call
+    if (read8(0x0360) & 1) return false;               // FSBusy
     if ((hcpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt
     if (addressingModeSwapped()) return false;
     const u32 scratch = 0x0A78;
@@ -626,15 +632,18 @@ bool MacHostServices::guestRestart() {
 bool MacHostServices::guestPutAwaySecondDisk() {
     if (hd2_.empty() || inDriver_ || announceInFlight_) return false;
     if (read32(0x0358) == 0 || !volumeMountedFor(kHd2Drive)) return false;
+    if (!runToCall()) return false;
     const bool seen = hd2SeenMounted_;
-    const bool off = unmountSecondDisk();
+    unmountSecondDiskAtCall();
+    const bool off = !volumeMountedFor(kHd2Drive);
     hd2SeenMounted_ = seen;                           // as if the guest had done it
     return off;
 }
 
 bool MacHostServices::guestPowerOff() {
     if (inDriver_ || announceInFlight_) return false;
-    if (read32(0x0358) == 0 || (read8(0x0360) & 1)) return false;   // no System / FSBusy
+    if (read32(0x0358) == 0 || !runToCall()) return false;   // no System / no call
+    if (read8(0x0360) & 1) return false;               // FSBusy
     if ((hcpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt
     if (addressingModeSwapped()) return false;
     const u32 scratch = 0x0A78;
@@ -645,18 +654,26 @@ bool MacHostServices::guestPowerOff() {
     return true;
 }
 
+// The sound is played when the guest next makes a call it can be run at, in
+// the course of an ordinary frame: run to that call from here, the samples
+// of the wait would crowd the sound itself out of the machine's audio buffer.
 bool MacHostServices::systemBeep() {
-    if (inDriver_ || announceInFlight_) return false;
+    if (inDriver_ || announceInFlight_ || !guestRunning()) return false;
     if (read32(0x0358) == 0 || (read8(0x0360) & 1)) return false;   // no System / FSBusy
-    if ((hcpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt
-    if (!leaveSwappedAddressingMode()) return false;
+    beepAsked_ = true;
+    askForCall();
+    return true;
+}
+
+void MacHostServices::beepAtCall() {
+    if (inDriver_ || announceInFlight_ || addressingModeSwapped()) return;   // not this time
+    beepAsked_ = false;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = hcpu_.d[i]; sa[i] = hcpu_.a[i]; }
     hcpu_.a[7] -= 2;
     write16(hcpu_.a[7], 30);                          // duration, in ticks
     execute68kTrap(0xA9C8);                           // _SysBeep
     for (int i = 0; i < 8; ++i) { hcpu_.d[i] = sd[i]; hcpu_.a[i] = sa[i]; }
-    return true;
 }
 
 void MacHostServices::execute68kTrap(u16 trap) {
@@ -685,17 +702,40 @@ void MacHostServices::execute68kTrap(u16 trap) {
     const u32 savedPc = hcpu_.pc;
     const u16 savedSr = hcpu_.getSR();
     hcpu_.pc = scratch;
+    // The trap makes calls of its own, and those are not the guest's: the
+    // CPU is not to stop at one. A request that was standing, or one a clock
+    // tick makes while the trap runs, is put to the CPU again afterwards.
+    const bool wasAsked = hcpu_.holdAtCalls != 0;
+    hcpu_.holdAtCalls = 0;
+    const bool outer = !inGuestCall_;
+    inGuestCall_ = true;
     for (int guard = 0; guard < 64000000 && hcpu_.pc != scratch + 2 && !hcpu_.halted;
          ++guard) {
         stepInstruction();
+    }
+    // A call that never came back is given up, and said: the guest was not
+    // in a state to take it, and what the caller reads next is not a result.
+    if (hcpu_.pc != scratch + 2 && onDiag) {
+        char b[96];
+        std::snprintf(b, sizeof b, "guest call %04X did not return (given up at pc %08X)", trap,
+                      hcpu_.pc);
+        onDiag(b);
     }
     hcpu_.pc = savedPc;
     hcpu_.setSR(savedSr);
     write8(scratch, was0);
     write8(scratch + 1, was1);
+    if (outer) {
+        inGuestCall_ = false;
+        if (wasAsked || askedInCall_) {
+            askedInCall_ = false;
+            askForCall();
+        }
+    }
 }
 
 s32 MacHostServices::gestaltQuery(u32 selector, u32& response) {
+    runToCall();                                  // where the guest stands, failing that
     if (!leaveSwappedAddressingMode()) { response = 0; return -1; }
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = hcpu_.d[i]; sa[i] = hcpu_.a[i]; }
@@ -709,6 +749,7 @@ s32 MacHostServices::gestaltQuery(u32 selector, u32& response) {
 
 bool MacHostServices::slotResources(std::vector<SlotResource>& out) {
     out.clear();
+    runToCall();                                  // where the guest stands, failing that
     if (!leaveSwappedAddressingMode()) return false;
     u32 sd[8], sa[8];
     for (int i = 0; i < 8; ++i) { sd[i] = hcpu_.d[i]; sa[i] = hcpu_.a[i]; }
@@ -864,10 +905,14 @@ bool MacHostServices::markVolumeClean(u16 drive) {
 
 bool MacHostServices::shutdownVolumes() {
     if (hd_.empty() && hd2_.empty()) return false;
-    if (inDriver_ || announceInFlight_) return false;
-    if (read32(0x0358) == 0) return false;            // System never came up
-    if ((((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) == 0xFFFFFFFFu))
-        return false;                                 // FS queue not built
+    if (inDriver_ || announceInFlight_ || !guestRunning()) return false;
+    if (!fileSystemUp()) return false;                // no System, or no FS queue yet
+    // At a call of the guest's own, like every other trap run for the host.
+    // A guest that makes none -- stopped on a system error, say -- still gets
+    // its volumes flushed, where it stands: the machine is about to go, and
+    // blocks left in its cache are lost for certain.
+    runToCall();
+    if (!fileSystemUp()) return false;                // it went down meanwhile
     if (!leaveSwappedAddressingMode()) return false;
     announceInFlight_ = true;
     u32 sd[8], sa[8];
@@ -934,9 +979,20 @@ bool MacHostServices::shutdownVolumes() {
 bool MacHostServices::unmountSecondDisk() {
     if (hd2_.empty()) return true;
     if (inDriver_ || announceInFlight_) return false;
-    if (read32(0x0358) == 0) return true;             // System never came up
-    if ((((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) == 0xFFFFFFFFu))
-        return true;                                  // FS queue not built
+    if (!fileSystemUp()) return true;                 // no System, or no FS queue yet
+    if (!volumeMountedFor(kHd2Drive)) return true;    // already off line
+    if (!guestRunning()) return true;                 // nothing is reading it
+    hd2UnmountAsked_ = 30;
+    askForCall();
+    return false;
+}
+
+// The unmount itself, with the CPU in front of one of the guest's calls.
+// True = the traps were run (or there was nothing to unmount); false = the
+// File Manager was busy, and the request stands.
+bool MacHostServices::unmountSecondDiskAtCall() {
+    if (hd2_.empty() || !fileSystemUp()) return true;
+    if (inDriver_ || announceInFlight_) return false;
     if (read8(0x0360) & 1) return false;              // FSBusy: a file op is running
     if ((hcpu_.getSR() & 0x0700) != 0) return false;   // mid-interrupt: not now
     if (addressingModeSwapped()) return false;        // not now
@@ -973,7 +1029,7 @@ bool MacHostServices::unmountSecondDisk() {
                       off ? "off line" : "STILL MOUNTED");
         onDiag(b);
     }
-    return off;
+    return true;
 }
 
 // Read a file the way an application does: the guest's File Manager walks the
@@ -994,6 +1050,8 @@ bool MacHostServices::readFileThroughGuest(const std::string& name,
     }
     if (read8(0x0360) & 1) { why = "the File Manager is busy"; return false; }
     if (name.empty() || name.size() > 31) { why = "bad name"; return false; }
+    if (!runToCall()) { why = "the guest made no call this could be run at"; return false; }
+    if (read8(0x0360) & 1) { why = "the File Manager is busy"; return false; }
     if (!leaveSwappedAddressingMode()) { why = "busy"; return false; }
 
     constexpr u32 kChunk = 32768;
@@ -1208,20 +1266,29 @@ int MacHostServices::insertCd(std::vector<u8> image) {
 // The front end's Eject only STAGES: the disc has a volume mounted on it, and
 // taking the medium out from under one leaves the guest holding a volume with
 // nothing behind it -- offLinErr forever, which is exactly what the floppy path
-// had to learn. completeCdEject unmounts first, at a frame edge, on the
-// emulation thread.
+// had to learn. completeCdEject unmounts first, on the emulation thread, when
+// the guest next makes a call it can be run at.
 void MacHostServices::ejectCd() {
     if (!cdrom_->discPresent()) return;
     cdEjectPending_ = true;
 }
 
+// Does the disc carry a volume the guest has to let go of first?
+bool MacHostServices::cdEjectNeedsGuest() {
+    // Whichever driver has the disc: this machine's, or the guest's own.
+    const u16 drive = cdDrive_ ? cdDrive_ : guestCdDrive();
+    return drive && guestRunning() && read32(0x0358) != 0 && volumeMountedFor(drive);
+}
+
+// With the CPU in front of one of the guest's calls: unmount the disc's
+// volume, then take the disc.
 void MacHostServices::completeCdEject() {
     if (!cdEjectPending_) return;
     if (inDriver_ || announceInFlight_) return;
-    // Whichever driver has the disc: this machine's, or the guest's own.
     const u16 drive = cdDrive_ ? cdDrive_ : guestCdDrive();
-    if (drive && read32(0x0358) != 0 && !(read8(0x0360) & 1) &&
-        (hcpu_.getSR() & 0x0700) == 0 && volumeMountedFor(drive)) {
+    if (drive && read32(0x0358) != 0 && volumeMountedFor(drive)) {
+        if ((read8(0x0360) & 1) || (hcpu_.getSR() & 0x0700) != 0 || addressingModeSwapped())
+            return;                                   // not now: next second
         announceInFlight_ = true;
         u32 sd[8], sa[8];
         for (int i = 0; i < 8; ++i) { sd[i] = hcpu_.d[i]; sa[i] = hcpu_.a[i]; }
@@ -1251,6 +1318,10 @@ void MacHostServices::completeCdEject() {
             if (++cdEjectTries_ < 20) return;
         }
     }
+    finishCdEject();
+}
+
+void MacHostServices::finishCdEject() {
     cdEjectPending_ = false;
     cdEjectTries_ = 0;
     cdrom_->eject();
@@ -1380,15 +1451,82 @@ void MacHostServices::watchSecondDiskPutAway() {
     if (onDiag) onDiag("hd2: the Macintosh put the volume away");
 }
 
+bool MacHostServices::fileSystemUp() {
+    return read32(0x0358) != 0 &&                     // a volume is on line
+           ((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) != 0xFFFFFFFFu;
+}
+
+u8 MacHostServices::callClasses() {
+    return startupFinished() ? M68040::kEventCalls
+                             : static_cast<u8>(M68040::kEventCalls | M68040::kResourceCalls);
+}
+
+void MacHostServices::askForCall() {
+    if (inGuestCall_) askedInCall_ = true;
+    else hcpu_.holdAtCalls = callClasses();
+}
+
+// Is there work for the guest's next call? Only what could run there: a
+// request that would give up at its first check asks for nothing, so a
+// machine with nothing to do is never stopped.
+bool MacHostServices::storageWorkWanted() {
+    if (!guestRunning() || read32(0x0358) == 0) return false;
+    if (!suppressHdAnnounce && (hdAnnouncePending_ || hd2AnnouncePending_) && lowMemoryFresh())
+        return true;
+    if (cdEjectPending_ || (cdMountPending_ && cdDrive_)) return true;
+    return cdrom_->attachedState() && !cdDrvr_ && cdInstallTries_ <= 30 &&
+           startupFinished() && !guestCdDrive();
+}
+
+// The CPU has stopped in front of one of the guest's calls. This second's
+// storage work is run if it is still owed, then the board's, then an unmount
+// the front end asked for.
+void MacHostServices::storageAtCall() {
+    atCall_ = true;
+    if (storageDue_) {
+        storageDue_ = false;
+        announceHardDisks();
+        // The CD's driver goes in on the same clock and for the same reason:
+        // there is no unit table to install into until the System has built
+        // one. Eject before mount, so a disc swapped at the host is unmounted
+        // before its replacement is announced.
+        if (cdrom_->attachedState() && !cdDrvr_) installCdDriver();
+        if (cdEjectPending_) completeCdEject();
+        else if (cdMountPending_) mountCdVolume();
+    }
+    if (boardWorkWanted()) boardWorkAtCall();
+    if (hd2UnmountAsked_ > 0 && unmountSecondDiskAtCall()) hd2UnmountAsked_ = 0;
+    if (beepAsked_) beepAtCall();
+}
+
+// An idle System 7.5 Finder makes its event call once a second; three
+// seconds of a 33 MHz machine is some thirty million instructions.
+bool MacHostServices::runToCall() {
+    if (!guestRunning() || hcpu_.halted || inGuestCall_) return false;
+    atCall_ = false;
+    hcpu_.holdAtCalls = callClasses();
+    for (int guard = 0; guard < 30000000 && !atCall_ && !hcpu_.halted && guestRunning();
+         ++guard) {
+        stepInstruction();
+    }
+    return atCall_;
+}
+
 // Once per emulated second.
 void MacHostServices::storageSecondTick() {
-    announceHardDisks();
     watchSecondDiskPutAway();
-    // The CD's driver goes in on the same clock and for the same reason:
-    // there is no unit table to install into until the System has built one.
-    if (cdrom_->attachedState() && !cdDrvr_) installCdDriver();
-    if (cdEjectPending_) completeCdEject();
-    else if (cdMountPending_) mountCdVolume();
+    // Watched every second, whoever asks later: a name left in CurApName by
+    // the last startup only counts once it has been seen unset.
+    (void)startupFinished();
+    // A second's work still owed means that second brought no call.
+    const bool noCall = storageDue_;
+    // A disc with no volume on line comes out at once. One the guest holds
+    // waits for its next call; after twenty seconds without one, or twenty
+    // refusals, it comes out anyway.
+    if (cdEjectPending_ && (!cdEjectNeedsGuest() || (noCall && ++cdEjectTries_ >= 20)))
+        finishCdEject();
+    storageDue_ = storageWorkWanted();
+    if (storageDue_) askForCall();
 }
 
 // Once per frame.
@@ -1400,6 +1538,10 @@ void MacHostServices::storageFrameTick() {
     if (lowMemoryFresh() &&
         ((!hd_.empty() && !diskPrimePc_[0]) || (!hd2_.empty() && !diskPrimePc_[1])))
         findDiskDriverPrime();
+    // What does not keep to the second: an unmount the front end is asking
+    // for, and the board's own work.
+    if (hd2UnmountAsked_ > 0) --hd2UnmountAsked_;
+    if (hd2UnmountAsked_ > 0 || beepAsked_ || boardWorkWanted()) askForCall();
 }
 
 } // namespace openmac

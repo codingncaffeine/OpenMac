@@ -26,7 +26,8 @@ add_library(openmac_core STATIC
     src/machine/hostservices.cpp
     src/machine/quadra/quadra.cpp
     src/machine/quadra950/quadra950.cpp
-    src/machine/quadra950/state.cpp
+    src/machine/quadra/state.cpp
+    src/machine/state.cpp
     src/machine/machine.cpp
     src/machine/cdmedia.cpp
     src/machine/via.cpp

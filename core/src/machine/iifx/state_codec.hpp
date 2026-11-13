@@ -39,7 +39,7 @@ namespace openmac {
 
 namespace statecodec {
 
-constexpr u32 kStateVersion = 18;
+constexpr u32 kStateVersion = 19;
 constexpr u32 kEndianMarker = 0x12345678u;
 constexpr u32 kPageBytes = 4096;
 constexpr u64 kMaxMediaBytes = 1024ull * 1024ull * 1024ull;
@@ -353,7 +353,8 @@ void section(Io& io, u32 tag) {
 using namespace statecodec;
 
 class IifxStateCodec {
-    friend class Quadra950StateCodec;   // uses the shared parts' visitors
+    friend class QuadraStateCodec;   // uses the shared parts' visitors
+    friend class ClassicStateCodec;
 public:
     static std::vector<u8> save(const IifxMachine& source) {
         IifxMachine& machine = const_cast<IifxMachine&>(source);
@@ -481,6 +482,27 @@ public:
         } else {
             machine.hardDisk_.clear();
             machine.disk_->image_ = nullptr;
+        }
+        if (version >= 19) {
+            ScsiDisk& seat = machine.scsi_->disk;
+            const std::size_t seatBytes = machine.hardDisk2_.size();
+            if (seatBytes == 0) {
+                machine.scsiImage2_.clear();
+                seat.image_ = nullptr;
+            } else {
+                const u64 end = machine.hardDisk2IsWholeScsi_
+                    ? static_cast<u64>(seatBytes)
+                    : static_cast<u64>(machine.hfsImageOffset2_) + seatBytes;
+                if (machine.scsiImage2_.empty() || end > machine.scsiImage2_.size())
+                    return fail("checkpoint second disk lies outside its SCSI image");
+                const std::size_t first = machine.hardDisk2IsWholeScsi_
+                    ? 0u : machine.hfsImageOffset2_;
+                machine.hardDisk2_.assign(
+                    machine.scsiImage2_.begin() + static_cast<std::ptrdiff_t>(first),
+                    machine.scsiImage2_.begin() + static_cast<std::ptrdiff_t>(end));
+                seat.image_ = &machine.scsiImage2_;
+                seat.id_ = 1;
+            }
         }
         machine.floppy_->drive_.image = machine.floppy_->media_.empty()
             ? nullptr : &machine.floppy_->media_;
@@ -1127,6 +1149,38 @@ private:
             machine.cdMountPending_ = false;
             machine.cdMountTries_ = machine.cdInstallTries_ = 0;
             machine.cdEjectPending_ = false; machine.cdEjectTries_ = 0;
+        }
+        // Format 19: the second seat with its disk, and what is waiting for
+        // the guest's next call. An earlier file leaves the seat to whoever
+        // loads it, and nothing was waiting in a machine that ran its guest
+        // calls where the clock tick fell.
+        if (stateVersion >= 19) {
+            u64 seatBytes = static_cast<u64>(machine.hardDisk2_.size());
+            io.boundedU64(seatBytes, kMaxMediaBytes);
+            if (io.applying())
+                machine.hardDisk2_.assign(static_cast<std::size_t>(seatBytes), 0);
+            io.sparse(machine.scsiImage2_, kMaxMediaBytes);
+            io.u32v(machine.hfsImageOffset2_);
+            io.boolv(machine.hardDisk2IsWholeScsi_);
+            io.boolv(machine.hardDisk2MountPending_);
+            io.u32v(machine.hardDisk2MountTries_);
+            io.boolv(machine.hardDisk2SeenOnLine_);
+            io.intv(machine.hardDisk2OffSeconds_);
+            io.boolv(machine.hardDisk2PutAway_);
+            io.boolv(machine.unitTableFresh_); io.boolv(machine.sawNoApp_);
+            io.boolv(machine.storageDue_);
+            io.intv(machine.hardDisk2UnmountAsked_);
+            io.u8v(machine.cpu_.holdAtCalls);
+        } else if (io.applying()) {
+            machine.unitTableFresh_ = true;
+            machine.sawNoApp_ = true;
+            machine.storageDue_ = false;
+            machine.hardDisk2UnmountAsked_ = 0;
+            machine.cpu_.holdAtCalls = 0;
+        }
+        if (io.applying()) {
+            machine.cpu_.heldAtCall = false;
+            machine.atCall_ = machine.inGuestCall_ = machine.askedInCall_ = false;
         }
 
         IopFloppy& floppy = *machine.floppy_;

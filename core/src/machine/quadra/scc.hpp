@@ -198,7 +198,7 @@ public:
 
 private:
     friend class IifxStateCodec;
-    friend class Quadra950StateCodec;
+    friend class QuadraStateCodec;
 
     // One byte on the wire at LocalTalk speed: 8 bits at 230.4 kbit/s is
     // ~34.7 us, ~1150 CPU cycles at 33 MHz. The pacing matters more than the

@@ -29,7 +29,7 @@ namespace openmac {
 
 class Via6522;
 class EgretController;
-class Quadra950StateCodec;
+class QuadraStateCodec;
 class MemoryController950;
 class IoProcessor;
 class Scc8530;
@@ -42,7 +42,7 @@ class IopFloppy;
 class ScsiEthernet;
 
 class Quadra950Machine final : public IBus040, public MacHostServices {
-    friend class Quadra950StateCodec;
+    friend class QuadraStateCodec;
 public:
     struct Config {
         // The four SIMM banks A-D in megabytes: 0 (empty) or 4, 8, 16, 32, 64.
@@ -147,6 +147,7 @@ public:
     // its volumes before it asks.
     void powerOff() { poweredOff_ = true; }
     bool poweredOff() const { return poweredOff_; }
+    bool guestRunning() const override { return !poweredOff_; }
 
     // What the memory controller's three boundaries currently say, in bytes.
     u32 bankBoundary(int k) const;

@@ -1,24 +1,29 @@
-// The Quadra 950's saved state, in the format of the Macintosh IIfx's
+// The saved states of the two Quadras, in the format of the Macintosh IIfx's
 // checkpoints (iifx/state_codec.hpp): a 64-byte header naming the ROM and the
-// RAM size, then one tagged section per part. The chips the two machines
-// share are written by the IIfx codec's visitors; what those visitors leave
-// out, because the IIfx never used it, follows in a section of this file's
-// own, so the IIfx's format does not move.
+// RAM size, then one tagged section per part. The chips the machines share
+// are written by the IIfx codec's visitors; what those visitors leave out,
+// because the IIfx never used it, follows in a section of this file's own, so
+// the IIfx's format does not move. The Quadra 950's file comes first, the
+// Quadra 650's after it; the storage both get from MacHostServices is one
+// visitor.
 
+#include "openmac/quadra.hpp"
 #include "openmac/quadra950.hpp"
 
 #include "../iifx/state_codec.hpp"
-#include "../quadra/dafb.hpp"
-#include "../quadra/ncr53c96.hpp"
+#include "../quadra950/egret.hpp"
+#include "../quadra950/memctl.hpp"
 #include "../scsinet.hpp"
-#include "egret.hpp"
-#include "memctl.hpp"
+#include "dafb.hpp"
+#include "ncr53c96.hpp"
+#include "pseudovia.hpp"
 
 namespace openmac {
 
 namespace {
 
-constexpr u32 k950StateVersion = 1;
+// Format 2 adds what is waiting for the guest's next call (CALL section).
+constexpr u32 k950StateVersion = 2;
 constexpr char k950StateMagic[8] = {'O', 'M', 'Q', '9', '5', '0', 'S', 'T'};
 constexpr u64 k950MaxRamBytes = 256ull * 1024ull * 1024ull;
 // A 1 GB volume behind its driver partition.
@@ -27,14 +32,18 @@ constexpr u64 k950MaxVideoRam = 4ull * 1024ull * 1024ull;
 // The shared visitors take the IIfx's format number: the current one.
 constexpr u32 kSharedFormat = kStateVersion;
 
+constexpr u32 k650StateVersion = 1;
+constexpr char k650StateMagic[8] = {'O', 'M', 'Q', '6', '5', '0', 'S', 'T'};
+constexpr u64 k650MaxRamBytes = 136ull * 1024ull * 1024ull;
+
 } // namespace
 
-class Quadra950StateCodec {
+class QuadraStateCodec {
 public:
     static std::vector<u8> save(const Quadra950Machine& source) {
         Quadra950Machine& machine = const_cast<Quadra950Machine&>(source);
         StateWriter payload;
-        visit(payload, machine);
+        visit(payload, machine, k950StateVersion);
 
         u32 version = k950StateVersion;
         u32 headerBytes = 64;
@@ -86,7 +95,7 @@ public:
         header.u64v(payloadBytes);
         header.u64v(payloadHash);
         if (!header.ok()) return fail(header.error());
-        if (version != k950StateVersion)
+        if (version < 1 || version > k950StateVersion)
             return fail("unsupported Quadra 950 saved-state version");
         if (headerBytes != 64 || endian != kEndianMarker)
             return fail("invalid Quadra 950 saved-state header");
@@ -107,12 +116,12 @@ public:
         // Every section, length and sparse page is read once without touching
         // the machine, so a damaged file changes nothing.
         StateReader validator(payload, static_cast<std::size_t>(payloadBytes), false);
-        visit(validator, machine);
+        visit(validator, machine, version);
         if (!validator.ok()) return fail(validator.error());
         if (!validator.atEnd()) return fail("saved state has trailing payload data");
 
         StateReader reader(payload, static_cast<std::size_t>(payloadBytes), true);
-        visit(reader, machine);
+        visit(reader, machine, version);
         if (!reader.ok() || !reader.atEnd())
             return fail(reader.ok() ? "saved state has trailing payload data" : reader.error());
 
@@ -290,7 +299,7 @@ private:
     // the drivers' hooked entry points, and the CD driver's bookkeeping. The
     // disc itself is the loader's to put back, as on the IIfx.
     template <typename Io>
-    static void visitHostServices(Io& io, Quadra950Machine& m) {
+    static void visitHostServices(Io& io, MacHostServices& m) {
         section(io, fourcc('H', 'O', 'S', 'T'));
         io.boolv(m.unitTableFresh_); io.boolv(m.sawNoApp_); io.boolv(m.inDriver_);
         for (u32& value : m.diskPrimePc_) io.u32v(value);
@@ -330,8 +339,30 @@ private:
         io.intv(m.hdTraceBudget_); io.intv(m.hdErrBudget_);
     }
 
+    // What is waiting for the guest's next call. A format 1 file was written
+    // by a machine that ran its guest calls where the clock tick fell:
+    // nothing was waiting in it.
     template <typename Io>
-    static void visit(Io& io, Quadra950Machine& m) {
+    static void visitCalls(Io& io, MacHostServices& m, bool present) {
+        if (present) {
+            section(io, fourcc('C', 'A', 'L', 'L'));
+            io.boolv(m.storageDue_); io.intv(m.hd2UnmountAsked_);
+            io.boolv(m.beepAsked_);
+            io.u8v(m.hcpu_.holdAtCalls);
+        } else if (io.applying()) {
+            m.storageDue_ = false;
+            m.hd2UnmountAsked_ = 0;
+            m.beepAsked_ = false;
+            m.hcpu_.holdAtCalls = 0;
+        }
+        if (io.applying()) {
+            m.hcpu_.heldAtCall = false;
+            m.atCall_ = m.inGuestCall_ = m.askedInCall_ = false;
+        }
+    }
+
+    template <typename Io>
+    static void visit(Io& io, Quadra950Machine& m, u32 version) {
         section(io, fourcc('Q', '9', '5', '0'));
         io.sparse(m.ram_, k950MaxRamBytes);
         io.boolv(m.overlay_);
@@ -367,16 +398,214 @@ private:
         visitDafb(io, *m.dafb_);
         visitHostServices(io, m);
         visitSharedExtras(io, m);
+        visitCalls(io, m, version >= 2);
+        section(io, fourcc('E', 'N', 'D', '!'));
+    }
+
+    // ---- the Quadra 650 -------------------------------------------------
+public:
+    static std::vector<u8> save650(const QuadraMachine& source) {
+        QuadraMachine& machine = const_cast<QuadraMachine&>(source);
+        StateWriter payload;
+        visit650(payload, machine);
+
+        u32 version = k650StateVersion;
+        u32 headerBytes = 64;
+        u32 endian = kEndianMarker;
+        u32 flags = configuration650(machine);
+        u64 romBytes = static_cast<u64>(machine.rom_.size());
+        u64 romHash = fnv1a(machine.rom_.data(), machine.rom_.size());
+        u64 ramBytes = static_cast<u64>(machine.ram_.size());
+        u64 payloadBytes = static_cast<u64>(payload.data().size());
+        u64 payloadHash = fnv1a(payload.data().data(), payload.data().size());
+
+        StateWriter output;
+        output.bytes(reinterpret_cast<const u8*>(k650StateMagic), sizeof k650StateMagic);
+        output.u32v(version);
+        output.u32v(headerBytes);
+        output.u32v(endian);
+        output.u32v(flags);
+        output.u64v(romBytes);
+        output.u64v(romHash);
+        output.u64v(ramBytes);
+        output.u64v(payloadBytes);
+        output.u64v(payloadHash);
+        std::vector<u8> result = output.take();
+        const std::vector<u8>& body = payload.data();
+        result.insert(result.end(), body.begin(), body.end());
+        return result;
+    }
+
+    static bool load650(QuadraMachine& machine, const u8* data, std::size_t size,
+                        std::string* error) {
+        const auto fail = [error](const std::string& text) {
+            if (error) *error = text;
+            return false;
+        };
+        if (!data || size < 64) return fail("saved state is too small");
+        if (std::memcmp(data, k650StateMagic, sizeof k650StateMagic) != 0)
+            return fail("not an OpenMac Quadra 650 saved state");
+
+        StateReader header(data + sizeof k650StateMagic, size - sizeof k650StateMagic, true);
+        u32 version = 0, headerBytes = 0, endian = 0, flags = 0;
+        u64 romBytes = 0, romHash = 0, ramBytes = 0, payloadBytes = 0, payloadHash = 0;
+        header.u32v(version);
+        header.u32v(headerBytes);
+        header.u32v(endian);
+        header.u32v(flags);
+        header.u64v(romBytes);
+        header.u64v(romHash);
+        header.u64v(ramBytes);
+        header.u64v(payloadBytes);
+        header.u64v(payloadHash);
+        if (!header.ok()) return fail(header.error());
+        if (version != k650StateVersion)
+            return fail("unsupported Quadra 650 saved-state version");
+        if (headerBytes != 64 || endian != kEndianMarker)
+            return fail("invalid Quadra 650 saved-state header");
+        if (payloadBytes != size - headerBytes)
+            return fail("saved-state payload length mismatch");
+        if (romBytes != machine.rom_.size() ||
+            romHash != fnv1a(machine.rom_.data(), machine.rom_.size()))
+            return fail("the state was saved with a different Quadra 650 ROM");
+        if (ramBytes != machine.ram_.size())
+            return fail("the state was saved with a different amount of RAM");
+        if (flags != configuration650(machine))
+            return fail("the state was saved with a different monitor");
+        const u8* payload = data + headerBytes;
+        if (payloadHash != fnv1a(payload, static_cast<std::size_t>(payloadBytes)))
+            return fail("saved-state payload checksum mismatch");
+
+        // Every section, length and sparse page is read once without touching
+        // the machine, so a damaged file changes nothing.
+        StateReader validator(payload, static_cast<std::size_t>(payloadBytes), false);
+        visit650(validator, machine);
+        if (!validator.ok()) return fail(validator.error());
+        if (!validator.atEnd()) return fail("saved state has trailing payload data");
+
+        StateReader reader(payload, static_cast<std::size_t>(payloadBytes), true);
+        visit650(reader, machine);
+        if (!reader.ok() || !reader.atEnd())
+            return fail(reader.ok() ? "saved state has trailing payload data" : reader.error());
+
+        // What is derived from the restored bytes rather than stored.
+        if (!rebindDisk(*machine.disk_, machine.hd_, machine.scsiImage_, machine.hfsImageOffset_))
+            return fail("saved hard disk lies outside its SCSI image");
+        if (!rebindDisk(*machine.disk2_, machine.hd2_, machine.scsiImage2_,
+                        machine.hfsImageOffset2_))
+            return fail("saved second disk lies outside its SCSI image");
+        machine.fd_->image = machine.floppy_.empty() ? nullptr : &machine.floppy_;
+        machine.updateIpl();
+        if (error) error->clear();
+        return true;
+    }
+
+private:
+    // What a state has to be loaded back into: the monitor's wiring. RAM is
+    // in the header; the SCSI devices sit where the board put them.
+    static u32 configuration650(QuadraMachine& machine) {
+        const Dafb& dafb = *machine.dafb_;
+        u32 word = (dafb.vramFitted_ >> 20) & 0xFu;
+        word |= static_cast<u32>(dafb.monitor_.grounded & 0x7u) << 4;
+        word |= static_cast<u32>(dafb.monitor_.pairs & 0x7u) << 7;
+        return word;
+    }
+
+    template <typename Io>
+    static void visitPseudoVia(Io& io, PseudoVia& via) {
+        section(io, fourcc('P', 'V', 'I', 'A'));
+        io.u8v(via.ifr_); io.u8v(via.ier_);
+        io.u8v(via.ora_); io.u8v(via.orb_); io.u8v(via.ddra_); io.u8v(via.ddrb_);
+        io.boolv(via.irqOut_);
+        io.boolv(via.scsiDrqPrev_); io.boolv(via.slotPrev_);
+        io.boolv(via.scsiIrqPrev_); io.boolv(via.ascPrev_);
+        io.intv(via.rdBudget_); io.intv(via.drqDiagBudget_);
+    }
+
+    // What the IIfx's visitors leave out of the chips this machine has.
+    template <typename Io>
+    static void visitSharedExtras650(Io& io, QuadraMachine& machine) {
+        section(io, fourcc('X', 'T', 'R', 'A'));
+        io.boolv(machine.via1_->cb1_); io.boolv(machine.via1_->cb2_);
+        for (auto& channel : machine.scc_->ch_) {
+            io.u8v(channel.shiftByte); io.u8v(channel.bufByte);
+            io.boolv(channel.rxAvail); io.u8v(channel.rxData);
+            io.boolv(channel.zeroCount); io.u64v(channel.brgPhase);
+        }
+        Easc& sound = *machine.easc_;
+        io.u8v(sound.playRecA_);
+        io.bytes(sound.waveRam_, sizeof sound.waveRam_);
+    }
+
+    template <typename Io>
+    static void visit650(Io& io, QuadraMachine& m) {
+        section(io, fourcc('Q', '6', '5', '0'));
+        io.sparse(m.ram_, k650MaxRamBytes);
+        io.boolv(m.overlay_);
+        for (u32& value : m.djmemcRegs_) io.u32v(value);
+        for (u16& value : m.iosbRegs_) io.u16v(value);
+        io.u8v(m.swimMode_); io.u8v(m.swimSetup_); io.u8v(m.swimPhases_);
+        io.bytes(m.swimParams_, sizeof m.swimParams_);
+        io.intv(m.swimParamPtr_);
+        for (u16& value : m.sonicRegs_) io.u16v(value);
+        io.bytes(m.macProm_, sizeof m.macProm_);
+
+        // The floppy: the disk in the drive, one that left it and waits for
+        // the host to write it back, one waiting for the drive to empty, and
+        // the containers the medium arrived in.
+        io.sparse(m.floppy_, kMaxSmallBlob);
+        io.sparse(m.floppyEjected_, kMaxSmallBlob);
+        io.boolv(m.floppyEjectPending_); io.intv(m.floppyEjectWait_);
+        io.sparse(m.floppyPending_, kMaxSmallBlob);
+        io.boolv(m.floppyPendingRO_); io.boolv(m.floppyPendingSet_);
+        io.intv(m.floppyPendingDelay_);
+        io.sparse(m.fdMbHeader_, kMaxSmallBlob);
+        io.sparse(m.fdMbResource_, kMaxSmallBlob);
+        io.sparse(m.fdDcHeader_, kMaxSmallBlob);
+        io.sparse(m.fdDcTags_, kMaxSmallBlob);
+        io.boolv(m.floppySel_); io.u8v(m.swimPhasePrev_);
+        io.u32v(m.fdReadCount_); io.u32v(m.fdWriteCount_);
+
+        io.boolv(m.adbArmed_); io.boolv(m.adbArmedInput_);
+        io.intv(m.adbPending_); io.boolv(m.adbPendingInput_);
+        io.intv(m.adbWakeStreak_); io.u32v(m.adbLastPollTotal_);
+
+        io.u64v(m.totalCycles_); io.u64v(m.frameCounter_);
+        io.intv(m.via1Remainder_); io.u64v(m.secondAcc_);
+        io.intv(m.audioAcc_); io.intv(m.sliceInFrame_); io.u32v(m.vblAcc_);
+        io.intv(m.ca2PulseSlices_); io.u32v(m.bootTraceFrame_);
+        io.boolv(m.dafbIrq_);
+        io.sparse(m.audioOut_, kMaxSmallBlob);
+        // The log budgets: a loaded machine's log continues the saved one's.
+        io.intv(m.eascDiagBudget_); io.intv(m.swimDiagBudget_);
+        io.intv(m.cmdDiagBudget_); io.intv(m.primeDiagBudget_);
+        io.intv(m.scsiDiagBudget_); io.intv(m.iplDiagBudget_);
+        io.intv(m.via2DiagBudget_); io.intv(m.cdbDiagBudget_);
+        io.intv(m.cdbListBudget_); io.intv(m.cdbSeen_);
+
+        IifxStateCodec::visitCpu(io, m.cpu_);
+        IifxStateCodec::visitVia(io, *m.via1_);
+        visitPseudoVia(io, *m.via2_);
+        IifxStateCodec::visitRtc(io, *m.rtc_);
+        IifxStateCodec::visitAdb(io, *m.adb_);
+        IifxStateCodec::visitScc(io, *m.scc_);
+        IifxStateCodec::visitEasc(io, *m.easc_);
+        visitNcr(io, *m.scsi_, fourcc('S', 'C', 'S', '0'));
+        IifxStateCodec::visitSony(io, *m.fd_);
+        visitDafb(io, *m.dafb_);
+        visitHostServices(io, m);
+        visitSharedExtras650(io, m);
+        visitCalls(io, m, true);
         section(io, fourcc('E', 'N', 'D', '!'));
     }
 };
 
 std::vector<u8> Quadra950Machine::saveState() const {
-    return Quadra950StateCodec::save(*this);
+    return QuadraStateCodec::save(*this);
 }
 
 bool Quadra950Machine::loadState(const u8* data, std::size_t size, std::string* error) {
-    return Quadra950StateCodec::load(*this, data, size, error);
+    return QuadraStateCodec::load(*this, data, size, error);
 }
 
 bool Quadra950Machine::saveStateFile(const std::string& path, std::string* error) const {
@@ -397,6 +626,42 @@ bool Quadra950Machine::saveStateFile(const std::string& path, std::string* error
 }
 
 bool Quadra950Machine::loadStateFile(const std::string& path, std::string* error) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        if (error) *error = "cannot open the saved state for reading: " + path;
+        return false;
+    }
+    std::vector<u8> state{std::istreambuf_iterator<char>(input),
+                          std::istreambuf_iterator<char>()};
+    return loadState(state.data(), state.size(), error);
+}
+
+std::vector<u8> QuadraMachine::saveState() const {
+    return QuadraStateCodec::save650(*this);
+}
+
+bool QuadraMachine::loadState(const u8* data, std::size_t size, std::string* error) {
+    return QuadraStateCodec::load650(*this, data, size, error);
+}
+
+bool QuadraMachine::saveStateFile(const std::string& path, std::string* error) const {
+    const std::vector<u8> state = saveState();
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        if (error) *error = "cannot open the saved state for writing: " + path;
+        return false;
+    }
+    output.write(reinterpret_cast<const char*>(state.data()),
+                 static_cast<std::streamsize>(state.size()));
+    if (!output) {
+        if (error) *error = "failed while writing the saved state: " + path;
+        return false;
+    }
+    if (error) error->clear();
+    return true;
+}
+
+bool QuadraMachine::loadStateFile(const std::string& path, std::string* error) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         if (error) *error = "cannot open the saved state for reading: " + path;

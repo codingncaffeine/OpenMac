@@ -87,6 +87,47 @@ TEST_CASE("via T1 one-shot fires and gates the IRQ line") {
 // guest wrote them, plus the clock -- so a setting stored by a control panel
 // comes back whatever it was, and nothing on the host has to know which byte
 // holds it.
+TEST_CASE("Classic saved state: a machine loaded from one goes on exactly as the machine that saved it") {
+    std::vector<u8> disk(2u * 1024u * 1024u);
+    for (std::size_t i = 0; i < disk.size(); ++i) disk[i] = static_cast<u8>(i * 31u + (i >> 9));
+    Machine first(fakeRom(), {1u * 1024 * 1024});
+    first.insertHardDisk2(disk, true);
+    for (int i = 0; i < 3; ++i) first.runFrame();
+    const std::vector<u8> saved = first.saveState();
+    REQUIRE(saved.size() > 64);
+
+    Machine second(fakeRom(), {1u * 1024 * 1024});
+    std::string why;
+    REQUIRE(second.loadState(saved.data(), saved.size(), &why));
+    CHECK(second.frameCount() == 3);
+    CHECK(second.hardDisk2Image() == disk);           // the disk came with the state
+    CHECK(second.saveState() == saved);               // nothing is lost in the round trip
+    for (int i = 0; i < 2; ++i) { first.runFrame(); second.runFrame(); }
+    CHECK(second.saveState() == first.saveState());   // and both arrive at the same place
+
+    // A state belongs to the machine it was saved on.
+    std::vector<u8> otherRom = fakeRom();
+    otherRom[0x200] ^= 0xFF;
+    Machine differentRom(std::move(otherRom), {1u * 1024 * 1024});
+    CHECK_FALSE(differentRom.loadState(saved.data(), saved.size(), &why));
+    CHECK(why.find("ROM") != std::string::npos);
+    Machine differentRam(fakeRom(), {4u * 1024 * 1024});
+    CHECK_FALSE(differentRam.loadState(saved.data(), saved.size(), &why));
+    CHECK(why.find("RAM") != std::string::npos);
+    Machine withDrive(fakeRom(), {1u * 1024 * 1024});
+    withDrive.setExternalDriveAttached(true);
+    CHECK_FALSE(withDrive.loadState(saved.data(), saved.size(), &why));
+
+    // A damaged file changes nothing.
+    Machine untouched(fakeRom(), {1u * 1024 * 1024});
+    const std::vector<u8> before = untouched.saveState();
+    std::vector<u8> damaged = saved;
+    damaged[damaged.size() / 2] ^= 0x01;
+    CHECK_FALSE(untouched.loadState(damaged.data(), damaged.size(), &why));
+    CHECK_FALSE(untouched.loadState(saved.data(), saved.size() - 9, &why));
+    CHECK(untouched.saveState() == before);
+}
+
 TEST_CASE("parameter RAM survives the machine it came from") {
     Machine a(fakeRom(), {1u * 1024 * 1024});
     // Write a pattern through the chip the way the guest would see it, plus a

@@ -632,6 +632,13 @@ int Quadra950Machine::stepInstruction() {
         return 40;
     }
     const int c = cpu_.step();
+    if (cpu_.heldAtCall) {
+        // The CPU stopped in front of a call instead of executing it: the
+        // moment work for the host was waiting for (MacHostServices).
+        cpu_.heldAtCall = false;
+        storageAtCall();
+        return 0;
+    }
     tickDevices(c);
     return c;
 }

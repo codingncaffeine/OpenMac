@@ -29,6 +29,39 @@ inline std::vector<u8> loadFile(const char* path) {
     return std::vector<u8>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
+// ---- call census ------------------------------------------------------
+// How often the guest makes the calls a machine can hang work of its own on:
+// the event calls a program makes from its own level, and the Resource
+// Manager's reads, which is most of what a startup with no program yet is
+// made of. Fed from the CPU's trap hook; one line per emulated second with
+// the counts and the longest stretch of frames without an event call.
+struct CallCensus {
+    bool on = false;
+    u32 events = 0, resources = 0, second = 0;
+    u32 lastEventFrame = 0, longestGap = 0;
+    static bool eventCall(u16 w) { return w == 0xA970 || w == 0xA860 || w == 0xA971 || w == 0xA9B4; }
+    static bool resourceCall(u16 w) {
+        return w == 0xA9A0 || w == 0xA81F || w == 0xA9A1 || w == 0xA820 || w == 0xA997 || w == 0xA81A;
+    }
+    void note(u16 opcode, u16 sr, u32 frame) {
+        if (!on || (sr & 0x0700u) != 0) return;
+        if (eventCall(opcode)) {
+            ++events;
+            if (frame - lastEventFrame > longestGap) longestGap = frame - lastEventFrame;
+            lastEventFrame = frame;
+        } else if (resourceCall(opcode)) {
+            ++resources;
+        }
+    }
+    void frameDone(u32 frame) {
+        if (!on || (frame + 1) % 60 != 0) return;
+        if (frame - lastEventFrame > longestGap) longestGap = frame - lastEventFrame;
+        std::printf("calls second %u (to frame %u): event %u, resource %u, longest stretch without an event call %u frames\n",
+                    second++, frame, events, resources, longestGap);
+        events = resources = longestGap = 0;
+    }
+};
+
 // ---- drop box ---------------------------------------------------------
 // The front end walks a host folder and hands each file to the volume
 // builder; this is the same walk, so a headless run exercises the code path

@@ -20,6 +20,8 @@ M68040::M68040(IBus040& bus, M68kCpuModel model)
 
 void M68040::reset() {
     sr_      = 0x2700;        // supervisor, interrupt stack, mask 7, no trace
+    holdAtCalls = 0;
+    heldAtCall = false;
     stopped  = false;
     halted   = false;
     vbr      = 0;

@@ -1160,7 +1160,15 @@ void QuadraMachine::tickDevices(int cpuCycles) {
             // medium out so the driver's next status poll finds the drive
             // empty. Without this a guest-commanded eject never finishes and
             // an installer can never ask for the next disk of a set.
-            completeFloppyEject();
+            // A staged eject of a disk with no volume on line needs nothing
+            // from the guest. One with a volume waits for the guest's next
+            // call; five seconds without one and it is run where the guest
+            // stands, as it always was.
+            if (floppyEjectPending_) {
+                if (!floppyEjectNeedsGuest() || ++floppyEjectWait_ > 300) completeFloppyEject();
+            } else {
+                floppyEjectWait_ = 0;
+            }
             fd_->tickEject(totalCycles_);
             if (fd_->takeEjectRequest()) {
                 if (onDiag) {
@@ -1323,6 +1331,13 @@ int QuadraMachine::stepInstruction() {
         return 40;
     }
     const int c = cpu_.step();
+    if (cpu_.heldAtCall) {
+        // The CPU stopped in front of a call instead of executing it: the
+        // moment work for the host was waiting for (MacHostServices).
+        cpu_.heldAtCall = false;
+        storageAtCall();
+        return 0;
+    }
     tickDevices(c);
     return c;
 }
@@ -1588,23 +1603,35 @@ void QuadraMachine::ejectFloppy() {
     floppyEjectPending_ = true;
 }
 
-// Carry out a staged eject, at a frame boundary with the guest between
-// instructions. Flush first so anything the System was still holding reaches
-// the image the host keeps, then unmount so the volume leaves the desktop,
-// then release the medium.
+// Does a staged eject have to go through the guest? Only when the disk's
+// volume is on line. Before the System is up there is no volume to unmount
+// and no File Manager to ask.
+bool QuadraMachine::floppyEjectNeedsGuest() {
+    return fileSystemUp() && volumeMountedFor(1);
+}
+
+bool QuadraMachine::boardWorkWanted() {
+    return floppyEjectPending_ && floppyEjectNeedsGuest();
+}
+
+void QuadraMachine::boardWorkAtCall() { completeFloppyEject(); }
+
+// Carry out a staged eject: with the CPU in front of one of the guest's
+// calls when the disk has a volume on line, at a frame boundary when it has
+// none. Flush first so anything the System was still holding reaches the
+// image the host keeps, then unmount so the volume leaves the desktop, then
+// release the medium.
 void QuadraMachine::completeFloppyEject() {
     if (!floppyEjectPending_) return;
     if (inDriver_ || announceInFlight_) return;
     if ((cpu_.getSR() & 0x0700) != 0) return;         // mid-interrupt
     if (addressingModeSwapped()) return;              // not now
-    // Before the System is up there is no volume to unmount and no File
-    // Manager to ask -- just take the disk.
-    const bool fsUp =
-        read32(0x0358) != 0 && (read8(0x0360) & 1) == 0 &&
-        (((static_cast<u32>(read16(0x0360)) << 16) | read16(0x0362)) != 0xFFFFFFFFu);
+    const bool mounted = floppyEjectNeedsGuest();
+    // The File Manager is in a call of its own: at the guest's next call.
+    if (mounted && (read8(0x0360) & 1) != 0) return;
     s16 fl = 0, ej = 0, un = 0;
     bool ejected = false;
-    if (fsUp && volumeMountedFor(1)) {
+    if (mounted) {
         ejected = true;
         announceInFlight_ = true;
         u32 sd[8], sa[8];
@@ -1668,6 +1695,7 @@ void QuadraMachine::completeFloppyEject() {
         announceInFlight_ = false;
     }
     floppyEjectPending_ = false;
+    floppyEjectWait_ = 0;
     if (ejected) {
         // The File Manager has it: the driver's eject is running, and
         // tickEject will hand the medium back at the frame it completes.

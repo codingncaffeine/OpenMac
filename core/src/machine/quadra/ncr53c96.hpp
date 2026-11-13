@@ -33,7 +33,7 @@
 namespace openmac {
 
 class Ncr53c96 {
-    friend class Quadra950StateCodec;
+    friend class QuadraStateCodec;
 public:
     enum Phase : u8 {
         kDataOut = 0, kDataIn = 1, kCommand = 2, kStatus = 3,

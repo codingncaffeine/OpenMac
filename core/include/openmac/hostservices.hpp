@@ -21,11 +21,11 @@
 namespace openmac {
 
 class ScsiDisk;
-class Quadra950StateCodec;
+class QuadraStateCodec;
 class ScsiCdRom;
 
 class MacHostServices {
-    friend class Quadra950StateCodec;
+    friend class QuadraStateCodec;
 public:
     // SCSI media, mirroring the Classic's surface. Images are wrapped in an
     // Apple partition map with a driver the ROM's boot scan can load.
@@ -58,6 +58,10 @@ public:
     // let go of the volume -- and write its cached blocks through our driver
     // into the image -- before the host may rebuild it. Returns true once the
     // volume is off line, which includes it never having been mounted.
+    //
+    // False means not yet: the unmount is carried out when the guest next
+    // makes a call it can be run at (see storageAtCall), and the caller asks
+    // again. A request nobody repeats for half a second is dropped.
     bool unmountSecondDisk();
     // Read a file off the second disk's volume THROUGH THE GUEST: its own File
     // Manager, _Open / _Read / _Close, served by our driver hook exactly as an
@@ -90,7 +94,7 @@ public:
     // Down ends in. False = not now.
     bool guestPowerOff();
     // Test entry: have the guest play its alert sound (SysBeep) by running
-    // the trap on the guest CPU. False = not now.
+    // the trap on the guest CPU, at its next event call. False = not now.
     bool systemBeep();
     // Ask the guest's Gestalt a question by running the trap on the guest
     // CPU. Headless diagnosis only: the answer is whatever the System's own
@@ -132,6 +136,39 @@ protected:
     bool serveStorageHooks(u64 frame);
     void storageSecondTick();   // once per emulated second
     void storageFrameTick();    // once per frame
+
+    // ---- guest calls run for the host -----------------------------------
+    // A mount, an unmount or a flush is a trap run on the guest CPU, and the
+    // trap allocates memory and calls the File Manager. A Macintosh allows
+    // that from a program's own level only: put in wherever the CPU happens
+    // to be, it can land inside the Memory Manager with the heap half moved.
+    // So nothing is run where a clock tick fell. The work is noted, the CPU
+    // is asked to stop in front of the guest's next event call (M68040::
+    // holdAtCalls), and the board hands over here when it has.
+    //
+    // The board: the CPU has just stopped in front of such a call
+    // (heldAtCall, which the board clears). Runs what was waiting.
+    void storageAtCall();
+    // The board's own work for that moment, if it has any.
+    virtual bool boardWorkWanted() { return false; }
+    virtual void boardWorkAtCall() {}
+    // False while the machine executes nothing (switched off).
+    virtual bool guestRunning() const { return true; }
+    // Run the guest on until it stops in front of such a call: for a request
+    // that has to be answered before the caller goes on. False = it made
+    // none in about three seconds of its own time.
+    bool runToCall();
+    // Ask the CPU for the next call (not from inside a call of ours).
+    void askForCall();
+    // The calls work may be run at just now: the event calls, and until an
+    // application has been launched the Resource Manager's reads as well.
+    u8 callClasses();
+    bool fileSystemUp();
+    bool storageWorkWanted();
+    bool unmountSecondDiskAtCall();
+    void beepAtCall();
+    bool cdEjectNeedsGuest();
+    void finishCdEject();
 
     // Guest memory through the board's bus, as the moved code always read it.
     u8   read8(u32 addr) { return hbus_.read8(addr); }
@@ -195,6 +232,12 @@ protected:
     M68040& hcpu_;
     std::vector<u8>& hram_;
 
+    bool storageDue_ = false;       // this second's work waits for a call
+    int  hd2UnmountAsked_ = 0;      // frames an asked-for unmount stays wanted
+    bool beepAsked_ = false;        // systemBeep waits for a call
+    bool atCall_ = false;           // runToCall: the CPU stopped at one
+    bool inGuestCall_ = false;      // inside execute68kTrap
+    bool askedInCall_ = false;      // askForCall came while inside one
     bool unitTableFresh_ = false;   // rebuilt since the machine last started
     bool sawNoApp_ = false;         // CurApName seen unset since then
     bool inDriver_ = false;      // serving a driver request: no nested traps

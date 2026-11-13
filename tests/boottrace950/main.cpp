@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
     struct Input { int frame, kind, a, b, c; };   // kind 0 = mouse (dx, dy, button), 1 = key (code, down)
     std::vector<Input> inputs;
     std::vector<std::pair<int, int>> pramBytes;
+    tracetools::CallCensus census;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--rom" && i + 1 < argc) romPath = argv[++i];
@@ -173,6 +174,7 @@ int main(int argc, char** argv) {
             hashFrom = std::atoi(argv[++i]);
             hashStep = std::max(1, std::atoi(argv[++i]));
         }
+        else if (a == "--call-census") census.on = true;
         else if (a == "--log") log = true;
         else if (a == "--report") report = true;
         else if (a == "--tests") tests = true;
@@ -318,6 +320,10 @@ int main(int argc, char** argv) {
         if (mac.saveStateFile(path, &why)) std::printf("state saved: %s, frame %d\n", path.c_str(), frame);
         else std::fprintf(stderr, "state not saved: %s\n", why.c_str());
     };
+    if (census.on) {
+        census.lastEventFrame = static_cast<u32>(firstFrame);
+        mac.cpu().onTrap = [&](u16 opcode, u32) { census.note(opcode, mac.cpu().getSR(), lastFrame); };
+    }
     bool floppyIn = mac.floppyPresent();
     for (int f = firstFrame; f < frames; ++f) {
         if (f == saveStateAt) saveStateTo(saveStateAtPath, f);
@@ -370,6 +376,7 @@ int main(int argc, char** argv) {
             else mac.keyEvent(static_cast<u8>(in.a), in.b != 0);
         }
         mac.runFrame();
+        census.frameDone(static_cast<u32>(f));
         audioChunk.clear();
         mac.drainAudio(audioChunk);
         audio.insert(audio.end(), audioChunk.begin(), audioChunk.end());

@@ -116,6 +116,33 @@ public:
     // trap opcode and its address. Used by the debugger for trap breakpoints.
     std::function<void(u16 opcode, u32 pc)> onTrap;
 
+    // A machine with a call of its own to run on the guest asks for the CPU
+    // at a moment the guest could take one. With a class bit set here the
+    // CPU stops in front of the next A-line word of that class it meets with
+    // interrupts open and tracing off: the PC stays on the word, nothing of
+    // it is carried out, the request is cleared and heldAtCall is set. The
+    // next step executes the word as if nothing had happened.
+    //
+    // The event calls are the ones a program makes from its own level, with
+    // its heap in order and no call of the system's half done: the moment a
+    // real machine mounts an inserted disk. The Resource Manager's reads are
+    // the same kind of moment while a startup has no program running yet.
+    static constexpr u8 kEventCalls = 1;
+    static constexpr u8 kResourceCalls = 2;
+    static u8 callClass(u16 opcode) {
+        switch (opcode) {
+        case 0xA970: case 0xA860: case 0xA971: case 0xA9B4:
+            return kEventCalls;      // _GetNextEvent _WaitNextEvent _EventAvail _SystemTask
+        case 0xA9A0: case 0xA81F: case 0xA9A1: case 0xA820: case 0xA997: case 0xA81A:
+            return kResourceCalls;   // _GetResource _Get1Resource, the two by name,
+                                     // _OpenResFile _HOpenResFile
+        default:
+            return 0;
+        }
+    }
+    u8 holdAtCalls = 0;
+    bool heldAtCall = false;
+
     // Fires when the CPU takes an interrupt, with the level (1-7), the
     // autovector number, and the PC being interrupted. Diagnostics only.
     std::function<void(int level, u32 autovector, u32 pc)> onInterrupt;

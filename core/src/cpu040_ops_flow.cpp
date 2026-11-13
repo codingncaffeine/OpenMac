@@ -223,6 +223,12 @@ int CpuOps040::opIllegal(M68040& c, u16) {
 
 int CpuOps040::opALine(M68040& c, u16 opcode) {
     c.pc = instrStart(c);
+    if (c.holdAtCalls && (c.holdAtCalls & M68040::callClass(opcode)) != 0 &&
+        (c.getSR() & (0x0700u | kT1040 | kT0040)) == 0) {
+        c.holdAtCalls = 0;
+        c.heldAtCall = true;
+        return 0;
+    }
     if (c.onTrap) c.onTrap(opcode, c.pc);
     return raiseException(c, kVec040ALine, c.is68030() ? 18 : 16);
 }
