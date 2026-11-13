@@ -7,6 +7,8 @@
 #include "../quadra/scc.hpp"
 #include "../rtc.hpp"
 #include "../scsi.hpp"
+#include "../scsicd.hpp"
+#include "../scsinet.hpp"
 #include "../via.hpp"
 #include "video.hpp"
 
@@ -23,6 +25,13 @@
 //   $50F0 6000  SCSI data with handshake        $50F1 0000  SCSI registers
 //   $50F1 2000  SCSI data                       $50F1 4000  sound chip
 //   $50F1 6000  floppy chip
+//
+// The SCSI chip has three faces. $50F1 0000 is its eight registers, n at
+// n * $10. The other two reach its data register through /DACK, whatever
+// the offset (the ROM reads at +$60 and writes at +0): $50F1 2000 completes
+// the cycle at once, $50F0 6000 holds it until the chip's data request and
+// ends it in a bus error when none comes. The chip's data request and
+// interrupt outputs also go to VIA2's CA2 and CB2.
 //   $FE00 0000  video RAM, 64 KB repeating      $FEFF 0000  video ROM
 //
 // The device window repeats every $2 0000 through $5000 0000-$57FF FFFF.
@@ -43,6 +52,14 @@ constexpr int kAdbShiftClocks = 10880;
 // VIA2 port B inputs: bit 6 low (sound always stereo), bits 5-4 low (no slot
 // transfer error), bit 3 low (the machine's identity), the rest high.
 constexpr u8 kVia2PortB = 0x87;
+// The board ends any bus cycle that lasts 44 microseconds in a bus error
+// (Designing Cards and Drivers, 3rd ed., the SE/30's watchdog timer).
+constexpr int kWatchdogClocks = 689;
+// A target's time from the last byte of a write to its Status: 100
+// microseconds. A model constant; no document gives a drive's figure, and
+// only its order matters (the ROM reads the phase lines right after the last
+// byte and expects them unchanged, see the dossier).
+constexpr int kScsiStatusDelayClocks = 1567;
 
 u32 be32(const u8* p) {
     return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
@@ -95,6 +112,7 @@ Se30Machine::Se30Machine(std::vector<u8> rom, const Config& cfg)
       adbPort_(std::make_unique<AdbViaPort>(*adb_, *via1_, kAdbShiftClocks)),
       scc_(std::make_unique<Scc8530>()),
       scsi_(std::make_unique<Ncr5380>()),
+      netdev_(std::make_unique<ScsiEthernet>()),
       asc_(std::make_unique<Asc>()),
       floppy_(std::make_unique<DirectFloppy>(kCpuHz)),
       video_(std::make_unique<Se30Video>()),
@@ -174,6 +192,21 @@ void Se30Machine::wireDevices() {
     scc_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
     scc_->setClocks(kCpuHz, 3672000);
 
+    // ---- SCSI (dossier, "SCSI") ---------------------------------------------
+    // One bus: the two hard-disk seats at IDs 0 and 1, the CD-ROM drive
+    // (ID 3 when attached) and the network adapter (ID 4 when attached).
+    scsi_->dmaNeedsPhaseMatch = true;     // the board holds a cycle on the DRQ pin
+    scsi_->statusDelayClocks = kScsiStatusDelayClocks;
+    scsi_->addTarget(disk_.get());
+    scsi_->addTarget(disk2_.get());
+    scsi_->addTarget(cdrom_.get());
+    scsi_->addTarget(netdev_.get());
+    // The vendor mode page Apple's CD-ROM driver looks for, and a tray, as on
+    // the Quadras. (This ROM does not start up from a CD.)
+    cdrom_->setStartupDrive(true);
+    cdrom_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
+    netdev_->onDiag = [this](const char* m) { if (onDiag) onDiag(m); };
+
     cpu_.onResetInstruction = [this] { resetPeripherals(); };
 }
 
@@ -205,6 +238,7 @@ void Se30Machine::resetPeripherals() {
     via2_->setCA2(false);
     via2_->setCB2(false);
     secondPulseLines_ = 0;
+    busWaitClocks_ = 0;
     updateIpl();
 }
 
@@ -245,6 +279,26 @@ u32 Se30Machine::ramIndex(u32 addr) const {
     return bankA_ ? (addr & (bankA_ - 1)) : kNoRam;
 }
 
+// The chip's two outputs as VIA2 sees them: data request on CA2, interrupt
+// on CB2, both high when asserted. Nothing moves on the bus between two
+// accesses to the chip, so the lines are brought up to date after each one.
+void Se30Machine::updateScsiLines() {
+    via2_->setCA2(scsi_->dmaRequestAsserted());
+    via2_->setCB2(scsi_->irqAsserted());
+    updateIpl();
+}
+
+// A cycle at the handshake address: true when the chip asks for a byte, and
+// the cycle completes with it. With none coming the board's watchdog ends
+// the cycle 44 microseconds on, in a bus error (false).
+bool Se30Machine::scsiHandshakeCycle() {
+    ++scsiHandshakeCycles_;
+    if (scsi_->dmaRequestAsserted()) return true;
+    ++scsiHandshakeTimeouts_;
+    busWaitClocks_ += kWatchdogClocks;
+    return false;
+}
+
 // ---- bus ------------------------------------------------------------------------
 
 namespace {
@@ -279,9 +333,23 @@ bool Se30Machine::deviceRead8(u32 addr, u8& out) {
             case 0: out = via1_->read(static_cast<int>((off >> 9) & 15)); updateIpl(); return true;
             case 1: out = via2_->read(static_cast<int>((off >> 9) & 15)); updateIpl(); return true;
             case 2: out = scc_->read(off & 6u); updateIpl(); return true;
-            case 3: out = scsi_->read(6); return true;                       // data, with handshake
-            case 8: out = scsi_->read(static_cast<int>((off >> 4) & 7)); return true;
-            case 9: out = scsi_->read(6); return true;                       // data
+            case 3:                                    // SCSI data, cycle held for the data request
+                if (!scsiHandshakeCycle()) return false;
+                out = scsi_->read(6);
+                updateScsiLines();
+                return true;
+            case 8: {                                  // SCSI registers
+                const int reg = static_cast<int>((off >> 4) & 7);
+                // Register 6 without /DACK shows the byte and moves nothing.
+                out = reg == 6 ? scsi_->inputDataNoAck() : scsi_->read(reg);
+                updateScsiLines();
+                return true;
+            }
+            case 9:                                    // SCSI data, no wait
+                ++scsiPlainCycles_;
+                out = scsi_->read(6);
+                updateScsiLines();
+                return true;
             case 10: out = asc_->read(off & 0xFFFu); return true;
             case 11: out = floppy_->access(static_cast<int>((off >> 9) & 15), false, 0, totalCycles_); return true;
             default: return false;
@@ -314,9 +382,20 @@ bool Se30Machine::deviceWrite8(u32 addr, u8 value) {
             case 0: via1_->write(static_cast<int>((off >> 9) & 15), value); updateIpl(); return true;
             case 1: via2_->write(static_cast<int>((off >> 9) & 15), value); updateIpl(); return true;
             case 2: scc_->write(off & 6u, value); updateIpl(); return true;
-            case 3: scsi_->write(0, value); return true;
-            case 8: scsi_->write(static_cast<int>((off >> 4) & 7), value); return true;
-            case 9: scsi_->write(0, value); return true;
+            case 3:
+                if (!scsiHandshakeCycle()) return false;
+                scsi_->write(0, value);
+                updateScsiLines();
+                return true;
+            case 8:
+                scsi_->write(static_cast<int>((off >> 4) & 7), value);
+                updateScsiLines();
+                return true;
+            case 9:
+                ++scsiPlainCycles_;
+                scsi_->write(0, value);
+                updateScsiLines();
+                return true;
             case 10: asc_->write(off & 0xFFFu, value); return true;
             case 11: (void)floppy_->access(static_cast<int>((off >> 9) & 15), true, value, totalCycles_); return true;
             default: return false;
@@ -411,6 +490,7 @@ void Se30Machine::tickDevices(int cpuCycles) {
     }
     adbPort_->tick(cpuCycles);
     scc_->tick(static_cast<s32>(cpuCycles));
+    if (scsi_->advance(cpuCycles)) updateScsiLines();
 
     secondAcc_ += static_cast<u64>(cpuCycles);
     if (secondAcc_ >= kCpuHz) {
@@ -458,13 +538,18 @@ int Se30Machine::stepInstruction() {
         tickDevices(40);
         return 40;
     }
-    const int c = cpu_.step();
+    int c = cpu_.step();
     if (cpu_.heldAtCall) {
         // The CPU stopped in front of a call instead of executing it: the
         // moment work for the host was waiting for (MacHostServices).
         cpu_.heldAtCall = false;
         storageAtCall();
         return 0;
+    }
+    if (busWaitClocks_) {
+        // A bus cycle the board held until its watchdog ended it.
+        c += busWaitClocks_;
+        busWaitClocks_ = 0;
     }
     tickDevices(c);
     return c;
@@ -528,8 +613,7 @@ void Se30Machine::askGuestToEjectFloppy() {
     s16 flushed = 0, ejected = 0;
     if (hdMountPb_) {
         const auto call = [&](u16 trap) -> s16 {
-            for (u32 i = 0; i < 80; ++i) write8(hdMountPb_ + i, 0);
-            write16(hdMountPb_ + 22, 1);              // ioVRefNum = drive 1
+            primeParamBlock(hdMountPb_, 1);           // drive 1
             cpu_.a[0] = hdMountPb_;
             execute68kTrap(trap);
             return static_cast<s16>(cpu_.d[0] & 0xFFFF);
@@ -555,6 +639,24 @@ std::vector<u8> Se30Machine::floppyForWriteBack() { return floppy_->fileImage();
 Se30Machine::FloppyCounts Se30Machine::floppyCounts() const {
     return {floppy_->bytesRead(), floppy_->bytesWritten(), floppy_->tracksWritten(), floppy_->chip().ismSelected(),
             floppy_->mechanism().track};
+}
+
+void Se30Machine::attachNet(bool attached, int busId) { netdev_->setAttached(attached, busId); }
+bool Se30Machine::netAttached() const { return netdev_->attachedState(); }
+bool Se30Machine::netInject(const u8* frame, u32 len) { return netdev_->injectFrame(frame, len); }
+bool Se30Machine::netDrain(std::vector<u8>& out) { return netdev_->drainFrame(out); }
+
+Se30Machine::ScsiCounts Se30Machine::scsiCounts() const {
+    ScsiCounts c{};
+    c.selections = scsi_->diagSelects;
+    c.commands = scsi_->diagCommands;
+    c.bytesIn = scsi_->diagDataInBytes;
+    c.bytesOut = scsi_->diagDataOutBytes;
+    for (std::size_t id = 0; id < c.commandsById.size(); ++id) c.commandsById[id] = scsi_->diagCommandsById[id];
+    c.plainDataCycles = scsiPlainCycles_;
+    c.handshakeDataCycles = scsiHandshakeCycles_;
+    c.handshakeTimeouts = scsiHandshakeTimeouts_;
+    return c;
 }
 
 int Se30Machine::screenWidth() const { return Se30Video::kWidth; }

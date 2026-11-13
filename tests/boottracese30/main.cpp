@@ -9,6 +9,29 @@
 //                     [--mouse-at FRAME DX DY BUTTON]... [--key-at FRAME CODE down|up]...
 //                     [--floppy FILE] [--floppy-writable] [--save-floppy OUT]
 //                     [--floppy-at FRAME FILE]... [--eject-floppy-at FRAME]...
+//                     [--harddisk FILE] [--harddisk2 FILE] [--harddisk2-read-only]
+//                     [--save-harddisk OUT] [--cd FILE] [--eject-cd-at FRAME]
+//                     [--guest-restart-at FRAME] [--put-away-disk2-at FRAME]
+//                     [--dropbox DIR] [--dropbox-guest-read FILE] [--net]
+//                     [--gestalt] [--drivers] [--shutdown] [--hd-trace N]
+//                     [--profile FROM TO] [--disasm ADDRESS COUNT]...
+//                     [--traps FRAME COUNT] [--guest-calls] [--driver-over-scsi]
+//
+// Disk and disc files are read into memory and never written; --save-harddisk
+// writes the first disk as it stands at the end. --dropbox builds a volume
+// from a host folder and puts it on the second hard-disk seat, as the front
+// end's drop box does; --dropbox-guest-read has the guest read one of its
+// files back at the end. --net attaches the SCSI Ethernet adapter (ID 4).
+// --gestalt asks the System what it is running on; --drivers lists the
+// guest's unit table; --shutdown flushes and unmounts as the front end does
+// when it closes. --hd-trace logs the first N requests to the disks' driver.
+// --profile counts instructions per 16 bytes of code between two frames and
+// lists the busiest places: where a machine that looks hung spends its time.
+// --disasm lists guest code at the end of the run. --traps lists the first
+// COUNT system calls the guest makes from FRAME on, with D0 and A0;
+// --guest-calls (with --log) reports each call the machine runs on the guest
+// CPU for the host, going in and coming out. --driver-over-scsi leaves the
+// hard disks' own driver to move every block over the SCSI bus.
 //
 // A floppy file is never changed: a writable disk lives in memory and goes to
 // --save-floppy at the end, in the file format it came in.
@@ -27,10 +50,12 @@
 // D6; the start-up chime's routine at $5E4A is reached only when none failed.
 // Exit code 0 = ran to the end; 1 = the CPU halted; 2 = bad arguments.
 
+#include "openmac/debugger.hpp"
 #include "openmac/se30.hpp"
 
 #include "../common/tracetools.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -60,6 +85,14 @@ int main(int argc, char** argv) {
     std::string romPath, vromPath, shotPath, pramIn, pramOut, floppyPath, floppyOut;
     bool floppyWritable = false;
     std::vector<std::pair<int, std::string>> floppyEvents;   // frame, file ("" = eject)
+    std::string hdPath, hd2Path, hdOut, cdPath, dropBoxDir, dropBoxGuestRead;
+    bool hd2ReadOnly = false, netAttach = false, askGestalt = false, showDrivers = false, doShutdown = false;
+    int ejectCdAt = -1, guestRestartAt = -1, putAwayDisk2At = -1, hdTrace = 0;
+    int profileFrom = -1, profileTo = -1;
+    std::map<u32, u64> profile;
+    std::vector<std::pair<u32, int>> listings;
+    int trapsFrom = -1, trapsLeft = 0;
+    bool guestCalls = false, driverOverScsi = false;
     int frames = 600;
     u32 bankA = 4, bankB = 4;
     bool log = false, report = false;
@@ -91,6 +124,29 @@ int main(int argc, char** argv) {
         else if (a == "--save-floppy" && i + 1 < argc) floppyOut = argv[++i];
         else if (a == "--floppy-at" && i + 2 < argc) { const int f = std::atoi(argv[++i]); floppyEvents.emplace_back(f, argv[++i]); }
         else if (a == "--eject-floppy-at" && i + 1 < argc) floppyEvents.emplace_back(std::atoi(argv[++i]), "");
+        else if (a == "--harddisk" && i + 1 < argc) hdPath = argv[++i];
+        else if (a == "--harddisk2" && i + 1 < argc) hd2Path = argv[++i];
+        else if (a == "--harddisk2-read-only") hd2ReadOnly = true;
+        else if (a == "--save-harddisk" && i + 1 < argc) hdOut = argv[++i];
+        else if (a == "--cd" && i + 1 < argc) cdPath = argv[++i];
+        else if (a == "--eject-cd-at" && i + 1 < argc) ejectCdAt = std::atoi(argv[++i]);
+        else if (a == "--guest-restart-at" && i + 1 < argc) guestRestartAt = std::atoi(argv[++i]);
+        else if (a == "--put-away-disk2-at" && i + 1 < argc) putAwayDisk2At = std::atoi(argv[++i]);
+        else if (a == "--dropbox" && i + 1 < argc) dropBoxDir = argv[++i];
+        else if (a == "--dropbox-guest-read" && i + 1 < argc) dropBoxGuestRead = argv[++i];
+        else if (a == "--net") netAttach = true;
+        else if (a == "--gestalt") askGestalt = true;
+        else if (a == "--drivers") showDrivers = true;
+        else if (a == "--shutdown") doShutdown = true;
+        else if (a == "--hd-trace" && i + 1 < argc) hdTrace = std::atoi(argv[++i]);
+        else if (a == "--guest-calls") guestCalls = true;
+        else if (a == "--driver-over-scsi") driverOverScsi = true;
+        else if (a == "--profile" && i + 2 < argc) { profileFrom = std::atoi(argv[++i]); profileTo = std::atoi(argv[++i]); }
+        else if (a == "--traps" && i + 2 < argc) { trapsFrom = std::atoi(argv[++i]); trapsLeft = std::atoi(argv[++i]); }
+        else if (a == "--disasm" && i + 2 < argc) {
+            const u32 at = static_cast<u32>(std::strtoul(argv[++i], nullptr, 0));
+            listings.emplace_back(at, std::atoi(argv[++i]));
+        }
         else if (a == "--log") log = true;
         else if (a == "--report") report = true;
         else if (a == "--hashes" && i + 2 < argc) { hashFrom = std::atoi(argv[++i]); hashStep = std::atoi(argv[++i]); }
@@ -140,12 +196,46 @@ int main(int argc, char** argv) {
         std::printf("floppy %s: %s\n", floppyPath.c_str(), ok ? "inserted" : "NOT a floppy image");
         if (!ok) return 2;
     }
+    if (hdTrace > 0) mac.traceHdRequests(hdTrace);
+    mac.traceGuestCalls = guestCalls;
+    mac.diskDriverOverScsi = driverOverScsi;
+    if (netAttach) mac.attachNet(true);
+    if (!hdPath.empty()) {
+        std::vector<u8> hd = tracetools::loadFile(hdPath.c_str());
+        if (hd.empty()) { std::fprintf(stderr, "cannot read disk: %s\n", hdPath.c_str()); return 2; }
+        std::printf("hard disk %s: attached (%zu KB)\n", hdPath.c_str(), hd.size() >> 10);
+        mac.insertHardDisk(std::move(hd));
+    }
+    if (!hd2Path.empty()) {
+        std::vector<u8> hd = tracetools::loadFile(hd2Path.c_str());
+        if (hd.empty()) { std::fprintf(stderr, "cannot read disk: %s\n", hd2Path.c_str()); return 2; }
+        std::printf("second hard disk %s: attached (%zu KB)%s\n", hd2Path.c_str(), hd.size() >> 10,
+                    hd2ReadOnly ? ", read-only" : "");
+        mac.insertHardDisk2(std::move(hd), hd2ReadOnly);
+    }
+    if (!dropBoxDir.empty()) {
+        std::string why;
+        std::vector<u8> volume = tracetools::buildFolderVolume(dropBoxDir, why);
+        if (volume.empty()) { std::fprintf(stderr, "dropbox: build FAILED: %s\n", why.c_str()); return 2; }
+        mac.insertHardDisk2(std::move(volume), false);
+        std::printf("dropbox: %s built and attached\n", dropBoxDir.c_str());
+    }
+    if (!cdPath.empty()) {
+        std::vector<u8> cd = tracetools::loadFile(cdPath.c_str());
+        if (cd.empty()) { std::fprintf(stderr, "cannot read disc: %s\n", cdPath.c_str()); return 2; }
+        mac.attachCdRom(true, 3);
+        const bool ok = mac.insertCd(std::move(cd)) != 0;
+        std::printf("cd %s: %s\n", cdPath.c_str(), ok ? "in the drive" : "REFUSED");
+        if (!ok) return 2;
+    }
 
     // The verdict of the start-up tests, read at the ROM's own two exits.
     bool testFailed = false, chimeReached = false;
     u32 failedTest = 0, failedBits = 0;
     int failedFrame = 0, chimeFrame = 0;
     mac.cpu().onStep = [&](u32 pc) {
+        if (profileFrom >= 0 && static_cast<int>(lastFrame) >= profileFrom && static_cast<int>(lastFrame) < profileTo)
+            ++profile[pc >> 4];
         if (pc == 0x40802C3Cu && !testFailed && !chimeReached) {
             testFailed = true;
             failedTest = mac.cpu().d[7] & 0xFFFFu;
@@ -157,14 +247,40 @@ int main(int argc, char** argv) {
         }
     };
 
+    if (trapsFrom >= 0) {
+        mac.cpu().onTrap = [&](u16 opcode, u32 pc) {
+            if (static_cast<int>(lastFrame) < trapsFrom || trapsLeft <= 0) return;
+            --trapsLeft;
+            std::printf("trap %04X at %08X: D0=%08X A0=%08X A1=%08X SR=%04X\n", opcode, pc, mac.cpu().d[0], mac.cpu().a[0],
+                        mac.cpu().a[1], mac.cpu().getSR());
+        };
+    }
+
     std::vector<u32> px(static_cast<std::size_t>(mac.screenWidth()) * static_cast<std::size_t>(mac.screenHeight()));
     std::map<u32, int> hashes;   // picture -> first frame seen
     u32 lastHash = 0;            // the frame before's
     std::vector<u8> audio;
     int ejectsSeen = 0;
     u64 audioSamples = 0, loudSamples = 0;
+    bool disk2PutAwaySeen = false;
     for (int f = 0; f < frames; ++f) {
         lastFrame = static_cast<u32>(f);
+        if (ejectCdAt == f) {
+            mac.ejectCd();
+            std::printf("cd eject asked for at frame %d\n", f);
+        }
+        if (putAwayDisk2At >= 0 && f >= putAwayDisk2At && mac.guestPutAwaySecondDisk()) {
+            std::printf("second disk: the guest unmounted its volume at frame %d\n", f);
+            putAwayDisk2At = -1;
+        }
+        if (!disk2PutAwaySeen && mac.secondDiskPutAway()) {
+            disk2PutAwaySeen = true;
+            std::printf("second disk: put away by the Macintosh, seen at frame %d\n", f);
+        }
+        if (guestRestartAt >= 0 && f >= guestRestartAt && mac.guestRestart()) {
+            std::printf("guest restart at frame %d\n", f);
+            guestRestartAt = -1;
+        }
         for (const MouseEvent& e : mouse) if (e.frame == f) mac.mouseEvent(e.dx, e.dy, e.button);
         for (const KeyEvent& e : keys) if (e.frame == f) mac.keyEvent(e.code, e.down);
         for (const auto& [at, file] : floppyEvents) {
@@ -185,7 +301,8 @@ int main(int argc, char** argv) {
         if (mac.cpu().halted) break;
         // The hook costs a call per instruction; both exits are passed in
         // the first frames.
-        if ((chimeReached || testFailed) && mac.cpu().onStep) mac.cpu().onStep = nullptr;
+        if ((chimeReached || testFailed) && (profileFrom < 0 || f >= profileTo) && mac.cpu().onStep)
+            mac.cpu().onStep = nullptr;
         mac.drainAudio(audio);
         audioSamples += audio.size();
         for (u8 s : audio) if (s < 0x7C || s > 0x84) ++loudSamples;
@@ -264,6 +381,18 @@ int main(int argc, char** argv) {
         }
         std::printf("guest: application '%s', volumes [%s]\n", pascal(0x0910, 31).c_str(), volumes.c_str());
     }
+    {
+        const Se30Machine::ScsiCounts sc = mac.scsiCounts();
+        std::printf("scsi: %u selections, %u commands, %u bytes in, %u out; data cycles: %llu plain, %llu with handshake, "
+                    "%u ended by the watchdog; driver served %u reads, %u writes\n",
+                    sc.selections, sc.commands, sc.bytesIn, sc.bytesOut,
+                    static_cast<unsigned long long>(sc.plainDataCycles),
+                    static_cast<unsigned long long>(sc.handshakeDataCycles), sc.handshakeTimeouts, mac.hdReads(),
+                    mac.hdWrites());
+        std::printf("scsi commands by ID:");
+        for (std::size_t id = 0; id < sc.commandsById.size(); ++id) std::printf(" %zu=%u", id, sc.commandsById[id]);
+        std::printf("\n");
+    }
     std::printf("end: frame %llu pc=%08X sr=%04X overlay=%d%s\n", static_cast<unsigned long long>(mac.frameCount()),
                 mac.cpu().pc, mac.cpu().getSR(), mac.overlayActive() ? 1 : 0, mac.cpu().halted ? " HALTED" : "");
     if (report) std::fputs(mac.diagnosticReport().c_str(), stdout);
@@ -271,6 +400,51 @@ int main(int argc, char** argv) {
         std::printf("pictures from frame %d, every %d: %zu distinct:", hashFrom, hashStep, hashes.size());
         for (const auto& [h, f] : hashes) std::printf(" %08X@%d", h, f);
         std::printf("\n");
+    }
+    if (!profile.empty()) {
+        std::vector<std::pair<u64, u32>> places;
+        u64 total = 0;
+        for (const auto& [place, count] : profile) { places.emplace_back(count, place); total += count; }
+        std::sort(places.rbegin(), places.rend());
+        std::printf("profile, frames %d to %d, %llu instructions:\n", profileFrom, profileTo,
+                    static_cast<unsigned long long>(total));
+        for (std::size_t k = 0; k < places.size() && k < 20; ++k)
+            std::printf("   %08X  %5.1f%%\n", places[k].second << 4,
+                        100.0 * static_cast<double>(places[k].first) / static_cast<double>(total));
+    }
+    for (const auto& [from, count] : listings) {
+        u32 at = from;
+        for (int k = 0; k < count; ++k) {
+            std::string text;
+            int len = 2;
+            try {
+                len = dbg::disasm([&](u32 a) { return mac.read16(a); }, at, text);
+            } catch (const BusFault&) {
+                text = "(bus error)";
+            }
+            std::printf("%08X  %s\n", at, text.c_str());
+            at += static_cast<u32>(len > 0 ? len : 2);
+        }
+    }
+    if (askGestalt) {
+        // What the System itself answers: machine type, System version, CPU, memory.
+        for (const char* code : {"mach", "sysv", "proc", "fpu ", "ram ", "lram", "addr"}) {
+            const u32 selector = (static_cast<u32>(static_cast<u8>(code[0])) << 24) |
+                                 (static_cast<u32>(static_cast<u8>(code[1])) << 16) |
+                                 (static_cast<u32>(static_cast<u8>(code[2])) << 8) | static_cast<u8>(code[3]);
+            u32 response = 0;
+            const s32 err = mac.gestaltQuery(selector, response);
+            std::printf("gestalt '%s' -> err %d resp %08X (%u)\n", code, err, response, response);
+        }
+    }
+    if (showDrivers) tracetools::printDrivers(mac, mac.ramBytes());
+    if (!dropBoxGuestRead.empty()) tracetools::reportGuestRead(mac, dropBoxGuestRead);
+    if (doShutdown) std::printf("shutdown volumes: %s\n", mac.shutdownVolumes() ? "unmounted" : "nothing to do");
+    if (!hdOut.empty()) {
+        const std::vector<u8>& image = mac.hardDiskImage();
+        std::ofstream out(hdOut, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
+        std::printf("hard disk saved: %s (%zu bytes)\n", hdOut.c_str(), image.size());
     }
     for (const auto& [at, count] : peeks) {
         std::printf("peek %08X:", at);

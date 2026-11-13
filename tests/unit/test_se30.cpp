@@ -15,7 +15,9 @@ constexpr u32 MB = 1024 * 1024;
 
 // Device addresses as the ROM uses them.
 constexpr u32 kVia1 = 0x50F00000u, kVia2 = 0x50F02000u;
-constexpr u32 kOrb = 0x0000, kDdrb = 0x0400, kDdra = 0x0600, kIfr = 0x1A00, kIer = 0x1C00, kOra = 0x1E00;
+constexpr u32 kOrb = 0x0000, kDdrb = 0x0400, kDdra = 0x0600, kPcr = 0x1800, kIfr = 0x1A00, kIer = 0x1C00, kOra = 0x1E00;
+// The SCSI chip's three faces: registers (n at n * $10), data, data with handshake.
+constexpr u32 kScsi = 0x50F10000u, kScsiData = 0x50F12000u, kScsiHandshake = 0x50F06000u;
 
 // A ROM that is nothing but ORI.B #0,D0: the processor walks through it and
 // touches nothing, so a frame of machine time can pass. A few marker bytes
@@ -52,7 +54,151 @@ void setSizeBits(Se30Machine& m, u8 bits) {
     m.write8(kVia2 + kOra, static_cast<u8>(bits << 6));
 }
 
+u32 scsiReg(int n) { return kScsi + static_cast<u32>(n) * 0x10u; }
+
+// The first hard-disk seat with a disk of zeros behind OpenMac's partition
+// map, and a READ(6) of block 0 issued the way the ROM does it through the
+// register face; the chip is left in Data In with DMA receive started. Block
+// 0 is the driver descriptor map: 'E', 'R', the block size 512, the block
+// count.
+void startBlockZeroRead(Se30Machine& m) {
+    m.insertHardDisk(std::vector<u8>(256 * 512, 0));
+    m.write8(scsiReg(0), 0x81);                        // the Macintosh's ID and target 0 on the data bus
+    m.write8(scsiReg(1), 0x04);                        // /SEL without /BSY
+    m.write8(scsiReg(1), 0x00);
+    REQUIRE((m.read8(scsiReg(4)) & 0x40) != 0);        // /BSY: the disk answered
+    const u8 read6[6] = {0x08, 0x00, 0x00, 0x00, 0x01, 0x00};
+    for (u8 b : read6) {
+        m.write8(scsiReg(0), b);
+        m.write8(scsiReg(1), 0x11);                    // data bus and /ACK
+        m.write8(scsiReg(1), 0x00);
+    }
+    REQUIRE((m.read8(scsiReg(4)) & 0x1C) == 0x04);     // Data In
+    m.write8(scsiReg(3), 0x01);                        // Target Command: Data In
+    m.write8(scsiReg(2), 0x02);                        // Mode: DMA
+    m.write8(scsiReg(7), 0x00);                        // start DMA receive
+}
+
 } // namespace
+
+TEST_CASE("SE/30 SCSI: registers at $50F1 0000, data at $50F1 2000, data held for the chip at $50F0 6000") {
+    Se30Machine m(quietRom(), banks(1, 0));
+    // Nothing selected: the handshake face has no byte to wait for.
+    CHECK_THROWS_AS(m.read8(kScsiHandshake + 0x60), BusFault);
+    startBlockZeroRead(m);
+    CHECK((m.read8(scsiReg(5)) & 0x40) != 0);          // Bus and Status: data request
+
+    // The data face completes at once and takes the byte, whatever the
+    // offset (the ROM reads at +$60 and writes at +0).
+    CHECK(m.read8(kScsiData + 0x60) == 'E');
+    CHECK(m.read8(kScsiData) == 'R');
+    // Register 6 on the register face shows the byte and takes nothing.
+    CHECK(m.read8(scsiReg(6)) == 0x02);
+    CHECK(m.read8(scsiReg(6)) == 0x02);
+    // The handshake face: a long word is four cycles, each given its byte.
+    CHECK(m.read32(kScsiHandshake + 0x60) == 0x02000000u);   // block size 512, then the count's top bytes
+    for (int i = 6; i < 512; ++i) CHECK_NOTHROW(m.read8(kScsiHandshake + 0x60));
+    const Se30Machine::ScsiCounts before = m.scsiCounts();
+    CHECK(before.bytesIn == 512);
+    CHECK(before.plainDataCycles == 2);
+    CHECK(before.handshakeDataCycles == 511);          // one refused before the read, 510 served
+    CHECK(before.handshakeTimeouts == 1);
+
+    // The disk is at Status now: no more data will be asked for. The
+    // handshake face ends in a bus error and takes nothing; the data face
+    // answers and takes nothing either.
+    REQUIRE((m.read8(scsiReg(4)) & 0x1C) == 0x0C);
+    CHECK_THROWS_AS(m.read8(kScsiHandshake + 0x60), BusFault);
+    CHECK_THROWS_AS(m.read32(kScsiHandshake + 0x60), BusFault);
+    CHECK_THROWS_AS(m.write8(kScsiHandshake, 0x55), BusFault);
+    CHECK_NOTHROW(m.read8(kScsiData + 0x60));
+    CHECK((m.read8(scsiReg(4)) & 0x1C) == 0x0C);       // still Status
+    CHECK(m.scsiCounts().handshakeTimeouts == 4);
+    CHECK(m.scsiCounts().bytesIn == 512);
+}
+
+TEST_CASE("SE/30 SCSI: a handshake cycle nobody answers lasts the watchdog's 44 microseconds") {
+    Se30Machine m(quietRom(), banks(1, 0));
+    u64 at = m.totalCycles();
+    m.stepInstruction();
+    const u64 plain = m.totalCycles() - at;            // one instruction of the quiet ROM
+    at = m.totalCycles();
+    m.stepInstruction();
+    REQUIRE(m.totalCycles() - at == plain);
+    CHECK_THROWS_AS(m.read8(kScsiHandshake + 0x60), BusFault);
+    at = m.totalCycles();
+    m.stepInstruction();
+    CHECK(m.totalCycles() - at == plain + 689);        // 44 microseconds at 15.6672 MHz
+    at = m.totalCycles();
+    m.stepInstruction();
+    CHECK(m.totalCycles() - at == plain);              // charged once
+}
+
+TEST_CASE("SE/30 SCSI: the chip's data request is VIA2's CA2 and its interrupt CB2, both high when asserted") {
+    Se30Machine m(quietRom(), banks(1, 0));
+    CHECK((m.read8(kVia2 + kIfr) & 0x09) == 0);        // at rest, and no edge from the reset
+    m.write8(kVia2 + kPcr, 0x44);                      // both lines flag a rising edge
+    startBlockZeroRead(m);
+    CHECK((m.read8(kVia2 + kIfr) & 0x09) == 0x01);     // data request: CA2
+    for (int i = 0; i < 512; ++i) (void)m.read8(kScsiData + 0x60);
+    // The disk went on to Status with the chip in DMA mode: its interrupt.
+    CHECK((m.read8(scsiReg(5)) & 0x10) != 0);
+    CHECK((m.read8(kVia2 + kIfr) & 0x08) != 0);        // CB2
+    m.write8(kVia2 + kIfr, 0x09);                      // flags cleared
+    (void)m.read8(scsiReg(7));                         // the chip's interrupt reset: the line falls
+    m.write8(scsiReg(2), 0x00);
+    CHECK((m.read8(kVia2 + kIfr) & 0x09) == 0);        // falling edges flag nothing here
+    m.write8(kVia2 + kPcr, 0x00);                      // the ROM's setting: falling edges
+    m.write8(scsiReg(2), 0x02);                        // DMA mode with Status pending: no data request
+    CHECK((m.read8(kVia2 + kIfr) & 0x01) == 0);
+}
+
+TEST_CASE("SE/30 SCSI: disks at IDs 0 and 1, the CD-ROM drive at 3 and the network adapter at 4 share the bus") {
+    Se30Machine m(quietRom(), banks(1, 0));
+    const auto answers = [&](int id) {
+        m.write8(scsiReg(1), 0x80);                    // bus reset, released
+        m.write8(scsiReg(1), 0x00);
+        m.write8(scsiReg(0), static_cast<u8>(0x80u | (1u << id)));
+        m.write8(scsiReg(1), 0x04);
+        m.write8(scsiReg(1), 0x00);
+        return (m.read8(scsiReg(4)) & 0x40) != 0;
+    };
+    for (int id = 0; id < 7; ++id) CHECK_FALSE(answers(id));   // an empty bus
+    m.insertHardDisk(std::vector<u8>(256 * 512, 0));
+    m.insertHardDisk2(std::vector<u8>(256 * 512, 0));
+    m.attachCdRom(true, 3);
+    m.attachNet(true);
+    for (int id = 0; id < 7; ++id) CHECK(answers(id) == (id == 0 || id == 1 || id == 3 || id == 4));
+    m.detachHardDisk2();
+    m.attachNet(false);
+    CHECK_FALSE(answers(1));
+    CHECK_FALSE(answers(4));
+    CHECK(answers(0));
+}
+
+TEST_CASE("SE/30 host calls: this ROM's System heap begins at $1E00, and $1EFC is no addressing-mode flag") {
+    Se30Machine m(quietRom(), banks(4, 0));
+    overlayOff(m);
+    setSizeBits(m, 1);
+    // The Macintosh II family's 256K ROMs: SysZone ($02A6) = $1E00, so the
+    // byte at $1EFC is heap data. Whatever it holds, the System is a 24-bit
+    // one, and the MMU's mode (MMU32Bit, $0CB2) alone says whether it has
+    // been switched away from that.
+    m.write32(0x02A6, 0x00001E00);
+    m.write8(0x0CB2, 0x00);
+    m.write8(0x1EFC, 0x01);
+    CHECK_FALSE(m.addressingModeSwapped());
+    m.write8(0x0CB2, 0x01);
+    CHECK(m.addressingModeSwapped());
+    // A ROM whose low memory reaches past it (SysZone = $2000): the byte is
+    // MMFlags, bit 0 the mode the System started in.
+    m.write32(0x02A6, 0x00002000);
+    CHECK_FALSE(m.addressingModeSwapped());            // 32-bit System, 32-bit now
+    m.write8(0x0CB2, 0x00);
+    CHECK(m.addressingModeSwapped());
+    m.write8(0x1EFC, 0x00);
+    CHECK_FALSE(m.addressingModeSwapped());
+}
 
 TEST_CASE("SE/30 RAM: the RAM-size bits pick one address line as the bank select") {
     Se30Machine m(quietRom(), banks(1, 1));
@@ -157,8 +303,11 @@ TEST_CASE("SE/30 address map: every device answers and the gaps end in a bus err
     CHECK_NOTHROW(m.read8(0x50F17C00u));               // floppy chip
     CHECK_NOTHROW(m.read8(0x50F04002u));               // serial chip, A control
     CHECK(m.read8(0x50F14800u) == 0x00);               // sound chip version: first generation
-    CHECK_NOTHROW(m.read8(0x50F06000u));               // SCSI data with handshake
     CHECK_NOTHROW(m.read8(0x50F12000u));               // SCSI data
+    // SCSI data with handshake: the cycle waits for the chip's data request,
+    // and with none coming the watchdog ends it.
+    CHECK_THROWS_AS(m.read8(0x50F06000u), BusFault);
+    CHECK_THROWS_AS(m.write8(0x50F06000u, 0), BusFault);
     // The device window repeats: the table in the cards book gives $5000 xxxx.
     m.write8(0x50000000u + kDdra, 0x3D);
     CHECK(m.read8(kVia1 + kDdra) == 0x3D);

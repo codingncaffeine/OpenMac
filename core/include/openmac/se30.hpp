@@ -12,7 +12,8 @@
 // and Drivers for the Macintosh Family 3rd ed., Apple Technical Notes HW14
 // and HW25, MAME and Linux as behavioral references). Clean-room.
 //
-// Under construction: disks on the SCSI bus follow.
+// Hard disks, the CD-ROM drive and the network adapter sit on the one SCSI
+// bus (IDs 0, 1, 3 and 4); MacHostServices runs them for the front end.
 
 #include "openmac/bus040.hpp"
 #include "openmac/cpu030.hpp"
@@ -33,6 +34,7 @@ class AdbTransceiver;
 class AdbViaPort;
 class Scc8530;
 class Ncr5380;
+class ScsiEthernet;
 class Asc;
 class DirectFloppy;
 class Se30Video;
@@ -100,6 +102,26 @@ public:
     struct FloppyCounts { u64 bytesRead, bytesWritten; u32 tracksWritten; bool secondRegisterSet; int track; };
     FloppyCounts floppyCounts() const;
 
+    // The SCSI Ethernet adapter, on the same bus as the disks. Frames cross
+    // to the host through netInject (host to guest) and netDrain.
+    void attachNet(bool attached, int busId = 4);
+    bool netAttached() const;
+    bool netInject(const u8* frame, u32 len);
+    bool netDrain(std::vector<u8>& out);
+
+    // What has crossed the SCSI chip since the machine was built: targets
+    // selected, commands carried out (in all and by target ID), data bytes
+    // each way, accesses through each of the two data addresses, and
+    // handshake cycles the board ended in a bus error because the chip asked
+    // for no byte.
+    struct ScsiCounts {
+        u32 selections, commands, bytesIn, bytesOut;
+        std::array<u32, 8> commandsById;
+        u64 plainDataCycles, handshakeDataCycles;
+        u32 handshakeTimeouts;
+    };
+    ScsiCounts scsiCounts() const;
+
     int screenWidth() const;
     int screenHeight() const;
     void renderScreen(u32* argbOut) const;
@@ -151,6 +173,8 @@ private:
     void tickDevices(int cpuCycles);
     void updateIpl();
     void updateRamDecode();
+    void updateScsiLines();
+    bool scsiHandshakeCycle();
     bool deviceRead8(u32 addr, u8& out);
     bool deviceWrite8(u32 addr, u8 value);
 
@@ -172,6 +196,7 @@ private:
     std::unique_ptr<AdbViaPort> adbPort_;
     std::unique_ptr<Scc8530> scc_;
     std::unique_ptr<Ncr5380> scsi_;
+    std::unique_ptr<ScsiEthernet> netdev_;
     std::unique_ptr<Asc> asc_;
     std::unique_ptr<DirectFloppy> floppy_;
     std::unique_ptr<Se30Video> video_;
@@ -186,6 +211,9 @@ private:
     int line_ = 0;
     u64 secondAcc_ = 0;
     int secondPulseLines_ = 0;
+    int busWaitClocks_ = 0;    // clocks a bus cycle was held beyond the instruction's own
+    u64 scsiPlainCycles_ = 0, scsiHandshakeCycles_ = 0;
+    u32 scsiHandshakeTimeouts_ = 0;
     bool floppyEjectPending_ = false;   // the host's Eject, until the disk is out
     bool floppyEjectAsked_ = false;     // the File Manager has been asked
     int floppyEjectFrames_ = 0;         // frames since the host's Eject
