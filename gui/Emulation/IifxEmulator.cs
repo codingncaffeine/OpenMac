@@ -477,6 +477,12 @@ public sealed class IifxEmulator : IEmulator
         return false;
     }
 
+    public bool LoadState(string path, out string error)
+    {
+        error = "this machine has no saved state";
+        return false;
+    }
+
     public bool RemoveTransferDisk(out string error)
     {
         error = "";

@@ -1116,6 +1116,34 @@ OMAC_API int omac_q_harddisk2_put_away(OMacQ* m)
     return (m && m->hs().secondDiskPutAway()) ? 1 : 0;
 }
 
+static int stateResult(bool ok, const std::string& why, char* err, size_t cap)
+{
+    if (err && cap) {
+        const size_t n = why.size() < cap - 1 ? why.size() : cap - 1;
+        std::memcpy(err, why.data(), n);
+        err[n] = 0;
+    }
+    return ok ? 1 : 0;
+}
+
+OMAC_API int omac_q_save_state(OMacQ* m, const char* path, char* err, size_t cap)
+{
+    if (!m || !path) return stateResult(false, "no machine", err, cap);
+    if (!m->q950) return stateResult(false, "this machine has no saved state", err, cap);
+    std::string why;
+    const bool ok = m->q950->saveStateFile(path, &why);
+    return stateResult(ok, why, err, cap);
+}
+
+OMAC_API int omac_q_load_state(OMacQ* m, const char* path, char* err, size_t cap)
+{
+    if (!m || !path) return stateResult(false, "no machine", err, cap);
+    if (!m->q950) return stateResult(false, "this machine has no saved state", err, cap);
+    std::string why;
+    const bool ok = m->q950->loadStateFile(path, &why);
+    return stateResult(ok, why, err, cap);
+}
+
 OMAC_API int omac_q_shutdown_volumes(OMacQ* m)
 {
     // A machine that switched itself off has done this already, and is not

@@ -13,6 +13,7 @@
 //                    [--harddisk FILE] [--harddisk2 FILE] [--save-harddisk OUT]
 //                    [--cd FILE] [--eject-cd-at FRAME] [--guest-restart-at FRAME]
 //                    [--put-away-disk2-at FRAME]
+//                    [--load-state FILE] [--save-state-at FRAME FILE] [--save-state FILE]
 //                    [--gestalt] [--slots] [--shutdown] [--profile FROM TO]
 //                    [--beep-at FRAME] [--guest-power-off-at FRAME]
 //                    [--dropbox DIR] [--dropbox-guest-read FILE] [--drivers]
@@ -77,6 +78,12 @@ int main(int argc, char** argv) {
     std::vector<u8> audio, audioChunk;
     int ejectCdAt = -1, guestRestartAt = -1, beepAt = -1, guestPowerOffAt = -1;
     int putAwayDisk2At = -1;        // --put-away-disk2-at N: the guest unmounts the second volume
+    // --load-state FILE starts from a saved state (frame numbers go on from
+    // the state's own); --save-state-at N FILE saves before frame N runs;
+    // --save-state FILE saves when the run ends.
+    std::string loadStatePath, saveStatePath, saveStateAtPath;
+    int saveStateAt = -1;
+    bool hd2ReadOnly = false;       // --harddisk2-read-only: as a dropped file's disk is attached
     bool disk2PutAwaySeen = false;
     bool askGestalt = false, doShutdown = false, askSlots = false;
     int profileFrom = -1, profileTo = -1;
@@ -129,6 +136,9 @@ int main(int argc, char** argv) {
         else if (a == "--eject-cd-at" && i + 1 < argc) ejectCdAt = std::atoi(argv[++i]);
         else if (a == "--guest-restart-at" && i + 1 < argc) guestRestartAt = std::atoi(argv[++i]);
         else if (a == "--put-away-disk2-at" && i + 1 < argc) putAwayDisk2At = std::atoi(argv[++i]);
+        else if (a == "--load-state" && i + 1 < argc) loadStatePath = argv[++i];
+        else if (a == "--save-state" && i + 1 < argc) saveStatePath = argv[++i];
+        else if (a == "--save-state-at" && i + 2 < argc) { saveStateAt = std::atoi(argv[++i]); saveStateAtPath = argv[++i]; }
         else if (a == "--profile" && i + 2 < argc) { profileFrom = std::atoi(argv[++i]); profileTo = std::atoi(argv[++i]); }
         else if (a == "--gestalt") askGestalt = true;
         else if (a == "--slots") askSlots = true;
@@ -138,6 +148,7 @@ int main(int argc, char** argv) {
         else if (a == "--dropbox-guest-read" && i + 1 < argc) dropBoxGuestRead = argv[++i];
         else if (a == "--drivers") showDrivers = true;
         else if (a == "--harddisk2-external") cfg.secondDiskExternal = true;
+        else if (a == "--harddisk2-read-only") hd2ReadOnly = true;
         else if (a == "--net") netAttach = true;
         else if (a == "--dump-audio" && i + 1 < argc) wavPath = argv[++i];
         else if (a == "--clut-trace" && i + 2 < argc) { clutTraceAt = std::atoi(argv[++i]); clutTraceCount = std::atoi(argv[++i]); }
@@ -244,7 +255,7 @@ int main(int argc, char** argv) {
         std::vector<u8> hd = readFile(hd2Path);
         if (hd.empty()) { std::fprintf(stderr, "cannot read disk: %s\n", hd2Path.c_str()); return 2; }
         std::printf("second hard disk %s: attached (%zu MB)\n", hd2Path.c_str(), hd.size() >> 20);
-        mac.insertHardDisk2(std::move(hd), false);
+        mac.insertHardDisk2(std::move(hd), hd2ReadOnly);
     }
     if (!dropBoxDir.empty()) {
         std::string why;
@@ -290,8 +301,26 @@ int main(int argc, char** argv) {
     std::map<u32, int> hashes;
 
     bool halted = false;
+    int firstFrame = 0;
+    if (!loadStatePath.empty()) {
+        std::string why;
+        if (!mac.loadStateFile(loadStatePath, &why)) {
+            std::fprintf(stderr, "state not loaded: %s\n", why.c_str());
+            return 2;
+        }
+        firstFrame = static_cast<int>(mac.frameCount());
+        std::printf("state loaded: %s, frame %d\n", loadStatePath.c_str(), firstFrame);
+        // The self-tests are long over in any state worth saving.
+        if (watchPcs.empty() && profileFrom < 0) mac.cpu().onStep = nullptr;
+    }
+    const auto saveStateTo = [&](const std::string& path, int frame) {
+        std::string why;
+        if (mac.saveStateFile(path, &why)) std::printf("state saved: %s, frame %d\n", path.c_str(), frame);
+        else std::fprintf(stderr, "state not saved: %s\n", why.c_str());
+    };
     bool floppyIn = mac.floppyPresent();
-    for (int f = 0; f < frames; ++f) {
+    for (int f = firstFrame; f < frames; ++f) {
+        if (f == saveStateAt) saveStateTo(saveStateAtPath, f);
         lastFrame = static_cast<u32>(f);
         if (mac.floppyPresent() != floppyIn) {
             floppyIn = !floppyIn;
@@ -514,6 +543,7 @@ int main(int argc, char** argv) {
     if (showDrivers) tracetools::printDrivers(mac, mac.ramBytes());
     if (!dropBoxGuestRead.empty()) tracetools::reportGuestRead(mac, dropBoxGuestRead);
     if (doShutdown) std::printf("shutdown volumes: %s\n", mac.shutdownVolumes() ? "unmounted" : "nothing to do");
+    if (!saveStatePath.empty()) saveStateTo(saveStatePath, static_cast<int>(mac.frameCount()));
     if (!hdOut.empty()) {
         const std::vector<u8>& image = mac.hardDiskImage();
         std::ofstream out(hdOut, std::ios::binary);

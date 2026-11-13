@@ -506,6 +506,45 @@ public sealed class QuadraEmulator : IEmulator
         return false;
     }
 
+    public bool LoadState(string path, out string error)
+    {
+        error = "";
+        byte[] why = new byte[512];
+        byte[]? seat = null;
+        lock (_sync)
+        {
+            if (_h == IntPtr.Zero) { error = "no machine"; return false; }
+            if (Native.omac_q_load_state(_h, path, why, (nuint)why.Length) == 0)
+            {
+                int n = Array.IndexOf(why, (byte)0);
+                error = System.Text.Encoding.UTF8.GetString(why, 0, n < 0 ? why.Length : n);
+                return false;
+            }
+            _screenW = Native.omac_q_screen_w(_h);
+            _screenH = Native.omac_q_screen_h(_h);
+            // A disk the state carries on the second seat is the front end's
+            // to answer for from here on, as if it had been dropped just now.
+            nuint size = Native.omac_q_harddisk2_data(_h, null, 0);
+            if (size != 0 && _seat?.Folder is null)
+            {
+                seat = new byte[size];
+                if (Native.omac_q_harddisk2_data(_h, seat, size) == 0) seat = null;
+            }
+        }
+        if (seat is not null)
+        {
+            _readOnlySeatImage = seat;
+            // An HFS volume's name: a Pascal string 36 bytes into its master
+            // directory block.
+            int len = seat.Length > 1024 + 64 ? Math.Min((int)seat[1024 + 36], 27) : 0;
+            TransferDiskLabel = len > 0
+                ? System.Text.Encoding.Latin1.GetString(seat, 1024 + 37, len) : "second disk";
+        }
+        Log.Line($"[state] loaded {Path.GetFileName(path)}"
+                 + (seat is not null ? $", with “{TransferDiskLabel}” on the second SCSI seat" : ""));
+        return true;
+    }
+
     public bool RemoveTransferDisk(out string error)
     {
         error = "";

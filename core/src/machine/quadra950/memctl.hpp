@@ -31,6 +31,7 @@
 namespace openmac {
 
 class MemoryController950 {
+    friend class Quadra950StateCodec;
 public:
     static constexpr u32 kSpaceBytes = 0x10000000u;   // 256 MB of RAM space
     static constexpr u32 kUnitShift = 22;             // boundaries count 4 MB

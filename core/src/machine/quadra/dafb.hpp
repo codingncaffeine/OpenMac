@@ -43,6 +43,7 @@
 namespace openmac {
 
 class Dafb {
+    friend class Quadra950StateCodec;
 public:
     // Memc: the cell inside the Quadra 610/650/800 memory controller, 1 MB.
     // Standalone: the Quadra 950's chip, with 1 MB or 2 MB of video RAM fitted.

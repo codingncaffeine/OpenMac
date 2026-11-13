@@ -142,6 +142,7 @@ public:
 
 private:
     friend class IifxStateCodec;
+    friend class Quadra950StateCodec;
 
     static u32 be32(const u8* p) {
         return (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | p[3];
@@ -324,6 +325,7 @@ public:
 
 private:
     friend class IifxStateCodec;
+    friend class Quadra950StateCodec;
 
     // ---- registers -------------------------------------------------------
     void writeMr(u8 v) {

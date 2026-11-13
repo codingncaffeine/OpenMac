@@ -47,6 +47,7 @@
 namespace openmac {
 
 class EgretController {
+    friend class Quadra950StateCodec;
 public:
     // Commands of packet type 1 the model acts on. Names follow the public
     // Linux header (cuda.h) where it has one.

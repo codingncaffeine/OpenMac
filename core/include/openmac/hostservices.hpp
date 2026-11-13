@@ -21,9 +21,11 @@
 namespace openmac {
 
 class ScsiDisk;
+class Quadra950StateCodec;
 class ScsiCdRom;
 
 class MacHostServices {
+    friend class Quadra950StateCodec;
 public:
     // SCSI media, mirroring the Classic's surface. Images are wrapped in an
     // Apple partition map with a driver the ROM's boot scan can load.

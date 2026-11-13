@@ -29,6 +29,7 @@ namespace openmac {
 
 class Via6522;
 class EgretController;
+class Quadra950StateCodec;
 class MemoryController950;
 class IoProcessor;
 class Scc8530;
@@ -41,6 +42,7 @@ class IopFloppy;
 class ScsiEthernet;
 
 class Quadra950Machine final : public IBus040, public MacHostServices {
+    friend class Quadra950StateCodec;
 public:
     struct Config {
         // The four SIMM banks A-D in megabytes: 0 (empty) or 4, 8, 16, 32, 64.
@@ -123,6 +125,18 @@ public:
     static constexpr u32 kPramBlobBytes = 268;
     u32 savePram(u8* out, u32 cap) const;
     bool loadPram(const u8* data, u32 len, u32 addSeconds);
+
+    // A saved state: everything that changes while the machine runs -- the
+    // processor, RAM, every chip, both hard disks' contents, the floppy in
+    // the drive -- in the format of the Macintosh IIfx's checkpoints. The ROM
+    // is named by its contents, not copied; RAM banks, video RAM, the monitor
+    // and which bus the second disk is on are configuration, and a state
+    // loads only into a machine built the same way. A CD and the network
+    // adapter are the loader's to put back. Take one between frames.
+    std::vector<u8> saveState() const;
+    bool loadState(const u8* data, std::size_t size, std::string* error = nullptr);
+    bool saveStateFile(const std::string& path, std::string* error = nullptr) const;
+    bool loadStateFile(const std::string& path, std::string* error = nullptr);
     const std::array<u8, 256>& pram() const;
 
     // The guest asked the microcontroller to switch the machine off (Shut

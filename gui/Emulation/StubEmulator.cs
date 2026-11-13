@@ -132,6 +132,12 @@ public sealed class StubEmulator : IEmulator
         TransferDiskLabel = System.IO.Path.GetFileName(filePath);
         return true;
     }
+    public bool LoadState(string path, out string error)
+    {
+        error = "this machine has no saved state";
+        return false;
+    }
+
     public bool RemoveTransferDisk(out string error)
     {
         error = "";

@@ -771,3 +771,58 @@ TEST_CASE("950 parameter RAM: asked without a buffer the machine gives the size,
     CHECK(clock == 0x12345678u + 10);                 // the time the file sat unread is added
     CHECK_FALSE(other.loadPram(blob.data(), 100, 0)); // a file of the wrong size is refused
 }
+
+TEST_CASE("950 saved state: a machine loaded from one goes on exactly as the machine that saved it") {
+    const auto nopRom = [] {
+        std::vector<u8> rom(0x100000);
+        for (std::size_t i = 0; i < rom.size(); i += 2) { rom[i] = 0x4E; rom[i + 1] = 0x71; }   // NOP
+        const u8 vectors[8] = {0x00, 0x00, 0x20, 0x00, 0x40, 0x80, 0x01, 0x00};
+        std::copy(vectors, vectors + 8, rom.begin());
+        return rom;
+    };
+    Quadra950Machine first(nopRom());
+    first.reset();
+    for (int i = 0; i < 3; ++i) first.runFrame();
+    const std::vector<u8> saved = first.saveState();
+    REQUIRE(saved.size() > 64);
+
+    Quadra950Machine second(nopRom());
+    second.reset();
+    std::string why;
+    REQUIRE(second.loadState(saved.data(), saved.size(), &why));
+    CHECK(second.frameCount() == 3);
+    CHECK(second.saveState() == saved);               // nothing is lost in the round trip
+    for (int i = 0; i < 2; ++i) { first.runFrame(); second.runFrame(); }
+    CHECK(second.saveState() == first.saveState());   // and both arrive at the same place
+
+    // A state belongs to the machine it was saved on.
+    std::vector<u8> otherRom = nopRom();
+    otherRom[0x200] ^= 0xFF;
+    Quadra950Machine differentRom(std::move(otherRom));
+    differentRom.reset();
+    CHECK_FALSE(differentRom.loadState(saved.data(), saved.size(), &why));
+    CHECK(why.find("ROM") != std::string::npos);
+    Quadra950Machine::Config big;
+    big.bankMb = {16, 16, 0, 0};
+    Quadra950Machine differentRam(nopRom(), big);
+    differentRam.reset();
+    CHECK_FALSE(differentRam.loadState(saved.data(), saved.size(), &why));
+    CHECK(why.find("RAM") != std::string::npos);
+    Quadra950Machine::Config oneMeg;
+    oneMeg.vramMb = 1;
+    Quadra950Machine differentVideo(nopRom(), oneMeg);
+    differentVideo.reset();
+    CHECK_FALSE(differentVideo.loadState(saved.data(), saved.size(), &why));
+
+    // A damaged file changes nothing.
+    Quadra950Machine untouched(nopRom());
+    untouched.reset();
+    const std::vector<u8> before = untouched.saveState();
+    std::vector<u8> damaged = saved;
+    damaged[damaged.size() / 2] ^= 0x01;
+    CHECK_FALSE(untouched.loadState(damaged.data(), damaged.size(), &why));
+    CHECK_FALSE(untouched.loadState(saved.data(), saved.size() - 9, &why));
+    CHECK_FALSE(untouched.loadState(saved.data(), 20, &why));
+    CHECK(untouched.saveState() == before);
+}
+

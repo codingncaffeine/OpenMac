@@ -219,6 +219,14 @@ internal static class Native
     public static extern int omac_q_harddisk2_put_away(IntPtr h);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_save_state(
+        IntPtr h, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] err, nuint errCap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int omac_q_load_state(
+        IntPtr h, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, byte[] err, nuint errCap);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern nuint omac_q_diagnostics(IntPtr h, byte[]? outBuf, nuint cap);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

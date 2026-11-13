@@ -367,6 +367,7 @@ public:
 
 private:
     friend class IifxStateCodec;
+    friend class Quadra950StateCodec;
 
     bool highDensity() const { return media_.size() == 1474560u; }
 

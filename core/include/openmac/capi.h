@@ -261,6 +261,15 @@ OMAC_API int    omac_q_unmount_harddisk2(OMacQ*);
    detach clears it. */
 OMAC_API int    omac_q_harddisk2_put_away(OMacQ*);
 
+/* The Quadra 950's saved state: the whole running machine in one file, both
+   hard disks' contents included (Quadra950Machine::saveState). A state loads
+   only into a machine with the same ROM, RAM, video RAM, monitor and SCSI
+   layout; a CD is the caller's to put back. 1 = done; on 0 the reason is in
+   err as a C string. The Quadra 650 has no saved state and answers 0. Call
+   between frames. */
+OMAC_API int    omac_q_save_state(OMacQ*, const char* path, char* err, size_t err_cap);
+OMAC_API int    omac_q_load_state(OMacQ*, const char* path, char* err, size_t err_cap);
+
 /* A text snapshot of CPU, low memory and every device, for capturing what a
    wedged guest was doing. Pass out=NULL to learn the size needed. Reads model
    state only, so taking it cannot disturb the machine. */

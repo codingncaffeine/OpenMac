@@ -151,6 +151,13 @@ public interface IEmulator : IDisposable
     /// open on it -- the disk then stays where it is.</summary>
     bool RemoveTransferDisk(out string error);
 
+    // ---- saved state ----
+    /// <summary>Put the machine into a state saved earlier: the whole running
+    /// Mac, its hard disks' contents included. Only a machine set up the way
+    /// the state was saved takes it; false, with the reason, otherwise --
+    /// and on a machine that has no saved state.</summary>
+    bool LoadState(string path, out string error);
+
     // ---- CD-ROM ----
     // The drive is a SCSI device (attached to the bus; the ROM and the Apple CD
     // software find it during the boot-time bus scan). A disc is media: put in
