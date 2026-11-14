@@ -188,6 +188,13 @@ public:
     int takeCyclePenalty() override;
     int pendingCyclePenalty() const override { return busWaitClocks_; }
 
+    // Guest memory at an address the System uses, which is what the host's
+    // storage code reads and writes through (see HostBus below): for a
+    // debugger and for tests.
+    u8 guestRead8(u32 addr) { return hostBus_.read8(addr); }
+    u32 guestRead32(u32 addr) { return hostBus_.read32(addr); }
+    void guestWrite8(u32 addr, u8 value) { hostBus_.write8(addr, value); }
+
     static constexpr u32 kNoRam = 0xFFFFFFFFu;
     // Where a RAM-space address lands in the fitted bytes (bank A first,
     // then bank B), or kNoRam for an empty bank.
@@ -198,7 +205,31 @@ protected:
     void boardWorkAtCall() override;
 
 private:
+    // Guest memory as the host's storage code reaches it (MacHostServices):
+    // an address the System uses, not one on the board's address lines. The
+    // two are the same while the RAM-size bits name bank A's real SIMMs, as
+    // the ROM sets them. A System that sets them wider and puts bank B back
+    // behind bank A with the memory management unit (the 32-Bit System
+    // Enabler does) still addresses the fitted bytes in their order, bank A
+    // then bank B, and that is what this bus gives; everything that is not
+    // RAM goes to the board as it is.
+    class HostBus final : public IBus040 {
+    public:
+        explicit HostBus(Se30Machine& machine) : m_(machine) {}
+        u8 read8(u32 addr) override;
+        u16 read16(u32 addr) override;
+        u32 read32(u32 addr) override;
+        void write8(u32 addr, u8 value) override;
+        void write16(u32 addr, u16 value) override;
+        void write32(u32 addr, u32 value) override;
+    private:
+        bool ram(u32 addr, u32 bytes) const;
+        Se30Machine& m_;
+    };
+    HostBus hostBus_{*this};
+
     void wireDevices();
+    void watchSystemRebuilt();
     void askGuestToEjectFloppy();
     void resetPeripherals();
     void tickDevices(int cpuCycles);
@@ -253,6 +284,7 @@ private:
     u64 fetchesCounted_ = 0;   // instruction fetches from memory already charged
     u64 scsiPlainCycles_ = 0, scsiHandshakeCycles_ = 0;
     u32 scsiHandshakeTimeouts_ = 0;
+    u32 systemHeapSeen_ = 0;   // the System heap's address as low memory last gave it
     bool floppyEjectPending_ = false;   // the host's Eject, until the disk is out
     bool floppyEjectAsked_ = false;     // the File Manager has been asked
     int floppyEjectFrames_ = 0;         // frames since the host's Eject

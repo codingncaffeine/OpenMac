@@ -124,7 +124,7 @@ bool Se30Machine::banksForTotal(u32 totalMb, u32& bankAMb, u32& bankBMb) {
 }
 
 Se30Machine::Se30Machine(std::vector<u8> rom, const Config& cfg)
-    : MacHostServices(*this, cpu_, ram_),
+    : MacHostServices(hostBus_, cpu_, ram_),
       rom_(std::move(rom)),
       videoRom_(cfg.videoRom.empty() && !cfg.emptyVideoSlot ? Se30VideoRom::build() : cfg.videoRom),
       ownVideoRom_(cfg.videoRom.empty() && !cfg.emptyVideoSlot),
@@ -285,6 +285,7 @@ void Se30Machine::reset() {
     audioStereo_.clear();
     cpu_.reset();
     fetchesCounted_ = 0;      // the processor's own counts start again with it
+    systemHeapSeen_ = 0;
 }
 
 void Se30Machine::updateIpl() {
@@ -570,6 +571,44 @@ void Se30Machine::write32(u32 addr, u32 value) {
     chargeAccess(addr);
 }
 
+// ---- the host's view of guest memory ---------------------------------------------
+
+bool Se30Machine::HostBus::ram(u32 addr, u32 bytes) const {
+    return !m_.overlay_ && addr < m_.ram_.size() && m_.ram_.size() - addr >= bytes;
+}
+
+u8 Se30Machine::HostBus::read8(u32 addr) {
+    return ram(addr, 1) ? m_.ram_[addr] : m_.read8(addr);
+}
+
+u16 Se30Machine::HostBus::read16(u32 addr) {
+    if (!ram(addr, 2)) return m_.read16(addr);
+    return static_cast<u16>((m_.ram_[addr] << 8) | m_.ram_[addr + 1]);
+}
+
+u32 Se30Machine::HostBus::read32(u32 addr) {
+    return ram(addr, 4) ? be32(&m_.ram_[addr]) : m_.read32(addr);
+}
+
+void Se30Machine::HostBus::write8(u32 addr, u8 value) {
+    if (ram(addr, 1)) m_.ram_[addr] = value;
+    else m_.write8(addr, value);
+}
+
+void Se30Machine::HostBus::write16(u32 addr, u16 value) {
+    if (!ram(addr, 2)) { m_.write16(addr, value); return; }
+    m_.ram_[addr] = static_cast<u8>(value >> 8);
+    m_.ram_[addr + 1] = static_cast<u8>(value);
+}
+
+void Se30Machine::HostBus::write32(u32 addr, u32 value) {
+    if (!ram(addr, 4)) { m_.write32(addr, value); return; }
+    m_.ram_[addr] = static_cast<u8>(value >> 24);
+    m_.ram_[addr + 1] = static_cast<u8>(value >> 16);
+    m_.ram_[addr + 2] = static_cast<u8>(value >> 8);
+    m_.ram_[addr + 3] = static_cast<u8>(value);
+}
+
 // ---- time -----------------------------------------------------------------------
 
 void Se30Machine::tickDevices(int cpuCycles) {
@@ -635,14 +674,46 @@ void Se30Machine::tickDevices(int cpuCycles) {
                     floppy_->eject();
                 }
             }
+            watchSystemRebuilt();
             storageFrameTick();
         }
     }
     updateIpl();
 }
 
+// A System built again without the machine restarting. The 32-Bit System
+// Enabler does it a second into a start-up from a disk it is on: with
+// interrupts off it calls the ROM's start-up routines from RAM, makes the
+// System heap and the unit table anew and has the ROM start the System file a
+// second time. Nothing passes the ROM's entry, so the host's storage would go
+// on believing in the first System's drivers and volumes, and mount a disk in
+// the middle of the second one's start. The mark is the System heap's
+// address in low memory ($02A6) naming another heap than it did; once a
+// frame is soon enough, the second start makes no call the host waits for
+// before its heap exists. (After a restart of such a System the ROM's own
+// heap is another one too and is told the same way: the host's start-up
+// state is set a second time, to what the restart had already made it.)
+void Se30Machine::watchSystemRebuilt() {
+    if (ram_.size() < 0x0400) return;
+    const u32 zone = be32(&ram_[0x02A6]);
+    if (zone == systemHeapSeen_) return;
+    // A heap: a RAM address whose first long word, the heap's end, lies
+    // above it. The ROM's RAM test leaves patterns here that are neither.
+    if (zone == 0 || (zone & 3u) != 0 || zone + 4 > ram_.size()) return;
+    const u32 limit = be32(&ram_[zone]);
+    if (limit <= zone || (limit & 3u) != 0 || limit >= ram_.size()) return;
+    const bool rebuilt = systemHeapSeen_ != 0;
+    systemHeapSeen_ = zone;
+    if (!rebuilt) return;
+    if (onDiag) onDiag("a new System heap: the System was built again, the last one's drivers and volumes are void");
+    machineStarting();
+}
+
 int Se30Machine::stepInstruction() {
-    if (cpu_.pc == 0x4080000Au || (overlay_ && cpu_.pc == romEntry_)) machineStarting();
+    if (cpu_.pc == 0x4080000Au || (overlay_ && cpu_.pc == romEntry_)) {
+        machineStarting();
+        systemHeapSeen_ = 0;
+    }
     // The board's longer bus cycles reach the processor through
     // takeCyclePenalty(), inside step(). What the host's own reads and
     // stores of guest memory added is not machine time and is dropped.

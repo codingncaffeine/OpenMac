@@ -835,6 +835,72 @@ TEST_CASE("SE/30 saved state: a machine loaded from one goes on as the machine t
     }
 }
 
+TEST_CASE("SE/30 host storage: guest RAM is addressed as the System addresses it, whatever the RAM-size bits") {
+    // The 32-Bit System Enabler sets the bits to their widest (bank B at
+    // $0400 0000 on the board) and maps bank B back behind bank A with the
+    // memory management unit. A guest address in bank B is then not the
+    // board's address, and the host's stores must still land in bank B.
+    Se30Machine m(quietRom(), banks(4, 4));
+    overlayOff(m);
+    setSizeBits(m, 3);
+    for (u32 k = 0; k < 80; ++k) {
+        m.write8(0x00000100u + k, 0x11);       // bank A, where the board repeats it at 4 MB
+        m.write8(0x04000100u + k, 0x22);       // bank B on the board
+    }
+    for (u32 k = 0; k < 80; ++k) m.guestWrite8(0x00400100u + k, static_cast<u8>(k));   // the System's address of that part of bank B
+    CHECK(m.read8(0x04000100u) == 0x00);
+    CHECK(m.read8(0x04000100u + 23) == 23);
+    CHECK(m.read8(0x04000100u + 79) == 79);
+    CHECK(m.guestRead8(0x00400100u + 23) == 23);
+    CHECK(m.guestRead32(0x00400100u + 20) == 0x14151617u);
+    CHECK(m.read8(0x00000100u) == 0x11);        // bank A was not touched
+    CHECK(m.read8(0x00000100u + 23) == 0x11);
+    // What is not RAM goes to the board: the ROM and its marker bytes.
+    CHECK(m.guestRead8(0x40801000u) == 0xC3);
+
+    SUBCASE("with the bits as the ROM sets them the two addresses are one") {
+        Se30Machine plain(quietRom(), banks(4, 4));
+        overlayOff(plain);
+        setSizeBits(plain, 1);
+        plain.guestWrite8(0x00400117u, 0x33);
+        CHECK(plain.read8(0x00400117u) == 0x33);
+    }
+
+    SUBCASE("while the ROM sits over RAM the host sees what the processor sees") {
+        Se30Machine starting(quietRom(), banks(4, 4));
+        CHECK(starting.guestRead8(0x00001000u) == 0xC3);
+    }
+}
+
+TEST_CASE("SE/30: a System built again without a restart is noticed once, by its new heap") {
+    Se30Machine m(quietRom(), banks(4, 0));
+    overlayOff(m);
+    setSizeBits(m, 1);
+    int said = 0;
+    m.onDiag = [&](const char* text) {
+        if (std::strstr(text, "the System was built again")) ++said;
+    };
+    const auto heapAt = [&](u32 zone) {
+        m.write32(zone, zone + 0x4000u);        // a heap begins with the address of its end
+        m.write32(0x02A6, zone);                // SysZone
+    };
+    m.write32(0x02A6, 0xDADADADAu);             // what a RAM test leaves is no heap
+    m.runFrame();
+    CHECK(said == 0);
+    heapAt(0x1E00);                             // the ROM's own start: the first heap
+    m.runFrame();
+    m.runFrame();
+    CHECK(said == 0);
+    heapAt(0x2000);                             // the same machine, another System heap
+    m.runFrame();
+    CHECK(said == 1);
+    m.runFrame();
+    CHECK(said == 1);
+    m.write32(0x02A6, 0x00002004u);             // an address with no heap behind it
+    m.runFrame();
+    CHECK(said == 1);
+}
+
 TEST_CASE("declaration ROM builders: the IIfx's generated video ROM is what it was before they moved") {
     const IifxNuBusVideo video;
     CHECK(video.declarationRom().size() == 65536);

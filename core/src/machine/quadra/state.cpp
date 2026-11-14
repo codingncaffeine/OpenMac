@@ -697,6 +697,8 @@ public:
         // What is derived from the restored bytes rather than stored.
         machine.busWaitClocks_ = 0;
         machine.updateRamDecode();
+        machine.systemHeapSeen_ = 0;
+        machine.watchSystemRebuilt();     // the heap low memory names now is the one known
         if (!rebindDisk(*machine.disk_, machine.hd_, machine.scsiImage_, machine.hfsImageOffset_))
             return fail("saved hard disk lies outside its SCSI image");
         if (!rebindDisk(*machine.disk2_, machine.hd2_, machine.scsiImage2_,
