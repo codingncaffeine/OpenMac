@@ -1,12 +1,19 @@
 # OpenMac
 
-A from-scratch Macintosh emulator for Windows: four machines over one shared
+A from-scratch Macintosh emulator for Windows: five machines over one shared
 core, implemented from period hardware documentation.
 
 - **Macintosh Classic** — 68000 (validated against the SingleStepTests suite at
   100% state accuracy), VIA 6522, ADB, IWM floppy, NCR 5380 SCSI, real-time
   clock, and the scanline sound buffer. Boots System 6.0.8 and System 7.0.1 to a
   fully working desktop, and the ROM's built-in System 6.0.3 ROM disk.
+- **Macintosh SE/30** — 16 MHz 68030/68882 with both of the processor's caches,
+  the built-in 512×342 screen behind its own video ROM (OpenMac's, or the
+  original file), two VIAs, ADB, the SWIM chip and the internal SuperDrive,
+  NCR 5380 SCSI with hard disks and a CD-ROM drive, the Apple Sound Chip, and
+  bus cycles at their real length: Speedometer scores land within 5% of a real
+  machine's. Boots System 6.0.8, 7.0.1, 7.1 and 7.5 from a floppy or a hard
+  disk with 1 to 128 MB of RAM, and shuts down and restarts from the Finder.
 - **Macintosh IIfx** — 40 MHz 68030/68882, OSS interrupt controller, dual I/O
   Processor interfaces, NCR 5380 SCSI, internal SuperDrive, ASC audio, and the
   **Macintosh Display Card 8•24 GC** in slot $9: the card's Am29000 runs Apple's
@@ -32,9 +39,17 @@ core, implemented from period hardware documentation.
 ## Getting started
 
 1. Build (below) or pick up a [release](https://github.com/codingncaffeine/OpenMac/releases).
-2. Machine ▸ Model to choose the Classic, Macintosh IIfx, Quadra 650, or Quadra 950.
+2. Machine ▸ Model to choose the Classic, Macintosh SE/30, Macintosh IIfx, Quadra 650, or Quadra 950.
 3. File ▸ Open ROM… and choose the matching ROM dump.
 4. Insert a floppy image, or create a hard disk and install a System onto it, and boot.
+
+For the SE/30, use the 256 KB ROM with checksum `97221136` (the one the
+Macintosh IIx and IIcx share). The machine starts on OpenMac's own video ROM;
+Machine ▸ Video ROM… takes the original 8 KB file. More than 8 MB of RAM needs
+System 7.1 with the 32-Bit System Enabler in the System Folder and 32-bit
+addressing switched on in the Memory control panel. Under System 7.5, set
+Submenus to Off in the Apple Menu Options control panel (the wiki's SE/30 page
+says why).
 
 For the IIfx, use the 512 KB ROM with checksum `4147DD77`. The RAM menu exposes
 only realizable four-SIMM bank totals: 4, 8, 16, 20, 32, 64, 68, 80, and
