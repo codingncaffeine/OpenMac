@@ -9,7 +9,7 @@ public sealed class Settings
     public int RamMB { get; set; } = 4;
     public bool BootRomDisk { get; set; }
 
-    /// <summary>Which machine the GUI runs: "classic", "iifx", "quadra650" or "quadra950". Each model
+    /// <summary>Which machine the GUI runs: "classic", "iifx", "quadra650", "quadra950" or "se30". Each model
     /// remembers its own ROM, floppy and hard disk — they are not interchangeable.</summary>
     public string Model { get; set; } = "classic";
     public string? LastRomIifx { get; set; }
@@ -36,6 +36,19 @@ public sealed class Settings
     public int VramMBQuadra950 { get; set; } = 2;
     public string? MonitorQuadra950 { get; set; }
 
+    public string? LastRomSe30 { get; set; }
+    public string? LastFloppySe30 { get; set; }
+    public string? LastHardDiskSe30 { get; set; }
+    public int RamMBSe30 { get; set; } = 8;
+    /// <summary>The SE/30's 8 KB video ROM file (part 341-0650): its built-in
+    /// screen is a card in slot $E with a declaration ROM of its own.</summary>
+    public string? VideoRomSe30 { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsSe30 => Model == "se30";
+    /// <summary>The Macintosh Classic: the model that is none of the others.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsClassic => !IsQuadra && !IsIifx && !IsSe30;
     /// <summary>Either Quadra: the two share one backend.</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public bool IsQuadra => Model == "quadra650" || Model == "quadra950";
@@ -57,10 +70,11 @@ public sealed class Settings
     [System.Text.Json.Serialization.JsonIgnore]
     public string? ModelLastRom
     {
-        get => IsIifx ? LastRomIifx : IsQuadra950 ? LastRomQuadra950 : IsQuadra ? LastRomQuadra : LastRom;
+        get => IsIifx ? LastRomIifx : IsSe30 ? LastRomSe30 : IsQuadra950 ? LastRomQuadra950 : IsQuadra ? LastRomQuadra : LastRom;
         set
         {
             if (IsIifx) LastRomIifx = value;
+            else if (IsSe30) LastRomSe30 = value;
             else if (IsQuadra950) LastRomQuadra950 = value;
             else if (IsQuadra) LastRomQuadra = value;
             else LastRom = value;
@@ -69,10 +83,11 @@ public sealed class Settings
     [System.Text.Json.Serialization.JsonIgnore]
     public string? ModelLastHardDisk
     {
-        get => IsIifx ? LastHardDiskIifx : IsQuadra950 ? LastHardDiskQuadra950 : IsQuadra ? LastHardDiskQuadra : LastHardDisk;
+        get => IsIifx ? LastHardDiskIifx : IsSe30 ? LastHardDiskSe30 : IsQuadra950 ? LastHardDiskQuadra950 : IsQuadra ? LastHardDiskQuadra : LastHardDisk;
         set
         {
             if (IsIifx) LastHardDiskIifx = value;
+            else if (IsSe30) LastHardDiskSe30 = value;
             else if (IsQuadra950) LastHardDiskQuadra950 = value;
             else if (IsQuadra) LastHardDiskQuadra = value;
             else LastHardDisk = value;
@@ -81,17 +96,18 @@ public sealed class Settings
     [System.Text.Json.Serialization.JsonIgnore]
     public string? ModelLastFloppy
     {
-        get => IsIifx ? LastFloppyIifx : IsQuadra950 ? LastFloppyQuadra950 : IsQuadra ? LastFloppyQuadra : LastFloppy;
+        get => IsIifx ? LastFloppyIifx : IsSe30 ? LastFloppySe30 : IsQuadra950 ? LastFloppyQuadra950 : IsQuadra ? LastFloppyQuadra : LastFloppy;
         set
         {
             if (IsIifx) LastFloppyIifx = value;
+            else if (IsSe30) LastFloppySe30 = value;
             else if (IsQuadra950) LastFloppyQuadra950 = value;
             else if (IsQuadra) LastFloppyQuadra = value;
             else LastFloppy = value;
         }
     }
     [System.Text.Json.Serialization.JsonIgnore]
-    public int ModelRamMB => IsIifx ? RamMBIifx : IsQuadra950 ? RamMBQuadra950 : IsQuadra ? RamMBQuadra : RamMB;
+    public int ModelRamMB => IsIifx ? RamMBIifx : IsSe30 ? RamMBSe30 : IsQuadra950 ? RamMBQuadra950 : IsQuadra ? RamMBQuadra : RamMB;
 
     public int Scale { get; set; } = 2;              // 0 = fit, else fixed multiplier
     public string? LastRom { get; set; }

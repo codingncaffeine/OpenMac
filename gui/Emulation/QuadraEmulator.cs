@@ -40,16 +40,23 @@ public sealed class QuadraEmulator : IEmulator
     /// <summary>The Quadra 950 instead of the Quadra 650. Fixed for the life
     /// of the backend: the window makes a new one when the model changes.</summary>
     public bool Is950 { get; init; }
+    /// <summary>The Macintosh SE/30, which the same backend runs. Fixed for
+    /// the life of the backend, like <see cref="Is950"/>.</summary>
+    public bool IsSe30 { get; init; }
+    /// <summary>The SE/30's 8 KB video ROM file (its built-in screen is a
+    /// card in slot $E with a ROM of its own); takes effect at the next ROM
+    /// load. Without it the machine has no screen.</summary>
+    public string? VideoRomPath { get; set; }
     /// <summary>Video RAM fitted in the Quadra 950 (1 or 2 MB); takes effect
     /// at the next ROM load.</summary>
     public int VramMB { get; set; } = 2;
-    private string MachineName => Is950 ? "Quadra 950" : "Quadra 650";
-    private string PramKey => Is950 ? "quadra950" : "quadra";
+    private string MachineName => Is950 ? "Quadra 950" : IsSe30 ? "Macintosh SE/30" : "Quadra 650";
+    private string PramKey => Is950 ? "quadra950" : IsSe30 ? "se30" : "quadra";
     /// <summary>True once the Quadra 950 has shut down and switched itself
     /// off. It stays dark until the ROM is loaded again.</summary>
     public bool PoweredOff { get; private set; }
 
-    public string BackendName => Is950 ? "native-quadra950" : "native-quadra";
+    public string BackendName => Is950 ? "native-quadra950" : IsSe30 ? "native-se30" : "native-quadra";
     public bool IsRealCore => true;
 
     public bool IsRomLoaded => _h != IntPtr.Zero;
@@ -116,12 +123,17 @@ public sealed class QuadraEmulator : IEmulator
         lock (_sync)
         {
             Destroy();
+            byte[]? videoRom = IsSe30 && !string.IsNullOrEmpty(VideoRomPath) && File.Exists(VideoRomPath)
+                ? File.ReadAllBytes(VideoRomPath) : null;
             _h = Is950
                 ? Native.omac_q_create_model(rom, (nuint)rom.Length, 1, (uint)ramMB, (uint)VramMB)
+                : IsSe30
+                ? Native.omac_q_create_se30(rom, (nuint)rom.Length, (uint)ramMB, videoRom,
+                                            (nuint)(videoRom?.Length ?? 0))
                 : Native.omac_q_create(rom, (nuint)rom.Length, (uint)ramMB);
             PoweredOff = false;
             if (_h == IntPtr.Zero)
-                throw new InvalidOperationException("Quadra core failed to initialize (bad ROM or size?)");
+                throw new InvalidOperationException($"{MachineName} core failed to initialize (bad ROM or size?)");
             // Put the battery back before the machine runs a single frame. The
             // ROM reads parameter RAM during startup and hands what it finds to
             // the System; blank PRAM means the ROM writes defaults over it and
@@ -132,7 +144,7 @@ public sealed class QuadraEmulator : IEmulator
                 Log.Line($"[core] parameter RAM restored ({pramAge}s since it was saved)");
             // Plug the monitor in before the machine runs a single frame: the
             // ROM senses the video port during startup and never looks again.
-            if (!string.IsNullOrEmpty(Monitor) &&
+            if (!IsSe30 && !string.IsNullOrEmpty(Monitor) &&
                 Native.omac_q_set_display(_h, Monitor!) == 0)
                 Log.Line($"[core] unknown monitor '{Monitor}', keeping the default");
             _screenW = Native.omac_q_screen_w(_h);
@@ -154,7 +166,10 @@ public sealed class QuadraEmulator : IEmulator
         HardDiskPath = null;
         _seat?.Cancel();   // a republish in flight belonged to the old machine
         Log.Line($"[core] {MachineName} created — {ramMB} MB, ROM {Path.GetFileName(path)}, "
-                 + $"monitor {Monitor ?? "13-inch RGB"} ({_screenW}x{_screenH})"
+                 + (IsSe30
+                     ? $"built-in screen ({_screenW}x{_screenH}), video ROM "
+                       + (string.IsNullOrEmpty(VideoRomPath) ? "none" : Path.GetFileName(VideoRomPath))
+                     : $"monitor {Monitor ?? "13-inch RGB"} ({_screenW}x{_screenH})")
                  + (Is950 ? $", {VramMB} MB video RAM" : ""));
     }
 
@@ -296,7 +311,7 @@ public sealed class QuadraEmulator : IEmulator
         }
         if (ok == 0) return false;
         FloppyPath = path;
-        Log.Line($"[core] Quadra floppy: {Path.GetFileName(path)}");
+        Log.Line($"[core] {MachineName} floppy: {Path.GetFileName(path)}");
         return true;
     }
 
@@ -314,6 +329,8 @@ public sealed class QuadraEmulator : IEmulator
             ? "The internal SuperDrive takes a 400K/800K/1.44 MB dump or a DiskCopy 4.2 / MacBinary image. "
               + (Is950
                   ? "A disk that is not a startup disk is ejected when the machine starts; put it in once the Finder is up."
+                  : IsSe30
+                  ? "The SE/30 starts from System 6.0.8, 7.0.1, 7.1 and 7.5 disks."
                   : "System 7.5 boots the Quadra 650 (7.1 needs a System Enabler this build doesn't carry).")
             : $"The {MachineName} has one internal floppy drive; there is no external drive port on this machine.";
 
@@ -570,6 +587,10 @@ public sealed class QuadraEmulator : IEmulator
         {
             error = "A file on it is still open in the Mac. Quit the program that "
                   + "is using it, then remove the disk again.";
+            // System 6 refuses to unmount any volume while its Finder runs.
+            if (IsSe30)
+                error += "\n\nUnder System 6 the Mac lets go of a disk only one way: "
+                       + "drag its icon to the Trash in the Finder.";
             return false;
         }
         lock (_sync) { if (_h != IntPtr.Zero) Native.omac_q_detach_harddisk2(_h); }
@@ -721,7 +742,7 @@ public sealed class QuadraEmulator : IEmulator
         if (ok == 0) return false;
         CdRomAttached = true;
         CdPath = path;
-        Log.Line($"[core] Quadra CD: {Path.GetFileName(path)}");
+        Log.Line($"[core] {MachineName} CD: {Path.GetFileName(path)}");
         return true;
     }
 

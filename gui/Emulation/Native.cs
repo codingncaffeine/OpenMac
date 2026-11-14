@@ -154,6 +154,10 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr omac_q_create_model(byte[] rom, nuint romLen, int model, uint ramMb, uint vramMb);
 
+    // The Macintosh SE/30 on the same handle; vrom is its 8 KB video ROM.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr omac_q_create_se30(byte[] rom, nuint romLen, uint ramMb, byte[]? vrom, nuint vromLen);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int omac_q_powered_off(IntPtr h);
 

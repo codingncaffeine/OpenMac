@@ -847,13 +847,17 @@ OMAC_API void omac_fx_poll_log(OMacFx* m, char* out, size_t cap)
 
 #include "openmac/quadra.hpp"
 #include "openmac/quadra950.hpp"
+#include "openmac/se30.hpp"
 
 #include <array>
 #include <memory>
 
+// One handle for the machines whose storage MacHostServices runs: the two
+// Quadras and the Macintosh SE/30. Exactly one of the three is set.
 struct OMacQ {
     std::unique_ptr<openmac::QuadraMachine> q650;
     std::unique_ptr<openmac::Quadra950Machine> q950;
+    std::unique_ptr<openmac::Se30Machine> se30;
     std::vector<u8> audioBuf;
     std::vector<std::string> logBuf;   // drained off the hot path by omac_q_poll_log
 
@@ -871,8 +875,14 @@ struct OMacQ {
         }
     }
 
-    OMacQ(std::vector<u8> rom, uint32_t ramMB, int model, uint32_t vramMB) {
-        if (model == 1) {
+    OMacQ(std::vector<u8> rom, uint32_t ramMB, int model, uint32_t vramMB, std::vector<u8> videoRom = {}) {
+        if (model == 2) {
+            // A total the SE/30 does not offer gets 8 MB (4 MB in each bank).
+            openmac::Se30Machine::Config cfg;
+            if (!openmac::Se30Machine::banksForTotal(ramMB, cfg.bankAMb, cfg.bankBMb)) cfg.bankAMb = cfg.bankBMb = 4;
+            cfg.videoRom = std::move(videoRom);
+            se30 = std::make_unique<openmac::Se30Machine>(std::move(rom), cfg);
+        } else if (model == 1) {
             openmac::Quadra950Machine::Config cfg;
             cfg.bankMb = banksFor(ramMB);
             cfg.vramMb = vramMB == 1 ? 1 : 2;
@@ -884,24 +894,34 @@ struct OMacQ {
         // The faults behind a bomb box. Without this the front end is deaf to
         // everything the guest does wrong: a "type 1" system error reached the
         // user with not one line in the log to say where it came from.
-        // onDiag is deliberately NOT wired here -- this machine's device
+        // onDiag is deliberately NOT wired whole -- this machine's device
         // channels run at frame rate (the SCC alone writes a thousand lines
         // across a boot) and would bury exactly the lines worth reading.
-        // One line is let through: a call run on the guest that never came
-        // back, which is what a wrecked startup looks like from here.
+        // Let through: a call run on the guest that never came back, which
+        // is what a wrecked startup looks like from here, and what happened
+        // to a disk (put in, mounted, ejected, written back, let go of).
         hs().onDiag = [this](const char* s) {
-            if (std::strncmp(s, "guest call", 10) == 0) log(s);
+            for (const char* kind : {"guest call", "hd:", "hd2:", "cd:", "floppy:"})
+                if (std::strncmp(s, kind, std::strlen(kind)) == 0) { log(s); return; }
         };
         cpu().onException = [this](int vector, u32 pc) { fault(vector, pc); };
     }
 
     openmac::MacHostServices& hs() {
         if (q950) return *q950;
+        if (se30) return *se30;
         return *q650;
     }
-    openmac::M68040& cpu() { return q950 ? q950->cpu() : q650->cpu(); }
-    u8 read8(u32 addr) { return q950 ? q950->read8(addr) : q650->read8(addr); }
-    unsigned long long frameCount() const { return q950 ? q950->frameCount() : q650->frameCount(); }
+    // What all three machines answer under one name: f is called with the
+    // one this handle holds.
+    template <class F> decltype(auto) board(F&& f) {
+        if (q950) return f(*q950);
+        if (se30) return f(*se30);
+        return f(*q650);
+    }
+    openmac::M68040& cpu() { return q950 ? q950->cpu() : se30 ? se30->cpu() : q650->cpu(); }
+    u8 read8(u32 addr) { return board([&](auto& b) { return b.read8(addr); }); }
+    unsigned long long frameCount() { return board([](auto& b) { return static_cast<unsigned long long>(b.frameCount()); }); }
 
     void log(const char* s) {
         if (logBuf.size() < 4000) logBuf.emplace_back(s);
@@ -919,6 +939,14 @@ struct OMacQ {
         // slots; that traffic is startup, not a failure. What the System and
         // an application do is in RAM.
         if (pc >= 0x40000000u) return;
+        // The SE/30's ROM runs its start-up in 24-bit mode, where it sits at
+        // $80 0000 (MMU32Bit, $0CB2, says which mode the MMU is in).
+        if (se30 && (pc >> 20) == 0x008u && read8(0x0CB2u) == 0) return;
+        // The Slot Manager learns which slots hold a card by reading the last
+        // byte of each one's space ($FsFF FFFF) and taking the bus error of
+        // an empty one. On the SE/30 the ROM does it, and so does the Slot
+        // Manager System 7 loads into RAM in the ROM's place, at every start.
+        if (se30 && vector == 2 && (cpu().lastFaultAddr & 0xF0FFFFFFu) == 0xF0FFFFFFu) return;
         if (faultBudget_ <= 0) return;
         // A bomb repeats -- the handler re-runs the faulting instruction, and a
         // wild jump faults over and over -- so each site gets two lines.
@@ -1016,11 +1044,27 @@ OMAC_API OMacQ* omac_q_create(const uint8_t* rom, size_t rom_len, uint32_t ram_m
     return omac_q_create_model(rom, rom_len, 0, ram_mb, 0);
 }
 
+// The Macintosh SE/30 on the same handle. RAM: 1, 2, 4, 5, 8, 16, 17, 20, 32,
+// 65, 68, 80 or 128 MB (anything else gets 8). vrom is the 8 KB declaration
+// ROM of the built-in screen; without one slot $E is empty.
+OMAC_API OMacQ* omac_q_create_se30(const uint8_t* rom, size_t rom_len, uint32_t ram_mb,
+                                   const uint8_t* vrom, size_t vrom_len)
+{
+    if (!rom || rom_len == 0) return nullptr;
+    try {
+        std::vector<u8> video;
+        if (vrom && vrom_len) video.assign(vrom, vrom + vrom_len);
+        return new OMacQ(std::vector<u8>(rom, rom + rom_len), ram_mb ? ram_mb : 8u, 2, 0, std::move(video));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 OMAC_API void omac_q_destroy(OMacQ* m) { delete m; }
 OMAC_API void omac_q_reset(OMacQ* m)
 {
     if (!m) return;
-    if (m->q950) m->q950->reset(); else m->q650->reset();
+    m->board([](auto& b) { b.reset(); });
 }
 OMAC_API void omac_q_run_frame(OMacQ* m)
 {
@@ -1033,6 +1077,8 @@ OMAC_API void omac_q_run_frame(OMacQ* m)
             m->q950->powerOff();
             m->log("[power] the Macintosh switched itself off (Shut Down)");
         }
+    } else if (m->se30) {
+        m->se30->runFrame();
     } else {
         m->q650->runFrame();
     }
@@ -1040,22 +1086,22 @@ OMAC_API void omac_q_run_frame(OMacQ* m)
 OMAC_API int omac_q_powered_off(OMacQ* m) { return m && m->q950 && m->q950->poweredOff() ? 1 : 0; }
 OMAC_API int omac_q_screen_w(OMacQ* m)
 {
-    return !m ? 640 : m->q950 ? m->q950->screenWidth() : m->q650->screenWidth();
+    return !m ? 640 : m->board([](auto& b) { return b.screenWidth(); });
 }
 OMAC_API int omac_q_screen_h(OMacQ* m)
 {
-    return !m ? 480 : m->q950 ? m->q950->screenHeight() : m->q650->screenHeight();
+    return !m ? 480 : m->board([](auto& b) { return b.screenHeight(); });
 }
 OMAC_API void omac_q_render(OMacQ* m, uint32_t* argb)
 {
     if (!m || !argb) return;
-    if (m->q950) m->q950->renderScreen(argb); else m->q650->renderScreen(argb);
+    m->board([&](auto& b) { b.renderScreen(argb); });
 }
 
 OMAC_API size_t omac_q_drain_audio(OMacQ* m, uint8_t* out, size_t cap)
 {
     if (!m || !out || cap == 0) return 0;
-    if (m->q950) m->q950->drainAudio(m->audioBuf); else m->q650->drainAudio(m->audioBuf);
+    m->board([&](auto& b) { b.drainAudio(m->audioBuf); });
     const size_t n = m->audioBuf.size() < cap ? m->audioBuf.size() : cap;
     if (n) std::memcpy(out, m->audioBuf.data(), n);
     return n;
@@ -1064,14 +1110,15 @@ OMAC_API size_t omac_q_drain_audio(OMacQ* m, uint8_t* out, size_t cap)
 OMAC_API void omac_q_mouse(OMacQ* m, int dx, int dy, int button)
 {
     if (!m) return;
-    if (m->q950) m->q950->mouseEvent(dx, dy, button != 0); else m->q650->mouseMove(dx, dy, button != 0);
+    if (m->q950) m->q950->mouseEvent(dx, dy, button != 0);
+    else if (m->se30) m->se30->mouseEvent(dx, dy, button != 0);
+    else m->q650->mouseMove(dx, dy, button != 0);
 }
 
 OMAC_API void omac_q_key(OMacQ* m, int adb_code, int down)
 {
     if (!m) return;
-    if (m->q950) m->q950->keyEvent(static_cast<u8>(adb_code), down != 0);
-    else m->q650->keyEvent(static_cast<u8>(adb_code), down != 0);
+    m->board([&](auto& b) { b.keyEvent(static_cast<u8>(adb_code), down != 0); });
 }
 
 OMAC_API void omac_q_insert_harddisk(OMacQ* m, const uint8_t* img, size_t len, int ro)
@@ -1134,6 +1181,7 @@ static int stateResult(bool ok, const std::string& why, char* err, size_t cap)
 OMAC_API int omac_q_save_state(OMacQ* m, const char* path, char* err, size_t cap)
 {
     if (!m || !path) return stateResult(false, "no machine", err, cap);
+    if (m->se30) return stateResult(false, "the Macintosh SE/30 has no saved state yet", err, cap);
     std::string why;
     const bool ok = m->q950 ? m->q950->saveStateFile(path, &why)
                             : m->q650->saveStateFile(path, &why);
@@ -1143,6 +1191,7 @@ OMAC_API int omac_q_save_state(OMacQ* m, const char* path, char* err, size_t cap
 OMAC_API int omac_q_load_state(OMacQ* m, const char* path, char* err, size_t cap)
 {
     if (!m || !path) return stateResult(false, "no machine", err, cap);
+    if (m->se30) return stateResult(false, "the Macintosh SE/30 has no saved state yet", err, cap);
     std::string why;
     const bool ok = m->q950 ? m->q950->loadStateFile(path, &why)
                             : m->q650->loadStateFile(path, &why);
@@ -1192,7 +1241,7 @@ OMAC_API int omac_q_shutdown_volumes(OMacQ* m)
 OMAC_API size_t omac_q_floppy_writeback(OMacQ* m, uint8_t* out, size_t cap)
 {
     if (!m) return 0;
-    const std::vector<u8> img = m->q950 ? m->q950->floppyForWriteBack() : m->q650->floppyForWriteBack();
+    const std::vector<u8> img = m->board([](auto& b) { return b.floppyForWriteBack(); });
     if (img.empty()) return 0;
     if (!out) return img.size();
     if (cap < img.size()) return 0;
@@ -1206,22 +1255,21 @@ OMAC_API size_t omac_q_floppy_writeback(OMacQ* m, uint8_t* out, size_t cap)
 OMAC_API size_t omac_q_pram_save(OMacQ* m, uint8_t* out, size_t cap)
 {
     if (!m) return 0;
-    return m->q950 ? m->q950->savePram(out, static_cast<uint32_t>(cap)) : m->q650->savePram(out, static_cast<uint32_t>(cap));
+    return m->board([&](auto& b) { return b.savePram(out, static_cast<uint32_t>(cap)); });
 }
 
 OMAC_API int omac_q_pram_load(OMacQ* m, const uint8_t* data, size_t len,
                               uint32_t addSeconds)
 {
     if (!m) return 0;
-    const bool ok = m->q950 ? m->q950->loadPram(data, static_cast<uint32_t>(len), addSeconds)
-                            : m->q650->loadPram(data, static_cast<uint32_t>(len), addSeconds);
+    const bool ok = m->board([&](auto& b) { return b.loadPram(data, static_cast<uint32_t>(len), addSeconds); });
     return ok ? 1 : 0;
 }
 
 OMAC_API size_t omac_q_diagnostics(OMacQ* m, char* out, size_t cap)
 {
     if (!m) return 0;
-    const std::string s = m->q950 ? m->q950->diagnosticReport() : m->q650->diagnosticReport();
+    const std::string s = m->board([](auto& b) { return b.diagnosticReport(); });
     if (!out || cap == 0) return s.size() + 1;
     const size_t n = s.size() < cap - 1 ? s.size() : cap - 1;
     std::copy(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(n), out);
@@ -1251,25 +1299,26 @@ OMAC_API int omac_q_insert_floppy(OMacQ* m, const uint8_t* img, size_t len, int 
 {
     if (!m || !img) return 0;
     if (m->q950) return m->q950->insertFloppy(std::vector<u8>(img, img + len), ro != 0) ? 1 : 0;
+    if (m->se30) return m->se30->insertFloppy(std::vector<u8>(img, img + len), ro != 0) ? 1 : 0;
     return m->q650->insertFloppy(std::vector<u8>(img, img + len), ro != 0);
 }
 
 OMAC_API void omac_q_eject_floppy(OMacQ* m)
 {
     if (!m) return;
-    if (m->q950) m->q950->ejectFloppy(); else m->q650->ejectFloppy();
+    m->board([](auto& b) { b.ejectFloppy(); });
 }
 
 OMAC_API int omac_q_floppy_present(OMacQ* m)
 {
     if (!m) return 0;
-    return (m->q950 ? m->q950->floppyPresent() : m->q650->floppyPresent()) ? 1 : 0;
+    return m->board([](auto& b) { return b.floppyPresent(); }) ? 1 : 0;
 }
 
 OMAC_API size_t omac_q_floppy_data(OMacQ* m, uint8_t* out, size_t cap)
 {
     if (!m || !omac_q_floppy_present(m)) return 0;
-    const auto& img = m->q950 ? m->q950->floppySectors() : m->q650->floppyImage();
+    const auto& img = m->q950 ? m->q950->floppySectors() : m->se30 ? m->se30->floppySectors() : m->q650->floppyImage();
     if (!out) return img.size();
     if (cap < img.size()) return 0;
     std::copy(img.begin(), img.end(), out);
@@ -1313,6 +1362,7 @@ OMAC_API const char* omac_q_display_name(int index, int* w, int* h)
 OMAC_API int omac_q_set_display(OMacQ* m, const char* name)
 {
     if (!m || !name) return 0;
+    if (m->se30) return 0;                 // one built-in screen, nothing to plug in
     return (m->q950 ? m->q950->setDisplay(name) : m->q650->setDisplay(name)) ? 1 : 0;
 }
 
