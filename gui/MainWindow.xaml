@@ -62,6 +62,9 @@
                 <MenuItem Header="Model">
                     <MenuItem x:Name="ModelClassicItem" Header="Macintosh Classic"
                               Click="ModelClassic_Click" />
+                    <MenuItem x:Name="ModelSe30Item" Header="Macintosh SE/30"
+                              Click="ModelSe30_Click"
+                              ToolTip="68030/68882 @ 16 MHz with the built-in 512×342 black-and-white screen. Needs the 256 KB ROM (checksum 97221136) and the 8 KB video ROM; each model remembers its own ROM and disk." />
                     <MenuItem x:Name="ModelIifxItem" Header="Macintosh IIfx"
                               Click="ModelIifx_Click"
                               ToolTip="68030/68882 @ 40 MHz with OSS, two I/O processors and Macintosh II NuBus video. Needs the 512 KB IIfx ROM; each model remembers its own ROM, RAM and SCSI disk." />
@@ -79,12 +82,36 @@
                     <MenuItem x:Name="Vram1Item" Header="1 MB" Tag="1" Click="VideoRam_Click" />
                     <MenuItem x:Name="Vram2Item" Header="2 MB" Tag="2" Click="VideoRam_Click" />
                 </MenuItem>
+                <MenuItem x:Name="Se30VideoRomItem" Header="Video ROM…"
+                          Click="Se30VideoRom_Click"
+                          ToolTip="Choose the SE/30's video ROM: an 8 KB file, Apple part 341-0650. The built-in screen needs it; OpenMac does not distribute this ROM." />
                 <MenuItem x:Name="IifxVideoRomItem" Header="8•24 GC Card ROM…"
                           Click="IifxVideoRom_Click"
                           ToolTip="Choose the declaration ROM from an Apple Macintosh Display Card 8•24 GC. The IIfx restarts with the genuine slot-$9 card; OpenMac does not distribute this ROM." />
                 <Separator />
                 <MenuItem Header="Reset" InputGestureText="Ctrl+R" Click="Reset_Click" />
                 <Separator />
+                <MenuItem x:Name="MemSe1Item" Header="1 MB RAM" Tag="1" Click="MemorySe30_Click" />
+                <MenuItem x:Name="MemSe2Item" Header="2 MB RAM" Tag="2" Click="MemorySe30_Click" />
+                <MenuItem x:Name="MemSe4Item" Header="4 MB RAM" Tag="4" Click="MemorySe30_Click" />
+                <MenuItem x:Name="MemSe5Item" Header="5 MB RAM" Tag="5" Click="MemorySe30_Click" />
+                <MenuItem x:Name="MemSe8Item" Header="8 MB RAM" Tag="8" Click="MemorySe30_Click" />
+                <MenuItem x:Name="MemSe16Item" Header="16 MB RAM" Tag="16" Click="MemorySe30_Click"
+                          ToolTip="The SE/30's ROM uses 24-bit addresses: a System uses 8 MB of this by itself, and all of it with the 32-Bit System Enabler (System 7.1) or MODE32." />
+                <MenuItem x:Name="MemSe17Item" Header="17 MB RAM" Tag="17" Click="MemorySe30_Click"
+                          ToolTip="The SE/30's ROM uses 24-bit addresses: a System uses 8 MB of this by itself, and all of it with the 32-Bit System Enabler (System 7.1) or MODE32." />
+                <MenuItem x:Name="MemSe20Item" Header="20 MB RAM" Tag="20" Click="MemorySe30_Click"
+                          ToolTip="The SE/30's ROM uses 24-bit addresses: a System uses 8 MB of this by itself, and all of it with the 32-Bit System Enabler (System 7.1) or MODE32." />
+                <MenuItem x:Name="MemSe32Item" Header="32 MB RAM" Tag="32" Click="MemorySe30_Click"
+                          ToolTip="The SE/30's ROM uses 24-bit addresses: a System uses 8 MB of this by itself, and all of it with the 32-Bit System Enabler (System 7.1) or MODE32." />
+                <MenuItem x:Name="MemSe65Item" Header="65 MB RAM" Tag="65" Click="MemorySe30_Click"
+                          ToolTip="The SE/30's ROM uses 24-bit addresses: a System uses 8 MB of this by itself, and all of it with the 32-Bit System Enabler (System 7.1) or MODE32." />
+                <MenuItem x:Name="MemSe68Item" Header="68 MB RAM" Tag="68" Click="MemorySe30_Click"
+                          ToolTip="The SE/30's ROM uses 24-bit addresses: a System uses 8 MB of this by itself, and all of it with the 32-Bit System Enabler (System 7.1) or MODE32." />
+                <MenuItem x:Name="MemSe80Item" Header="80 MB RAM" Tag="80" Click="MemorySe30_Click"
+                          ToolTip="The SE/30's ROM uses 24-bit addresses: a System uses 8 MB of this by itself, and all of it with the 32-Bit System Enabler (System 7.1) or MODE32." />
+                <MenuItem x:Name="MemSe128Item" Header="128 MB RAM" Tag="128" Click="MemorySe30_Click"
+                          ToolTip="The SE/30's ROM uses 24-bit addresses: a System uses 8 MB of this by itself, and all of it with the 32-Bit System Enabler (System 7.1) or MODE32." />
                 <MenuItem x:Name="Mem1Item" Header="1 MB RAM" Tag="1" Click="Memory_Click" />
                 <MenuItem x:Name="Mem2Item" Header="2 MB RAM" Tag="2" Click="Memory_Click" />
                 <MenuItem x:Name="Mem4Item" Header="4 MB RAM" Tag="4" Click="Memory_Click" />
@@ -176,7 +203,7 @@
                                Foreground="{StaticResource TextPrimary}" HorizontalAlignment="Center" />
                     <Border Width="66" Height="3" Background="{StaticResource Accent}"
                             Margin="0,12" HorizontalAlignment="Center" />
-                    <TextBlock Text="Classic · IIfx · Quadra 650 · Quadra 950" FontSize="14"
+                    <TextBlock Text="Classic · SE/30 · IIfx · Quadra 650 · Quadra 950" FontSize="14"
                                Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" />
                     <TextBlock Text="File  ▸  Open ROM  to begin" Margin="0,16,0,0"
                                Foreground="{StaticResource TextSecondary}" HorizontalAlignment="Center" />

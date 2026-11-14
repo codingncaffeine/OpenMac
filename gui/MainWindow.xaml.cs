@@ -121,6 +121,11 @@ public partial class MainWindow : Window
                 Log.Line("backend: native core (openmac_c.dll), Macintosh IIfx");
                 return new IifxEmulator { VideoRomPath = settings.VideoRomIifx };
             }
+            if (settings.IsSe30)
+            {
+                Log.Line("backend: native core (openmac_c.dll), Macintosh SE/30");
+                return new QuadraEmulator { IsSe30 = true, VideoRomPath = settings.VideoRomSe30 };
+            }
             if (settings.IsQuadra)
             {
                 Log.Line("backend: native core (openmac_c.dll), "
@@ -175,6 +180,7 @@ public partial class MainWindow : Window
     private void ModelIifx_Click(object sender, RoutedEventArgs e) => SwitchModel("iifx");
     private void ModelQuadra_Click(object sender, RoutedEventArgs e) => SwitchModel("quadra650");
     private void ModelQuadra950_Click(object sender, RoutedEventArgs e) => SwitchModel("quadra950");
+    private void ModelSe30_Click(object sender, RoutedEventArgs e) => SwitchModel("se30");
 
     /// <summary>Fit 1 or 2 MB of video RAM in the Quadra 950. The ROM sizes
     /// video RAM while it starts, so the machine starts again.</summary>
@@ -625,24 +631,43 @@ public partial class MainWindow : Window
         // The two Quadras take different 1 MB ROMs; the 950's is told by its
         // checksum, the first four bytes of the file.
         bool looksQuadra950 = looksQuadra && header == 0x3DC27823u;
+        // The SE/30's ROM is 256 KB (the one the Macintosh IIx and IIcx share).
+        bool looksSe30 = romLen == 256 * 1024 && header == 0x97221136u;
         bool rightModel = _settings.IsQuadra950 ? looksQuadra950
                         : _settings.IsQuadra ? looksQuadra && !looksQuadra950
                         : _settings.IsIifx ? looksIifx
-                        : !looksQuadra && !looksIifx;
+                        : _settings.IsSe30 ? looksSe30
+                        : !looksQuadra && !looksIifx && !looksSe30;
         if (!rightModel)
         {
             string detected = looksQuadra950 ? "the Macintosh Quadra 950 ROM (checksum 3DC27823)"
                             : looksQuadra ? "a Quadra-family ROM"
                             : looksIifx ? "the Macintosh IIfx ROM (checksum 4147DD77)"
+                            : looksSe30 ? "the Macintosh SE/30 ROM (checksum 97221136)"
                             : "a Classic-family 512 KB ROM";
             string wanted = _settings.IsQuadra950 ? "Macintosh Quadra 950 (its ROM's checksum is 3DC27823)"
                           : _settings.IsQuadra ? "Macintosh Quadra 650"
                           : _settings.IsIifx ? "Macintosh IIfx"
+                          : _settings.IsSe30 ? "Macintosh SE/30 (its ROM is 256 KB, checksum 97221136)"
                           : "Macintosh Classic";
             string msg = $"This file looks like {detected}, but the current model is the {wanted}.\n\n"
                        + "Choose the matching machine under Machine > Model, then open its ROM there.";
             Log.Line($"ROM refused (wrong model): {path} ({romLen} bytes, model={_settings.Model})");
             MessageBox.Show(this, msg, "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        // The SE/30's screen is a card with a ROM of its own; without that
+        // file the machine starts with no picture at all.
+        if (_settings.IsSe30 && (string.IsNullOrEmpty(_settings.VideoRomSe30) || !File.Exists(_settings.VideoRomSe30)))
+        {
+            Log.Line("ROM kept, not started: the SE/30 has no video ROM file yet");
+            _settings.ModelLastRom = path;
+            _settings.Save();
+            MessageBox.Show(this,
+                "The SE/30 also needs its video ROM: an 8 KB file, Apple part 341-0650.\n\n"
+                + "Choose it under Machine > Video ROM…; the machine then starts.",
+                "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+            UpdateUi();
             return;
         }
         Log.Line($"load ROM: {path}  (RAM={_settings.ModelRamMB} MB, bootRomDisk={_settings.BootRomDisk}, "
@@ -664,7 +689,7 @@ public partial class MainWindow : Window
             _emulator.WriteProtectFloppies = _settings.WriteProtectFloppies;
             // Only the Classic has an external floppy port in this frontend.
             // The internal-drive restore below is shared by every model.
-            if (!_settings.IsQuadra && !_settings.IsIifx)
+            if (_settings.IsClassic)
             {
                 if (_settings.ExternalDrive) _emulator.SetExternalDrive(true);
                 if (!string.IsNullOrEmpty(_settings.LastExternalFloppy) &&
@@ -686,7 +711,7 @@ public partial class MainWindow : Window
             }
             if (!string.IsNullOrEmpty(_settings.ModelLastHardDisk) && File.Exists(_settings.ModelLastHardDisk))
                 _emulator.AttachHardDisk(_settings.ModelLastHardDisk!);
-            if (_settings.IsQuadra || _settings.IsIifx)
+            if (!_settings.IsClassic)
             {
                 // Mount a remembered SCSI CD so it is present for the scan (the
                 // Quadra) or as soon as the System is up (the IIfx installs its
@@ -699,7 +724,7 @@ public partial class MainWindow : Window
                     _settings.LastCd = null;
                 }
             }
-            if (!_settings.IsQuadra && !_settings.IsIifx)
+            if (_settings.IsClassic)
             {
                 if (_settings.CdRomAttached) _emulator.SetCdRomAttached(true);
                 if (!string.IsNullOrEmpty(_settings.LastCd) && File.Exists(_settings.LastCd) &&
@@ -775,6 +800,34 @@ public partial class MainWindow : Window
             LoadRom(path);
     }
 
+    /// <summary>Choose the SE/30's video ROM file. The machine starts (or
+    /// starts again) with it.</summary>
+    private void Se30VideoRom_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_settings.IsSe30) return;
+        if (FilePicker.Open(this, _settings, FilePicker.VideoRom,
+                            "Open Macintosh SE/30 Video ROM",
+                            "SE/30 video ROM (*.uk6;*.bin;*.rom)|*.uk6;*.bin;*.rom|All files (*.*)|*.*",
+                            _settings.VideoRomSe30) is not { } path)
+            return;
+        // The 8 KB chip, or a 32 KB dump that holds it at its top.
+        long bytes = FileSize.Of(path);
+        if (bytes != 8 * 1024 && bytes != 32 * 1024)
+        {
+            MessageBox.Show(this,
+                "The SE/30's video ROM is an 8 KB file (a 32 KB dump of the same chip is taken too).",
+                "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        _settings.VideoRomSe30 = path;
+        _settings.Save();
+        Log.Line($"SE/30 video ROM: {path}");
+        if (_emulator is QuadraEmulator { IsSe30: true } se) se.VideoRomPath = path;
+        string? rom = _emulator.RomPath ?? _settings.ModelLastRom;
+        if (!string.IsNullOrEmpty(rom) && File.Exists(rom)) LoadRom(rom!);
+        UpdateUi();
+    }
+
     private void IifxVideoRom_Click(object sender, RoutedEventArgs e)
     {
         if (!_settings.IsIifx) return;
@@ -826,6 +879,14 @@ public partial class MainWindow : Window
     private void Memory_Click(object sender, RoutedEventArgs e)
     {
         _settings.RamMB = int.Parse((string)((MenuItem)sender).Tag);
+        _settings.Save();
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
+        UpdateUi();
+    }
+
+    private void MemorySe30_Click(object sender, RoutedEventArgs e)
+    {
+        _settings.RamMBSe30 = int.Parse((string)((MenuItem)sender).Tag);
         _settings.Save();
         if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
         UpdateUi();
@@ -1108,7 +1169,7 @@ public partial class MainWindow : Window
     {
         // A Quadra has no machine until a ROM is opened: keep the disc for then
         // (opening the ROM inserts the remembered one) rather than refuse it.
-        if (_settings.IsQuadra && !_emulator.IsRomLoaded)
+        if ((_settings.IsQuadra || _settings.IsSe30) && !_emulator.IsRomLoaded)
         {
             _settings.CdRomAttached = true;
             _settings.LastCd = path;
@@ -1808,7 +1869,7 @@ public partial class MainWindow : Window
     private void About_Click(object sender, RoutedEventArgs e) =>
         MessageBox.Show(this,
             "OpenMac\nA from-scratch Macintosh emulator for Windows.\n\n"
-            + "Macintosh Classic · Macintosh IIfx · Quadra 650 · Quadra 950\n"
+            + "Macintosh Classic · Macintosh SE/30 · Macintosh IIfx · Quadra 650 · Quadra 950\n"
             + "68000, 68030 and 68040 machines with model-specific video, storage, input, audio and PRAM.",
             "About OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
 
@@ -1905,6 +1966,7 @@ public partial class MainWindow : Window
         string machine = _emulator.IsRomLoaded
             ? (_settings.IsQuadra950 ? "Quadra 950  •  "
                : _settings.IsQuadra ? "Quadra 650  •  "
+               : _settings.IsSe30 ? "Macintosh SE/30  •  "
                : _settings.IsIifx ? "Macintosh IIfx  •  " : "")
               + $"{_settings.ModelRamMB} MB"
               + (_emulator.FloppyPath is { } f ? $"  •  Floppy: {Path.GetFileName(f)}" : "")
@@ -1924,7 +1986,22 @@ public partial class MainWindow : Window
         bool q = _settings.IsQuadra;
         bool q950 = _settings.IsQuadra950;
         bool fx = _settings.IsIifx;
-        bool classic = !q && !fx;
+        bool se = _settings.IsSe30;
+        bool classic = _settings.IsClassic;
+        ModelSe30Item.IsChecked = se;
+        Se30VideoRomItem.Visibility = se ? Visibility.Visible : Visibility.Collapsed;
+        Se30VideoRomItem.IsEnabled = se;
+        Se30VideoRomItem.Header = se && !string.IsNullOrEmpty(_settings.VideoRomSe30)
+            ? $"Video ROM…  ({Path.GetFileName(_settings.VideoRomSe30)})"
+            : "Video ROM…";
+        foreach (var item in new[] { MemSe1Item, MemSe2Item, MemSe4Item, MemSe5Item, MemSe8Item, MemSe16Item,
+                                     MemSe17Item, MemSe20Item, MemSe32Item, MemSe65Item, MemSe68Item,
+                                     MemSe80Item, MemSe128Item })
+        {
+            item.Visibility = se ? Visibility.Visible : Visibility.Collapsed;
+            item.IsEnabled = se;
+            item.IsChecked = se && _settings.RamMBSe30 == int.Parse((string)item.Tag);
+        }
         ModelClassicItem.IsChecked = classic;
         ModelIifxItem.IsChecked = fx;
         ModelQuadraItem.IsChecked = q && !q950;
@@ -1973,6 +2050,7 @@ public partial class MainWindow : Window
         MemQ256Item.IsEnabled = q950;
         MemQ256Item.IsChecked = q950 && _settings.RamMBQuadra950 == 256;
         MonitorMenu.IsEnabled = q;
+        MonitorMenu.Visibility = se ? Visibility.Collapsed : Visibility.Visible;   // one built-in screen: nothing to plug in
         BootRomDiskItem.IsChecked = _settings.BootRomDisk;
         BootRomDiskItem.IsEnabled = classic;
         BootExtensionsOffItem.IsChecked = _settings.BootExtensionsOff;
