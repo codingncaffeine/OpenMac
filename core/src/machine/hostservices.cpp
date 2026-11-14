@@ -763,6 +763,36 @@ s32 MacHostServices::gestaltQuery(u32 selector, u32& response) {
     return err;
 }
 
+s32 MacHostServices::driverCall(bool control, s16 refNum, u16 csCode, std::vector<u8>& record,
+                                std::vector<u8>& table) {
+    runToCall();                                  // where the guest stands, failing that
+    if (!leaveSwappedAddressingMode()) return 1;
+    u32 sd[8], sa[8];
+    for (int i = 0; i < 8; ++i) { sd[i] = hcpu_.d[i]; sa[i] = hcpu_.a[i]; }
+    // On the guest's stack: the table, the record, then the parameter block
+    // (ioCRefNum +24, csCode +26, csParam +28: a pointer to the record).
+    const u32 tableBytes = (static_cast<u32>(table.size()) + 3u) & ~3u;
+    const u32 recordBytes = (static_cast<u32>(record.size()) + 3u) & ~3u;
+    hcpu_.a[7] -= 80 + recordBytes + tableBytes;
+    const u32 pb = hcpu_.a[7], rec = pb + 80, tab = rec + recordBytes;
+    for (u32 i = 0; i < 80; ++i) write8(pb + i, 0);
+    for (u32 i = 0; i < table.size(); ++i) write8(tab + i, table[i]);
+    for (u32 i = 0; i < record.size(); ++i) write8(rec + i, record[i]);
+    if (!table.empty()) write32(rec, tab);
+    write16(pb + 24, static_cast<u16>(refNum));
+    write16(pb + 26, csCode);
+    write32(pb + 28, rec);
+    hcpu_.a[0] = pb;
+    execute68kTrap(control ? 0xA204 : 0xA205);    // _Control or _Status, immediate
+    const s32 err = static_cast<s16>(hcpu_.d[0] & 0xFFFF);
+    for (u32 i = 0; i < record.size(); ++i) record[i] = read8(rec + i);
+    // The pointer the caller sees is to its own table, not the guest's copy.
+    if (!table.empty() && record.size() >= 4 && read32(rec) == tab) record[0] = record[1] = record[2] = record[3] = 0;
+    for (u32 i = 0; i < table.size(); ++i) table[i] = read8(tab + i);
+    for (int i = 0; i < 8; ++i) { hcpu_.d[i] = sd[i]; hcpu_.a[i] = sa[i]; }
+    return err;
+}
+
 bool MacHostServices::slotResources(std::vector<SlotResource>& out) {
     out.clear();
     runToCall();                                  // where the guest stands, failing that

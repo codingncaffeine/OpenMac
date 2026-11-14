@@ -10,6 +10,7 @@
 #include "../scsicd.hpp"
 #include "../scsinet.hpp"
 #include "../via.hpp"
+#include "video_rom.hpp"
 #include "video.hpp"
 
 #include <cstdio>
@@ -123,7 +124,8 @@ bool Se30Machine::banksForTotal(u32 totalMb, u32& bankAMb, u32& bankBMb) {
 Se30Machine::Se30Machine(std::vector<u8> rom, const Config& cfg)
     : MacHostServices(*this, cpu_, ram_),
       rom_(std::move(rom)),
-      videoRom_(cfg.videoRom),
+      videoRom_(cfg.videoRom.empty() && !cfg.emptyVideoSlot ? Se30VideoRom::build() : cfg.videoRom),
+      ownVideoRom_(cfg.videoRom.empty() && !cfg.emptyVideoSlot),
       bankA_(bankBytes(cfg.bankAMb)),
       bankB_(bankBytes(cfg.bankBMb)),
       via1_(std::make_unique<Via6522>()),

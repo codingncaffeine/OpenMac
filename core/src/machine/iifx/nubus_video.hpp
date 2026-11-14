@@ -20,6 +20,7 @@
 
 #include "openmac/types.hpp"
 #include "am29000.hpp"
+#include "../declrom.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2456,99 +2457,8 @@ private:
                 "8*24 GC declaration ROM CRC does not match");
     }
 
-    struct RomBuilder {
-        struct Fixup { std::size_t entry; std::string target; };
-        std::vector<u8> data;
-        std::unordered_map<std::string, std::size_t> labels;
-        std::vector<Fixup> fixups;
-
-        void label(const char* name) { labels.emplace(name, data.size()); }
-        void byte(u8 v) { data.push_back(v); }
-        void word(u16 v) { byte(static_cast<u8>(v >> 8)); byte(static_cast<u8>(v)); }
-        void longword(u32 v) { word(static_cast<u16>(v >> 16)); word(static_cast<u16>(v)); }
-        void cstring(const char* s) {
-            while (*s) byte(static_cast<u8>(*s++));
-            byte(0);
-        }
-        void offsetEntry(u8 id, const char* target) {
-            const std::size_t at = data.size();
-            longword(u32(id) << 24);
-            fixups.push_back({at, target});
-        }
-        void dataEntry(u8 id, u32 value) {
-            if (value > 0x00FFFFFFu) throw std::logic_error("sResource data overflow");
-            longword((u32(id) << 24) | value);
-        }
-        void endList() { longword(0xFF000000u); }
-        void patchOffsets() {
-            for (const Fixup& f : fixups) {
-                const auto it = labels.find(f.target);
-                if (it == labels.end()) throw std::logic_error("missing declaration-ROM label");
-                const std::int64_t delta = static_cast<std::int64_t>(it->second) -
-                                           static_cast<std::int64_t>(f.entry);
-                if (delta < -0x800000 || delta > 0x7FFFFF)
-                    throw std::logic_error("declaration-ROM offset overflow");
-                const u32 encoded = static_cast<u32>(delta) & 0x00FFFFFFu;
-                data[f.entry + 1] = static_cast<u8>(encoded >> 16);
-                data[f.entry + 2] = static_cast<u8>(encoded >> 8);
-                data[f.entry + 3] = static_cast<u8>(encoded);
-            }
-        }
-    };
-
-    struct CodeBuilder {
-        struct Branch { std::size_t displacement; std::string target; };
-        struct PcRelative { std::size_t displacement; std::string target; };
-        std::vector<u8> code;
-        std::unordered_map<std::string, std::size_t> labels;
-        std::vector<Branch> branches;
-        std::vector<PcRelative> pcRelative;
-
-        void label(const char* name) { labels.emplace(name, code.size()); }
-        void word(u16 v) {
-            code.push_back(static_cast<u8>(v >> 8));
-            code.push_back(static_cast<u8>(v));
-        }
-        void longword(u32 v) { word(static_cast<u16>(v >> 16)); word(static_cast<u16>(v)); }
-        void branch(u16 opcode, const char* target) {
-            word(opcode);
-            const std::size_t at = code.size();
-            word(0);
-            branches.push_back({at, target});
-        }
-        void pcAddress(u16 opcode, const char* target) {
-            word(opcode);
-            const std::size_t at = code.size();
-            word(0);
-            pcRelative.push_back({at, target});
-        }
-        void patch() {
-            for (const Branch& b : branches) {
-                const auto it = labels.find(b.target);
-                if (it == labels.end()) throw std::logic_error("missing driver label");
-                // A 68k displacement counts from the address of the
-                // displacement word itself, not from the word after it.
-                const std::int64_t delta = static_cast<std::int64_t>(it->second) -
-                                           static_cast<std::int64_t>(b.displacement);
-                if (delta < -32768 || delta > 32767)
-                    throw std::logic_error("driver branch overflow");
-                const u16 d = static_cast<u16>(static_cast<std::int16_t>(delta));
-                code[b.displacement] = static_cast<u8>(d >> 8);
-                code[b.displacement + 1] = static_cast<u8>(d);
-            }
-            for (const PcRelative& p : pcRelative) {
-                const auto it = labels.find(p.target);
-                if (it == labels.end()) throw std::logic_error("missing driver PC-relative label");
-                const std::int64_t delta = static_cast<std::int64_t>(it->second) -
-                                           static_cast<std::int64_t>(p.displacement);
-                if (delta < -32768 || delta > 32767)
-                    throw std::logic_error("driver PC-relative displacement overflow");
-                const u16 d = static_cast<u16>(static_cast<std::int16_t>(delta));
-                code[p.displacement] = static_cast<u8>(d >> 8);
-                code[p.displacement + 1] = static_cast<u8>(d);
-            }
-        }
-    };
+    using RomBuilder = declrom::RomBuilder;
+    using CodeBuilder = declrom::CodeBuilder;
 
     static void emitDriverExit(CodeBuilder& c) {
         c.word(0x0828); c.word(0x0009); c.word(0x0006); // BTST #9,ioTrap(A0)

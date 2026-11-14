@@ -227,8 +227,8 @@ OMAC_API OMacQ* omac_q_create_model(const uint8_t* rom, size_t rom_len, int mode
                                     uint32_t vram_mb);
 /* The Macintosh SE/30 on the same handle: a 256 KB ROM; RAM of 1, 2, 4, 5, 8,
    16, 17, 20, 32, 65, 68, 80 or 128 MB (anything else gets 8); vrom is the
-   8 KB declaration ROM of its built-in 512x342 screen (NULL: slot $E is empty
-   and the machine has no screen). Every omac_q_ function serves it;
+   8 KB declaration ROM of its built-in 512x342 screen (NULL: OpenMac's own,
+   which answers the System the same way). Every omac_q_ function serves it;
    omac_q_set_display and the saved-state calls answer 0 for it. */
 OMAC_API OMacQ* omac_q_create_se30(const uint8_t* rom, size_t rom_len, uint32_t ram_mb,
                                    const uint8_t* vrom, size_t vrom_len);

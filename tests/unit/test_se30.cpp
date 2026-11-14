@@ -1,7 +1,9 @@
 #include <doctest/doctest.h>
 
 #include "../../core/src/machine/asc.hpp"
+#include "../../core/src/machine/iifx/nubus_video.hpp"
 #include "../../core/src/machine/se30/video.hpp"
+#include "../../core/src/machine/se30/video_rom.hpp"
 #include "openmac/se30.hpp"
 
 #include <algorithm>
@@ -463,7 +465,9 @@ TEST_CASE("SE/30 address map: every device answers and the gaps end in a bus err
     CHECK(m.read8(0xFEFFE000u) == 0x11);
     CHECK_NOTHROW(m.write8(0xFEFFFFFFu, 0));
     CHECK(m.read8(0xFEFFFFFFu) == 0x0F);
-    Se30Machine bare(quietRom(), banks(1, 0));         // no video ROM: slot $E is empty
+    Se30Machine::Config empty = banks(1, 0);
+    empty.emptyVideoSlot = true;                       // no ROM in slot $E at all
+    Se30Machine bare(quietRom(), empty);
     CHECK_THROWS_AS(bare.read8(0xFEFFFFFFu), BusFault);
 }
 
@@ -632,4 +636,132 @@ TEST_CASE("SE/30 parameter RAM: asked without a buffer the machine gives the siz
     blob[0] = 'X';
     CHECK_FALSE(m.loadPram(blob.data(), static_cast<u32>(blob.size()), 0));
     CHECK_FALSE(m.loadPram(back.data(), 100, 0));
+}
+
+namespace {
+
+u64 fnv64(const std::vector<u8>& bytes) {
+    u64 h = 1469598103934665603ull;
+    for (u8 b : bytes) h = (h ^ b) * 1099511628211ull;
+    return h;
+}
+
+u32 long_at(const std::vector<u8>& rom, std::size_t at) {
+    return (u32(rom[at]) << 24) | (u32(rom[at + 1]) << 16) | (u32(rom[at + 2]) << 8) | rom[at + 3];
+}
+
+// A resource list's entry with this ID: where it is, or kNoEntry when the list ends without one.
+constexpr std::size_t kNoEntry = ~std::size_t(0);
+std::size_t entry_at(const std::vector<u8>& rom, std::size_t list, u8 id) {
+    for (std::size_t at = list; at + 4 <= rom.size(); at += 4) {
+        if (rom[at] == 0xFF) return kNoEntry;
+        if (rom[at] == id) return at;
+    }
+    return kNoEntry;
+}
+
+// Where an offset entry points: its 24 bits are signed and count from the entry itself.
+std::size_t target_of(const std::vector<u8>& rom, std::size_t entry) {
+    const s32 offset = static_cast<s32>(long_at(rom, entry) << 8) >> 8;
+    return static_cast<std::size_t>(static_cast<s64>(entry) + offset);
+}
+
+} // namespace
+
+TEST_CASE("SE/30 own video ROM: the format block, the two resources and the mode the System reads") {
+    const std::vector<u8> rom = Se30VideoRom::build();
+    REQUIRE(rom.size() == 0x2000);
+    // The format block is the ROM's last 20 bytes: the directory's offset, the length, the
+    // checksum, revision 1, Apple's format, the test pattern, a zero and the byte lanes.
+    const std::size_t format = rom.size() - 20;
+    CHECK(long_at(rom, format + 4) == 0x2000);
+    CHECK(rom[format + 12] == 1);
+    CHECK(rom[format + 13] == 1);
+    CHECK(long_at(rom, format + 14) == 0x5A932BC7u);
+    CHECK(rom[format + 18] == 0);
+    CHECK(rom[format + 19] == 0x0F);
+    // The checksum the Slot Manager computes: rotate left one bit, add each byte, the
+    // checksum's own four bytes left out.
+    u32 sum = 0;
+    for (std::size_t i = 0; i < rom.size(); ++i) {
+        sum = (sum << 1) | (sum >> 31);
+        if (i < format + 8 || i >= format + 12) sum += rom[i];
+    }
+    CHECK(sum == long_at(rom, format + 8));
+    CHECK(rom[format] == 0);                                // the offset is 24 bits under a zero byte
+    const std::size_t directory = target_of(rom, format);
+    REQUIRE(directory < format);
+
+    const std::size_t boardEntry = entry_at(rom, directory, 1);
+    const std::size_t videoEntry = entry_at(rom, directory, 0x80);
+    REQUIRE(boardEntry != kNoEntry);
+    REQUIRE(videoEntry != kNoEntry);
+    const std::size_t board = target_of(rom, boardEntry);
+    const std::size_t video = target_of(rom, videoEntry);
+    // The board: type 1 0 0 0, board ID $000C, a start-up routine for a 68020.
+    const std::size_t boardType = target_of(rom, entry_at(rom, board, 1));
+    CHECK(long_at(rom, boardType) == 0x00010000u);
+    CHECK(long_at(rom, boardType + 4) == 0);
+    CHECK((long_at(rom, entry_at(rom, board, 32)) & 0x00FFFFFFu) == 0x000C);
+    const std::size_t startUp = target_of(rom, entry_at(rom, board, 34));
+    CHECK(rom[startUp + 4] == 2);
+    CHECK(rom[startUp + 5] == 2);
+    CHECK(long_at(rom, startUp + 8) == 4);
+    CHECK(long_at(rom, startUp) > 12);
+    // The screen: display, video, Apple, hardware 9; one mode, $80.
+    const std::size_t videoType = target_of(rom, entry_at(rom, video, 1));
+    CHECK(long_at(rom, videoType) == 0x00030001u);
+    CHECK(long_at(rom, videoType + 4) == 0x00010009u);
+    CHECK(std::string(reinterpret_cast<const char*>(&rom[target_of(rom, entry_at(rom, video, 2))])) ==
+          "Display_Video_Apple_MacSE/30 Video");
+    CHECK(long_at(rom, target_of(rom, entry_at(rom, video, 10))) == 0);
+    CHECK(long_at(rom, target_of(rom, entry_at(rom, video, 11))) == 0x8040u + 342u * 64u);
+    CHECK(entry_at(rom, video, 0x81) == kNoEntry);
+    const std::size_t mode = target_of(rom, entry_at(rom, video, 0x80));
+    CHECK((long_at(rom, entry_at(rom, mode, 3)) & 0x00FFFFFFu) == 2);      // two pages
+    CHECK((long_at(rom, entry_at(rom, mode, 4)) & 0x00FFFFFFu) == 1);      // a fixed color table
+    const std::size_t params = target_of(rom, entry_at(rom, mode, 1));
+    CHECK(long_at(rom, params) == 46);
+    CHECK(long_at(rom, params + 4) == 0x8040);                             // the main buffer
+    CHECK(long_at(rom, params + 8) == 0x00400000u);                        // 64 bytes a row, top 0
+    CHECK(long_at(rom, params + 12) == 0x00000156u);                       // left 0, bottom 342
+    CHECK((long_at(rom, params + 16) >> 16) == 512);
+    CHECK((long_at(rom, params + 36) & 0xFFFFu) == 1);                     // one bit a dot
+    // The driver: its header's four routines lie inside it, under its name.
+    const std::size_t drivers = target_of(rom, entry_at(rom, video, 4));
+    const std::size_t driver = target_of(rom, entry_at(rom, drivers, 2)) + 4;
+    const u32 driverBytes = long_at(rom, driver - 4) - 4;
+    CHECK(((u32(rom[driver]) << 8) | rom[driver + 1]) == 0x4C00);
+    for (std::size_t at : {8u, 12u, 14u, 16u}) {
+        const u32 routine = (u32(rom[driver + at]) << 8) | rom[driver + at + 1];
+        CHECK(routine > 18);
+        CHECK(routine < driverBytes);
+    }
+    CHECK(rom[driver + 18] == 35);
+    CHECK(std::string(reinterpret_cast<const char*>(&rom[driver + 19]), 35) == ".Display_Video_Apple_MacSE/30 Video");
+}
+
+TEST_CASE("SE/30 own video ROM: it is the image whose answers were compared with the real ROM's") {
+    // Any change to the routines changes this sum. Run scratch/se30/vrom/calls.sh again (the
+    // driver's answers and the pictures under System 6.0.8 and 7.5, against the real ROM's)
+    // before giving it a new one.
+    CHECK(fnv64(Se30VideoRom::build()) == 0xAE9A43F548485997ull);
+}
+
+TEST_CASE("SE/30 own video ROM: a machine without a ROM file has it in slot $E") {
+    Se30Machine m(quietRom(), banks(1, 0));
+    CHECK(m.ownVideoRom());
+    const std::vector<u8> rom = Se30VideoRom::build();
+    for (u32 at : {0u, 0x123u, 0x1FEBu, 0x1FFFu}) CHECK(m.read8(0xFEFFE000u + at) == rom[at]);
+    Se30Machine::Config file = banks(1, 0);
+    file.videoRom = videoRomImage();
+    Se30Machine real(quietRom(), file);
+    CHECK_FALSE(real.ownVideoRom());
+    CHECK(real.read8(0xFEFFE000u) == 0x11);
+}
+
+TEST_CASE("declaration ROM builders: the IIfx's generated video ROM is what it was before they moved") {
+    const IifxNuBusVideo video;
+    CHECK(video.declarationRom().size() == 65536);
+    CHECK(fnv64(video.declarationRom()) == 0xDD91F3059CF7DB01ull);
 }

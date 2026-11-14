@@ -1046,7 +1046,7 @@ OMAC_API OMacQ* omac_q_create(const uint8_t* rom, size_t rom_len, uint32_t ram_m
 
 // The Macintosh SE/30 on the same handle. RAM: 1, 2, 4, 5, 8, 16, 17, 20, 32,
 // 65, 68, 80 or 128 MB (anything else gets 8). vrom is the 8 KB declaration
-// ROM of the built-in screen; without one slot $E is empty.
+// ROM of the built-in screen; without one the machine has OpenMac's own.
 OMAC_API OMacQ* omac_q_create_se30(const uint8_t* rom, size_t rom_len, uint32_t ram_mb,
                                    const uint8_t* vrom, size_t vrom_len)
 {

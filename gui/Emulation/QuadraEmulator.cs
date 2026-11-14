@@ -43,9 +43,9 @@ public sealed class QuadraEmulator : IEmulator
     /// <summary>The Macintosh SE/30, which the same backend runs. Fixed for
     /// the life of the backend, like <see cref="Is950"/>.</summary>
     public bool IsSe30 { get; init; }
-    /// <summary>The SE/30's 8 KB video ROM file (its built-in screen is a
-    /// card in slot $E with a ROM of its own); takes effect at the next ROM
-    /// load. Without it the machine has no screen.</summary>
+    /// <summary>The SE/30's real 8 KB video ROM file (its built-in screen is
+    /// a card in slot $E with a ROM of its own); takes effect at the next ROM
+    /// load. Without it the machine has OpenMac's own video ROM.</summary>
     public string? VideoRomPath { get; set; }
     /// <summary>Video RAM fitted in the Quadra 950 (1 or 2 MB); takes effect
     /// at the next ROM load.</summary>
@@ -120,11 +120,11 @@ public sealed class QuadraEmulator : IEmulator
         // And the PRAM, for the same reason: this is how the machine restarts
         // onto another monitor or RAM size, and the chip goes with it.
         SavePram();
+        byte[]? videoRom = IsSe30 && !string.IsNullOrEmpty(VideoRomPath) && File.Exists(VideoRomPath)
+            ? File.ReadAllBytes(VideoRomPath) : null;
         lock (_sync)
         {
             Destroy();
-            byte[]? videoRom = IsSe30 && !string.IsNullOrEmpty(VideoRomPath) && File.Exists(VideoRomPath)
-                ? File.ReadAllBytes(VideoRomPath) : null;
             _h = Is950
                 ? Native.omac_q_create_model(rom, (nuint)rom.Length, 1, (uint)ramMB, (uint)VramMB)
                 : IsSe30
@@ -168,7 +168,7 @@ public sealed class QuadraEmulator : IEmulator
         Log.Line($"[core] {MachineName} created — {ramMB} MB, ROM {Path.GetFileName(path)}, "
                  + (IsSe30
                      ? $"built-in screen ({_screenW}x{_screenH}), video ROM "
-                       + (string.IsNullOrEmpty(VideoRomPath) ? "none" : Path.GetFileName(VideoRomPath))
+                       + (videoRom is null ? "OpenMac's own" : Path.GetFileName(VideoRomPath))
                      : $"monitor {Monitor ?? "13-inch RGB"} ({_screenW}x{_screenH})")
                  + (Is950 ? $", {VramMB} MB video RAM" : ""));
     }

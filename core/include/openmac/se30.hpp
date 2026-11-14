@@ -46,9 +46,12 @@ public:
         // ROM wants the larger SIMMs in bank A and a single set in bank A.
         u32 bankAMb = 4;
         u32 bankBMb = 4;
-        // The 8 KB declaration ROM of the built-in screen. Without one slot
-        // $E is empty and the machine starts with no screen.
+        // The 8 KB declaration ROM of the built-in screen: the real one's
+        // file, or empty for OpenMac's own (se30/video_rom.hpp), which
+        // answers the System the same way.
         std::vector<u8> videoRom;
+        // No ROM in slot $E at all: the machine starts with no screen.
+        bool emptyVideoSlot = false;
     };
 
     // The RAM totals this ROM starts with, in megabytes, and the SIMM sets
@@ -156,6 +159,8 @@ public:
         std::array<u32, 8> unansweredAtFrame;
     };
     BoardState boardState() const;
+    // True when the screen's ROM is OpenMac's own, not a file's.
+    bool ownVideoRom() const { return ownVideoRom_; }
 
     // A text snapshot of the CPU and the devices, for when the guest stops.
     std::string diagnosticReport() const;
@@ -201,6 +206,7 @@ private:
     std::vector<u8> videoRom_;
     u32 romMask_ = 0;
     u32 videoRomMask_ = 0;
+    bool ownVideoRom_ = false;
     u32 romEntry_ = 0;         // the reset vector's program counter
     u32 bankA_ = 0, bankB_ = 0;   // bytes
     u8 sizeBits_ = 3;          // VIA2 port A bits 7-6 as the board sees them

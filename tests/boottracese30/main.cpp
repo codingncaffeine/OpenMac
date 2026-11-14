@@ -14,7 +14,7 @@
 //                     [--cd FILE] [--eject-cd-at FRAME]
 //                     [--guest-restart-at FRAME] [--put-away-disk2-at FRAME]
 //                     [--dropbox DIR] [--dropbox-guest-read FILE] [--net]
-//                     [--gestalt] [--drivers] [--shutdown] [--hd-trace N]
+//                     [--gestalt] [--drivers] [--video-calls] [--shutdown] [--hd-trace N]
 //                     [--profile FROM TO] [--disasm ADDRESS COUNT]...
 //                     [--traps FRAME COUNT] [--guest-calls] [--driver-over-scsi]
 //                     [--beep-at FRAME]... [--guest-power-off-at FRAME] [--dump-audio OUT.wav]
@@ -25,6 +25,9 @@
 // from a host folder and puts it on the second hard-disk seat, as the front
 // end's drop box does; --dropbox-guest-read has the guest read one of its
 // files back at the end. --net attaches the SCSI Ethernet adapter (ID 4).
+// --video-calls makes every Status and Control call of the screen's driver
+// on the guest at the end of the run and prints each answer (the last one
+// grays the screen).
 // --gestalt asks the System what it is running on; --drivers lists the
 // guest's unit table; --shutdown flushes and unmounts as the front end does
 // when it closes. --hd-trace logs the first N requests to the disks' driver.
@@ -97,6 +100,7 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int, std::string>> floppyEvents;   // frame, file ("" = eject)
     std::string hdPath, hd2Path, hdOut, cdPath, dropBoxDir, dropBoxGuestRead;
     bool hd2ReadOnly = false, netAttach = false, askGestalt = false, showDrivers = false, doShutdown = false;
+    bool videoCalls = false;
     int ejectCdAt = -1, guestRestartAt = -1, putAwayDisk2At = -1, hdTrace = 0;
     int guestPowerOffAt = -1, hdOutAtFrame = -1;
     std::vector<int> beeps;         // frames at which the alert sound is asked for, in order
@@ -152,6 +156,7 @@ int main(int argc, char** argv) {
         else if (a == "--net") netAttach = true;
         else if (a == "--gestalt") askGestalt = true;
         else if (a == "--drivers") showDrivers = true;
+        else if (a == "--video-calls") videoCalls = true;
         else if (a == "--shutdown") doShutdown = true;
         else if (a == "--hd-trace" && i + 1 < argc) hdTrace = std::atoi(argv[++i]);
         else if (a == "--guest-calls") guestCalls = true;
@@ -529,6 +534,118 @@ int main(int argc, char** argv) {
         }
     }
     if (showDrivers) tracetools::printDrivers(mac, mac.ramBytes());
+    if (videoCalls) {
+        // The screen's driver, by the reference number in the main screen's
+        // device record (MainDevice, $08A4: a handle; gdRefNum is its first word).
+        const u32 device = mac.read32(mac.read32(0x08A4) & 0x00FFFFFFu) & 0x00FFFFFFu;
+        const s16 ref = static_cast<s16>(mac.read16(device));
+        std::printf("video: driver reference %d, device type %u\n", ref, mac.read16(device + 12));
+        auto hex = [](const std::vector<u8>& bytes) {
+            std::string text;
+            char one[4];
+            for (std::size_t i = 0; i < bytes.size(); ++i) {
+                std::snprintf(one, sizeof one, "%02X", bytes[i]);
+                text += one;
+                if ((i & 1u) == 1u && i + 1 < bytes.size()) text += ' ';
+            }
+            return text;
+        };
+        auto call = [&](bool control, u16 code, std::vector<u8> record, std::vector<u8> table, const char* what) {
+            const std::vector<u8> asked = record;
+            const s32 err = mac.driverCall(control, ref, code, record, table);
+            std::printf("video: %s %u %s: %s -> %d, %s", control ? "control" : "status", code, what, hex(asked).c_str(), err,
+                        hex(record).c_str());
+            if (!table.empty()) std::printf(", table %s", hex(table).c_str());
+            const Se30Machine::BoardState now = mac.boardState();
+            std::printf("; main buffer %s, interrupt %s\n", now.mainScreenBuffer ? "shown" : "hidden",
+                        now.screenInterruptEnabled ? "on" : "off");
+        };
+        const std::vector<u8> none;
+        // A page record is mode, data, page, base address: 12 bytes. Unused
+        // bytes are $EE so that what the driver leaves alone can be seen.
+        auto page = [](u16 mode, u16 pageNumber) {
+            return std::vector<u8>{static_cast<u8>(mode >> 8), static_cast<u8>(mode), 0xEE, 0xEE, 0xEE, 0xEE,
+                                   static_cast<u8>(pageNumber >> 8), static_cast<u8>(pageNumber), 0xEE, 0xEE, 0xEE, 0xEE};
+        };
+        const std::vector<u8> filler(12, 0xEE);
+        for (u16 code = 0; code <= 10; ++code) {
+            if (code == 3) continue;
+            call(false, code, code == 4 || code == 5 ? page(0x80, 0) : filler, none, "");
+        }
+        call(false, 4, page(0x81, 0), none, "pages of a mode it has not");
+        call(false, 5, page(0x80, 1), none, "base of page 1");
+        call(false, 5, page(0x80, 2), none, "base of page 2");
+        // Color table calls: the table pointer, first entry, count less one;
+        // each entry is a value and three components.
+        auto entries = [&](bool control, u16 start, u16 count, std::initializer_list<u16> values, const char* what) {
+            std::vector<u8> record{0, 0, 0, 0, static_cast<u8>(start >> 8), static_cast<u8>(start),
+                                   static_cast<u8>(count >> 8), static_cast<u8>(count)};
+            std::vector<u8> table;
+            for (u16 value : values) {
+                table.push_back(static_cast<u8>(value >> 8));
+                table.push_back(static_cast<u8>(value));
+                for (int k = 0; k < 6; ++k) table.push_back(0xEE);
+            }
+            // Room for more than was asked for: what a driver writes past
+            // the entries named must land here, not on the guest's stack.
+            table.resize(40, 0xEE);
+            call(control, 3, record, table, what);
+        };
+        entries(false, 0, 1, {0x7777, 0x7777}, "entries 0 and 1");
+        entries(false, 1, 0, {0x7777}, "entry 1");
+        entries(false, 0xFFFF, 1, {1, 0}, "entries by value: 1, 0");
+        entries(false, 0, 2, {0x7777, 0x7777, 0x7777}, "three entries");
+        entries(false, 0xFFFF, 0, {2}, "an entry by value 2");
+        entries(true, 0, 1, {0, 1}, "set entries");
+        call(true, 1, filler, none, "kill");
+        call(true, 4, filler, none, "gamma");
+        call(true, 6, filler, none, "gray");
+        call(true, 8, filler, none, "");
+        call(true, 7, std::vector<u8>{1, 0xEE}, none, "interrupt off");
+        call(false, 7, filler, none, "");
+        call(true, 7, std::vector<u8>{0, 0xEE}, none, "interrupt on");
+        call(false, 7, filler, none, "");
+        call(true, 2, page(0x80, 1), none, "page 1");
+        call(false, 2, filler, none, "");
+        call(true, 2, page(0x80, 0), none, "page 0");
+        call(false, 2, filler, none, "");
+        call(true, 2, page(0x81, 0), none, "a mode it has not");
+        call(true, 2, page(0x80, 2), none, "page 2");
+        // A buffer is 342 rows of 64 bytes; the alternate one is $0040 into
+        // the screen's memory, the main one $8040.
+        const u32 screen = 0xFE000000u;
+        auto sum = [&](u32 offset) {
+            u32 h = 2166136261u;
+            for (u32 i = 0; i < 342u * 64u; ++i) h = (h ^ mac.read8(screen + offset + i)) * 16777619u;
+            return h;
+        };
+        auto buffers = [&](const char* when) {
+            std::printf("video: %s: main buffer %08X (first rows %02X %02X), alternate %08X (%02X %02X), the long "
+                        "before each %08X %08X\n", when, sum(0x8040), mac.read8(screen + 0x8040),
+                        mac.read8(screen + 0x8040 + 64), sum(0x0040), mac.read8(screen + 0x0040),
+                        mac.read8(screen + 0x0040 + 64), mac.read32(screen + 0x803C), mac.read32(screen + 0x003C));
+        };
+        // Which buffer a gray call fills: the alternate one's first byte is
+        // marked (it is gray since the start-up routine), the main one holds
+        // the desktop.
+        mac.write8(screen + 0x0040, 0x00);
+        buffers("before any gray, alternate marked");
+        call(true, 5, page(0x80, 1), none, "gray page 1");
+        buffers("after gray page 1");
+        call(true, 2, page(0x80, 1), none, "page 1");
+        mac.write8(screen + 0x0040, 0x00);
+        call(true, 5, page(0x80, 0), none, "gray page 0 with page 1 shown");
+        buffers("after gray page 0 with page 1 shown");
+        call(true, 2, page(0x80, 0), none, "page 0");
+        mac.write8(screen + 0x0040, 0x00);
+        mac.write8(screen + 0x8040, 0x00);
+        call(true, 5, page(0x80, 2), none, "gray page 2");
+        buffers("after gray page 2");
+        mac.write8(screen + 0x8040, 0x00);
+        call(true, 0, filler, none, "reset");
+        call(false, 2, filler, none, "");
+        buffers("after reset");
+    }
     if (!dropBoxGuestRead.empty()) tracetools::reportGuestRead(mac, dropBoxGuestRead);
     if (doShutdown) std::printf("shutdown volumes: %s\n", mac.shutdownVolumes() ? "unmounted" : "nothing to do");
     if (!hdOut.empty()) {

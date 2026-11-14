@@ -106,6 +106,13 @@ public:
     // the addressing mode did not allow a call just now.
     struct SlotResource { u8 slot, id; u16 category, type, drvrSw, drvrHw; };
     bool slotResources(std::vector<SlotResource>& out);
+    // A Control or Status call to a driver, made on the guest CPU as an
+    // immediate call. `record` is the csParam record, copied to the guest
+    // and back; when `table` is not empty the record's first long is set to
+    // point at a copy of it in the guest, which is copied back too (the
+    // color table calls). Returns the driver's result, or 1 when the
+    // addressing mode did not allow a call just now. Headless diagnosis only.
+    s32 driverCall(bool control, s16 refNum, u16 csCode, std::vector<u8>& record, std::vector<u8>& table);
     u32 hdReads() const { return hdReadCount_; }
     u32 hdWrites() const { return hdWriteCount_; }
     void traceHdRequests(int n) { hdTraceBudget_ = n; }
