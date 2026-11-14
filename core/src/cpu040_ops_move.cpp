@@ -22,14 +22,14 @@ int CpuOps040::opMove(M68040& c, u16 op) {
 
     const u32 v = readEA(c, srcMode, srcReg, size);
     const int srcIdx = eaIndex(srcMode, srcReg);
-    const int srcTime = c.is68030() ? eaFetchTime030(srcIdx, size)
+    const int srcTime = c.is68030() ? eaFetchTime030(c, srcIdx, size)
                                     : eaTime(srcIdx);
 
     if (dstMode == 1) { // MOVEA: sign-extend word, no flags
         c.a[dstReg] = (size == 1)
             ? static_cast<u32>(static_cast<s32>(static_cast<s16>(v & 0xFFFF)))
             : v;
-        return (c.is68030() ? 2 : 1) + srcTime;
+        return timed030(c, srcMode <= 1 ? 2 : 0, 0, (c.is68030() ? 2 : 1) + srcTime);
     }
 
     setNZ(c, v, size);
@@ -37,7 +37,7 @@ int CpuOps040::opMove(M68040& c, u16 op) {
 
     if (dstMode == 0) {
         writeSized(c.d[dstReg], v, size);
-        return (c.is68030() ? 2 : 1) + srcTime;
+        return timed030(c, srcMode <= 1 ? 2 : 0, 0, (c.is68030() ? 2 : 1) + srcTime);
     }
     const u32 addr = calcEA(c, dstMode, dstReg, size);
     writeAt(c, addr, v, size);
@@ -58,6 +58,14 @@ int CpuOps040::opMove(M68040& c, u16 op) {
         };
         int base = dstBase[dstIdx];
         if (!sourceRegister && (dstIdx == 2 || dstIdx == 3)) base = 4;
+        if (c.overlapTiming030_) {
+            // The processor works the overlap out itself, from the source
+            // stage's tail as it came out. From a register the first three
+            // memory destinations have no head and a tail of 1, 1 and 2.
+            const bool plain = sourceRegister && dstIdx >= 2 && dstIdx <= 4;
+            return timed030(c, plain ? 0 : dstHead[dstIdx],
+                            plain ? (dstIdx == 4 ? 2 : 1) : 0, srcTime + base);
+        }
         const int overlap = sourceRegister ? 0
             : std::min(dstHead[dstIdx], srcTail[srcIdx]);
         return srcTime + base - overlap;
@@ -70,7 +78,7 @@ int CpuOps040::opMoveq(M68040& c, u16 op) {
     c.d[(op >> 9) & 7] = v;
     setNZ(c, v, 2);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
-    return c.is68030() ? 2 : 1;
+    return timed030(c, 2, 0, c.is68030() ? 2 : 1);
 }
 
 int CpuOps040::opMoveFromSR(M68040& c, u16 op) {
@@ -78,11 +86,11 @@ int CpuOps040::opMoveFromSR(M68040& c, u16 op) {
     const int mode = (op >> 3) & 7, reg = op & 7;
     if (mode == 0) {
         writeSized(c.d[reg], c.sr_, 1);
-        return c.is68030() ? 4 : 3;
+        return timed030(c, 2, 0, c.is68030() ? 4 : 3);
     }
     const u32 addr = calcEA(c, mode, reg, 1);
     c.wr16(addr, c.sr_);
-    if (c.is68030()) return 4 + eaCalcTime030(c, eaIndex(mode, reg));
+    if (c.is68030()) return timed030(c, 2, 0, 4 + eaCalcTime030(c, eaIndex(mode, reg)));
     return 3 + eaTime(eaIndex(mode, reg));
 }
 
@@ -91,11 +99,11 @@ int CpuOps040::opMoveFromCCR(M68040& c, u16 op) {
     const u16 ccr = static_cast<u16>(c.sr_ & 0x1F);
     if (mode == 0) {
         writeSized(c.d[reg], ccr, 1);
-        return c.is68030() ? 4 : 2;
+        return timed030(c, 2, 0, c.is68030() ? 4 : 2);
     }
     const u32 addr = calcEA(c, mode, reg, 1);
     c.wr16(addr, ccr);
-    if (c.is68030()) return 4 + eaCalcTime030(c, eaIndex(mode, reg));
+    if (c.is68030()) return timed030(c, 2, 0, 4 + eaCalcTime030(c, eaIndex(mode, reg)));
     return 2 + eaTime(eaIndex(mode, reg));
 }
 
@@ -103,7 +111,7 @@ int CpuOps040::opMoveToCCR(M68040& c, u16 op) {
     const int mode = (op >> 3) & 7, reg = op & 7;
     const u32 v = readEA(c, mode, reg, 1);
     c.setCCR(static_cast<u8>(v));
-    if (c.is68030()) return 4 + eaFetchTime030(eaIndex(mode, reg), 1);
+    if (c.is68030()) return timed030(c, mode == 0 ? 4 : 0, 0, 4 + eaFetchTime030(c, eaIndex(mode, reg), 1));
     return 2 + eaTime(eaIndex(mode, reg));
 }
 
@@ -112,7 +120,7 @@ int CpuOps040::opMoveToSR(M68040& c, u16 op) {
     const int mode = (op >> 3) & 7, reg = op & 7;
     const u32 v = readEA(c, mode, reg, 1);
     c.setSR(static_cast<u16>(v));
-    if (c.is68030()) return 8 + eaFetchTime030(eaIndex(mode, reg), 1);
+    if (c.is68030()) return 8 + eaFetchTime030(c, eaIndex(mode, reg), 1);
     return 9 + eaTime(eaIndex(mode, reg));
 }
 
@@ -122,7 +130,7 @@ int CpuOps040::opMoveUsp(M68040& c, u16 op) {
     const int reg = op & 7;
     if (op & 0x0008) c.a[reg] = c.usp;   // USP -> An
     else             c.usp = c.a[reg];   // An -> USP
-    if (c.is68030()) return 4;
+    if (c.is68030()) return timed030(c, 4, 0, 4);
     return (op & 0x0008) ? 3 : 7;   // UM 10.5: USP,An 3; An,USP 7
 }
 
@@ -130,7 +138,7 @@ int CpuOps040::opLea(M68040& c, u16 op) {
     const int mode = (op >> 3) & 7, reg = op & 7;
     const u32 addr = calcEA(c, mode, reg, 2);
     c.a[(op >> 9) & 7] = addr;
-    if (c.is68030()) return 2 + eaCalcTime030(c, eaIndex(mode, reg));
+    if (c.is68030()) return timed030(c, 2, 0, 2 + eaCalcTime030(c, eaIndex(mode, reg)));
     return 1 + eaTime(eaIndex(mode, reg));
 }
 
@@ -138,7 +146,7 @@ int CpuOps040::opPea(M68040& c, u16 op) {
     const int mode = (op >> 3) & 7, reg = op & 7;
     const u32 addr = calcEA(c, mode, reg, 2);
     c.push32(addr);
-    if (c.is68030()) return 4 + eaCalcTime030(c, eaIndex(mode, reg));
+    if (c.is68030()) return timed030(c, 0, 2, 4 + eaCalcTime030(c, eaIndex(mode, reg)));
     return 2 + eaTime(eaIndex(mode, reg));
 }
 
@@ -155,7 +163,8 @@ int CpuOps040::opClr(M68040& c, u16 op) {
     setFlag(c, kZ040, true);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
     if (c.is68030())
-        return mode == 0 ? 2 : 3 + eaCalcTime030(c, eaIndex(mode, reg));
+        return mode == 0 ? timed030(c, 2, 0, 2)
+                         : timed030(c, 0, 1, 3 + eaCalcTime030(c, eaIndex(mode, reg)));
     return mode == 0 ? 1 : 1 + eaTime(eaIndex(mode, reg));
 }
 
@@ -165,11 +174,11 @@ int CpuOps040::opScc(M68040& c, u16 op) {
     const u32 v = cond ? 0xFFu : 0x00u;
     if (mode == 0) {
         writeSized(c.d[reg], v, 0);
-        return c.is68030() ? 4 : 1;
+        return timed030(c, 4, 0, c.is68030() ? 4 : 1);
     }
     const u32 addr = calcEA(c, mode, reg, 0);
     c.wr8(addr, static_cast<u8>(v));   // '010+: no read-before-write
-    if (c.is68030()) return 5 + eaCalcTime030(c, eaIndex(mode, reg));
+    if (c.is68030()) return timed030(c, 0, 1, 5 + eaCalcTime030(c, eaIndex(mode, reg)));
     return 1 + eaTime(eaIndex(mode, reg));
 }
 
@@ -182,7 +191,7 @@ int CpuOps040::opTst(M68040& c, u16 op) {
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
     if (c.is68030()) {
         return mode <= 1 ? 2
-                         : 2 + eaFetchTime030(eaIndex(mode, reg), size);
+                         : 2 + eaFetchTime030(c, eaIndex(mode, reg), size);
     }
     return 1 + eaTime(eaIndex(mode, reg));
 }
@@ -193,7 +202,7 @@ int CpuOps040::opExg(M68040& c, u16 op) {
     if (pat == 0x0140)      { const u32 t = c.d[rx]; c.d[rx] = c.d[ry]; c.d[ry] = t; }
     else if (pat == 0x0148) { const u32 t = c.a[rx]; c.a[rx] = c.a[ry]; c.a[ry] = t; }
     else                    { const u32 t = c.d[rx]; c.d[rx] = c.a[ry]; c.a[ry] = t; }
-    return c.is68030() ? 4 : 1;
+    return timed030(c, 4, 0, c.is68030() ? 4 : 1);
 }
 
 int CpuOps040::opSwap(M68040& c, u16 op) {
@@ -201,7 +210,7 @@ int CpuOps040::opSwap(M68040& c, u16 op) {
     c.d[reg] = (c.d[reg] >> 16) | (c.d[reg] << 16);
     setNZ(c, c.d[reg], 2);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
-    return c.is68030() ? 4 : 2;
+    return timed030(c, 4, 0, c.is68030() ? 4 : 2);
 }
 
 int CpuOps040::opExt(M68040& c, u16 op) {
@@ -221,7 +230,7 @@ int CpuOps040::opExt(M68040& c, u16 op) {
         setNZ(c, v, 2);
     }
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
-    return c.is68030() ? 4 : 1;
+    return timed030(c, 4, 0, c.is68030() ? 4 : 1);
 }
 
 int CpuOps040::opLink(M68040& c, u16 op) {
@@ -241,7 +250,7 @@ int CpuOps040::opLinkL(M68040& c, u16 op) {
     c.wr32(c.a[7], c.a[reg]);
     c.a[reg] = c.a[7];
     c.a[7] += static_cast<u32>(disp);
-    return c.is68030() ? 6 : 3;
+    return timed030(c, 2, 0, c.is68030() ? 6 : 3);
 }
 
 int CpuOps040::opUnlk(M68040& c, u16 op) {
@@ -249,6 +258,16 @@ int CpuOps040::opUnlk(M68040& c, u16 op) {
     c.a[7] = c.a[reg];
     c.a[reg] = c.pop32();
     return c.is68030() ? 5 : 2;
+}
+
+// MOVEM to memory with overlap timing (MC68030UM 11.6.7, footnote): of n
+// writes w clocks over two, the last one's first two cost nothing, and
+// (n-1)w of the instruction is left to run under the next one.
+int CpuOps040::movemTime030(M68040& c, bool, int n, int cc) {
+    if (!c.overlapTiming030_ || n == 0) return timed030(c, 2, 0, cc);
+    const int w = std::min(c.writePenalty030_, 2);
+    c.lastAccessWrite030_ = false;      // the tail below is the whole of it
+    return timed030(c, 2, (n - 1) * w, cc - w);
 }
 
 int CpuOps040::opMovem(M68040& c, u16 op) {
@@ -276,7 +295,7 @@ int CpuOps040::opMovem(M68040& c, u16 op) {
             writeAt(c, addr, isLong ? val : (val & 0xFFFF), size);
         }
         c.a[reg] = addr;
-        if (c.is68030()) return 4 + 2 * n + eaCalcImmediateTime030(c, 4);
+        if (c.is68030()) return movemTime030(c, false, n, 4 + 2 * n + eaCalcImmediateTime030(c, 4));
         return 2 + n;
     }
 
@@ -289,22 +308,28 @@ int CpuOps040::opMovem(M68040& c, u16 op) {
             addr += static_cast<u32>(step);
         }
         if (c.is68030())
-            return 4 + 2 * n + eaCalcImmediateTime030(c, eaIndex(mode, reg));
+            return movemTime030(c, false, n, 4 + 2 * n + eaCalcImmediateTime030(c, eaIndex(mode, reg)));
         return 2 + n + eaTime(eaIndex(mode, reg));
     }
 
     // mem -> reg: D0..A7 ascending; word loads sign-extend.
     u32 addr = (mode == 3) ? c.a[reg] : calcEA(c, mode, reg, size);
+    int readsWithin = 0;   // clocks of the reads' cycles a register's four clocks hold
     for (int i = 0; i < 16; ++i) {
         if (!((mask >> i) & 1)) continue;
         u32 v = readAt(c, addr, size);
+        readsWithin += std::min(c.readPenalty030_, 2);
         if (!isLong) v = static_cast<u32>(static_cast<s32>(static_cast<s16>(v & 0xFFFF)));
         if (i < 8) c.d[i] = v; else c.a[i - 8] = v;
         addr += static_cast<u32>(step);
     }
     if (mode == 3) c.a[reg] = addr;   // a loaded base register keeps the load
-    if (c.is68030())
-        return 8 + 4 * n + eaCalcImmediateTime030(c, eaIndex(mode, reg));
+    if (c.is68030()) {
+        const int cc = 8 + 4 * n + eaCalcImmediateTime030(c, eaIndex(mode, reg));
+        // To the registers a read of up to four clocks costs no more than
+        // one of two, and nothing is left running (the table's footnote).
+        return timed030(c, 2, 0, c.overlapTiming030_ ? cc - readsWithin : cc);
+    }
     return 2 + n + eaTime(eaIndex(mode, reg));
 }
 

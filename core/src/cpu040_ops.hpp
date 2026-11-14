@@ -108,7 +108,16 @@ struct CpuOps040 {
     // e.g. (An) is 3 clocks when fetched, 2 when merely calculated, and 2 for
     // a jump.  Keep the three tables explicit so a 030 handler cannot silently
     // inherit an execute-stage number chosen for the 040.
-    static int eaFetchTime030(int idx, int size);
+    static int eaFetchTime030(M68040& c, int idx, int size);
+    // An operation's head and tail (MC68030UM 11.6, the two columns beside
+    // the times), kept for the processor's overlap timing; `cc` is handed
+    // back as it came. An operation that names none overlaps nothing.
+    static int movemTime030(M68040& c, bool toRegisters, int n, int cc);
+    static int timed030(M68040& c, int head, int tail, int cc) {
+        c.opHead030_ = head;
+        c.opTail030_ = tail;
+        return cc;
+    }
     static int eaFetchImmediateTime030(M68040& c, int idx, int size);
     static int eaCalcTime030(M68040& c, int idx);
     static int eaCalcImmediateTime030(M68040& c, int idx,

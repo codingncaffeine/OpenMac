@@ -28,6 +28,7 @@ add_executable(openmac_unit
     unit/test_cpu_reset.cpp
     unit/test_cpu040.cpp
     unit/test_cpu030.cpp
+    unit/test_cpu030_overlap.cpp
     unit/test_r65c02.cpp
     unit/test_iifx.cpp
     unit/test_hardware_trace.cpp

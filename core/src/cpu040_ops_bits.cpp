@@ -100,13 +100,17 @@ int CpuOps040::opShiftReg(M68040& c, u16 op) {
     if (c.is68030()) {
         const bool dynamic = (op & 0x0020) != 0;
         const int width = size == 0 ? 8 : size == 1 ? 16 : 32;
-        if (type == 2) return 12;                 // ROX
-        if (type == 0 && left) return dynamic ? 8 : 6;
-        if (type == 0 && !left)
-            return dynamic ? (count <= width ? 6 : 10) : 4;
-        if (type == 1)
-            return dynamic ? (count <= width ? 6 : 8) : 4;
-        return dynamic ? 8 : 6;                  // RO
+        if (type == 2) return timed030(c, 10, 0, 12);                 // ROX
+        if (type == 0 && left) return timed030(c, dynamic ? 4 : 2, 0, dynamic ? 8 : 6);
+        if (type == 0 && !left) {
+            const int cc = dynamic ? (count <= width ? 6 : 10) : 4;
+            return timed030(c, cc, 0, cc);
+        }
+        if (type == 1) {
+            const int cc = dynamic ? (count <= width ? 6 : 8) : 4;
+            return timed030(c, cc, 0, cc);
+        }
+        return timed030(c, dynamic ? 6 : 4, 0, dynamic ? 8 : 6);      // RO
     }
     return [&] {   // UM 10.6: ASL 3/4, ASR/LSx/ROL/ROR 2/3, ROX 5/6 (imm/reg count)
         const int dyn = (op & 0x0020) ? 1 : 0;
@@ -127,7 +131,7 @@ int CpuOps040::opShiftMem(M68040& c, u16 op) {
     if (c.is68030()) {
         const int base = type == 2 ? 4 : type == 1 ? 4
                        : type == 0 ? (left ? 6 : 4) : 6;
-        return base + eaFetchTime030(eaIndex(mode, reg), 1);
+        return base + eaFetchTime030(c, eaIndex(mode, reg), 1);
     }
     return 3 + eaTime(eaIndex(mode, reg));
 }
@@ -151,7 +155,7 @@ int CpuOps040::opBitOp(M68040& c, u16 op) {
         case 2: c.d[reg] &= ~m; break;
         default: c.d[reg] |= m; break;
         }
-        if (c.is68030()) return kind == 0 ? 4 : 6;
+        if (c.is68030()) return timed030(c, kind == 0 ? 4 : 6, 0, kind == 0 ? 4 : 6);
         return (kind == 0) ? 2 : 4;
     }
 
@@ -164,7 +168,7 @@ int CpuOps040::opBitOp(M68040& c, u16 op) {
         if (c.is68030()) {
             const int ea = isStatic
                 ? eaFetchImmediateTime030(c, eaIndex(mode, reg), 1)
-                : eaFetchTime030(eaIndex(mode, reg), 0);
+                : eaFetchTime030(c, eaIndex(mode, reg), 0);
             return 4 + ea;
         }
         return 2 + eaTime(eaIndex(mode, reg));
@@ -181,7 +185,7 @@ int CpuOps040::opBitOp(M68040& c, u16 op) {
     if (c.is68030()) {
         const int ea = isStatic
             ? eaFetchImmediateTime030(c, eaIndex(mode, reg), 1)
-            : eaFetchTime030(eaIndex(mode, reg), 0);
+            : eaFetchTime030(c, eaIndex(mode, reg), 0);
         return 6 + ea;
     }
     return 4 + eaTime(eaIndex(mode, reg));
@@ -219,18 +223,18 @@ int CpuOps040::opBitField(M68040& c, u16 op) {
 
         u32 newField = field;
         switch (kind) {
-        case 0: return c.is68030() ? 8 : 2;                 // BFTST
-        case 1: c.d[dn] = field; return c.is68030() ? 10 : 2; // BFEXTU
+        case 0: return timed030(c, 8, 0, c.is68030() ? 8 : 2);                 // BFTST
+        case 1: c.d[dn] = field; return timed030(c, 10, 0, c.is68030() ? 10 : 2); // BFEXTU
         case 3: c.d[dn] = (width == 32) ? field             // BFEXTS
                 : ((field & (1u << (width - 1))) ? (field | ~wmask) : field);
-            return c.is68030() ? 10 : 2;
+            return timed030(c, 10, 0, c.is68030() ? 10 : 2);
         case 5: {                                           // BFFFO
             // Register form: the offset is modulo 32 in all respects,
             // including the returned position.
             u32 i = 0;
             while (i < width && !(field & (1u << (width - 1 - i)))) ++i;
             c.d[dn] = off + i;
-            return c.is68030() ? 20 : 4;
+            return timed030(c, 20, 0, c.is68030() ? 20 : 4);
         }
         case 2: newField = field ^ wmask; break;            // BFCHG
         case 4: newField = 0; break;                        // BFCLR
@@ -247,7 +251,7 @@ int CpuOps040::opBitField(M68040& c, u16 op) {
         const u32 merged  = (rot & ~fmaskR) | (shifted & fmaskR);
         c.d[reg] = (off == 0) ? merged
                               : ((merged >> off) | (merged << (32 - off)));
-        if (c.is68030()) return kind == 7 ? 12 : 14;
+        if (c.is68030()) return timed030(c, kind == 7 ? 12 : 14, 0, kind == 7 ? 12 : 14);
         return 3;
     }
 
@@ -311,7 +315,7 @@ int CpuOps040::opBitField(M68040& c, u16 op) {
         case 5: operationCycles = five ? 28 : 22; break;
         default: operationCycles = five ? 18 : 12; break;
         }
-        return operationCycles + eaCalcImmediateTime030(c, eaIndex(mode, reg));
+        return timed030(c, 6, 0, operationCycles + eaCalcImmediateTime030(c, eaIndex(mode, reg)));
     }
     return 4 + eaTime(eaIndex(mode, reg));
 }

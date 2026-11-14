@@ -23,14 +23,16 @@ int CpuOps040::opBcc(M68040& c, u16 op) {
     if (cond == 1) { // BSR
         c.push32(c.pc);
         jumpTo(c, base + static_cast<u32>(disp));
-        return c.is68030() ? 6 : 2;
+        return timed030(c, 2, 0, c.is68030() ? 6 : 2);
     }
     if (cond == 0 || testCond(c, cond)) {
         jumpTo(c, base + static_cast<u32>(disp));
-        return c.is68030() ? 6 : 2;
+        return timed030(c, 6, 0, c.is68030() ? 6 : 2);
     }
-    if (c.is68030())
-        return displacementCode != 0 && displacementCode != 0xFF ? 4 : 6;
+    if (c.is68030()) {
+        const int cc = displacementCode != 0 && displacementCode != 0xFF ? 4 : 6;
+        return timed030(c, cc, 0, cc);
+    }
     return 3;   // not-taken costs more than taken on the '040
 }
 
@@ -38,22 +40,22 @@ int CpuOps040::opDbcc(M68040& c, u16 op) {
     const int reg = op & 7;
     const u32 base = c.pc;
     const s32 disp = static_cast<s16>(c.fetch16());
-    if (testCond(c, (op >> 8) & 15)) return c.is68030() ? 6 : 4;
+    if (testCond(c, (op >> 8) & 15)) return timed030(c, 6, 0, c.is68030() ? 6 : 4);
 
     const u16 count = static_cast<u16>((c.d[reg] & 0xFFFF) - 1);
     writeSized(c.d[reg], count, 1);
     if (count != 0xFFFF) {
         jumpTo(c, base + static_cast<u32>(disp));
-        return c.is68030() ? 6 : 3;
+        return timed030(c, 6, 0, c.is68030() ? 6 : 3);
     }
-    return c.is68030() ? 10 : 4;
+    return timed030(c, 10, 0, c.is68030() ? 10 : 4);
 }
 
 int CpuOps040::opJmp(M68040& c, u16 op) {
     const int mode = (op >> 3) & 7, reg = op & 7;
     const u32 addr = calcEA(c, mode, reg, 2);
     jumpTo(c, addr);
-    if (c.is68030()) return 4 + eaJumpTime030(c, eaIndex(mode, reg));
+    if (c.is68030()) return timed030(c, 4, 0, 4 + eaJumpTime030(c, eaIndex(mode, reg)));
     return 3 + eaTime(eaIndex(mode, reg));
 }
 
@@ -69,13 +71,13 @@ int CpuOps040::opJsr(M68040& c, u16 op) {
 
 int CpuOps040::opRts(M68040& c, u16) {
     jumpTo(c, c.pop32());
-    return c.is68030() ? 9 : 5;
+    return timed030(c, 1, 0, c.is68030() ? 9 : 5);
 }
 
 int CpuOps040::opRtr(M68040& c, u16) {
     c.setCCR(static_cast<u8>(c.pop16()));
     jumpTo(c, c.pop32());
-    return c.is68030() ? 12 : 7;
+    return timed030(c, 1, 0, c.is68030() ? 12 : 7);
 }
 
 int CpuOps040::opRtd(M68040& c, u16) {
@@ -83,7 +85,7 @@ int CpuOps040::opRtd(M68040& c, u16) {
     const u32 ret = c.pop32();
     c.a[7] += static_cast<u32>(disp);
     jumpTo(c, ret);
-    return c.is68030() ? 10 : 6;
+    return timed030(c, 2, 0, c.is68030() ? 10 : 6);
 }
 
 // RTE: read the frame in place (a faulting read restarts the RTE), then pop
@@ -174,7 +176,7 @@ int CpuOps040::opChk(M68040& c, u16 op) {
     const int dreg = (op >> 9) & 7;
     const s32 bound = signExtend(readEA(c, mode, reg, size), size);
     const s32 v = signExtend(c.d[dreg], size);
-    const int eaT = c.is68030() ? eaFetchTime030(eaIndex(mode, reg), size)
+    const int eaT = c.is68030() ? eaFetchTime030(c, eaIndex(mode, reg), size)
                                 : eaTime(eaIndex(mode, reg));
 
     c.sr_ = static_cast<u16>(c.sr_ & ~(kZ040 | kV040 | kC040));

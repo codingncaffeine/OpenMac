@@ -67,8 +67,10 @@ constexpr int kWatchdogClocks = 689;
 // apart; a VIA access starts on the VIA's own 783.36 kHz clock and ends half
 // of one later (the rule the IIfx's VIAs follow). The video RAM's wait
 // states are in no document in hand: it is given the other devices' cycle.
-// With these a real SE/30's Speedometer 3.06 figures are met to within 3%
-// (the dossier, "Speed").
+// The processor is asked for the manual's overlap timing (MC68030UM 11.3 to
+// 11.5): what one instruction's last bus cycle and the next one's start
+// share, and the clock an operand found in the data cache saves. The real
+// machine's Speedometer 3.06 figures are in the dossier, "Speed".
 constexpr int kNominalCycle = 2;
 constexpr int kMemoryCycle = 4;
 constexpr int kDeviceCycle = 4;
@@ -155,6 +157,7 @@ Se30Machine::Se30Machine(std::vector<u8> rom, const Config& cfg)
         videoRomMask_ = vs - 1;
     }
     wireDevices();
+    cpu_.setOverlapTiming030(true);
     reset();
 }
 

@@ -56,6 +56,11 @@ public:
     // since the preceding call.  Instruction tables already include their
     // nominal two-clock accesses, so this reports only the excess.
     virtual int takeCyclePenalty() { return 0; }
+
+    // The same excess as it stands now, without taking it: a processor that
+    // works out how far one instruction's last bus cycle runs under the next
+    // instruction (MC68030UM 11.5) reads it before and after an access.
+    virtual int pendingCyclePenalty() const { return 0; }
 };
 
 } // namespace openmac

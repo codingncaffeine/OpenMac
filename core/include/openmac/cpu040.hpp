@@ -198,6 +198,20 @@ public:
     // 68040 keeps no such cache here and nothing happens.
     void dropDataCache030(u32 address, u32 bytes);
 
+    // MC68030UM 11.3 to 11.5. The manual's instruction times are each
+    // instruction alone, every bus cycle two clocks, nothing answered by the
+    // data cache. A run of instructions takes less: the end of one (its
+    // tail, a bus cycle still going) runs under the start of the next (its
+    // head, work that needs no bus), an operand the data cache answers
+    // saves a clock, and a longer bus cycle lengthens the tail it ends. With
+    // this on, step() returns times worked out that way; off, the tables'
+    // plain sums, as before. A board asks for it when it is built.
+    void setOverlapTiming030(bool on) { overlapTiming030_ = on; prevTail030_ = 0; }
+    bool overlapTiming030() const { return overlapTiming030_; }
+    // The tail the last instruction left for the next one (saved state).
+    int pendingTail030() const { return prevTail030_; }
+    void setPendingTail030(int clocks) { prevTail030_ = clocks; }
+
 private:
     friend struct CpuOps040;
     friend class IifxStateCodec;
@@ -289,6 +303,31 @@ private:
     std::array<CacheLine030, 16> instructionCache030_{};
     std::array<CacheLine030, 16> dataCache030_{};
     CacheStats030 cacheStats030_{};
+
+    // Overlap timing (setOverlapTiming030). One instruction's record: the
+    // operation's head and tail from the tables, its effective-address
+    // stage, and what its bus cycles turned out to be.
+    struct Stage030 {
+        bool present = false;
+        bool plusOpHead = false;   // the tables' "n + op head"
+        int head = 0;
+        int tail = 0;              // as it came out: cache hit and wait states in
+    };
+    int settleTiming030(int cycles);
+    int fetchStage030(int head, int tail);
+    u32 dataRead030(u32 addr, int size);
+    void dataWrite030(u32 addr, u32 value, int size);
+    bool overlapTiming030_ = false;
+    int prevTail030_ = 0;          // what the last instruction left running
+    int opHead030_ = 0;
+    int opTail030_ = 0;
+    Stage030 ea030_{};
+    int readPenalty030_ = 0;       // clocks beyond two of the last operand read
+    int writePenalty030_ = 0;      // and of the last operand write
+    bool readHit030_ = false;      // the last operand read came from the data cache
+    bool lastAccessWrite030_ = false;
+    bool fetchedFromBus030_ = false;   // an instruction word needed a bus cycle
+    bool exception030_ = false;        // exception processing: nothing overlaps it
 
     // Software ATC: direct-mapped, tag = vpn | super, per-entry write and
     // modified bits so a write through a read-established entry re-walks to

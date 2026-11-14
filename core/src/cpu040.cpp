@@ -1,5 +1,7 @@
 #include "cpu040_ops.hpp"
 
+#include <algorithm>
+
 // M68040 core engine: reset, the three-bank stack model, MMU-translated bus
 // access with misaligned-access splitting, exception frame construction, and
 // the step loop. Instruction handlers live in the cpu040_ops_*.cpp files.
@@ -51,6 +53,7 @@ void M68040::reset() {
         clearCaches030();
         cacheStats030_ = CacheStats030{};
     }
+    prevTail030_ = 0;
     tlbFlush();
     isp      = bus_.read32(0);
     pc       = bus_.read32(4);
@@ -526,6 +529,7 @@ u32 M68040::readCached030(u32 addr, int size, u32 fc, bool instruction) {
         else ++cacheStats030_.dataHits;
         return extractCached030(line.data[entry], addr, size);
     }
+    if (instruction) fetchedFromBus030_ = true;
 
     bool cacheInhibit = false;
     const u32 pa = translateFc030(addr, false, fc, &cacheInhibit);
@@ -690,11 +694,35 @@ u32 M68040::invalidateInstructionCache030(u32 logical, u32 bytes) {
 // controller performs the same splitting for misaligned operands, so a
 // misaligned long that crosses a page boundary translates each piece.
 
-u8 M68040::rd8(u32 addr) {
-    if (is68030()) {
-        const u32 fc = (sr_ & kS040) ? 5u : 1u;
-        return static_cast<u8>(readCached030(addr, 0, fc, false));
+// An operand's read or write on the 68030. With overlap timing on, what the
+// cycle cost beyond two clocks and whether the data cache answered it are
+// kept for the instruction's time (settleTiming030).
+u32 M68040::dataRead030(u32 addr, int size) {
+    const u32 fc = (sr_ & kS040) ? 5u : 1u;
+    if (!overlapTiming030_) return readCached030(addr, size, fc, false);
+    const int before = bus_.pendingCyclePenalty();
+    const u64 hits = cacheStats030_.dataHits;
+    const u32 v = readCached030(addr, size, fc, false);
+    readPenalty030_ = bus_.pendingCyclePenalty() - before;
+    readHit030_ = cacheStats030_.dataHits != hits;
+    lastAccessWrite030_ = false;
+    return v;
+}
+
+void M68040::dataWrite030(u32 addr, u32 value, int size) {
+    const u32 fc = (sr_ & kS040) ? 5u : 1u;
+    if (!overlapTiming030_) {
+        writeCached030(addr, value, size, fc);
+        return;
     }
+    const int before = bus_.pendingCyclePenalty();
+    writeCached030(addr, value, size, fc);
+    writePenalty030_ = bus_.pendingCyclePenalty() - before;
+    lastAccessWrite030_ = true;
+}
+
+u8 M68040::rd8(u32 addr) {
+    if (is68030()) return static_cast<u8>(dataRead030(addr, 0));
     const u32 pa = translate(addr, false, false);
     try {
         return bus_.read8(pa);
@@ -708,10 +736,7 @@ u16 M68040::rd16(u32 addr) {
         const u16 hi = rd8(addr);
         return static_cast<u16>((hi << 8) | rd8(addr + 1));
     }
-    if (is68030()) {
-        const u32 fc = (sr_ & kS040) ? 5u : 1u;
-        return static_cast<u16>(readCached030(addr, 1, fc, false));
-    }
+    if (is68030()) return static_cast<u16>(dataRead030(addr, 1));
     const u32 pa = translate(addr, false, false);
     try {
         return bus_.read16(pa);
@@ -731,10 +756,7 @@ u32 M68040::rd32(u32 addr) {
         const u32 b3 = rd8(addr + 3);
         return (b0 << 24) | (w << 8) | b3;
     }
-    if (is68030()) {
-        const u32 fc = (sr_ & kS040) ? 5u : 1u;
-        return readCached030(addr, 2, fc, false);
-    }
+    if (is68030()) return dataRead030(addr, 2);
     const u32 pa = translate(addr, false, false);
     try {
         return bus_.read32(pa);
@@ -745,7 +767,7 @@ u32 M68040::rd32(u32 addr) {
 
 void M68040::wr8(u32 addr, u8 v) {
     if (is68030()) {
-        writeCached030(addr, v, 0, (sr_ & kS040) ? 5u : 1u);
+        dataWrite030(addr, v, 0);
         return;
     }
     const u32 pa = translate(addr, true, false);
@@ -763,7 +785,7 @@ void M68040::wr16(u32 addr, u16 v) {
         return;
     }
     if (is68030()) {
-        writeCached030(addr, v, 1, (sr_ & kS040) ? 5u : 1u);
+        dataWrite030(addr, v, 1);
         return;
     }
     const u32 pa = translate(addr, true, false);
@@ -787,7 +809,7 @@ void M68040::wr32(u32 addr, u32 v) {
         return;
     }
     if (is68030()) {
-        writeCached030(addr, v, 2, (sr_ & kS040) ? 5u : 1u);
+        dataWrite030(addr, v, 2);
         return;
     }
     const u32 pa = translate(addr, true, false);
@@ -832,6 +854,7 @@ u32  M68040::pop32() { const u32 v = rd32(a[7]); a[7] += 4; return v; }
 
 // Four-word format $0 frame: SR, PC, format|vector.
 int M68040::exceptionFrame0(int vector, int cycles) {
+    exception030_ = true;
     if (onException) onException(vector, instrStart_);
     const u16 oldSR = sr_;
     setSR(static_cast<u16>((sr_ | kS040) & ~(kT1040 | kT0040)));
@@ -845,6 +868,7 @@ int M68040::exceptionFrame0(int vector, int cycles) {
 
 // Six-word format $2 frame: SR, PC, format|vector, instruction address.
 int M68040::exceptionFrame2(int vector, u32 addr, int cycles) {
+    exception030_ = true;
     if (onException) onException(vector, instrStart_);
     const u16 oldSR = sr_;
     setSR(static_cast<u16>((sr_ | kS040) & ~(kT1040 | kT0040)));
@@ -859,6 +883,7 @@ int M68040::exceptionFrame2(int vector, u32 addr, int cycles) {
 
 int M68040::doInterrupt(int level) {
     stopped = false;
+    prevTail030_ = 0;
     if (onInterrupt)
         onInterrupt(level, static_cast<u32>(kVec040Autovector + level), pc);
     const u16 oldSR = sr_;
@@ -892,6 +917,7 @@ int M68040::doInterrupt(int level) {
 // stacked PC themselves when they want to skip the faulting access.
 int CpuOps040::enterAccessError(M68040& c, const M68040::AccessFault& f) {
     c.lastFaultAddr = f.addr;
+    c.prevTail030_ = 0;
     const int vector = (c.is68030() && f.instruction && !f.atc && (f.addr & 1))
                            ? kVec040AddressError
                            : kVec040AccessError;
@@ -984,6 +1010,54 @@ int CpuOps040::enterAccessError(M68040& c, const M68040::AccessFault& f) {
     }
 }
 
+// An effective-address stage that read its operand (the fetch tables). The
+// data cache answering saves a clock and shortens the tail (11.4, rules 1a
+// to 1c); a bus cycle longer than two clocks lengthens it (11.5, rule 1a).
+// Returns the clocks to take off the table's time.
+int M68040::fetchStage030(int head, int tail) {
+    int saved = 0;
+    if (readHit030_) {
+        if (tail >= 1) {
+            saved = 1;
+            tail = tail == 1 ? 0 : 1;
+        }
+    } else {
+        tail += readPenalty030_;
+    }
+    ea030_ = {true, false, head, tail};
+    return saved;
+}
+
+// MC68030UM 11.3.4, equation 11-2, for the instruction just carried out:
+// its time less what its effective-address stage and its operation share,
+// less what its head shares with the tail the last instruction left.
+int M68040::settleTiming030(int cycles) {
+    int head = opHead030_;
+    int inner = 0;
+    if (ea030_.present) {
+        if (ea030_.plusOpHead) {
+            head += ea030_.head;
+        } else {
+            head = ea030_.head;
+            inner = std::min(opHead030_, ea030_.tail);
+        }
+    }
+    // A write cycle longer than two clocks is still going when the
+    // microcode has finished (11.5, rule 3a).
+    int tail = opTail030_ + (lastAccessWrite030_ ? writePenalty030_ : 0);
+    // Head and tail are the cache case's (11.3.3): an instruction whose own
+    // words came over the bus overlaps nothing, nor does exception
+    // processing. The coprocessor's instructions are in none of the tables.
+    if (fetchedFromBus030_ || exception030_ || (ir_ >> 12) == 0xF) {
+        head = 0;
+        tail = 0;
+    }
+    if (exception030_ || (ir_ >> 12) == 0xF) inner = 0;
+    const int overlap = inner + std::min(head, prevTail030_);
+    prevTail030_ = tail;
+    return cycles > overlap ? cycles - overlap : 0;
+}
+
 int M68040::step() {
     // Discard reset/debugger traffic from before this instruction.  The
     // returned instruction time includes only penalties incurred by its own
@@ -1008,10 +1082,22 @@ int M68040::step() {
     snapSR_ = sr_;
     eaExtra_ = 0;
     lastEaFull030_ = false;
+    if (overlapTiming030_) {
+        opHead030_ = 0;
+        opTail030_ = 0;
+        ea030_ = Stage030{};
+        readPenalty030_ = 0;
+        writePenalty030_ = 0;
+        readHit030_ = false;
+        lastAccessWrite030_ = false;
+        fetchedFromBus030_ = false;
+        exception030_ = false;
+    }
     try {
         const u16 op = fetch16();
         ir_ = op;
         int cycles = CpuOps040::table(model_)[op](*this, op) + eaExtra_;
+        if (overlapTiming030_) cycles = settleTiming030(cycles);
         if (traced && !stopped && !halted) {
             cycles += exceptionFrame2(kVec040Trace, instrStart_,
                                       is68030() ? 22 : 25);
@@ -1066,12 +1152,21 @@ int CpuOps040::eaTime(int idx) {
 // MC68030UM 11.6.1, instruction-cache case, two-clock bus accesses.  Full
 // extension-word and memory-indirect supplements are accumulated by
 // indexExtension() in eaExtra_; these entries are the single/brief formats.
-int CpuOps040::eaFetchTime030(int idx, int size) {
+int CpuOps040::eaFetchTime030(M68040& c, int idx, int size) {
     static constexpr int t[12] = {
         0, 0, 3, 3, 4, 4, 6, 4, 4, 4, 6, 0
     };
-    if (idx == 11) return size == 2 ? 4 : 2;
-    return t[idx];
+    const int cc = idx == 11 ? (size == 2 ? 4 : 2) : t[idx];
+    if (!c.overlapTiming030_ || idx < 2) return cc;
+    if (idx == 11) {
+        c.ea030_ = {true, false, cc, 0};
+        return cc;
+    }
+    static constexpr int head[12] = {0, 0, 1, 0, 2, 2, 4, 2, 1, 2, 4, 0};
+    static constexpr int tail[12] = {0, 0, 1, 1, 2, 2, 2, 2, 0, 2, 2, 0};
+    // The full-format rows have heads of 2 and 4 and no tail: the lesser.
+    return cc - c.fetchStage030(c.lastEaFull030_ ? 2 : head[idx],
+                                c.lastEaFull030_ ? 0 : tail[idx]);
 }
 
 // MC68030UM 11.6.2.  This stage fetches an immediate source (byte/word = one
@@ -1084,8 +1179,20 @@ int CpuOps040::eaFetchImmediateTime030(M68040& c, int idx, int size) {
     static constexpr int lng[12] = {
         4, 4, 4, 7, 4, 6, 8, 8, 8, 6, 8, 6
     };
-    return (size == 2 ? lng[idx] : word[idx]) +
-           (c.lastEaFull030_ ? 2 : 0);
+    const int cc = (size == 2 ? lng[idx] : word[idx]) +
+                   (c.lastEaFull030_ ? 2 : 0);
+    if (!c.overlapTiming030_) return cc;
+    if (idx < 2 || idx == 11) {           // "n + op head": the whole stage is head
+        c.ea030_ = {true, true, cc, 0};
+        return cc;
+    }
+    static constexpr int headW[12] = {0, 0, 1, 2, 2, 2, 6, 4, 3, 2, 6, 0};
+    static constexpr int headL[12] = {0, 0, 1, 4, 2, 4, 8, 6, 5, 4, 8, 0};
+    static constexpr int tailW[12] = {0, 0, 1, 1, 2, 0, 2, 2, 0, 0, 2, 0};
+    static constexpr int tailL[12] = {0, 0, 0, 1, 0, 0, 2, 2, 0, 0, 2, 0};
+    if (c.lastEaFull030_) return cc - c.fetchStage030(2, 0);
+    return cc - c.fetchStage030(size == 2 ? headL[idx] : headW[idx],
+                                size == 2 ? tailL[idx] : tailW[idx]);
 }
 
 // MC68030UM 11.6.3.  This is address calculation only: no final operand read.
@@ -1093,7 +1200,15 @@ int CpuOps040::eaCalcTime030(M68040& c, int idx) {
     static constexpr int t[12] = {
         0, 0, 2, 2, 2, 2, 4, 2, 4, 2, 4, 0
     };
-    return t[idx] + (c.lastEaFull030_ ? 2 : 0);
+    const int cc = t[idx] + (c.lastEaFull030_ ? 2 : 0);
+    if (c.overlapTiming030_ && idx >= 2) {
+        // "n + op head" with n the stage's whole time, but for (An)+ (no
+        // head) and the full formats (2 at least).
+        if (c.lastEaFull030_) c.ea030_ = {true, false, 2, 0};
+        else if (idx == 3) c.ea030_ = {true, false, 0, 0};
+        else c.ea030_ = {true, true, cc, 0};
+    }
+    return cc;
 }
 
 // MC68030UM 11.6.4.  A second instruction word (MOVEM mask, MOVES extension,
@@ -1104,15 +1219,25 @@ int CpuOps040::eaCalcImmediateTime030(M68040& c, int idx, int operandWords) {
     static constexpr int oneWord[12] = {
         2, 2, 2, 4, 2, 4, 6, 4, 6, 4, 6, 2
     };
-    return oneWord[idx] + (operandWords > 1 ? (operandWords - 1) * 2 : 0) +
-           (c.lastEaFull030_ ? 2 : 0);
+    const int cc = oneWord[idx] + (operandWords > 1 ? (operandWords - 1) * 2 : 0) +
+                   (c.lastEaFull030_ ? 2 : 0);
+    if (c.overlapTiming030_) {
+        if (c.lastEaFull030_) c.ea030_ = {true, false, 4, 0};
+        else if (idx == 3) c.ea030_ = {true, false, operandWords * 2, 0};
+        else c.ea030_ = {true, true, cc, 0};
+    }
+    return cc;
 }
 
 // MC68030UM 11.6.5, single/brief jump effective addresses.
-int CpuOps040::eaJumpTime030(M68040&, int idx) {
+int CpuOps040::eaJumpTime030(M68040& c, int idx) {
     static constexpr int t[12] = {
         0, 0, 2, 0, 0, 4, 6, 2, 2, 4, 6, 0
     };
+    if (c.overlapTiming030_) {
+        if (c.lastEaFull030_) c.ea030_ = {true, false, 2, 0};
+        else c.ea030_ = {true, true, t[idx], 0};
+    }
     return t[idx];
 }
 

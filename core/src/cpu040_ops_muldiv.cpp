@@ -26,7 +26,7 @@ int CpuOps040::opMul(M68040& c, u16 op) {
     c.d[dreg] = r;
     setNZ(c, r, 2);
     c.sr_ = static_cast<u16>(c.sr_ & ~(kV040 | kC040));
-    if (c.is68030()) return 28 + eaFetchTime030(eaIndex(mode, reg), 1);
+    if (c.is68030()) return timed030(c, 2, 0, 28 + eaFetchTime030(c, eaIndex(mode, reg), 1));
     return (isSigned ? 16 : 14) + eaTime(eaIndex(mode, reg));
 }
 
@@ -36,8 +36,9 @@ int CpuOps040::opDiv(M68040& c, u16 op) {
     const int dreg = (op >> 9) & 7;
     const u16 s = static_cast<u16>(readEA(c, mode, reg, 1));
     const u32 t = c.d[dreg];
-    const int eaT = c.is68030() ? eaFetchTime030(eaIndex(mode, reg), 1)
+    const int eaT = c.is68030() ? eaFetchTime030(c, eaIndex(mode, reg), 1)
                                 : eaTime(eaIndex(mode, reg));
+    (void)timed030(c, mode == 0 ? 2 : 0, 0, 0);
 
     if (s == 0) {
         c.sr_ = static_cast<u16>(c.sr_ & ~(kN040 | kZ040 | kV040 | kC040));
@@ -234,7 +235,7 @@ int CpuOps040::opNbcd(M68040& c, u16 op) {
     const u32 addr = calcEA(c, mode, reg, 0);
     const u8 r = sbcdByte040(c, c.rd8(addr), 0);
     c.wr8(addr, r);
-    if (c.is68030()) return 6 + eaFetchTime030(eaIndex(mode, reg), 0);
+    if (c.is68030()) return 6 + eaFetchTime030(c, eaIndex(mode, reg), 0);
     return 3 + eaTime(eaIndex(mode, reg));
 }
 

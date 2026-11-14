@@ -176,6 +176,7 @@ public:
     // counts for an access, since the last call (wait states, 8-bit ports,
     // the watchdog).
     int takeCyclePenalty() override;
+    int pendingCyclePenalty() const override { return busWaitClocks_; }
 
     static constexpr u32 kNoRam = 0xFFFFFFFFu;
     // Where a RAM-space address lands in the fitted bytes (bank A first,
