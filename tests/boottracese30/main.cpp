@@ -18,6 +18,7 @@
 //                     [--profile FROM TO] [--disasm ADDRESS COUNT]...
 //                     [--traps FRAME COUNT] [--guest-calls] [--driver-over-scsi]
 //                     [--beep-at FRAME]... [--guest-power-off-at FRAME] [--dump-audio OUT.wav]
+//                     [--load-state FILE] [--save-state-at FRAME FILE] [--save-state FILE]
 //
 // Disk and disc files are read into memory and never written; --save-harddisk
 // writes the first disk as it stands at the end, --save-harddisk-at as it
@@ -108,6 +109,11 @@ int main(int argc, char** argv) {
     std::string wavPath;
     int profileFrom = -1, profileTo = -1;
     std::map<u32, u64> profile;
+    // --load-state FILE starts from a saved state (frame numbers go on from
+    // the state's own; a disc is given again with --cd); --save-state-at N
+    // FILE saves before frame N runs; --save-state FILE saves at the end.
+    std::string loadStatePath, saveStatePath, saveStateAtPath;
+    int saveStateAt = -1;
     std::vector<std::pair<u32, int>> listings;
     int trapsFrom = -1, trapsLeft = 0;
     bool guestCalls = false, driverOverScsi = false;
@@ -165,6 +171,9 @@ int main(int argc, char** argv) {
         else if (a == "--dump-audio" && i + 1 < argc) wavPath = argv[++i];
         else if (a == "--driver-over-scsi") driverOverScsi = true;
         else if (a == "--profile" && i + 2 < argc) { profileFrom = std::atoi(argv[++i]); profileTo = std::atoi(argv[++i]); }
+        else if (a == "--load-state" && i + 1 < argc) loadStatePath = argv[++i];
+        else if (a == "--save-state" && i + 1 < argc) saveStatePath = argv[++i];
+        else if (a == "--save-state-at" && i + 2 < argc) { saveStateAt = std::atoi(argv[++i]); saveStateAtPath = argv[++i]; }
         else if (a == "--traps" && i + 2 < argc) { trapsFrom = std::atoi(argv[++i]); trapsLeft = std::atoi(argv[++i]); }
         else if (a == "--disasm" && i + 2 < argc) {
             const u32 at = static_cast<u32>(std::strtoul(argv[++i], nullptr, 0));
@@ -285,7 +294,27 @@ int main(int argc, char** argv) {
     std::vector<u8> audio, audioChunk, stereo, stereoChunk;
     int ejectsSeen = 0;
     bool disk2PutAwaySeen = false;
-    for (int f = 0; f < frames; ++f) {
+    int firstFrame = 0;
+    if (!loadStatePath.empty()) {
+        std::string why;
+        if (!mac.loadStateFile(loadStatePath, &why)) {
+            std::fprintf(stderr, "state not loaded: %s\n", why.c_str());
+            return 2;
+        }
+        firstFrame = static_cast<int>(mac.frameCount());
+        ejectsSeen = static_cast<int>(mac.floppyEjects());
+        std::printf("state loaded: %s, frame %d\n", loadStatePath.c_str(), firstFrame);
+        // The start-up tests are long over in any state worth saving.
+        chimeReached = true;
+        if (profileFrom < 0) mac.cpu().onStep = nullptr;
+    }
+    const auto saveStateTo = [&](const std::string& path, int frame) {
+        std::string why;
+        if (mac.saveStateFile(path, &why)) std::printf("state saved: %s, frame %d\n", path.c_str(), frame);
+        else std::fprintf(stderr, "state not saved: %s\n", why.c_str());
+    };
+    for (int f = firstFrame; f < frames; ++f) {
+        if (f == saveStateAt) saveStateTo(saveStateAtPath, f);
         lastFrame = static_cast<u32>(f);
         if (hdOutAtFrame == f) {
             const std::vector<u8>& image = mac.hardDiskImage();
@@ -489,6 +518,7 @@ int main(int argc, char** argv) {
         for (std::size_t id = 0; id < sc.commandsById.size(); ++id) std::printf(" %zu=%u", id, sc.commandsById[id]);
         std::printf("\n");
     }
+    if (!saveStatePath.empty()) saveStateTo(saveStatePath, static_cast<int>(mac.frameCount()));
     std::printf("end: frame %llu pc=%08X sr=%04X overlay=%d%s\n", static_cast<unsigned long long>(mac.frameCount()),
                 mac.cpu().pc, mac.cpu().getSR(), mac.overlayActive() ? 1 : 0, mac.cpu().halted ? " HALTED" : "");
     if (report) std::fputs(mac.diagnosticReport().c_str(), stdout);

@@ -1181,9 +1181,9 @@ static int stateResult(bool ok, const std::string& why, char* err, size_t cap)
 OMAC_API int omac_q_save_state(OMacQ* m, const char* path, char* err, size_t cap)
 {
     if (!m || !path) return stateResult(false, "no machine", err, cap);
-    if (m->se30) return stateResult(false, "the Macintosh SE/30 has no saved state yet", err, cap);
     std::string why;
-    const bool ok = m->q950 ? m->q950->saveStateFile(path, &why)
+    const bool ok = m->se30 ? m->se30->saveStateFile(path, &why)
+                  : m->q950 ? m->q950->saveStateFile(path, &why)
                             : m->q650->saveStateFile(path, &why);
     return stateResult(ok, why, err, cap);
 }
@@ -1191,9 +1191,9 @@ OMAC_API int omac_q_save_state(OMacQ* m, const char* path, char* err, size_t cap
 OMAC_API int omac_q_load_state(OMacQ* m, const char* path, char* err, size_t cap)
 {
     if (!m || !path) return stateResult(false, "no machine", err, cap);
-    if (m->se30) return stateResult(false, "the Macintosh SE/30 has no saved state yet", err, cap);
     std::string why;
-    const bool ok = m->q950 ? m->q950->loadStateFile(path, &why)
+    const bool ok = m->se30 ? m->se30->loadStateFile(path, &why)
+                  : m->q950 ? m->q950->loadStateFile(path, &why)
                             : m->q650->loadStateFile(path, &why);
     return stateResult(ok, why, err, cap);
 }

@@ -113,6 +113,7 @@ public:
     }
 
 private:
+    friend class QuadraStateCodec;
     void maybeClock() {
         const bool canClock = adb_.state() != 3 || adb_.responsePending();
         if (canClock && armed_ && pending_ == 0) {

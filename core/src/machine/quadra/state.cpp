@@ -1,16 +1,21 @@
-// The saved states of the two Quadras, in the format of the Macintosh IIfx's
-// checkpoints (iifx/state_codec.hpp): a 64-byte header naming the ROM and the
-// RAM size, then one tagged section per part. The chips the machines share
-// are written by the IIfx codec's visitors; what those visitors leave out,
-// because the IIfx never used it, follows in a section of this file's own, so
-// the IIfx's format does not move. The Quadra 950's file comes first, the
-// Quadra 650's after it; the storage both get from MacHostServices is one
-// visitor.
+// The saved states of the machines built on MacHostServices (the two Quadras
+// and the Macintosh SE/30), in the format of the Macintosh IIfx's checkpoints
+// (iifx/state_codec.hpp): a 64-byte header naming the ROM and the RAM size,
+// then one tagged section per part. The chips the machines share are written
+// by the IIfx codec's visitors; what those visitors leave out, because the
+// IIfx never used it, follows in a section of this file's own, so the IIfx's
+// format does not move. The Quadra 950's file comes first, the Quadra 650's
+// after it, then the SE/30's; the storage all three get from MacHostServices
+// is one visitor.
 
 #include "openmac/quadra.hpp"
 #include "openmac/quadra950.hpp"
+#include "openmac/se30.hpp"
 
+#include "../adb_via.hpp"
+#include "../direct_floppy.hpp"
 #include "../iifx/state_codec.hpp"
+#include "../se30/video.hpp"
 #include "../quadra950/egret.hpp"
 #include "../quadra950/memctl.hpp"
 #include "../scsinet.hpp"
@@ -35,6 +40,10 @@ constexpr u32 kSharedFormat = kStateVersion;
 constexpr u32 k650StateVersion = 1;
 constexpr char k650StateMagic[8] = {'O', 'M', 'Q', '6', '5', '0', 'S', 'T'};
 constexpr u64 k650MaxRamBytes = 136ull * 1024ull * 1024ull;
+
+constexpr u32 kSe30StateVersion = 1;
+constexpr char kSe30StateMagic[8] = {'O', 'M', 'S', 'E', '3', '0', 'S', 'T'};
+constexpr u64 kSe30MaxRamBytes = 128ull * 1024ull * 1024ull;
 
 } // namespace
 
@@ -598,6 +607,211 @@ private:
         visitCalls(io, m, true);
         section(io, fourcc('E', 'N', 'D', '!'));
     }
+
+    // ---- the Macintosh SE/30 --------------------------------------------
+public:
+    static std::vector<u8> saveSe30(const Se30Machine& source) {
+        Se30Machine& machine = const_cast<Se30Machine&>(source);
+        StateWriter payload;
+        visitSe30(payload, machine);
+
+        u32 version = kSe30StateVersion;
+        u32 headerBytes = 64;
+        u32 endian = kEndianMarker;
+        u32 flags = configurationSe30(machine);
+        u64 romBytes = static_cast<u64>(machine.rom_.size());
+        u64 romHash = fnv1a(machine.rom_.data(), machine.rom_.size());
+        u64 ramBytes = static_cast<u64>(machine.ram_.size());
+        u64 payloadBytes = static_cast<u64>(payload.data().size());
+        u64 payloadHash = fnv1a(payload.data().data(), payload.data().size());
+
+        StateWriter output;
+        output.bytes(reinterpret_cast<const u8*>(kSe30StateMagic), sizeof kSe30StateMagic);
+        output.u32v(version);
+        output.u32v(headerBytes);
+        output.u32v(endian);
+        output.u32v(flags);
+        output.u64v(romBytes);
+        output.u64v(romHash);
+        output.u64v(ramBytes);
+        output.u64v(payloadBytes);
+        output.u64v(payloadHash);
+        std::vector<u8> result = output.take();
+        const std::vector<u8>& body = payload.data();
+        result.insert(result.end(), body.begin(), body.end());
+        return result;
+    }
+
+    static bool loadSe30(Se30Machine& machine, const u8* data, std::size_t size,
+                         std::string* error) {
+        const auto fail = [error](const std::string& text) {
+            if (error) *error = text;
+            return false;
+        };
+        if (!data || size < 64) return fail("saved state is too small");
+        if (std::memcmp(data, kSe30StateMagic, sizeof kSe30StateMagic) != 0)
+            return fail("not an OpenMac Macintosh SE/30 saved state");
+
+        StateReader header(data + sizeof kSe30StateMagic, size - sizeof kSe30StateMagic, true);
+        u32 version = 0, headerBytes = 0, endian = 0, flags = 0;
+        u64 romBytes = 0, romHash = 0, ramBytes = 0, payloadBytes = 0, payloadHash = 0;
+        header.u32v(version);
+        header.u32v(headerBytes);
+        header.u32v(endian);
+        header.u32v(flags);
+        header.u64v(romBytes);
+        header.u64v(romHash);
+        header.u64v(ramBytes);
+        header.u64v(payloadBytes);
+        header.u64v(payloadHash);
+        if (!header.ok()) return fail(header.error());
+        if (version != kSe30StateVersion)
+            return fail("unsupported Macintosh SE/30 saved-state version");
+        if (headerBytes != 64 || endian != kEndianMarker)
+            return fail("invalid Macintosh SE/30 saved-state header");
+        if (payloadBytes != size - headerBytes)
+            return fail("saved-state payload length mismatch");
+        if (romBytes != machine.rom_.size() ||
+            romHash != fnv1a(machine.rom_.data(), machine.rom_.size()))
+            return fail("the state was saved with a different Macintosh SE/30 ROM");
+        if (ramBytes != machine.ram_.size())
+            return fail("the state was saved with a different amount of RAM");
+        if (flags != configurationSe30(machine))
+            return fail("the state was saved with a different video ROM");
+        const u8* payload = data + headerBytes;
+        if (payloadHash != fnv1a(payload, static_cast<std::size_t>(payloadBytes)))
+            return fail("saved-state payload checksum mismatch");
+
+        // Every section, length and sparse page is read once without touching
+        // the machine, so a damaged file changes nothing.
+        StateReader validator(payload, static_cast<std::size_t>(payloadBytes), false);
+        visitSe30(validator, machine);
+        if (!validator.ok()) return fail(validator.error());
+        if (!validator.atEnd()) return fail("saved state has trailing payload data");
+
+        StateReader reader(payload, static_cast<std::size_t>(payloadBytes), true);
+        visitSe30(reader, machine);
+        if (!reader.ok() || !reader.atEnd())
+            return fail(reader.ok() ? "saved state has trailing payload data" : reader.error());
+
+        // What is derived from the restored bytes rather than stored.
+        machine.busWaitClocks_ = 0;
+        machine.updateRamDecode();
+        if (!rebindDisk(*machine.disk_, machine.hd_, machine.scsiImage_, machine.hfsImageOffset_))
+            return fail("saved hard disk lies outside its SCSI image");
+        if (!rebindDisk(*machine.disk2_, machine.hd2_, machine.scsiImage2_,
+                        machine.hfsImageOffset2_))
+            return fail("saved second disk lies outside its SCSI image");
+        DirectFloppy& floppy = *machine.floppy_;
+        floppy.drive_.image = floppy.media_.empty() ? nullptr : &floppy.media_;
+        machine.updateIpl();
+        if (error) error->clear();
+        return true;
+    }
+
+private:
+    // What a state has to be loaded back into beyond ROM and RAM: the
+    // screen's declaration ROM, by its bytes, and whether it is OpenMac's
+    // own (its driver is in the System's heap).
+    static u32 configurationSe30(Se30Machine& machine) {
+        u32 word = static_cast<u32>(fnv1a(machine.videoRom_.data(), machine.videoRom_.size())) & ~1u;
+        if (machine.ownVideoRom_) word |= 1u;
+        return word;
+    }
+
+    template <typename Io>
+    static void visitAdbViaPort(Io& io, AdbViaPort& port) {
+        section(io, fourcc('A', 'D', 'B', 'V'));
+        io.boolv(port.armed_); io.boolv(port.pendingInput_); io.intv(port.pending_);
+        io.u32v(port.lastPollTotal_); io.intv(port.wakeStreak_);
+    }
+
+    // The floppy chip's wiring to its one drive: the disk in the drive, the
+    // one that last came out, and the file the sectors arrived in.
+    template <typename Io>
+    static void visitDirectFloppy(Io& io, DirectFloppy& floppy) {
+        section(io, fourcc('D', 'F', 'L', 'P'));
+        io.sparse(floppy.media_, kMaxSmallBlob);
+        io.sparse(floppy.ejected_, kMaxSmallBlob);
+        io.sparse(floppy.mbHeader_, kMaxSmallBlob);
+        io.sparse(floppy.mbResource_, kMaxSmallBlob);
+        io.sparse(floppy.dcHeader_, kMaxSmallBlob);
+        io.sparse(floppy.dcTags_, kMaxSmallBlob);
+        io.boolv(floppy.readOnly_); io.boolv(floppy.sel_);
+        io.boolv(floppy.lstrbPrev_); io.boolv(floppy.actionPrev_);
+        io.boolv(floppy.writeMarkPrev_); io.boolv(floppy.readMarkPrev_);
+        io.u16v(floppy.crcOut_); io.u64v(floppy.dataBytes_);
+        io.u64v(floppy.dataWrites_); io.u32v(floppy.trackWrites_);
+        io.u32v(floppy.ejects_);
+    }
+
+    template <typename Io>
+    static void visitSe30Video(Io& io, Se30Video& video) {
+        section(io, fourcc('S', 'V', 'I', 'D'));
+        io.bytes(video.vram_.data(), video.vram_.size());
+        io.boolv(video.mainBuffer_); io.boolv(video.enabled_); io.boolv(video.request_);
+    }
+
+    // What the IIfx's visitors leave out of the chips this machine has.
+    template <typename Io>
+    static void visitSharedExtrasSe30(Io& io, Se30Machine& machine) {
+        section(io, fourcc('X', 'T', 'R', 'A'));
+        for (Via6522* via : {machine.via1_.get(), machine.via2_.get()}) {
+            io.boolv(via->cb1_); io.boolv(via->cb2_);
+        }
+        for (auto& channel : machine.scc_->ch_) {
+            io.u8v(channel.shiftByte); io.u8v(channel.bufByte);
+            io.boolv(channel.rxAvail); io.u8v(channel.rxData);
+            io.boolv(channel.zeroCount); io.u64v(channel.brgPhase);
+        }
+        Ncr5380& scsi = *machine.scsi_;
+        io.intv(scsi.settleLeft_);
+        for (u32& value : scsi.diagCommandsById) io.u32v(value);
+    }
+
+    template <typename Io>
+    static void visitSe30(Io& io, Se30Machine& m) {
+        section(io, fourcc('S', 'E', '3', '0'));
+        io.sameU32(m.bankA_); io.sameU32(m.bankB_);
+        io.sparse(m.ram_, kSe30MaxRamBytes);
+        io.boolv(m.overlay_); io.u8v(m.sizeBits_);
+        io.boolv(m.via2Pb7_); io.u64v(m.screenInterrupts_);
+        io.u64v(m.totalCycles_); io.u64v(m.frameCounter_);
+        io.intv(m.viaRemainder_); io.intv(m.lineAcc_); io.intv(m.line_);
+        io.u64v(m.secondAcc_); io.intv(m.secondPulseLines_);
+        io.u32v(m.secondsUnanswered_);
+        for (u32& value : m.unansweredAtFrame_) io.u32v(value);
+        io.u64v(m.serialFreeAt_); io.u64v(m.fetchesCounted_);
+        io.u64v(m.scsiPlainCycles_); io.u64v(m.scsiHandshakeCycles_);
+        io.u32v(m.scsiHandshakeTimeouts_);
+        io.boolv(m.floppyEjectPending_); io.boolv(m.floppyEjectAsked_);
+        io.intv(m.floppyEjectFrames_);
+        io.sparse(m.audioOut_, kMaxSmallBlob);
+        io.sparse(m.audioStereo_, kMaxSmallBlob);
+        // What the last instruction's bus cycle left running under the next.
+        int tail = m.cpu_.pendingTail030();
+        io.intv(tail);
+        if (io.applying()) m.cpu_.setPendingTail030(tail);
+
+        IifxStateCodec::visitCpu(io, m.cpu_);
+        IifxStateCodec::visitVia(io, *m.via1_);
+        IifxStateCodec::visitVia(io, *m.via2_);
+        IifxStateCodec::visitRtc(io, *m.rtc_);
+        IifxStateCodec::visitAdb(io, *m.adb_);
+        visitAdbViaPort(io, *m.adbPort_);
+        IifxStateCodec::visitScc(io, *m.scc_);
+        IifxStateCodec::visitScsi(io, *m.scsi_);
+        IifxStateCodec::visitAsc(io, *m.asc_);
+        visitDirectFloppy(io, *m.floppy_);
+        IifxStateCodec::visitSwim(io, m.floppy_->swim_, kSharedFormat);
+        IifxStateCodec::visitSony(io, m.floppy_->drive_);
+        IifxStateCodec::visitSony(io, m.floppy_->absent_);
+        visitSe30Video(io, *m.video_);
+        visitHostServices(io, m);
+        visitSharedExtrasSe30(io, m);
+        visitCalls(io, m, true);
+        section(io, fourcc('E', 'N', 'D', '!'));
+    }
 };
 
 std::vector<u8> Quadra950Machine::saveState() const {
@@ -626,6 +840,42 @@ bool Quadra950Machine::saveStateFile(const std::string& path, std::string* error
 }
 
 bool Quadra950Machine::loadStateFile(const std::string& path, std::string* error) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        if (error) *error = "cannot open the saved state for reading: " + path;
+        return false;
+    }
+    std::vector<u8> state{std::istreambuf_iterator<char>(input),
+                          std::istreambuf_iterator<char>()};
+    return loadState(state.data(), state.size(), error);
+}
+
+std::vector<u8> Se30Machine::saveState() const {
+    return QuadraStateCodec::saveSe30(*this);
+}
+
+bool Se30Machine::loadState(const u8* data, std::size_t size, std::string* error) {
+    return QuadraStateCodec::loadSe30(*this, data, size, error);
+}
+
+bool Se30Machine::saveStateFile(const std::string& path, std::string* error) const {
+    const std::vector<u8> state = saveState();
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        if (error) *error = "cannot open the saved state for writing: " + path;
+        return false;
+    }
+    output.write(reinterpret_cast<const char*>(state.data()),
+                 static_cast<std::streamsize>(state.size()));
+    if (!output) {
+        if (error) *error = "failed while writing the saved state: " + path;
+        return false;
+    }
+    if (error) error->clear();
+    return true;
+}
+
+bool Se30Machine::loadStateFile(const std::string& path, std::string* error) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         if (error) *error = "cannot open the saved state for reading: " + path;

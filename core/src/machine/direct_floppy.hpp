@@ -351,6 +351,7 @@ private:
         }
     }
 
+    friend class QuadraStateCodec;
     Iwm swim_;
     SonyDrive drive_;              // the internal SuperDrive
     SonyDrive absent_;             // the second connector: nothing plugged in

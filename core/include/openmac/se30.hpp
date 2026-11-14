@@ -40,6 +40,7 @@ class DirectFloppy;
 class Se30Video;
 
 class Se30Machine final : public IBus040, public MacHostServices {
+    friend class QuadraStateCodec;
 public:
     struct Config {
         // The two SIMM banks in megabytes: 0 (empty), 1, 4, 16 or 64. The
@@ -164,6 +165,15 @@ public:
 
     // A text snapshot of the CPU and the devices, for when the guest stops.
     std::string diagnosticReport() const;
+
+    // Saved states: the whole machine, RAM, chips, both disks and the floppy
+    // included, in the Quadras' format. A state loads into a machine built
+    // with the same ROM, SIMMs and video ROM; a disc in the CD-ROM drive is
+    // the loader's to put back.
+    std::vector<u8> saveState() const;
+    bool loadState(const u8* data, std::size_t size, std::string* error = nullptr);
+    bool saveStateFile(const std::string& path, std::string* error = nullptr) const;
+    bool loadStateFile(const std::string& path, std::string* error = nullptr);
 
     // IBus040 (the CPU's view of the machine).
     u8   read8(u32 addr) override;

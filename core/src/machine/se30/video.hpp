@@ -30,6 +30,7 @@
 namespace openmac {
 
 class Se30Video {
+    friend class QuadraStateCodec;
 public:
     static constexpr int kWidth = 512;
     static constexpr int kHeight = 342;

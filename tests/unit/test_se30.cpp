@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace openmac;
@@ -758,6 +759,80 @@ TEST_CASE("SE/30 own video ROM: a machine without a ROM file has it in slot $E")
     Se30Machine real(quietRom(), file);
     CHECK_FALSE(real.ownVideoRom());
     CHECK(real.read8(0xFEFFE000u) == 0x11);
+}
+
+TEST_CASE("SE/30 saved state: a machine loaded from one goes on as the machine that saved it") {
+    Se30Machine::Config c = banks(4, 1);
+    c.videoRom = videoRomImage();
+    Se30Machine a(quietRom(), c);
+    a.insertHardDisk(std::vector<u8>(256 * 512, 0x5A));
+    overlayOff(a);
+    setSizeBits(a, 1);
+    for (u32 k = 0; k < 64; ++k) a.write8(0x00400000u + k * 0x1001u, static_cast<u8>(k * 7 + 1));   // bank B
+    a.write8(0xFEE08040u, 0xA5);                       // the screen
+    a.write8(kVia1 + kDdrb, 0x40);
+    a.write8(kVia1 + kOrb, 0x00);                      // the screen's interrupt on
+    for (int k = 0; k < 3; ++k) a.runFrame();
+    // A bus cycle the last instruction left running under the next one.
+    a.cpu().setPendingTail030(3);
+    const std::vector<u8> saved = a.saveState();
+    REQUIRE(saved.size() > 64);
+
+    Se30Machine b(quietRom(), c);
+    std::string why = "untouched";
+    REQUIRE(b.loadState(saved.data(), saved.size(), &why));
+    CHECK(why.empty());
+    CHECK(b.saveState() == saved);
+    CHECK(b.frameCount() == a.frameCount());
+    CHECK(b.totalCycles() == a.totalCycles());
+    CHECK(b.cpu().pendingTail030() == 3);
+    CHECK(b.read8(0x00400000u + 5 * 0x1001u) == 5 * 7 + 1);
+    CHECK(b.read8(0xFEE08040u) == 0xA5);
+    CHECK(b.boardState().screenInterruptEnabled);
+    CHECK(b.hardDiskImage() == a.hardDiskImage());
+    for (int k = 0; k < 2; ++k) { a.runFrame(); b.runFrame(); }
+    CHECK(b.saveState() == a.saveState());
+
+    SUBCASE("a state is refused by a machine it was not saved from, and leaves it as it was") {
+        const auto refused = [&](Se30Machine& m, const std::vector<u8>& state, const char* reason) {
+            const std::vector<u8> before = m.saveState();
+            std::string error;
+            CHECK_FALSE(m.loadState(state.data(), state.size(), &error));
+            CHECK(error.find(reason) != std::string::npos);
+            CHECK(m.saveState() == before);
+        };
+        Se30Machine::Config more = banks(4, 4);
+        more.videoRom = videoRomImage();
+        Se30Machine otherRam(quietRom(), more);
+        refused(otherRam, saved, "different amount of RAM");
+
+        Se30Machine ownRom(quietRom(), banks(4, 1));    // OpenMac's own video ROM
+        refused(ownRom, saved, "different video ROM");
+
+        std::vector<u8> rom = quietRom();
+        rom[0x2000] = 0x01;
+        Se30Machine otherRom(std::move(rom), c);
+        refused(otherRom, saved, "different Macintosh SE/30 ROM");
+
+        Se30Machine fresh(quietRom(), c);
+        std::vector<u8> cut(saved.begin(), saved.begin() + static_cast<std::ptrdiff_t>(saved.size() / 2));
+        refused(fresh, cut, "length mismatch");
+        std::vector<u8> changed = saved;
+        changed[changed.size() - 9] ^= 0x04;
+        refused(fresh, changed, "checksum mismatch");
+        std::vector<u8> quadra = saved;
+        quadra[2] = 'Q';
+        refused(fresh, quadra, "not an OpenMac Macintosh SE/30 saved state");
+    }
+
+    SUBCASE("the same megabytes in the other pair of banks are another machine") {
+        Se30Machine::Config swapped = banks(1, 4);
+        swapped.videoRom = videoRomImage();
+        Se30Machine other(quietRom(), swapped);
+        std::string error;
+        CHECK_FALSE(other.loadState(saved.data(), saved.size(), &error));
+        CHECK_FALSE(error.empty());
+    }
 }
 
 TEST_CASE("declaration ROM builders: the IIfx's generated video ROM is what it was before they moved") {

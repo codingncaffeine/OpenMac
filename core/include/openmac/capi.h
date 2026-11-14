@@ -268,12 +268,14 @@ OMAC_API int    omac_q_unmount_harddisk2(OMacQ*);
    detach clears it. */
 OMAC_API int    omac_q_harddisk2_put_away(OMacQ*);
 
-/* A Quadra's saved state: the whole running machine in one file, both hard
-   disks' contents included (QuadraMachine::saveState, Quadra950Machine::
-   saveState). A state loads only into a machine of the same model with the
-   same ROM, RAM, monitor and, on the Quadra 950, video RAM and SCSI layout;
-   a CD is the caller's to put back. 1 = done; on 0 the reason is in err as a
-   C string. Call between frames. */
+/* The saved state of a machine on this handle (a Quadra or the Macintosh
+   SE/30): the whole running machine in one file, both hard disks' contents
+   included (QuadraMachine::saveState, Quadra950Machine::saveState,
+   Se30Machine::saveState). A state loads only into a machine of the same
+   model with the same ROM and RAM and, on a Quadra, the same monitor (on the
+   Quadra 950 also video RAM and SCSI layout), on the SE/30 the same SIMMs
+   and video ROM; a CD is the caller's to put back. 1 = done; on 0 the reason
+   is in err as a C string. Call between frames. */
 OMAC_API int    omac_q_save_state(OMacQ*, const char* path, char* err, size_t err_cap);
 OMAC_API int    omac_q_load_state(OMacQ*, const char* path, char* err, size_t err_cap);
 /* The same for the Macintosh Classic (Machine::saveState): a state loads into
