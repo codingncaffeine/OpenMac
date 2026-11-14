@@ -656,20 +656,6 @@ public partial class MainWindow : Window
             MessageBox.Show(this, msg, "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
-        // The SE/30's screen is a card with a ROM of its own; without that
-        // file the machine starts with no picture at all.
-        if (_settings.IsSe30 && (string.IsNullOrEmpty(_settings.VideoRomSe30) || !File.Exists(_settings.VideoRomSe30)))
-        {
-            Log.Line("ROM kept, not started: the SE/30 has no video ROM file yet");
-            _settings.ModelLastRom = path;
-            _settings.Save();
-            MessageBox.Show(this,
-                "The SE/30 also needs its video ROM: an 8 KB file, Apple part 341-0650.\n\n"
-                + "Choose it under Machine > Video ROM…; the machine then starts.",
-                "OpenMac", MessageBoxButton.OK, MessageBoxImage.Information);
-            UpdateUi();
-            return;
-        }
         Log.Line($"load ROM: {path}  (RAM={_settings.ModelRamMB} MB, bootRomDisk={_settings.BootRomDisk}, "
                  + $"floppies {(_settings.WriteProtectFloppies ? "write-protected" : "writable")})");
         try
@@ -800,8 +786,21 @@ public partial class MainWindow : Window
             LoadRom(path);
     }
 
-    /// <summary>Choose the SE/30's video ROM file. The machine starts (or
-    /// starts again) with it.</summary>
+    /// <summary>Back to OpenMac's own video ROM for the SE/30's screen: the
+    /// file is forgotten and the machine starts again.</summary>
+    private void Se30OwnVideoRom_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_settings.IsSe30 || string.IsNullOrEmpty(_settings.VideoRomSe30)) return;
+        _settings.VideoRomSe30 = null;
+        _settings.Save();
+        Log.Line("SE/30 video ROM: OpenMac's own");
+        if (_emulator is QuadraEmulator { IsSe30: true } se) se.VideoRomPath = null;
+        if (_emulator.IsRomLoaded && _emulator.RomPath is { } rom) LoadRom(rom);
+        UpdateUi();
+    }
+
+    /// <summary>Choose the SE/30's real video ROM file in place of OpenMac's
+    /// own. The machine starts (or starts again) with it.</summary>
     private void Se30VideoRom_Click(object sender, RoutedEventArgs e)
     {
         if (!_settings.IsSe30) return;
@@ -1993,7 +1992,9 @@ public partial class MainWindow : Window
         Se30VideoRomItem.IsEnabled = se;
         Se30VideoRomItem.Header = se && !string.IsNullOrEmpty(_settings.VideoRomSe30)
             ? $"Video ROM…  ({Path.GetFileName(_settings.VideoRomSe30)})"
-            : "Video ROM…";
+            : "Video ROM…  (OpenMac's own)";
+        Se30OwnVideoRomItem.Visibility = se ? Visibility.Visible : Visibility.Collapsed;
+        Se30OwnVideoRomItem.IsEnabled = se && !string.IsNullOrEmpty(_settings.VideoRomSe30);
         foreach (var item in new[] { MemSe1Item, MemSe2Item, MemSe4Item, MemSe5Item, MemSe8Item, MemSe16Item,
                                      MemSe17Item, MemSe20Item, MemSe32Item, MemSe65Item, MemSe68Item,
                                      MemSe80Item, MemSe128Item })

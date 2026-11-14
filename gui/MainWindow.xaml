@@ -64,7 +64,7 @@
                               Click="ModelClassic_Click" />
                     <MenuItem x:Name="ModelSe30Item" Header="Macintosh SE/30"
                               Click="ModelSe30_Click"
-                              ToolTip="68030/68882 @ 16 MHz with the built-in 512×342 black-and-white screen. Needs the 256 KB ROM (checksum 97221136) and the 8 KB video ROM; each model remembers its own ROM and disk." />
+                              ToolTip="68030/68882 @ 16 MHz with the built-in 512×342 black-and-white screen. Needs the 256 KB ROM (checksum 97221136); the real 8 KB video ROM is optional. Each model remembers its own ROM and disk." />
                     <MenuItem x:Name="ModelIifxItem" Header="Macintosh IIfx"
                               Click="ModelIifx_Click"
                               ToolTip="68030/68882 @ 40 MHz with OSS, two I/O processors and Macintosh II NuBus video. Needs the 512 KB IIfx ROM; each model remembers its own ROM, RAM and SCSI disk." />
@@ -84,7 +84,10 @@
                 </MenuItem>
                 <MenuItem x:Name="Se30VideoRomItem" Header="Video ROM…"
                           Click="Se30VideoRom_Click"
-                          ToolTip="Choose the SE/30's video ROM: an 8 KB file, Apple part 341-0650. The built-in screen needs it; OpenMac does not distribute this ROM." />
+                          ToolTip="Choose the SE/30's real video ROM: an 8 KB file, Apple part 341-0650 (OpenMac does not distribute it). Without one the built-in screen runs on OpenMac's own video ROM, which answers the System the same way." />
+                <MenuItem x:Name="Se30OwnVideoRomItem" Header="Use OpenMac's Own Video ROM"
+                          Click="Se30OwnVideoRom_Click"
+                          ToolTip="Forget the video ROM file and start the SE/30 again with OpenMac's own video ROM." />
                 <MenuItem x:Name="IifxVideoRomItem" Header="8•24 GC Card ROM…"
                           Click="IifxVideoRom_Click"
                           ToolTip="Choose the declaration ROM from an Apple Macintosh Display Card 8•24 GC. The IIfx restarts with the genuine slot-$9 card; OpenMac does not distribute this ROM." />
